@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/oom-edit-core", "crates/oom-edit"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/earendil-works/oom-edit"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
