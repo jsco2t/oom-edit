@@ -12,3 +12,10 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+doc_markdown = "allow"
+
+# Patch dirs-sys to remove the MPL-2.0 option-ext transitive dependency.
+# dirs-sys (MIT/Apache-2.0) depends on option-ext (MPL-2.0) for a trivial
+# OptionExt::contains method. We hand-roll that 3-line utility locally.
+[patch.crates-io]
+dirs-sys = { path = "crates/dirs-sys-patched" }
