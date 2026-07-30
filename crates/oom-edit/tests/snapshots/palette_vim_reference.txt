@@ -1,0 +1,24 @@
+   1  ┌─ metadata ─────────────────────────────────────────────────────────────┐
+   2  │ title: Kitchen Sink                                                    │
+   3  │ ┌ Command Palette ─────────────────────────────────────────────┐       │
+   4  └─│>                                                             │───────┘
+        │                                                              │
+   6  █ │  spell-suggest        spelling suggestions           Space s │
+        │  spell-add            add word to personal dictionary Space a│
+   8  So│  spell-toggle         toggle spelling                Space z │
+        │  trouble              document diagnostics           Space d │
+  10  ┃ │  ]s                   next spelling diagnostic            SP-│
+        │  [s                   previous spelling diagnostic        SP-│
+      ▏ │  :set spell / :set nospell enable or disable spelling        │
+  13  ▏ │  Space 1-9            jump to tab                         spa│
+  14  ▏ │  g t                  next tab                            nex│
+  15  ▏ │  g T                  previous tab                        pre│
+      ▏ │  {count} g t          jump to numbered tab                jum│
+        │  :tabnew {path}       open path in new tab                tab│
+  18  ──│  :tabclose            close tab                           tab│────────
+        │  :qa                  quit all tabs                       qui│
+  20  An│▸ j/k, ↑/↓             Move by rendered row.               R-N│
+        └──────────────────────────────────────────────────────────────┘
+  22  More text here.
+
+ NORMAL  ↑↓ navigate · type to filter · Enter execute · Esc close

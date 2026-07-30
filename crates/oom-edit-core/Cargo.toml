@@ -1,0 +1,52 @@
+[package]
+name = "oom-edit-core"
+version = "0.5.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Embeddable markdown editing engine — zero terminal dependencies"
+
+[dependencies]
+oom-spell = { path = "../oom-spell", version = "=0.1.0" }
+hjkl-engine = { version = "=0.39.0", default-features = false }
+hjkl-buffer = "=0.39.0"
+hjkl-vim = "=0.39.0"
+tree-sitter = "=0.26.11"
+tree-sitter-md = "=0.5.3"
+tree-sitter-rust = "=0.24.2"
+tree-sitter-python = "=0.25.0"
+tree-sitter-javascript = "=0.25.0"
+tree-sitter-typescript = "=0.23.2"
+tree-sitter-go = "=0.25.0"
+tree-sitter-bash = "=0.25.1"
+tree-sitter-json = "=0.24.8"
+tree-sitter-c = "=0.24.2"
+tree-sitter-yaml = "=0.7.2"
+tree-sitter-toml-ng = "=0.7.0"
+pulldown-cmark = { version = "=0.13.4", default-features = false }
+gray_matter = { version = "=0.3.2", features = ["toml"] }
+thiserror = "=2.0.18"
+tempfile = "=3.26.0"
+unicode-width = "=0.2.2"
+
+[dev-dependencies]
+proptest = "=1.10.0"
+
+[[bench]]
+name = "performance"
+harness = false
+
+[[test]]
+name = "smoke"
+path = "tests/smoke.rs"
+
+[[test]]
+name = "conformance"
+path = "tests/conformance/mod.rs"
+
+[[test]]
+name = "perf_smoke"
+path = "tests/perf_smoke.rs"
+
+[lints]
+workspace = true

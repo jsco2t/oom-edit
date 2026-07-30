@@ -1,0 +1,24 @@
+   1  ▌ x--- title: Kitchen Sink author: Test
+
+   6  █ Heading One
+
+   8  Some bold and italic text with inline code and a link [0].
+
+  10  ┃ A blockquote with emphasis inside.
+
+      ▏ rust       ┌ Quit? ───────────────────────────────┐
+  13  ▏ fn main() {│                                      │
+  14  ▏     println│  Save and quit?    [y/w]             │
+  15  ▏ }          │  Quit without save [n]               │
+      ▏            │  Cancel            [Esc]             │
+                   │                                      │
+  18  ─────────────└──────────────────────────────────────┘─────────────────────
+
+  20  Another heading.
+
+  22  More text here.
+
+      ─ links ─
+      [0] https://example.com
+
+ NORMAL  [+]  y/w save+quit · n quit · Esc cancel

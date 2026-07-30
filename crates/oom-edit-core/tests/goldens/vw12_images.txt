@@ -1,0 +1,10 @@
+⧉ Alt text [0]
+
+⧉ Another image [1]
+
+Reference image: ⧉ alt ref [2]
+
+─ links ─
+[0] https://example.com/image.png
+[1] https://example.org/photo.jpg
+[2] https://img.example.com/pic.png

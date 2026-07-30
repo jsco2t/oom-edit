@@ -1,0 +1,24 @@
+   1  ┌─ metadata ─────────────────────────────────────────────────────────────┐
+   2  │ title: Kitchen Sink                                                    │
+   3  │ ┌ Command Palette ─────────────────────────────────────────────┐       │
+   4  └─│> sav                                                         │───────┘
+        │                                                              │
+   6  █ │▸ save                 save                           Space w │
+        │  ]s                   next spelling diagnostic            SP-│
+   8  So│  [s                   previous spelling diagnostic        SP-│
+        │  g T                  previous tab                        pre│
+  10  ┃ │  Tab / S-Tab          Move between rendered jump targets. R-N│
+        │  :w                   Save (atomic).                      V-X│
+      ▏ │  :w {path}            Save a copy to path without retargeting│
+  13  ▏ │  :q!                  Quit; discards changes.             V-X│
+  14  ▏ │  :wq                  Save then quit.                     V-X│
+  15  ▏ │  :x                   Save then quit (if changed).        V-X│
+      ▏ │  :saveas {path}       Save to path and retarget buffer.   V-X│
+        │  :s/pat/rep/          Substitute on current line.         V-X│
+  18  ──│  :s/pat/rep/g         Substitute all on current line.     V-X│────────
+        │  :%s/pat/rep/g        Substitute all in document.         V-X│
+  20  An│  :noh                 Clear search-match highlighting.    V-X│
+        └──────────────────────────────────────────────────────────────┘
+  22  More text here.
+
+ NORMAL  ↑↓ navigate · type to filter · Enter execute · Esc close

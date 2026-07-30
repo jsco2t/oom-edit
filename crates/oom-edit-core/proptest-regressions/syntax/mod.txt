@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 84d62815079ab06729c16c4d0a9f63aad0cb00d519a6dfc58f59cc877322903c # shrinks to text = "A A  a\nA0A0  a \n\n a\n  0aA0A0 000 a  a00\n\nA\nA0\nA aa Aa \n0\n\na0A0 A\n0\n \n\naAA  AA AAa0Aaa \n a a\n\n\n \n\na 00\nA00\nAA0 0a\n0\n\\{m X2<`%'r.~^%\nW", edit_ops = [[60, 129, 173, 230]]
+cc 2a7472c3ce7186a67d571a0c5deed34aa4c3512474f3e67d3b78658d61f5bdc7 # shrinks to text = ">\nA A0\n\nA0AaA\n\n\nAAA\n\n0AA0 \n0AA\n\n\na A a0 A\n\n", edit_ops = [[71, 192], [45], [141], [122]]
+cc fad53b985b3d9e832977491a6f8ab06f21231d913314b39c8326cbac9ebee2e2 # shrinks to text = "0\n Aa0 0A\n\n \naAa  \nAa a 0\n\n0Aa!GJ^\n:\nLRa&fT?\nJ$c.x?u!\n\\;\nY&%\nv/\n\n:V\\l!<\n{\n\nN$Q =:\n`{\n'\n)$r\n\nH4'&\n\n!/]yE`{\n$&<LI<Ql}{%$^00@G\n:Y\n\"@\n\n\nLm'Q97\n+\n\n\"kx_\ng?,:,", edit_ops = [[210, 0], [116], [80, 49], [109, 227, 61], [222, 173, 239], [203, 163, 144], [75, 9], [177, 108]]

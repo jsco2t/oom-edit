@@ -1,0 +1,8 @@
+# Vendored-sources replacement (activated in T02).
+# All dependencies are vendored into vendor/ and builds run offline.
+
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"

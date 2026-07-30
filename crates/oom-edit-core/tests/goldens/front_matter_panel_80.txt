@@ -1,0 +1,16 @@
+  0 Metadata 0..4 ┌─ metadata ───────────────────────────────────────────────────────────────────┐
+  4 Metadata 4..23 │ # metadata comment                                                           │
+ 23 Metadata 23..89 │ title: "A long café 東京 title that wraps in narrow terminals"               │
+ 89 Metadata 89..97 │ author:                                                                      │
+ 97 Metadata 97..109 │   name: Ada                                                                  │
+109 Metadata 109..118 │   bio: |                                                                     │
+118 Metadata 118..134 │     First line.                                                              │
+134 Metadata 134..151 │     Second line.                                                             │
+151 Metadata 151..160 │ aliases:                                                                     │
+160 Metadata 160..170 │   - first                                                                    │
+170 Metadata 170..189 │   - 'second alias'                                                           │
+189 Metadata 189..190 │                                                                              │
+190 Metadata 190..203 │ empty_value:                                                                 │
+203 Metadata 203..207 └──────────────────────────────────────────────────────────────────────────────┘
+203 Document 203..207 
+208 Document 208..215 █ Body

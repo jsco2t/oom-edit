@@ -1,0 +1,11 @@
+Text with a footnote reference[1] and another[note].
+
+
+
+Final paragraph after footnotes.
+
+─ footnotes ─
+[1]: 
+Footnote definition one.
+[note]: 
+A longer footnote definition with multiple lines.

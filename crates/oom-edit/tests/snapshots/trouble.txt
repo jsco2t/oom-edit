@@ -1,0 +1,24 @@
+   1  ┌─ metadata ─────────────────────────────────────────────────────────────┐
+   2  │ title: Kitchen Sink                                                    │
+   3  │ author: Test                                                           │
+  ┌ Trouble (2) ─────────────────────────────────────────────────────────────┐─┘
+  │▸ 1:1 warning [spell] Unknown word: teh                                   │
+  │  4:7 info    [spell] Review unusual spelling                             │
+  │… checking diagnostics                                                    │
+  │                                                                          │
+  │                                                                          │
+  │                                                                          │
+  │                                                                          │
+  │                                                                          │
+  │                                                                          │
+  │                                                                          │
+  │                                                                          │
+  │                                                                          │
+  │                                                                          │
+  │                                                                          │──
+  │                                                                          │
+  │                                                                          │
+  └──────────────────────────────────────────────────────────────────────────┘
+  22  More text here.
+
+ NORMAL  j/k navigate · Enter jump · Esc close
