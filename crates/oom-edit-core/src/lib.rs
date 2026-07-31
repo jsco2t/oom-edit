@@ -16,4 +16,5 @@ pub mod frontmatter;
 pub mod session;
 pub mod style;
 pub mod syntax;
+pub mod view;
 mod vim;
