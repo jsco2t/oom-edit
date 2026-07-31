@@ -9,3 +9,7 @@
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
+
+pub mod session;
+pub mod style;
+mod vim;

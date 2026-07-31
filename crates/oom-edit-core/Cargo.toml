@@ -27,5 +27,13 @@ gray_matter = { version = "=0.3.2", features = ["toml"] }
 
 [dev-dependencies]
 
+[[test]]
+name = "smoke"
+path = "tests/smoke.rs"
+
+[[test]]
+name = "conformance"
+path = "tests/conformance/mod.rs"
+
 [lints]
 workspace = true
