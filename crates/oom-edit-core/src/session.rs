@@ -173,6 +173,11 @@ pub struct Viewport {
 
 use crate::vim::{UndoMark, VimCore, VimEffect};
 
+// ── Document (internal) ───────────────────────────────────────────────────
+
+use crate::document::Document;
+use crate::error::{OpenError, SaveError};
+
 // ── EditorSession ──────────────────────────────────────────────────────────
 
 /// The core editing session. This is the public façade through which a host
@@ -188,17 +193,58 @@ pub struct EditorSession {
     save_point: UndoMark,
     /// Buffer for ex-command text in Command mode.
     command_buffer: String,
+    /// The document model — text, path, front matter, I/O state.
+    document: Document,
 }
 
 impl EditorSession {
     /// Create a new session from initial text. Starts in Normal mode.
     pub fn from_text(text: &str) -> Self {
+        let mut document = Document::from_text(text);
+        let save_point = document.save_point();
         Self {
             vim: VimCore::new(text),
             mode: Mode::Normal,
-            save_point: UndoMark(0),
+            save_point,
             command_buffer: String::new(),
+            document,
         }
+    }
+
+    /// Open a session from a file path.
+    ///
+    /// If the file does not exist, creates a new-buffer session with empty
+    /// text and the path retained (FR-6.10 / new-file semantics).
+    ///
+    /// Per FR-5.1: invalid UTF-8 is refused with the byte offset of the
+    /// first bad byte.
+    pub fn open(path: &std::path::Path) -> Result<Self, OpenError> {
+        let mut document = Document::open(path)?;
+        let text = document.text().to_string();
+        let save_point = document.save_point();
+        Ok(Self {
+            vim: VimCore::new(&text),
+            mode: Mode::Normal,
+            save_point,
+            command_buffer: String::new(),
+            document,
+        })
+    }
+
+    /// Save the document to its path (or the given override path).
+    ///
+    /// `force: true` bypasses external-modification detection (FR-5.7).
+    ///
+    /// Returns `SaveError::ExternallyModified` if the file was externally
+    /// modified and `force` is `false` (FR-5.7).
+    pub fn save(&mut self, path: Option<&std::path::Path>, force: bool) -> Result<(), SaveError> {
+        // Get the current text from the vim buffer
+        let text = self.vim.text();
+        // Save using the document's I/O logic, passing the vim buffer text
+        self.document.save_with_text(&text, path, force)?;
+        // Update the vim core's save point to match
+        self.save_point = self.document.save_point();
+        Ok(())
     }
 
     /// Handle a key input. Returns zero or more effects.
@@ -286,6 +332,11 @@ impl EditorSession {
     /// Return the full document text.
     pub fn document(&self) -> String {
         self.vim.text()
+    }
+
+    /// Return a reference to the document model.
+    pub fn document_ref(&self) -> &Document {
+        &self.document
     }
 
     /// Return cursor position as `(line, col)` — 0-based.

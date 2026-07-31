@@ -530,7 +530,7 @@ impl VimCore {
 
 /// Opaque marker for an undo save point. Wraps the buffer's dirty generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct UndoMark(pub u64);
+pub struct UndoMark(pub u64);
 
 // ── Severity ───────────────────────────────────────────────────────────────
 

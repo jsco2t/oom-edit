@@ -10,6 +10,9 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod document;
+pub mod error;
+pub mod frontmatter;
 pub mod session;
 pub mod style;
 mod vim;
