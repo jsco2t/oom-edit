@@ -371,6 +371,14 @@ impl VimCore {
         UndoMark(self.save_point_dirty_gen)
     }
 
+    /// Replace the entire buffer text in place. Returns the old text.
+    pub(crate) fn set_text(&mut self, text: &str) -> String {
+        let old = self.editor.buffer().as_string();
+        self.editor.buffer_mut().replace_all(text);
+        self.save_point_dirty_gen = self.editor.buffer().dirty_gen();
+        old
+    }
+
     // ── Internal helpers ─────────────────────────────────────────────
 
     /// Normalize <C-[> (Ctrl+LeftBracket) to Esc.

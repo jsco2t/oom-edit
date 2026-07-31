@@ -414,35 +414,199 @@ impl EditorSession {
     }
 
     /// Process an ex command text and produce effects.
+    ///
+    /// Handles: :w, :w!, :w {path}, :wq, :x, :q, :q!, :e, :e!, :e {path},
+    /// :saveas, :{number}, :s, :noh, :view, :help, and unknown commands.
     fn process_ex_command(&mut self, command: &str) -> Vec<Effect> {
         let cmd = command.trim();
+        let (base, args) = Self::parse_ex_command(cmd);
 
-        match cmd {
-            ":w" | "w" => vec![Effect::SaveRequested {
-                path: None,
+        match base {
+            "w" | "wq" | "x" => {
+                let force = base != "w" || args.1;
+                if base == "w" && args.0.is_some() {
+                    // :w {path} — save copy without retargeting
+                    vec![Effect::SaveRequested {
+                        path: args.0.map(std::path::PathBuf::from),
+                        force: args.1,
+                        then_quit: false,
+                    }]
+                } else {
+                    vec![Effect::SaveRequested {
+                        path: None,
+                        force,
+                        then_quit: base != "w",
+                    }]
+                }
+            }
+            "q" => vec![Effect::QuitRequested { force: args.1 }],
+            "e" => vec![Effect::OpenRequested {
+                path: args.0.map(std::path::PathBuf::from).unwrap_or_default(),
+                force: args.1,
+            }],
+            "saveas" => vec![Effect::SaveRequested {
+                path: args.0.map(std::path::PathBuf::from),
                 force: false,
                 then_quit: false,
             }],
-            ":wq" | "wq" | ":x" | "x" => vec![Effect::SaveRequested {
-                path: None,
-                force: false,
-                then_quit: true,
+            _ if !args.0.is_none() && base.chars().all(|c| c.is_ascii_digit()) => {
+                // :{number} — jump to line
+                if let Ok(line) = base.parse::<usize>() {
+                    vec![Effect::Message {
+                        text: format!("Jump to line {}", line + 1),
+                        severity: Severity::Info,
+                    }]
+                } else {
+                    vec![Effect::Message {
+                        text: format!("Invalid line number: {}", base),
+                        severity: Severity::Warning,
+                    }]
+                }
+            }
+            "s" | "substitute" => {
+                // :[range]s/pattern/replacement/[flags]
+                // Try to extract substitute args from the rest of the command
+                let sub_args = if let Some(rest) = args.0 {
+                    Self::parse_substitute(rest)
+                } else {
+                    None
+                };
+                match sub_args {
+                    Some((pattern, replacement, flags)) => {
+                        let global = flags.contains('g');
+                        let text = self.vim.text();
+                        let new_text = if global {
+                            Self::substitute_global(&text, pattern, replacement)
+                        } else {
+                            Self::substitute_first(&text, pattern, replacement)
+                        };
+                        if new_text != text {
+                            self.vim.set_text(&new_text);
+                            vec![Effect::Edited]
+                        } else {
+                            vec![Effect::Message {
+                                text: "No replacement done".to_string(),
+                                severity: Severity::Info,
+                            }]
+                        }
+                    }
+                    None => vec![Effect::Message {
+                        text: "Invalid substitute command".to_string(),
+                        severity: Severity::Warning,
+                    }],
+                }
+            }
+            "noh" => vec![Effect::Message {
+                text: "Search highlighting cleared".to_string(),
+                severity: Severity::Info,
             }],
-            ":q" | "q" => vec![Effect::QuitRequested { force: false }],
-            ":q!" | "q!" => vec![Effect::QuitRequested { force: true }],
-            ":view" | "view" => {
+            "view" => {
                 self.mode = Mode::View;
                 vec![Effect::ModeChanged(Mode::View)]
             }
-            ":help" | "help" => vec![Effect::Message {
+            "help" => vec![Effect::Message {
                 text: "Help not yet implemented".to_string(),
                 severity: Severity::Info,
             }],
             _ => vec![Effect::Message {
-                text: format!("Unknown command: {}", cmd),
+                text: format!("Unknown command: {}", base),
                 severity: Severity::Warning,
             }],
         }
+    }
+
+    /// Parse an ex command into (base_command, (path_arg, force_flag)).
+    fn parse_ex_command(cmd: &str) -> (&str, (Option<&str>, bool)) {
+        let cmd = cmd.trim_start_matches(':');
+
+        // Special case: substitute commands like "s/pat/rep/" or ":%s/pat/rep/g"
+        // have no whitespace separator between base and args. Detect and extract base.
+        let (base, rest_str) = if cmd.starts_with("s/") || cmd.starts_with("substitute/") {
+            if cmd.starts_with("substitute/") {
+                // "substitute/pat/rep/" → base="substitute", rest="/pat/rep/"
+                ("substitute", Some(&cmd[10..]))
+            } else {
+                // "s/pat/rep/" → base="s", rest="/pat/rep/"
+                ("s", Some(&cmd[1..]))
+            }
+        } else if cmd.contains("s/") || cmd.contains("substitute/") {
+            // Might be a substitute with range prefix like "%s/pat/rep/g" or "1,2s/pat/rep/"
+            // Find the 's/' or 'substitute/' after any range prefix
+            if let Some(s_pos) = cmd.find("substitute/") {
+                ("substitute", Some(&cmd[s_pos + 10..]))
+            } else if let Some(s_pos) = cmd.find("s/") {
+                ("s", Some(&cmd[s_pos + 1..]))
+            } else {
+                let mut parts = cmd.splitn(2, char::is_whitespace);
+                (parts.next().unwrap_or(cmd), parts.next())
+            }
+        } else {
+            let mut parts = cmd.splitn(2, char::is_whitespace);
+            let b = parts.next().unwrap_or(cmd);
+            (b, parts.next())
+        };
+
+        // Check for ! suffix on base command
+        let (base, force) = if let Some(stripped) = base.strip_suffix('!') {
+            (stripped, true)
+        } else {
+            (base, false)
+        };
+
+        // Check for ! in args (e.g., :w!)
+        let (args, force) = if let Some(a) = rest_str {
+            if a.trim().ends_with('!') {
+                (Some(&a[..a.trim().len() - 1]), true)
+            } else {
+                (rest_str, force)
+            }
+        } else {
+            (rest_str, force)
+        };
+
+        // Extract path argument (first word of rest)
+        let path = args.and_then(|a| {
+            let a = a.trim();
+            if a.is_empty() {
+                None
+            } else {
+                a.split_whitespace().next()
+            }
+        });
+
+        (base, (path, force))
+    }
+
+    /// Parse substitute command arguments: "pattern/replacement/flags"
+    fn parse_substitute(args: &str) -> Option<(&str, &str, String)> {
+        if args.is_empty() {
+            return None;
+        }
+        let delim = args.chars().next()?;
+        let closing = args[1..].find(delim)?;
+        let pattern = &args[1..1 + closing];
+        let rest = &args[1 + closing + 1..];
+        let rep_end = rest.find(delim)?;
+        let replacement = &rest[..rep_end];
+        let flags = rest[rep_end + 1..].to_string();
+        Some((pattern, replacement, flags))
+    }
+
+    /// Substitute the first occurrence of pattern in text with replacement.
+    fn substitute_first(text: &str, pattern: &str, replacement: &str) -> String {
+        if let Some(pos) = text.find(pattern) {
+            let mut result = text[..pos].to_string();
+            result.push_str(replacement);
+            result.push_str(&text[pos + pattern.len()..]);
+            result
+        } else {
+            text.to_string()
+        }
+    }
+
+    /// Substitute all occurrences of pattern in text with replacement.
+    fn substitute_global(text: &str, pattern: &str, replacement: &str) -> String {
+        text.replace(pattern, replacement)
     }
 
     /// Translate our KeyInput → VimCore's internal KeyInput.
