@@ -104,11 +104,13 @@ pub(crate) enum VimEffect {
 /// A text edit describing a byte-range replacement in the document.
 /// Matches the shape tree-sitter's `InputEdit` consumes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TextEdit {
+pub struct TextEdit {
     /// Byte range in the document that was replaced.
     pub range: Range<usize>,
     /// Length of the replacement text in bytes.
     pub new_text_len: usize,
+    /// The new text that replaces the range (empty for deletes).
+    pub new_text: String,
 }
 
 // ── Mode ───────────────────────────────────────────────────────────────────
@@ -461,11 +463,16 @@ impl VimCore {
     /// Drain content edits from the editor and convert to our TextEdit shape.
     fn drain_content_edits(&mut self) -> Vec<TextEdit> {
         let hjkl_edits = self.editor.take_content_edits();
+        let text = self.editor.buffer().as_string();
         hjkl_edits
             .into_iter()
-            .map(|ce| TextEdit {
-                range: ce.start_byte..ce.old_end_byte,
-                new_text_len: ce.new_end_byte - ce.start_byte,
+            .map(|ce| {
+                let new_text = text[ce.start_byte..ce.new_end_byte].to_string();
+                TextEdit {
+                    range: ce.start_byte..ce.old_end_byte,
+                    new_text_len: ce.new_end_byte - ce.start_byte,
+                    new_text,
+                }
             })
             .collect()
     }

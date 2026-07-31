@@ -51,7 +51,7 @@ A change is complete only when **all** of the following hold — no exceptions, 
 2. Tests covering the new/changed behavior are written **in the same change**.
 3. `make fmt-check` passes.
 4. `make lint` passes (clippy with `-D warnings`).
-5. `make build` passes.
+5. `make build` passes with **NO** `warnings` or `errors` (all build issues regardless of origin must be resolved)
 6. **All** tests pass — `make test`, the entire suite, not just the new tests.
 7. If dependencies changed: `make deny` and `make audit` pass and `vendor/` + `Cargo.lock` are updated in the same change.
 

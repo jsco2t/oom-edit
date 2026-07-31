@@ -15,4 +15,5 @@ pub mod error;
 pub mod frontmatter;
 pub mod session;
 pub mod style;
+pub mod syntax;
 mod vim;
