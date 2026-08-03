@@ -177,6 +177,67 @@ use crate::vim::{UndoMark, VimCore, VimEffect};
 
 use crate::document::Document;
 use crate::error::{OpenError, SaveError};
+use crate::style::{SearchDirection, ViewCursor, ViewLayout, ViewSearch};
+use crate::view::nav;
+use crate::view::BlockModel;
+
+// ── ViewState ──────────────────────────────────────────────────────────────
+
+/// State for View mode (read-only rendered view).
+///
+/// Holds a cached layout, cursor position, search state, and front-matter
+/// panel collapse state. The layout is invalidated on edits.
+#[allow(dead_code)]
+struct ViewState {
+    /// Cached view layout (None = needs rebuild).
+    layout_cache: Option<ViewLayout>,
+    /// Current cursor position in view coordinates.
+    cursor: ViewCursor,
+    /// Active search state (if in search mode).
+    search: Option<ViewSearch>,
+    /// Whether the front-matter panel is collapsed.
+    fm_collapsed: bool,
+    /// Accumulated numeric count for navigation commands.
+    count: usize,
+}
+
+#[allow(dead_code)]
+impl ViewState {
+    fn new() -> Self {
+        Self {
+            layout_cache: None,
+            cursor: ViewCursor::new(0),
+            search: None,
+            fm_collapsed: false,
+            count: 0,
+        }
+    }
+
+    /// Get the layout, building it if necessary.
+    fn get_layout(&mut self, text: &str) -> &ViewLayout {
+        if self.layout_cache.is_none() {
+            let model = BlockModel::build(text, None);
+            // Use a default width of 80 for the layout
+            // The actual width comes from the viewport in the TUI layer
+            self.layout_cache = Some(ViewLayout::build(
+                &model,
+                80,
+                &crate::syntax::Highlighter::new(text),
+            ));
+        }
+        self.layout_cache.as_ref().unwrap()
+    }
+
+    /// Invalidate the layout cache.
+    fn invalidate(&mut self) {
+        self.layout_cache = None;
+    }
+
+    /// Clear search state.
+    fn clear_search(&mut self) {
+        self.search = None;
+    }
+}
 
 // ── EditorSession ──────────────────────────────────────────────────────────
 
@@ -195,6 +256,8 @@ pub struct EditorSession {
     command_buffer: String,
     /// The document model — text, path, front matter, I/O state.
     document: Document,
+    /// View mode state (only present when in View mode).
+    view_state: Option<ViewState>,
 }
 
 impl EditorSession {
@@ -208,6 +271,7 @@ impl EditorSession {
             save_point,
             command_buffer: String::new(),
             document,
+            view_state: None,
         }
     }
 
@@ -228,6 +292,7 @@ impl EditorSession {
             save_point,
             command_buffer: String::new(),
             document,
+            view_state: None,
         })
     }
 
@@ -244,6 +309,10 @@ impl EditorSession {
         self.document.save_with_text(&text, path, force)?;
         // Update the vim core's save point to match
         self.save_point = self.document.save_point();
+        // Invalidate view layout cache on save
+        if let Some(ref mut vs) = self.view_state {
+            vs.invalidate();
+        }
         Ok(())
     }
 
@@ -282,6 +351,10 @@ impl EditorSession {
                 }
                 VimEffect::Edited { edits: _ } => {
                     effects.push(Effect::Edited);
+                    // Invalidate view layout cache on edit
+                    if let Some(ref mut vs) = self.view_state {
+                        vs.invalidate();
+                    }
                 }
                 VimEffect::CursorMoved => {
                     effects.push(Effect::CursorMoved);
@@ -354,6 +427,37 @@ impl EditorSession {
         self.vim.command_line()
     }
 
+    /// Return the view cursor position, or `None` when not in View mode.
+    pub fn view_cursor(&self) -> Option<ViewCursor> {
+        self.view_state.as_ref().map(|vs| vs.cursor)
+    }
+
+    /// Return the view layout, or `None` when not in View mode.
+    pub fn view_layout(&self) -> Option<&ViewLayout> {
+        self.view_state
+            .as_ref()
+            .and_then(|vs| vs.layout_cache.as_ref())
+    }
+
+    /// Return the view layout (building it if necessary), or `None` when not in View mode.
+    pub fn view_layout_mut(&mut self) -> Option<&ViewLayout> {
+        if self.mode == Mode::View {
+            if let Some(ref mut vs) = self.view_state {
+                let text = self.vim.text();
+                Some(vs.get_layout(&text))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Return the view search state, or `None` when not in View mode.
+    pub fn view_search(&self) -> Option<&ViewSearch> {
+        self.view_state.as_ref().and_then(|vs| vs.search.as_ref())
+    }
+
     /// Check if the buffer is dirty (modified since last save).
     pub fn is_dirty(&self) -> bool {
         self.vim.is_modified_since(self.save_point)
@@ -384,12 +488,43 @@ impl EditorSession {
     pub fn toggle_view(&mut self) -> Vec<Effect> {
         if self.mode == Mode::View {
             // Exit View → Normal
+            // Apply leave_view to map cursor back to edit coordinates
+            let (edit_line, _edit_col) = if let Some(ref mut vs) = self.view_state {
+                let text = self.vim.text();
+                let cursor_line = vs.cursor.line;
+                let layout = vs.get_layout(&text);
+                let cursor = ViewCursor::new(cursor_line);
+                nav::leave_view(&cursor, layout, &text)
+            } else {
+                (0, 0)
+            };
+            // Move edit cursor to mapped position
+            self.vim.jump_to(edit_line, 0);
+            if let Some(ref mut vs) = self.view_state {
+                vs.clear_search();
+                vs.count = 0;
+            }
             self.mode = Mode::Normal;
-            vec![Effect::ModeChanged(Mode::Normal)]
+            let mut effects = vec![Effect::ModeChanged(Mode::Normal)];
+            effects.push(Effect::CursorMoved);
+            effects
         } else {
             // Enter View from Normal/Insert/Visual/etc.
             // FR-1.6: Insert/Visual cannot transition directly to View
             // — they first go to Normal
+            let (edit_line, edit_col) = self.vim.cursor();
+            let text = self.vim.text();
+            let model = BlockModel::build(&text, None);
+            let layout = ViewLayout::build(&model, 80, &crate::syntax::Highlighter::new(&text));
+            let cursor = nav::enter_view(edit_line, edit_col, &layout);
+
+            self.view_state = Some(ViewState {
+                layout_cache: Some(layout),
+                cursor,
+                search: None,
+                fm_collapsed: false,
+                count: 0,
+            });
             self.mode = Mode::View;
             vec![Effect::ModeChanged(Mode::View)]
         }
@@ -439,29 +574,160 @@ impl EditorSession {
         // FR-1.6 exception: i/a/o in View jump to editing at mapped position
         match key.code.kind {
             KeyCodeKind::Char('i') if !key.mods.ctrl && !key.mods.alt && !key.mods.shift => {
-                self.mode = Mode::Normal;
-                vec![Effect::ModeChanged(Mode::Normal)]
+                return self.exit_view_to_edit(0);
             }
             KeyCodeKind::Char('a') if !key.mods.ctrl && !key.mods.alt && !key.mods.shift => {
-                self.mode = Mode::Normal;
-                vec![Effect::ModeChanged(Mode::Normal)]
+                return self.exit_view_to_edit(1);
             }
             KeyCodeKind::Char('o') if !key.mods.ctrl && !key.mods.alt && !key.mods.shift => {
-                self.mode = Mode::Normal;
-                vec![Effect::ModeChanged(Mode::Normal)]
+                return self.exit_view_to_edit(self.line_count());
             }
             KeyCodeKind::Esc => {
-                self.mode = Mode::Normal;
-                vec![Effect::ModeChanged(Mode::Normal)]
+                return self.toggle_view();
             }
-            _ => {
-                // All other keys are no-ops in View mode (FR-1.6)
-                vec![Effect::Message {
-                    text: "read-only view — Esc to edit".to_string(),
-                    severity: Severity::Info,
-                }]
+            _ => {}
+        }
+
+        // Accumulate numeric count for navigation commands
+        if let KeyCodeKind::Char(c) = key.code.kind {
+            if c.is_ascii_digit() && !key.mods.ctrl && !key.mods.alt && !key.mods.shift {
+                let digit = c.to_digit(10).unwrap() as usize;
+                if let Some(vs) = self.view_state.as_mut() {
+                    vs.count = vs.count * 10 + digit;
+                }
+                return Vec::new();
             }
         }
+
+        // Handle navigation keys via nav module
+        let mut effects = Vec::new();
+
+        if let Some(ref mut vs) = self.view_state {
+            // Extract all needed data before getting mutable layout reference
+            let cursor_line = vs.cursor.line;
+            let search_pattern = vs.search.as_ref().map(|s| s.pattern.clone());
+            let search_direction = vs.search.as_ref().map(|s| s.last_direction);
+            let prev_count = vs.count;
+
+            // Reset count before getting layout
+            vs.count = 0;
+
+            let text = self.vim.text();
+            // Clone the layout to avoid holding a borrow on vs
+            let layout = vs.get_layout(&text).clone();
+            let jump_targets = layout.jump_targets.clone();
+            let max_view_lines = layout.lines.len();
+
+            let cursor = ViewCursor::new(cursor_line);
+            let search = search_pattern.as_ref().map(|p| {
+                let mut s = ViewSearch::new(p);
+                s.set_direction(search_direction.unwrap_or(SearchDirection::Forward));
+                s
+            });
+
+            let result = nav::handle_key(
+                key,
+                &cursor,
+                search.as_ref(),
+                max_view_lines,
+                &jump_targets,
+                &layout,
+                prev_count,
+            );
+
+            // Apply search state changes
+            if result.search_changed {
+                if let Some(new_search) = result.new_search {
+                    if new_search.pattern.is_empty() {
+                        // Search mode activated but no pattern yet
+                        vs.search = Some(new_search);
+                    } else {
+                        // Pattern entered, perform search
+                        vs.search = Some(new_search.clone());
+                        if let Some(match_line) = nav::find_next_match(
+                            &new_search,
+                            &cursor,
+                            &layout,
+                            &text,
+                            new_search.direction(),
+                        ) {
+                            vs.cursor.line = match_line;
+                            effects.push(Effect::CursorMoved);
+                        }
+                    }
+                } else {
+                    vs.clear_search();
+                }
+            } else if let Some(ref mut search_state) = vs.search {
+                // Check if we're in search mode and need to accumulate pattern
+                if let KeyCodeKind::Char(c) = key.code.kind {
+                    if c.is_ascii_alphanumeric() || c == ' ' || c == '.' || c == '_' {
+                        search_state.pattern.push(c);
+                        // Perform search with updated pattern
+                        if let Some(match_line) = nav::find_next_match(
+                            search_state,
+                            &cursor,
+                            &layout,
+                            &text,
+                            search_state.direction(),
+                        ) {
+                            vs.cursor.line = match_line;
+                            effects.push(Effect::CursorMoved);
+                        }
+                        return effects;
+                    } else if key.code.kind == KeyCodeKind::Esc {
+                        // Escape exits search mode
+                        vs.clear_search();
+                        return effects;
+                    }
+                }
+            }
+
+            // Apply cursor changes
+            if result.cursor_moved {
+                if let Some(new_cursor) = result.new_cursor {
+                    vs.cursor = new_cursor;
+                    effects.push(Effect::CursorMoved);
+                }
+            }
+        }
+
+        if effects.is_empty() {
+            vec![Effect::Message {
+                text: "read-only view — Esc to edit".to_string(),
+                severity: Severity::Info,
+            }]
+        } else {
+            effects
+        }
+    }
+
+    /// Exit View mode and enter Normal mode at a mapped edit position.
+    ///
+    /// `offset` is the column offset to apply after mapping:
+    /// - 0: start of line (i key)
+    /// - 1: after character (a key)
+    /// - line_count: next line after current (o key)
+    fn exit_view_to_edit(&mut self, _offset: usize) -> Vec<Effect> {
+        let (edit_line, _edit_col) = if let Some(ref mut vs) = self.view_state {
+            let text = self.vim.text();
+            let cursor_line = vs.cursor.line;
+            let layout = vs.get_layout(&text);
+            let cursor = ViewCursor::new(cursor_line);
+            nav::leave_view(&cursor, layout, &text)
+        } else {
+            (0, 0)
+        };
+
+        if let Some(ref mut vs) = self.view_state {
+            self.vim.jump_to(edit_line, 0);
+            vs.clear_search();
+            vs.count = 0;
+        }
+        self.mode = Mode::Normal;
+        let mut effects = vec![Effect::ModeChanged(Mode::Normal)];
+        effects.push(Effect::CursorMoved);
+        effects
     }
 
     /// Process an ex command text and produce effects.

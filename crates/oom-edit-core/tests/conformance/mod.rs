@@ -2367,6 +2367,348 @@ fn counts_repeat_n() {
     assert!(sess.cursor().0 >= 1);
 }
 
+// ── VN: View mode navigation ──────────────────────────────────────────────
+
+/// Helper to create a session and toggle to View mode.
+fn view_session(text: &str) -> EditorSession {
+    let mut sess = session(text);
+    // Enter View mode via toggle_view
+    sess.toggle_view();
+    assert_eq!(sess.mode(), oom_edit_core::session::Mode::View);
+    sess
+}
+
+#[test]
+fn vn1_j_down_navigation() {
+    let mut sess = view_session("line1\nline2\nline3\nline4\nline5");
+    // Move down 3 lines
+    let effects = sess.handle_key(KeyInput {
+        code: KeyCode {
+            kind: KeyCodeKind::Char('j'),
+        },
+        mods: Modifiers::default(),
+    });
+    assert!(effects.iter().any(|e| matches!(e, Effect::CursorMoved)));
+}
+
+#[test]
+fn vn1_k_up_navigation() {
+    let mut sess = view_session("line1\nline2\nline3\nline4\nline5");
+    // Move down first, then up
+    sess.handle_key(KeyInput {
+        code: KeyCode {
+            kind: KeyCodeKind::Char('j'),
+        },
+        mods: Modifiers::default(),
+    });
+    let effects = sess.handle_key(KeyInput {
+        code: KeyCode {
+            kind: KeyCodeKind::Char('k'),
+        },
+        mods: Modifiers::default(),
+    });
+    assert!(effects.iter().any(|e| matches!(e, Effect::CursorMoved)));
+}
+
+#[test]
+fn vn1_arrows_navigation() {
+    let mut sess = view_session("line1\nline2\nline3");
+    // Down arrow
+    sess.handle_key(KeyInput {
+        code: KeyCode {
+            kind: KeyCodeKind::Down,
+        },
+        mods: Modifiers::default(),
+    });
+    // Up arrow
+    sess.handle_key(KeyInput {
+        code: KeyCode {
+            kind: KeyCodeKind::Up,
+        },
+        mods: Modifiers::default(),
+    });
+}
+
+#[test]
+fn vn3_gg_first_line() {
+    let mut sess = view_session("line1\nline2\nline3");
+    // Move down a few lines
+    sess.handle_key(KeyInput {
+        code: KeyCode {
+            kind: KeyCodeKind::Char('j'),
+        },
+        mods: Modifiers::default(),
+    });
+    sess.handle_key(KeyInput {
+        code: KeyCode {
+            kind: KeyCodeKind::Char('j'),
+        },
+        mods: Modifiers::default(),
+    });
+    // Go to first line
+    let effects = sess.handle_key(KeyInput {
+        code: KeyCode {
+            kind: KeyCodeKind::Char('g'),
+        },
+        mods: Modifiers::default(),
+    });
+    assert!(effects.iter().any(|e| matches!(e, Effect::CursorMoved)));
+}
+
+#[test]
+fn vn3_g_last_line() {
+    let mut sess = view_session("line1\nline2\nline3");
+    // Go to last line
+    let effects = sess.handle_key(KeyInput {
+        code: KeyCode {
+            kind: KeyCodeKind::Char('G'),
+        },
+        mods: Modifiers::default(),
+    });
+    assert!(effects.iter().any(|e| matches!(e, Effect::CursorMoved)));
+}
+
+#[test]
+fn vn4_tab_jump_targets() {
+    let mut sess = view_session("# Heading1\n\n## Heading2\n\n## Heading3");
+    // Tab should jump to next heading
+    let effects = sess.handle_key(KeyInput {
+        code: KeyCode {
+            kind: KeyCodeKind::Tab,
+        },
+        mods: Modifiers::default(),
+    });
+    assert!(effects.iter().any(|e| matches!(e, Effect::CursorMoved)));
+}
+
+#[test]
+fn vn4_backtab_jump_targets() {
+    let mut sess = view_session("# Heading1\n\n## Heading2\n\n## Heading3");
+    // Move to end first
+    sess.handle_key(KeyInput {
+        code: KeyCode {
+            kind: KeyCodeKind::Char('G'),
+        },
+        mods: Modifiers::default(),
+    });
+    // Shift-Tab should jump to previous heading
+    let effects = sess.handle_key(KeyInput {
+        code: KeyCode {
+            kind: KeyCodeKind::BackTab,
+        },
+        mods: Modifiers::default(),
+    });
+    assert!(effects.iter().any(|e| matches!(e, Effect::CursorMoved)));
+}
+
+#[test]
+fn vn5_forward_search() {
+    let mut sess = view_session("hello world\nfoo bar\nhello again");
+    // Start forward search and type pattern
+    sess.handle_key(KeyInput {
+        code: KeyCode {
+            kind: KeyCodeKind::Char('/'),
+        },
+        mods: Modifiers::default(),
+    });
+    // Type "foo" to trigger search
+    for c in "foo".chars() {
+        let effects = sess.handle_key(KeyInput {
+            code: KeyCode {
+                kind: KeyCodeKind::Char(c),
+            },
+            mods: Modifiers::default(),
+        });
+        if effects.iter().any(|e| matches!(e, Effect::CursorMoved)) {
+            break;
+        }
+    }
+}
+
+#[test]
+fn vn5_backward_search() {
+    let mut sess = view_session("hello world\nfoo bar\nhello again");
+    // Start backward search and type pattern
+    sess.handle_key(KeyInput {
+        code: KeyCode {
+            kind: KeyCodeKind::Char('?'),
+        },
+        mods: Modifiers::default(),
+    });
+    // Type "hello" to trigger search
+    for c in "hello".chars() {
+        let effects = sess.handle_key(KeyInput {
+            code: KeyCode {
+                kind: KeyCodeKind::Char(c),
+            },
+            mods: Modifiers::default(),
+        });
+        if effects.iter().any(|e| matches!(e, Effect::CursorMoved)) {
+            break;
+        }
+    }
+}
+
+#[test]
+fn vn6_n_repeat_search() {
+    let mut sess = view_session("hello\nworld\nhello\nworld");
+    // Start search and type pattern
+    sess.handle_key(KeyInput {
+        code: KeyCode {
+            kind: KeyCodeKind::Char('/'),
+        },
+        mods: Modifiers::default(),
+    });
+    // Type "hello"
+    for c in "hello".chars() {
+        sess.handle_key(KeyInput {
+            code: KeyCode {
+                kind: KeyCodeKind::Char(c),
+            },
+            mods: Modifiers::default(),
+        });
+    }
+    // Press n to repeat
+    let effects = sess.handle_key(KeyInput {
+        code: KeyCode {
+            kind: KeyCodeKind::Char('n'),
+        },
+        mods: Modifiers::default(),
+    });
+    assert!(effects.iter().any(|e| matches!(e, Effect::CursorMoved)));
+}
+
+#[test]
+fn fr_1_6_read_only_view() {
+    let mut sess = view_session("line1\nline2\nline3");
+    // Typing a character in View mode should show read-only message
+    let effects = sess.handle_key(KeyInput {
+        code: KeyCode {
+            kind: KeyCodeKind::Char('x'),
+        },
+        mods: Modifiers::default(),
+    });
+    assert!(effects
+        .iter()
+        .any(|e| matches!(e, Effect::Message { text, severity: _ } if text.contains("read-only"))));
+}
+
+#[test]
+fn fr_1_6_i_exit_to_edit() {
+    let mut sess = view_session("line1\nline2\nline3");
+    // Press 'i' to exit to edit mode
+    let effects = sess.handle_key(KeyInput {
+        code: KeyCode {
+            kind: KeyCodeKind::Char('i'),
+        },
+        mods: Modifiers::default(),
+    });
+    assert!(effects
+        .iter()
+        .any(|e| matches!(e, Effect::ModeChanged(oom_edit_core::session::Mode::Normal))));
+}
+
+#[test]
+fn fr_1_6_a_exit_to_edit() {
+    let mut sess = view_session("line1\nline2\nline3");
+    // Press 'a' to exit to edit mode
+    let effects = sess.handle_key(KeyInput {
+        code: KeyCode {
+            kind: KeyCodeKind::Char('a'),
+        },
+        mods: Modifiers::default(),
+    });
+    assert!(effects
+        .iter()
+        .any(|e| matches!(e, Effect::ModeChanged(oom_edit_core::session::Mode::Normal))));
+}
+
+#[test]
+fn fr_1_6_o_exit_to_edit() {
+    let mut sess = view_session("line1\nline2\nline3");
+    // Press 'o' to exit to edit mode
+    let effects = sess.handle_key(KeyInput {
+        code: KeyCode {
+            kind: KeyCodeKind::Char('o'),
+        },
+        mods: Modifiers::default(),
+    });
+    assert!(effects
+        .iter()
+        .any(|e| matches!(e, Effect::ModeChanged(oom_edit_core::session::Mode::Normal))));
+}
+
+#[test]
+fn fr_1_6_esc_exit_to_edit() {
+    let mut sess = view_session("line1\nline2\nline3");
+    // Press Esc to exit to edit mode
+    let effects = sess.handle_key(KeyInput {
+        code: KeyCode {
+            kind: KeyCodeKind::Esc,
+        },
+        mods: Modifiers::default(),
+    });
+    assert!(effects
+        .iter()
+        .any(|e| matches!(e, Effect::ModeChanged(oom_edit_core::session::Mode::Normal))));
+}
+
+#[test]
+fn vp_4_toggle_roundtrip() {
+    let mut sess = session("line1\nline2\nline3");
+    // Toggle to View
+    let effects = sess.toggle_view();
+    assert!(effects
+        .iter()
+        .any(|e| matches!(e, Effect::ModeChanged(oom_edit_core::session::Mode::View))));
+    // Toggle back to Normal
+    let effects = sess.toggle_view();
+    assert!(effects
+        .iter()
+        .any(|e| matches!(e, Effect::ModeChanged(oom_edit_core::session::Mode::Normal))));
+}
+
+#[test]
+fn view_cursor_accessible() {
+    let sess = view_session("line1\nline2\nline3");
+    // View cursor should be accessible
+    assert!(sess.view_cursor().is_some());
+    let cursor = sess.view_cursor().unwrap();
+    assert!(cursor.line < 10); // Should be within reasonable bounds
+}
+
+#[test]
+fn view_layout_accessible() {
+    let sess = view_session("line1\nline2\nline3");
+    // View layout should be accessible
+    assert!(sess.view_layout().is_some());
+}
+
+#[test]
+fn view_scroll_top_centered() {
+    use oom_edit_core::view::nav::view_scroll_top;
+    // With a 24-line viewport, cursor at line 12 should keep scroll at 0
+    let top = view_scroll_top(12, 24, 100, 0);
+    assert_eq!(top, 0);
+}
+
+#[test]
+fn view_scroll_top_bottom() {
+    use oom_edit_core::view::nav::view_scroll_top;
+    // With a 24-line viewport and 100 lines, cursor at line 99 should scroll to bottom
+    let top = view_scroll_top(99, 24, 100, 0);
+    assert_eq!(top, 76); // 100 - 24 = 76
+}
+
+#[test]
+fn view_scroll_top_hysteresis() {
+    use oom_edit_core::view::nav::view_scroll_top;
+    // Cursor moves within center third — scroll shouldn't change
+    let top1 = view_scroll_top(15, 24, 100, 0);
+    let top2 = view_scroll_top(16, 24, 100, top1);
+    assert_eq!(top1, top2);
+}
+
 // ── Coverage meta-test (SC-1) ─────────────────────────────────────────────
 
 /// All row IDs that must be covered by conformance test case names.

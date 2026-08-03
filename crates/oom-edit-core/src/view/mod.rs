@@ -15,6 +15,7 @@
 //! flat: each inline node carries exactly one `SemanticStyle`.
 
 mod blocks;
+pub mod nav;
 mod table;
 mod wrap;
 

@@ -381,6 +381,21 @@ impl VimCore {
         old
     }
 
+    /// Move the cursor to the given (row, col) position.
+    pub(crate) fn jump_to(&mut self, row: usize, col: usize) {
+        use hjkl_buffer::Position;
+        let pos = Position {
+            row,
+            col: col.min(
+                self.editor
+                    .line(row)
+                    .map(|l| l.chars().count())
+                    .unwrap_or(0),
+            ),
+        };
+        self.editor.buffer_mut().set_cursor(pos);
+    }
+
     // ── Internal helpers ─────────────────────────────────────────────
 
     /// Normalize <C-[> (Ctrl+LeftBracket) to Esc.

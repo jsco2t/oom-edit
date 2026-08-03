@@ -182,3 +182,30 @@ pub struct ViewLayout {
     /// to `link_index[n]`.
     pub link_index: Vec<(usize, String)>,
 }
+
+/// Cursor position in View mode (0-based line number).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ViewCursor {
+    /// 0-based line number in the view layout.
+    pub line: usize,
+}
+
+/// Search state for View mode navigation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewSearch {
+    /// The search pattern.
+    pub pattern: String,
+    /// Whether the pattern is a regex.
+    pub is_regex: bool,
+    /// The last search direction.
+    pub last_direction: SearchDirection,
+}
+
+/// Direction of a search operation in View mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchDirection {
+    /// Search forward (next match).
+    Forward,
+    /// Search backward (previous match).
+    Backward,
+}
