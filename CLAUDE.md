@@ -2,7 +2,7 @@
 
 oom-edit is a console/TUI markdown editor written in Rust: true Vim-style modal editing (Normal/Insert/Visual + a rendered, navigable **View** mode) over tree-sitter-highlighted markdown, including rich highlighting of YAML/TOML front matter and fenced code blocks. The editing core ships as the reusable `oom-edit-core` crate — embeddable in other applications with zero terminal dependencies; the `oom-edit` binary is a thin ratatui shell over it.
 
-**License:** Apache 2.0. **Status:** Greenfield (planning complete, implementation not started).
+**License:** MIT
 
 ## Planning docs (authoritative)
 
@@ -12,6 +12,7 @@ Engineering plans live outside this repo in the project notebook. Read these whe
 - **Plan & specification:** `…/oom-edit/plan.md` — requirement IDs (FR-x.y, NFR-x, V-xx, VW-x, VN-x, VP-x) are referenced throughout the tasks.
 - **Architecture:** `…/oom-edit/architecture.md` — crate/module structure, public API contracts, seams.
 - **Tasks:** `…/oom-edit/tasks/index.md` — the ordered implementation plan. Work tasks in order; update the tracking table as you go.
+- **Markdown Spec** Located in the repo at `docs/markdown-spec.md`.
 
 The plan and architecture documents are the source of truth for scope and structure. If implementation reality contradicts them, stop and resolve the contradiction explicitly — don't silently diverge.
 

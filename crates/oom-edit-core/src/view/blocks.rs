@@ -22,7 +22,7 @@ pub struct BlockModel {
 // ── Block ──────────────────────────────────────────────────────────────────
 
 /// A single block in the document tree.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Block {
     /// Byte range into the source text (inclusive start, exclusive end).
     pub span: std::ops::Range<usize>,
@@ -31,7 +31,7 @@ pub struct Block {
 }
 
 /// The kind of a markdown block.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum BlockKind {
     /// YAML/TOML front matter (passthrough from the caller-provided span).
     FrontMatter,
@@ -122,7 +122,7 @@ impl TableAlignment {
 // ── ListItem ───────────────────────────────────────────────────────────────
 
 /// A single item within a list.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct ListItem {
     /// Byte range into the source text.
     pub span: std::ops::Range<usize>,

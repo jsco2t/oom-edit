@@ -26,6 +26,7 @@ pulldown-cmark = { version = "=0.13.4", default-features = false }
 gray_matter = { version = "=0.3.2", features = ["toml"] }
 thiserror = "=2.0.18"
 tempfile = "=3.26.0"
+unicode-width = "=0.2.2"
 
 [dev-dependencies]
 proptest = "=1.10.0"

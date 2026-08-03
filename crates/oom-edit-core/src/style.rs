@@ -120,3 +120,65 @@ pub struct SourceFrame {
     /// ranges into the full document text.
     pub selections: Vec<std::ops::Range<usize>>,
 }
+
+// ── View layout types ──────────────────────────────────────────────────────
+
+/// The kind of a rendered view line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineKind {
+    /// A line derived from actual document content.
+    Content,
+    /// A synthetic line (blank separator, border, links index, footnote
+    /// separator). Per VP-1: synthetic lines carry the source span of the
+    /// nearest preceding content line.
+    Synthetic,
+}
+
+/// A single rendered line in the View layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewLine {
+    /// The styled text for this line.
+    pub styled: StyledLine,
+    /// Source byte range into the original markdown text. For content lines
+    /// this covers the actual source; for synthetic lines it carries the
+    /// nearest preceding content line's span (VP-1).
+    pub source: std::ops::Range<usize>,
+    /// Whether this line is content or synthetic.
+    pub kind: LineKind,
+}
+
+/// The kind of jump target in the View layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetKind {
+    /// A heading jump target, carrying the heading level (1–6).
+    Heading(u8),
+    /// A link jump target, carrying the index into `link_index`.
+    Link(usize),
+    /// A footnote jump target.
+    Footnote,
+}
+
+/// A jump target within the View layout (for navigation).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JumpTarget {
+    /// 0-based line number in `ViewLayout.lines` where this target begins.
+    pub line: usize,
+    /// The kind of target.
+    pub kind: TargetKind,
+}
+
+/// The full rendered layout for View mode.
+///
+/// Produced by `ViewLayout::build()` from a `BlockModel`, wrap width, and
+/// highlighter. The layout is a sequence of styled, wrapped lines with
+/// source-mapping and jump targets for navigation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ViewLayout {
+    /// Rendered lines, in display order.
+    pub lines: Vec<ViewLine>,
+    /// Jump targets sorted by line number.
+    pub jump_targets: Vec<JumpTarget>,
+    /// Link destinations: `(marker_index, url)` pairs. Marker `[n]` refers
+    /// to `link_index[n]`.
+    pub link_index: Vec<(usize, String)>,
+}

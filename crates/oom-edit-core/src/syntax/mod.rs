@@ -9,6 +9,9 @@
 mod captures;
 mod languages;
 
+pub use captures::capture_to_style;
+pub use languages::{find_by_alias, find_by_name, resolve_language, LangDef, LANGUAGES};
+
 use std::ops::Range;
 
 use tree_sitter::{Parser, Point, Query, QueryCursor, StreamingIterator, Tree};
@@ -505,6 +508,127 @@ impl Highlighter {
             }
         }
     }
+}
+
+// ── Standalone snippet highlighting ─────────────────────────────────────────
+
+/// Highlight a standalone code snippet with the given language.
+///
+/// This is used by the View layout renderer for fenced code blocks: each
+/// fence is highlighted as an independent snippet, not as part of the
+/// document's incremental tree (FR-3.5).
+///
+/// Unknown languages return the text unstyled (CodeBlock style).
+pub fn highlight_snippet(lang: &str, text: &str) -> Vec<StyledLine> {
+    if text.is_empty() {
+        return vec![StyledLine {
+            text: String::new(),
+            spans: Vec::new(),
+        }];
+    }
+
+    let lang_def = languages::find_by_alias(lang);
+    let lang_obj = lang_def.map(|d| (d.language_fn)());
+
+    let Some(lang_obj) = lang_obj else {
+        // Unknown language — return unstyled
+        return highlight_lines_for_text(text);
+    };
+
+    let query = Query::new(&lang_obj, get_highlight_query(&lang_obj)).ok();
+    let Some(query) = query else {
+        return highlight_lines_for_text(text);
+    };
+
+    let mut parser = Parser::new();
+    if parser.set_language(&lang_obj).is_err() {
+        return highlight_lines_for_text(text);
+    }
+
+    let tree = parser.parse(text, None);
+
+    let Some(tree) = tree else {
+        return highlight_lines_for_text(text);
+    };
+
+    let text_bytes = text.as_bytes();
+    let root = tree.root_node();
+    let mut cursor = QueryCursor::new();
+
+    // Collect all spans from the query
+    let mut all_spans: Vec<Span> = Vec::new();
+    let mut matches = cursor.matches(&query, root, text_bytes);
+
+    while let Some(m) = matches.next() {
+        for capture in m.captures {
+            let capture_name = query.capture_names()[capture.index as usize];
+            let style = captures::capture_to_style(capture_name);
+            let node = capture.node;
+            let start = node.start_byte();
+            let end = node.end_byte();
+            if start < end {
+                all_spans.push(Span {
+                    start_col: start,
+                    end_col: end,
+                    style,
+                });
+            }
+        }
+    }
+
+    // Group spans by line and produce StyledLines
+    let line_starts = line_start_indices(text);
+    let num_lines = if text.ends_with('\n') && !text.is_empty() {
+        line_starts.len().saturating_sub(1)
+    } else {
+        line_starts.len()
+    };
+
+    let mut result = Vec::with_capacity(num_lines);
+    for line_idx in 0..num_lines {
+        let line_start = line_starts[line_idx];
+        let next_start = if line_idx + 1 < line_starts.len() {
+            line_starts[line_idx + 1]
+        } else {
+            text.len()
+        };
+        let line_end = if next_start > line_start && text.as_bytes()[next_start - 1] == b'\n' {
+            next_start - 1
+        } else {
+            next_start
+        };
+        let line_text = &text[line_start..line_end.min(text.len())];
+
+        let mut spans: Vec<Span> = all_spans
+            .iter()
+            .filter(|s| s.start_col < line_end && s.end_col > line_start)
+            .map(|s| Span {
+                start_col: s.start_col.saturating_sub(line_start),
+                end_col: s.end_col.saturating_sub(line_start),
+                style: s.style,
+            })
+            .collect();
+
+        spans.sort_by_key(|s| s.start_col);
+        spans = merge_overlapping_spans(spans);
+
+        result.push(StyledLine {
+            text: line_text.to_string(),
+            spans,
+        });
+    }
+
+    result
+}
+
+/// Helper: split text into lines and return unstyled StyledLines.
+fn highlight_lines_for_text(text: &str) -> Vec<StyledLine> {
+    text.lines()
+        .map(|line| StyledLine {
+            text: line.to_string(),
+            spans: Vec::new(),
+        })
+        .collect()
 }
 
 // ── Helper: find info_string child of a fenced code block ───────────────────
