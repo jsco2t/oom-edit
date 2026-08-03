@@ -464,16 +464,32 @@ impl<'a> ViewLayoutBuilder<'a> {
         };
 
         let indent = "  ".repeat(depth);
-        let _prefix = format!("{}{} ", indent, bullet);
+        let prefix = format!("{}{} ", indent, bullet);
+        let prefix_char_len = prefix.chars().count();
 
-        // Render children
+        // Render children and prepend list item prefix to each line
         for child in &item.children {
-            self.render_block(child);
-        }
+            let child_layout = ViewLayout::build(
+                &BlockModel {
+                    blocks: vec![child.clone()],
+                },
+                self.width.saturating_sub(prefix_char_len as u16),
+                self.highlighter,
+            );
 
-        // For the item's own inline content (if any), render it with hanging indent
-        // List items in BlockModel don't carry direct inlines — they carry child blocks.
-        // The text content is in the first child block (usually a paragraph).
+            for view_line in &child_layout.lines {
+                let mut text = prefix.clone();
+                text.push_str(&view_line.styled.text);
+
+                let mut spans = view_line.styled.spans.clone();
+                for span in &mut spans {
+                    span.start_col += prefix_char_len;
+                    span.end_col += prefix_char_len;
+                }
+
+                self.make_content_line(StyledLine { text, spans }, view_line.source.clone());
+            }
+        }
     }
 
     // ── VW-7: Task lists ─────────────────────────────────────────────

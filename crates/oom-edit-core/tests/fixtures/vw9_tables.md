@@ -1,0 +1,8 @@
+| Left | Center | Right |
+|:-----|:------:|------:|
+| a    |   b    |     c |
+| long text | x | z |
+
+| Simple | Table |
+|--------|-------|
+| cell   | cell  |

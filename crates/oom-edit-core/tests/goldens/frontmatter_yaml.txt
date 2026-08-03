@@ -1,0 +1,6 @@
+────────────────────────────────────────────────────────────
+
+▌ title: My Document author: Test Author date: 2026-07-31
+nested: key: value number: 42
+
+Document content here.

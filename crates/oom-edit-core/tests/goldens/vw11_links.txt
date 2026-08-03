@@ -1,0 +1,13 @@
+Link text [0]
+
+Another link with title [1].
+
+Reference-style link: ref link [2]
+
+Autolink: https://autolink.example.com [3]
+
+─ links ─
+[0] https://example.com
+[1] https://example.org
+[2] https://reference.example.com
+[3] https://autolink.example.com

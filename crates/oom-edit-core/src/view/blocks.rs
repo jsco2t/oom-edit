@@ -362,9 +362,15 @@ impl BlockBuilder {
             }
 
             Event::Start(Tag::Item) => {
+                // Push ListItem to collect children, then push Paragraph to collect
+                // inline text (pulldown-cmark does NOT emit Start(Paragraph) for list items).
                 self.stack.push(BuildContext::ListItem {
                     start: span.start,
                     children: Vec::new(),
+                });
+                self.stack.push(BuildContext::Paragraph {
+                    start: span.start,
+                    inlines: Vec::new(),
                 });
             }
 
@@ -530,7 +536,30 @@ impl BlockBuilder {
             }
 
             Event::End(TagEnd::Item) => {
-                if let Some(BuildContext::ListItem { start, children }) = self.stack.pop() {
+                // Pop the implicit Paragraph that was pushed by Start(Item) to collect
+                // inline text (pulldown-cmark does NOT emit Start/End(Paragraph) for list items).
+                let mut paragraph_inlines: Option<Vec<Inline>> = None;
+                if matches!(self.stack.last(), Some(BuildContext::Paragraph { .. })) {
+                    if let Some(BuildContext::Paragraph { mut inlines, .. }) = self.stack.pop() {
+                        paragraph_inlines = Some(std::mem::take(&mut inlines));
+                    }
+                }
+
+                if let Some(BuildContext::ListItem {
+                    start,
+                    mut children,
+                }) = self.stack.pop()
+                {
+                    // Add the implicit paragraph (if any inlines were collected) as a child
+                    if let Some(inlines) = paragraph_inlines {
+                        if !inlines.is_empty() || span.start != span.end {
+                            children.push(Block {
+                                span: start..span.end,
+                                kind: BlockKind::Paragraph { inlines },
+                            });
+                        }
+                    }
+
                     let task = self.detect_task_checkbox(start, span.end);
 
                     // Find the parent list to get tightness
@@ -621,8 +650,18 @@ impl BlockBuilder {
                     indented,
                 }) = self.stack.pop()
                 {
-                    let content_start = start + fence_len + 1;
-                    let content_end = span.end.saturating_sub(fence_len + 1);
+                    let (content_start, content_end) = if indented {
+                        // Indented code block: content is the full span minus trailing newline
+                        let content_end = span.end.saturating_sub(1);
+                        (start, content_end)
+                    } else {
+                        // Fenced code block: skip opening fence + newline + info string,
+                        // and closing fence + newline
+                        let info_len = lang.as_ref().map(|s| s.len()).unwrap_or(0);
+                        let content_start = start + fence_len + 1 + info_len;
+                        let content_end = span.end.saturating_sub(fence_len + 1);
+                        (content_start, content_end)
+                    };
                     let block = Block {
                         span: start..span.end,
                         kind: BlockKind::CodeFence {
@@ -692,10 +731,11 @@ impl BlockBuilder {
             Event::End(TagEnd::Emphasis) => {
                 if let Some(BuildContext::InlineStack {
                     kind: InlineStackKind::Emph,
+                    mut inlines,
                     ..
                 }) = self.stack.pop()
                 {
-                    let inner = self.take_inline_stack_inlines();
+                    let inner = std::mem::take(&mut inlines);
                     self.push_inline(Inline::Emph(inner));
                 }
             }
@@ -703,10 +743,11 @@ impl BlockBuilder {
             Event::End(TagEnd::Strong) => {
                 if let Some(BuildContext::InlineStack {
                     kind: InlineStackKind::Strong,
+                    mut inlines,
                     ..
                 }) = self.stack.pop()
                 {
-                    let inner = self.take_inline_stack_inlines();
+                    let inner = std::mem::take(&mut inlines);
                     self.push_inline(Inline::Strong(inner));
                 }
             }
@@ -714,10 +755,11 @@ impl BlockBuilder {
             Event::End(TagEnd::Strikethrough) => {
                 if let Some(BuildContext::InlineStack {
                     kind: InlineStackKind::Strike,
+                    mut inlines,
                     ..
                 }) = self.stack.pop()
                 {
-                    let inner = self.take_inline_stack_inlines();
+                    let inner = std::mem::take(&mut inlines);
                     self.push_inline(Inline::Strike(inner));
                 }
             }
@@ -726,10 +768,11 @@ impl BlockBuilder {
                 if let Some(BuildContext::InlineStack {
                     kind: InlineStackKind::Link,
                     _dest,
+                    mut inlines,
                     ..
                 }) = self.stack.pop()
                 {
-                    let text = self.take_inline_stack_inlines();
+                    let text = std::mem::take(&mut inlines);
                     self.push_inline(Inline::Link {
                         text,
                         dest: _dest.clone(),
@@ -741,10 +784,11 @@ impl BlockBuilder {
                 if let Some(BuildContext::InlineStack {
                     kind: InlineStackKind::Image,
                     _dest,
+                    mut inlines,
                     ..
                 }) = self.stack.pop()
                 {
-                    let inlines = self.take_inline_stack_inlines();
+                    let inlines = std::mem::take(&mut inlines);
                     let alt = inlines
                         .into_iter()
                         .filter_map(|i| match i {
@@ -814,16 +858,6 @@ impl BlockBuilder {
         {
             inlines.push(inline);
         }
-    }
-
-    /// Take the inlines from the topmost InlineStack context.
-    fn take_inline_stack_inlines(&mut self) -> Vec<Inline> {
-        for ctx in self.stack.iter_mut().rev() {
-            if let BuildContext::InlineStack { inlines, .. } = ctx {
-                return std::mem::take(inlines);
-            }
-        }
-        Vec::new()
     }
 
     /// Detect if a list item has a task checkbox by examining source text.
