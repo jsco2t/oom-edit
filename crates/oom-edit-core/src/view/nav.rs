@@ -10,7 +10,9 @@
 
 use std::ops::Range;
 
-use crate::style::{LineKind, SearchDirection, ViewCursor, ViewLayout, ViewSearch};
+use crate::style::{
+    JumpTarget, LineKind, SearchDirection, TargetKind, ViewCursor, ViewLayout, ViewSearch,
+};
 
 // ── ViewCursor ─────────────────────────────────────────────────────────────
 
@@ -220,6 +222,10 @@ pub struct ViewKeyResult {
     pub new_search: Option<ViewSearch>,
     /// Whether the layout should be recomputed.
     pub layout_dirty: bool,
+    /// Whether the fm_collapsed state should be toggled.
+    pub fm_collapsed_toggled: bool,
+    /// Status message to display (e.g. "Search wrapped", "FM collapsed").
+    pub message: Option<String>,
 }
 
 /// Handle a key in View mode. Returns the effect of the keypress.
@@ -230,6 +236,7 @@ pub struct ViewKeyResult {
 /// - VN-4: Tab/Shift-Tab for jump targets
 /// - VN-5: search with / and ?
 /// - VN-6: n/N for repeat search
+#[allow(clippy::too_many_arguments)]
 pub fn handle_key(
     key: crate::session::KeyInput,
     cursor: &ViewCursor,
@@ -238,6 +245,7 @@ pub fn handle_key(
     jump_targets: &[crate::style::JumpTarget],
     layout: &ViewLayout,
     count: usize,
+    text: &str,
 ) -> ViewKeyResult {
     let mut result = ViewKeyResult::default();
     let step = if count > 1 { count } else { 1 };
@@ -359,6 +367,180 @@ pub fn handle_key(
                 result.cursor_moved = true;
                 result.new_cursor = Some(ViewCursor::new(target));
             }
+        }
+
+        // Ctrl-d: scroll down half viewport
+        crate::session::KeyCodeKind::Char('d') if key.mods.ctrl => {
+            let page = if count > 1 { count } else { max_view_lines / 2 };
+            let new_line = (cursor.line.saturating_add(page)).min(max_view_lines.saturating_sub(1));
+            result.cursor_moved = true;
+            result.new_cursor = Some(ViewCursor::new(new_line));
+        }
+
+        // Ctrl-u: scroll up half viewport
+        crate::session::KeyCodeKind::Char('u') if key.mods.ctrl => {
+            let page = if count > 1 { count } else { max_view_lines / 2 };
+            let new_line = cursor.line.saturating_sub(page);
+            result.cursor_moved = true;
+            result.new_cursor = Some(ViewCursor::new(new_line));
+        }
+
+        // Ctrl-f: scroll down full viewport
+        crate::session::KeyCodeKind::Char('f') if key.mods.ctrl => {
+            let page = if count > 1 { count } else { max_view_lines };
+            let new_line = (cursor.line.saturating_add(page)).min(max_view_lines.saturating_sub(1));
+            result.cursor_moved = true;
+            result.new_cursor = Some(ViewCursor::new(new_line));
+        }
+
+        // Ctrl-b: scroll up full viewport
+        crate::session::KeyCodeKind::Char('b') if key.mods.ctrl => {
+            let page = if count > 1 { count } else { max_view_lines };
+            let new_line = cursor.line.saturating_sub(page);
+            result.cursor_moved = true;
+            result.new_cursor = Some(ViewCursor::new(new_line));
+        }
+
+        // n: repeat search in same direction (with cursor movement)
+        crate::session::KeyCodeKind::Char('n')
+            if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
+        {
+            if let Some(current_search) = search {
+                if !current_search.pattern.is_empty() {
+                    if let Some(match_line) = find_next_match(
+                        current_search,
+                        cursor,
+                        layout,
+                        text,
+                        current_search.direction(),
+                    ) {
+                        result.cursor_moved = true;
+                        result.new_cursor = Some(ViewCursor::new(match_line));
+                        // Check if we wrapped around the document
+                        let wrapped = if current_search.direction() == SearchDirection::Forward {
+                            match_line < cursor.line
+                        } else {
+                            match_line > cursor.line
+                        };
+                        if wrapped {
+                            result
+                                .message
+                                .get_or_insert_with(String::new)
+                                .push_str(" (wrapped)");
+                        }
+                    }
+                }
+                result.search_changed = true;
+                result.new_search = Some(current_search.clone());
+            }
+        }
+
+        // N: repeat search in reverse direction (with cursor movement)
+        crate::session::KeyCodeKind::Char('N')
+            if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
+        {
+            if let Some(current_search) = search {
+                if !current_search.pattern.is_empty() {
+                    let mut reverse = current_search.clone();
+                    reverse.set_direction(match reverse.direction() {
+                        SearchDirection::Forward => SearchDirection::Backward,
+                        SearchDirection::Backward => SearchDirection::Forward,
+                    });
+                    if let Some(match_line) =
+                        find_next_match(&reverse, cursor, layout, text, reverse.direction())
+                    {
+                        result.cursor_moved = true;
+                        result.new_cursor = Some(ViewCursor::new(match_line));
+                    }
+                }
+                result.search_changed = true;
+                let mut new_search = current_search.clone();
+                new_search.set_direction(match new_search.direction() {
+                    SearchDirection::Forward => SearchDirection::Backward,
+                    SearchDirection::Backward => SearchDirection::Forward,
+                });
+                result.new_search = Some(new_search);
+            }
+        }
+
+        // {: jump to previous synthetic boundary line
+        crate::session::KeyCodeKind::Char('{')
+            if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
+        {
+            if let Some(target) = find_prev_boundary(cursor, layout) {
+                result.cursor_moved = true;
+                result.new_cursor = Some(ViewCursor::new(target));
+            }
+        }
+
+        // }: jump to next synthetic boundary line
+        crate::session::KeyCodeKind::Char('}')
+            if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
+        {
+            if let Some(target) = find_next_boundary(cursor, layout) {
+                result.cursor_moved = true;
+                result.new_cursor = Some(ViewCursor::new(target));
+            }
+        }
+
+        // [[: jump to previous heading
+        crate::session::KeyCodeKind::Char('[')
+            if !key.mods.ctrl && !key.mods.alt && !key.mods.shift && count > 1 =>
+        {
+            let targets: Vec<&JumpTarget> = layout
+                .jump_targets
+                .iter()
+                .filter(|t| matches!(t.kind, TargetKind::Heading(_)))
+                .collect();
+            if let Some(target) = find_prev_by_kind(cursor, &targets, count) {
+                result.cursor_moved = true;
+                result.new_cursor = Some(ViewCursor::new(target.line));
+            }
+        }
+
+        // ]]: jump to next heading
+        crate::session::KeyCodeKind::Char(']')
+            if !key.mods.ctrl && !key.mods.alt && !key.mods.shift && count > 1 =>
+        {
+            let targets: Vec<&JumpTarget> = layout
+                .jump_targets
+                .iter()
+                .filter(|t| matches!(t.kind, TargetKind::Heading(_)))
+                .collect();
+            if let Some(target) = find_next_by_kind(cursor, &targets, count) {
+                result.cursor_moved = true;
+                result.new_cursor = Some(ViewCursor::new(target.line));
+            }
+        }
+
+        // Enter: on a link-target line, show destination
+        crate::session::KeyCodeKind::Enter
+            if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
+        {
+            if let Some(target) = layout.jump_targets.iter().find(|t| t.line == cursor.line) {
+                match &target.kind {
+                    TargetKind::Heading(_) => {
+                        result.message = Some(format!("Heading at line {}", target.line + 1));
+                    }
+                    TargetKind::Link(idx) => {
+                        if let Some((_, url)) = layout.link_index.get(*idx) {
+                            result.message = Some(format!("Link: {}", url));
+                        }
+                    }
+                    TargetKind::Footnote => {
+                        result.message = Some(format!("Footnote at line {}", target.line + 1));
+                    }
+                }
+            }
+        }
+
+        // z: toggle front-matter collapse
+        crate::session::KeyCodeKind::Char('z')
+            if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
+        {
+            result.layout_dirty = true;
+            result.fm_collapsed_toggled = true;
+            result.message = Some("FM collapse toggled".to_string());
         }
 
         // Page Up / Page Down: handled by session layer with viewport info
@@ -508,4 +690,49 @@ pub fn find_next_match(
             .find_map(|vl| if *vl < cursor.line { Some(*vl) } else { None })
             .or_else(|| view_lines_with_matches.last().copied())
     }
+}
+
+// ── Block boundary jumping ({/}) ──────────────────────────────────────────
+
+/// Find the previous synthetic boundary line before the cursor.
+fn find_prev_boundary(cursor: &ViewCursor, layout: &ViewLayout) -> Option<usize> {
+    let cursor_line = cursor.line;
+    (0..cursor_line)
+        .rev()
+        .find(|&i| layout.lines[i].kind == LineKind::Synthetic)
+}
+
+/// Find the next synthetic boundary line after the cursor.
+fn find_next_boundary(cursor: &ViewCursor, layout: &ViewLayout) -> Option<usize> {
+    let cursor_line = cursor.line;
+    (cursor_line + 1..layout.lines.len()).find(|&i| layout.lines[i].kind == LineKind::Synthetic)
+}
+
+// ── Heading jumping ([[ / ]]) ─────────────────────────────────────────────
+
+/// Find the previous heading target before the cursor, with multiplicity.
+fn find_prev_by_kind<'a>(
+    cursor: &'a ViewCursor,
+    targets: &'a [&'a JumpTarget],
+    count: usize,
+) -> Option<&'a JumpTarget> {
+    targets
+        .iter()
+        .rev()
+        .filter(|t| t.line < cursor.line)
+        .nth(count.saturating_sub(1))
+        .copied()
+}
+
+/// Find the next heading target after the cursor, with multiplicity.
+fn find_next_by_kind<'a>(
+    cursor: &'a ViewCursor,
+    targets: &'a [&'a JumpTarget],
+    count: usize,
+) -> Option<&'a JumpTarget> {
+    targets
+        .iter()
+        .filter(|t| t.line > cursor.line)
+        .nth(count.saturating_sub(1))
+        .copied()
 }

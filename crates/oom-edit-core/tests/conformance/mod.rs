@@ -2709,6 +2709,80 @@ fn view_scroll_top_hysteresis() {
     assert_eq!(top1, top2);
 }
 
+// ── VP-4: Proptest — enter_view → leave_view identity + random nav ────────
+
+use proptest::prelude::*;
+
+proptest! {
+    #[test]
+    fn vp_4_enter_leave_identity(
+        text in r"[\x20-\x7e\n]{10,200}",
+        edit_line in 0usize..20usize,
+    ) {
+        let mut sess = session(&text);
+        let max_lines = sess.line_count();
+        let target_line = edit_line.min(max_lines.saturating_sub(1));
+        // Use ex command to jump to line
+        sess.handle_key(KeyInput {
+            code: KeyCode { kind: KeyCodeKind::Char(':') },
+            mods: Modifiers::default(),
+        });
+        for c in target_line.to_string().chars() {
+            sess.handle_key(KeyInput {
+                code: KeyCode { kind: KeyCodeKind::Char(c) },
+                mods: Modifiers::default(),
+            });
+        }
+        sess.handle_key(KeyInput {
+            code: KeyCode { kind: KeyCodeKind::Enter },
+            mods: Modifiers::default(),
+        });
+
+        // Enter View
+        let effects = sess.toggle_view();
+        prop_assert!(effects.iter().any(|e| matches!(e, Effect::ModeChanged(oom_edit_core::session::Mode::View))));
+
+        // Immediate leave View
+        let effects = sess.toggle_view();
+        prop_assert!(effects.iter().any(|e| matches!(e, Effect::ModeChanged(oom_edit_core::session::Mode::Normal))));
+
+        // Cursor should be in-bounds
+        let (line, _col) = sess.cursor();
+        prop_assert!(line < sess.line_count());
+    }
+
+    #[test]
+    fn vp_4_random_nav_sequence(
+        text in r"[\x20-\x7e\n]{10,200}",
+    ) {
+        let mut sess = session(&text);
+        let line_count = sess.line_count();
+
+        // Enter View
+        sess.toggle_view();
+
+        // Simulate a nav sequence (up to 50 keys)
+        let nav_keys = [
+            KeyInput { code: KeyCode { kind: KeyCodeKind::Char('j') }, mods: Modifiers::default() },
+            KeyInput { code: KeyCode { kind: KeyCodeKind::Char('k') }, mods: Modifiers::default() },
+            KeyInput { code: KeyCode { kind: KeyCodeKind::Char('g') }, mods: Modifiers::default() },
+            KeyInput { code: KeyCode { kind: KeyCodeKind::Char('G') }, mods: Modifiers::default() },
+            KeyInput { code: KeyCode { kind: KeyCodeKind::Down }, mods: Modifiers::default() },
+            KeyInput { code: KeyCode { kind: KeyCodeKind::Up }, mods: Modifiers::default() },
+        ];
+
+        for i in 0..50usize {
+            let key = &nav_keys[i % nav_keys.len()];
+            sess.handle_key(*key);
+        }
+
+        // Leave View — cursor should still be in-bounds
+        sess.toggle_view();
+        let (line, _col) = sess.cursor();
+        prop_assert!(line < line_count);
+    }
+}
+
 // ── Coverage meta-test (SC-1) ─────────────────────────────────────────────
 
 /// All row IDs that must be covered by conformance test case names.

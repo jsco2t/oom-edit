@@ -633,6 +633,7 @@ impl EditorSession {
                 &jump_targets,
                 &layout,
                 prev_count,
+                &text,
             );
 
             // Apply search state changes
@@ -689,6 +690,24 @@ impl EditorSession {
                     vs.cursor = new_cursor;
                     effects.push(Effect::CursorMoved);
                 }
+            }
+
+            // Apply layout dirty flag
+            if result.layout_dirty {
+                vs.invalidate();
+            }
+
+            // Apply fm_collapsed toggle
+            if result.fm_collapsed_toggled {
+                vs.fm_collapsed = !vs.fm_collapsed;
+            }
+
+            // Apply status message
+            if let Some(msg) = result.message {
+                effects.push(Effect::Message {
+                    text: msg,
+                    severity: Severity::Info,
+                });
             }
         }
 
