@@ -139,6 +139,11 @@ pub enum Effect {
     CursorMoved,
     /// Buffer was edited (dirty may have changed).
     Edited,
+    /// Help was requested (from `:help` or `F1`).
+    ///
+    /// The TUI opens its command palette with the Vim reference section.
+    /// Headless hosts may ignore this effect.
+    HelpRequested,
 }
 
 // ── Severity ───────────────────────────────────────────────────────────────
@@ -178,6 +183,7 @@ use crate::vim::{UndoMark, VimCore, VimEffect};
 use crate::document::Document;
 use crate::error::{OpenError, SaveError};
 use crate::style::{SearchDirection, ViewCursor, ViewLayout, ViewSearch};
+use crate::syntax::Highlighter;
 use crate::view::nav;
 use crate::view::BlockModel;
 
@@ -191,6 +197,8 @@ use crate::view::BlockModel;
 struct ViewState {
     /// Cached view layout (None = needs rebuild).
     layout_cache: Option<ViewLayout>,
+    /// The width used when the layout was last built.
+    last_width: u16,
     /// Current cursor position in view coordinates.
     cursor: ViewCursor,
     /// Active search state (if in search mode).
@@ -206,6 +214,19 @@ impl ViewState {
     fn new() -> Self {
         Self {
             layout_cache: None,
+            last_width: 0,
+            cursor: ViewCursor::new(0),
+            search: None,
+            fm_collapsed: false,
+            count: 0,
+        }
+    }
+
+    /// Create a new ViewState with a pre-built layout.
+    fn with_layout(layout: ViewLayout) -> Self {
+        Self {
+            layout_cache: Some(layout),
+            last_width: 0, // Will be set on first render_view call
             cursor: ViewCursor::new(0),
             search: None,
             fm_collapsed: false,
@@ -214,16 +235,12 @@ impl ViewState {
     }
 
     /// Get the layout, building it if necessary.
-    fn get_layout(&mut self, text: &str) -> &ViewLayout {
+    fn get_layout(&mut self, text: &str, highlighter: &Highlighter) -> &ViewLayout {
         if self.layout_cache.is_none() {
             let model = BlockModel::build(text, None);
             // Use a default width of 80 for the layout
             // The actual width comes from the viewport in the TUI layer
-            self.layout_cache = Some(ViewLayout::build(
-                &model,
-                80,
-                &crate::syntax::Highlighter::new(text),
-            ));
+            self.layout_cache = Some(ViewLayout::build(&model, 80, highlighter));
         }
         self.layout_cache.as_ref().unwrap()
     }
@@ -258,10 +275,22 @@ pub struct EditorSession {
     document: Document,
     /// View mode state (only present when in View mode).
     view_state: Option<ViewState>,
+    /// Syntax highlighter — kept in sync with buffer edits.
+    highlighter: Highlighter,
 }
 
 impl EditorSession {
     /// Create a new session from initial text. Starts in Normal mode.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use oom_edit_core::session::EditorSession;
+    ///
+    /// let session = EditorSession::from_text("# Hello\n\nWorld\n");
+    /// assert_eq!(session.mode(), oom_edit_core::session::Mode::Normal);
+    /// assert_eq!(session.line_count(), 4);
+    /// ```
     pub fn from_text(text: &str) -> Self {
         let mut document = Document::from_text(text);
         let save_point = document.save_point();
@@ -272,6 +301,7 @@ impl EditorSession {
             command_buffer: String::new(),
             document,
             view_state: None,
+            highlighter: Highlighter::new(text),
         }
     }
 
@@ -293,6 +323,7 @@ impl EditorSession {
             command_buffer: String::new(),
             document,
             view_state: None,
+            highlighter: Highlighter::new(&text),
         })
     }
 
@@ -309,6 +340,8 @@ impl EditorSession {
         self.document.save_with_text(&text, path, force)?;
         // Update the vim core's save point to match
         self.save_point = self.document.save_point();
+        // Rebuild the highlighter with saved text
+        self.highlighter = Highlighter::new(&text);
         // Invalidate view layout cache on save
         if let Some(ref mut vs) = self.view_state {
             vs.invalidate();
@@ -317,6 +350,21 @@ impl EditorSession {
     }
 
     /// Handle a key input. Returns zero or more effects.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use oom_edit_core::session::{EditorSession, KeyInput, KeyCode, KeyCodeKind, Modifiers};
+    ///
+    /// let mut session = EditorSession::from_text("hello");
+    /// let key = KeyInput {
+    ///     code: KeyCode { kind: KeyCodeKind::Char('i') },
+    ///     mods: Modifiers::default(),
+    /// };
+    /// let effects = session.handle_key(key);
+    /// assert!(effects.iter().any(|e| matches!(e, oom_edit_core::session::Effect::ModeChanged(_))));
+    /// assert_eq!(session.mode(), oom_edit_core::session::Mode::Insert);
+    /// ```
     pub fn handle_key(&mut self, key: KeyInput) -> Vec<Effect> {
         // View mode is read-only (FR-1.6) — most keys are no-ops
         if self.mode == Mode::View {
@@ -349,8 +397,10 @@ impl EditorSession {
                     self.mode = vim_mode.into();
                     effects.push(Effect::ModeChanged(self.mode));
                 }
-                VimEffect::Edited { edits: _ } => {
+                VimEffect::Edited { edits } => {
                     effects.push(Effect::Edited);
+                    // Apply edits to the highlighter for incremental re-parse
+                    self.highlighter.apply_edit(&edits);
                     // Invalidate view layout cache on edit
                     if let Some(ref mut vs) = self.view_state {
                         vs.invalidate();
@@ -407,6 +457,11 @@ impl EditorSession {
         self.vim.text()
     }
 
+    /// Return the syntax highlighter.
+    pub fn highlighter(&self) -> &Highlighter {
+        &self.highlighter
+    }
+
     /// Return a reference to the document model.
     pub fn document_ref(&self) -> &Document {
         &self.document
@@ -444,7 +499,7 @@ impl EditorSession {
         if self.mode == Mode::View {
             if let Some(ref mut vs) = self.view_state {
                 let text = self.vim.text();
-                Some(vs.get_layout(&text))
+                Some(vs.get_layout(&text, &self.highlighter))
             } else {
                 None
             }
@@ -483,6 +538,167 @@ impl EditorSession {
         self.vim.line(idx)
     }
 
+    /// Render the source editor frame for the given viewport.
+    ///
+    /// Produces a [`crate::style::SourceFrame`] containing:
+    /// - Highlighted styled lines (exactly `viewport.height` lines, padded)
+    /// - Cursor position in viewport-relative `(row, col)` coordinates
+    /// - Visual-mode selection ranges (clipped to viewport)
+    /// - Search-match ranges (if any)
+    ///
+    /// The `Viewport.top_line` is owned by the host; the core does not
+    /// modify it. The host keeps the cursor visible by adjusting
+    /// `top_line` based on `cursor_line()` output.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use oom_edit_core::session::{EditorSession, Viewport};
+    ///
+    /// let mut session = EditorSession::from_text("# Hello\n\nWorld\n");
+    /// let vp = Viewport { top_line: 0, height: 10, width: 80 };
+    /// let frame = session.render_source(vp);
+    /// assert_eq!(frame.lines.len(), 10); // padded to viewport height
+    /// assert!(!frame.lines[0].text.is_empty()); // first line has content
+    /// ```
+    pub fn render_source(&mut self, vp: Viewport) -> crate::style::SourceFrame {
+        let text = self.vim.text();
+        let line_count = self.line_count();
+        let (cursor_line, cursor_col) = self.cursor();
+
+        // Compute which document lines are visible
+        let first_visible = vp.top_line;
+        let last_visible = first_visible.saturating_add(vp.height as usize);
+
+        // Highlight the visible lines (pad to viewport height)
+        let start_line = first_visible.min(line_count);
+        let end_line = last_visible.min(line_count);
+        let highlighted = self.highlighter.highlight_lines(start_line..end_line);
+
+        // Build the lines vector, padding if needed
+        let mut lines = Vec::with_capacity(vp.height as usize);
+
+        // Lines before the visible region are blank (for padding above)
+        let padding_before = if first_visible > line_count {
+            vp.height as usize
+        } else {
+            0
+        };
+
+        for _ in 0..padding_before {
+            lines.push(crate::style::StyledLine {
+                text: String::new(),
+                spans: Vec::new(),
+            });
+        }
+
+        // Add highlighted lines
+        for styled_line in &highlighted {
+            lines.push(styled_line.clone());
+        }
+
+        // Pad with blank lines if we have fewer lines than viewport height
+        while lines.len() < vp.height as usize {
+            lines.push(crate::style::StyledLine {
+                text: String::new(),
+                spans: Vec::new(),
+            });
+        }
+
+        // Truncate to exactly viewport.height (in case we over-highlighted)
+        lines.truncate(vp.height as usize);
+
+        // Compute viewport-relative cursor position
+        let cursor_row = if cursor_line >= first_visible {
+            (cursor_line - first_visible) as u16
+        } else {
+            0
+        };
+        let cursor_col_u16 = cursor_col as u16;
+
+        // Collect visual-mode selections, clipped to viewport
+        let selections = self.vim.selections();
+        let viewport_selections: Vec<std::ops::Range<usize>> = selections
+            .into_iter()
+            .filter(|r| {
+                // Include selections that overlap with the visible region
+                let sel_start_line = text[..r.start].chars().filter(|&c| c == '\n').count();
+                let sel_end_line = text[..r.end].chars().filter(|&c| c == '\n').count();
+                sel_start_line < last_visible && sel_end_line >= first_visible
+            })
+            .collect();
+
+        crate::style::SourceFrame {
+            lines,
+            first_line_number: first_visible + 1,
+            cursor: (cursor_row.min(vp.height.saturating_sub(1)), cursor_col_u16),
+            selections: viewport_selections,
+        }
+    }
+
+    /// Render the View mode layout for the given width.
+    ///
+    /// Builds (or returns the cached layout for) a [`crate::style::ViewLayout`]
+    /// from the current document text, highlighter, and block model.
+    ///
+    /// The layout is invalidated on edits and width changes. Callers should
+    /// pass the current terminal width on each call.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use oom_edit_core::session::EditorSession;
+    ///
+    /// let mut session = EditorSession::from_text("# Hello\n\n* item\n");
+    /// let layout = session.render_view(80);
+    /// assert!(!layout.lines.is_empty());
+    /// ```
+    pub fn render_view(&mut self, width: u16) -> &crate::style::ViewLayout {
+        // Ensure view_state exists
+        if self.view_state.is_none() {
+            let text = self.vim.text();
+            let model = BlockModel::build(&text, None);
+            let layout = ViewLayout::build(&model, width, &self.highlighter);
+            self.view_state = Some(ViewState::with_layout(layout));
+        }
+
+        // Check if layout needs rebuilding
+        if let Some(ref mut vs) = self.view_state {
+            if vs.layout_cache.is_none() || vs.last_width != width {
+                let text = self.vim.text();
+                let model = BlockModel::build(&text, None);
+                let layout = ViewLayout::build(&model, width, &self.highlighter);
+                vs.layout_cache = Some(layout);
+                vs.last_width = width;
+            }
+            vs.layout_cache.as_ref().unwrap()
+        } else {
+            // This should never happen because we just created view_state above,
+            // but handle it gracefully by building a minimal layout.
+            let text = self.vim.text();
+            let model = BlockModel::build(&text, None);
+            let layout = ViewLayout::build(&model, 80, &self.highlighter);
+            self.view_state = Some(ViewState::with_layout(layout));
+            self.view_state
+                .as_ref()
+                .unwrap()
+                .layout_cache
+                .as_ref()
+                .unwrap()
+        }
+    }
+
+    /// Return the view cursor line position.
+    ///
+    /// Used by the host to implement scrolling: the host keeps the cursor
+    /// visible by adjusting `Viewport.top_line` based on this value.
+    pub fn view_cursor_line(&self) -> usize {
+        self.view_state
+            .as_ref()
+            .map(|vs| vs.cursor.line)
+            .unwrap_or(0)
+    }
+
     /// Toggle View mode. If in an editing mode, enter View. If in View,
     /// return to Normal.
     pub fn toggle_view(&mut self) -> Vec<Effect> {
@@ -492,7 +708,7 @@ impl EditorSession {
             let (edit_line, _edit_col) = if let Some(ref mut vs) = self.view_state {
                 let text = self.vim.text();
                 let cursor_line = vs.cursor.line;
-                let layout = vs.get_layout(&text);
+                let layout = vs.get_layout(&text, &self.highlighter);
                 let cursor = ViewCursor::new(cursor_line);
                 nav::leave_view(&cursor, layout, &text)
             } else {
@@ -515,11 +731,12 @@ impl EditorSession {
             let (edit_line, edit_col) = self.vim.cursor();
             let text = self.vim.text();
             let model = BlockModel::build(&text, None);
-            let layout = ViewLayout::build(&model, 80, &crate::syntax::Highlighter::new(&text));
+            let layout = ViewLayout::build(&model, 80, &self.highlighter);
             let cursor = nav::enter_view(edit_line, edit_col, &layout);
 
             self.view_state = Some(ViewState {
                 layout_cache: Some(layout),
+                last_width: 0,
                 cursor,
                 search: None,
                 fm_collapsed: false,
@@ -614,7 +831,7 @@ impl EditorSession {
 
             let text = self.vim.text();
             // Clone the layout to avoid holding a borrow on vs
-            let layout = vs.get_layout(&text).clone();
+            let layout = vs.get_layout(&text, &self.highlighter).clone();
             let jump_targets = layout.jump_targets.clone();
             let max_view_lines = layout.lines.len();
 
@@ -731,7 +948,7 @@ impl EditorSession {
         let (edit_line, _edit_col) = if let Some(ref mut vs) = self.view_state {
             let text = self.vim.text();
             let cursor_line = vs.cursor.line;
-            let layout = vs.get_layout(&text);
+            let layout = vs.get_layout(&text, &self.highlighter);
             let cursor = ViewCursor::new(cursor_line);
             nav::leave_view(&cursor, layout, &text)
         } else {
@@ -840,10 +1057,7 @@ impl EditorSession {
                 self.mode = Mode::View;
                 vec![Effect::ModeChanged(Mode::View)]
             }
-            "help" => vec![Effect::Message {
-                text: "Help not yet implemented".to_string(),
-                severity: Severity::Info,
-            }],
+            "help" => vec![Effect::HelpRequested],
             _ => vec![Effect::Message {
                 text: format!("Unknown command: {}", base),
                 severity: Severity::Warning,

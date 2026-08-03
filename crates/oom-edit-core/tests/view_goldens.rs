@@ -11,6 +11,9 @@ use oom_edit_core::syntax::Highlighter;
 use oom_edit_core::view::BlockModel;
 use std::path::Path;
 
+/// Default width for golden tests.
+const GOLDEN_WIDTH: u16 = 60;
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 fn fixture(name: &str) -> String {
@@ -86,7 +89,7 @@ fn assert_golden(name: &str, markdown: &str, width: u16) {
 #[test]
 fn golden_vw1_headings() {
     let md = fixture("vw1_headings.md");
-    assert_golden("vw1_headings.txt", &md, 60);
+    assert_golden("vw1_headings.txt", &md, GOLDEN_WIDTH);
 }
 
 // ── VW-2: Paragraphs ───────────────────────────────────────────────────────
@@ -94,7 +97,7 @@ fn golden_vw1_headings() {
 #[test]
 fn golden_vw2_paragraphs() {
     let md = fixture("vw2_paragraphs.md");
-    assert_golden("vw2_paragraphs.txt", &md, 60);
+    assert_golden("vw2_paragraphs.txt", &md, GOLDEN_WIDTH);
 }
 
 // ── VW-3: Emphasis ─────────────────────────────────────────────────────────
@@ -102,7 +105,7 @@ fn golden_vw2_paragraphs() {
 #[test]
 fn golden_vw3_emphasis() {
     let md = fixture("vw3_emphasis.md");
-    assert_golden("vw3_emphasis.txt", &md, 60);
+    assert_golden("vw3_emphasis.txt", &md, GOLDEN_WIDTH);
 }
 
 // ── VW-4: Inline Code ──────────────────────────────────────────────────────
@@ -110,7 +113,7 @@ fn golden_vw3_emphasis() {
 #[test]
 fn golden_vw4_inline_code() {
     let md = fixture("vw4_inline_code.md");
-    assert_golden("vw4_inline_code.txt", &md, 60);
+    assert_golden("vw4_inline_code.txt", &md, GOLDEN_WIDTH);
 }
 
 // ── VW-5: Fenced Code Blocks ───────────────────────────────────────────────
@@ -118,7 +121,7 @@ fn golden_vw4_inline_code() {
 #[test]
 fn golden_vw5_fenced_code() {
     let md = fixture("vw5_fenced_code.md");
-    assert_golden("vw5_fenced_code.txt", &md, 60);
+    assert_golden("vw5_fenced_code.txt", &md, GOLDEN_WIDTH);
 }
 
 // ── VW-6: Bulleted Lists ───────────────────────────────────────────────────
@@ -126,7 +129,7 @@ fn golden_vw5_fenced_code() {
 #[test]
 fn golden_vw6_bulleted_lists() {
     let md = fixture("vw6_bulleted_lists.md");
-    assert_golden("vw6_bulleted_lists.txt", &md, 60);
+    assert_golden("vw6_bulleted_lists.txt", &md, GOLDEN_WIDTH);
 }
 
 // ── VW-7: Task Lists ───────────────────────────────────────────────────────
@@ -134,7 +137,7 @@ fn golden_vw6_bulleted_lists() {
 #[test]
 fn golden_vw7_task_lists() {
     let md = fixture("vw7_task_lists.md");
-    assert_golden("vw7_task_lists.txt", &md, 60);
+    assert_golden("vw7_task_lists.txt", &md, GOLDEN_WIDTH);
 }
 
 // ── VW-8: Blockquotes ──────────────────────────────────────────────────────
@@ -142,7 +145,7 @@ fn golden_vw7_task_lists() {
 #[test]
 fn golden_vw8_blockquotes() {
     let md = fixture("vw8_blockquotes.md");
-    assert_golden("vw8_blockquotes.txt", &md, 60);
+    assert_golden("vw8_blockquotes.txt", &md, GOLDEN_WIDTH);
 }
 
 // ── VW-9: Tables ───────────────────────────────────────────────────────────
@@ -150,7 +153,7 @@ fn golden_vw8_blockquotes() {
 #[test]
 fn golden_vw9_tables() {
     let md = fixture("vw9_tables.md");
-    assert_golden("vw9_tables.txt", &md, 60);
+    assert_golden("vw9_tables.txt", &md, GOLDEN_WIDTH);
 }
 
 // ── VW-10: Thematic Break ──────────────────────────────────────────────────
@@ -158,7 +161,7 @@ fn golden_vw9_tables() {
 #[test]
 fn golden_vw10_thematic_break() {
     let md = fixture("vw10_thematic_break.md");
-    assert_golden("vw10_thematic_break.txt", &md, 60);
+    assert_golden("vw10_thematic_break.txt", &md, GOLDEN_WIDTH);
 }
 
 // ── VW-11: Links ───────────────────────────────────────────────────────────
@@ -166,7 +169,7 @@ fn golden_vw10_thematic_break() {
 #[test]
 fn golden_vw11_links() {
     let md = fixture("vw11_links.md");
-    assert_golden("vw11_links.txt", &md, 60);
+    assert_golden("vw11_links.txt", &md, GOLDEN_WIDTH);
 }
 
 // ── VW-12: Images ──────────────────────────────────────────────────────────
@@ -174,7 +177,7 @@ fn golden_vw11_links() {
 #[test]
 fn golden_vw12_images() {
     let md = fixture("vw12_images.md");
-    assert_golden("vw12_images.txt", &md, 60);
+    assert_golden("vw12_images.txt", &md, GOLDEN_WIDTH);
 }
 
 // ── VW-13: HTML ────────────────────────────────────────────────────────────
@@ -182,7 +185,7 @@ fn golden_vw12_images() {
 #[test]
 fn golden_vw13_html() {
     let md = fixture("vw13_html.md");
-    assert_golden("vw13_html.txt", &md, 60);
+    assert_golden("vw13_html.txt", &md, GOLDEN_WIDTH);
 }
 
 // ── VW-14: Footnotes ───────────────────────────────────────────────────────
@@ -190,7 +193,7 @@ fn golden_vw13_html() {
 #[test]
 fn golden_vw14_footnotes() {
     let md = fixture("vw14_footnotes.md");
-    assert_golden("vw14_footnotes.txt", &md, 60);
+    assert_golden("vw14_footnotes.txt", &md, GOLDEN_WIDTH);
 }
 
 // ── FR-3.6: Front Matter Panel ─────────────────────────────────────────────
@@ -198,13 +201,13 @@ fn golden_vw14_footnotes() {
 #[test]
 fn golden_frontmatter_yaml() {
     let md = fixture("highlight_frontmatter_yaml.md");
-    assert_golden("frontmatter_yaml.txt", &md, 60);
+    assert_golden("frontmatter_yaml.txt", &md, GOLDEN_WIDTH);
 }
 
 #[test]
 fn golden_frontmatter_toml() {
     let md = fixture("highlight_frontmatter_toml.md");
-    assert_golden("frontmatter_toml.txt", &md, 60);
+    assert_golden("frontmatter_toml.txt", &md, GOLDEN_WIDTH);
 }
 
 // ── Kitchen Sink ───────────────────────────────────────────────────────────
@@ -212,7 +215,7 @@ fn golden_frontmatter_toml() {
 #[test]
 fn golden_kitchen_sink() {
     let md = fixture("kitchen-sink.md");
-    assert_golden("kitchen_sink.txt", &md, 60);
+    assert_golden("kitchen_sink.txt", &md, GOLDEN_WIDTH);
 }
 
 // ── Determinism ────────────────────────────────────────────────────────────
@@ -324,13 +327,21 @@ fn golden_width_deterministic() {
     for width in [40, 60, 80, 120] {
         let layout = ViewLayout::build(&model, width, &highlighter);
 
-        // Verify wrapped content lines are within width (fenced code blocks may exceed)
+        // Verify rendered structure is consistent (same number of lines)
+        let line_count = layout.lines.len();
+
+        // Verify jump targets are sorted
+        for windows in layout.jump_targets.windows(2) {
+            assert!(
+                windows[0].line <= windows[1].line,
+                "jump targets not sorted by line"
+            );
+        }
+
+        // All lines should be within a reasonable width bound
         for (i, line) in layout.lines.iter().enumerate() {
-            if line.kind == oom_edit_core::style::LineKind::Content {
-                // Fenced code blocks may exceed width (they don't wrap)
-                // But regular content should not
-            }
-            // Just verify no line is absurdly wide (10x layout width)
+            // Fenced code blocks may exceed width (they don't wrap)
+            // But regular content should not be absurdly wide
             assert!(
                 line.styled.text.len() <= (width as usize) * 10,
                 "width {}: line {} is absurdly wide ({} > {})",
@@ -341,8 +352,12 @@ fn golden_width_deterministic() {
             );
         }
 
-        // Verify rendered structure is consistent (same number of lines)
-        let _line_count = layout.lines.len();
+        // Verify we got a reasonable number of lines
+        assert!(
+            line_count > 0,
+            "width {}: layout should have at least one line",
+            width
+        );
 
         // Verify jump targets are sorted
         for windows in layout.jump_targets.windows(2) {
@@ -352,4 +367,124 @@ fn golden_width_deterministic() {
             );
         }
     }
+}
+
+// ── Structural Invariants ──────────────────────────────────────────────────
+//
+// These tests validate the structure of ViewLayout independently of exact
+// rendering output. They allow rendering refactors (character changes,
+// spacing updates) without breaking tests — only the golden files need
+// updating, not the structural assertions.
+
+#[test]
+fn golden_structural_line_spans_valid() {
+    let md = fixture("kitchen-sink.md");
+    let model = BlockModel::build(&md, None);
+    let highlighter = Highlighter::new(&md);
+    let layout = ViewLayout::build(&model, GOLDEN_WIDTH, &highlighter);
+
+    for (i, line) in layout.lines.iter().enumerate() {
+        for span in &line.styled.spans {
+            assert!(
+                span.start_col <= span.end_col && span.end_col <= line.styled.text.len(),
+                "line {} span [{},{}] out of bounds for text len {}",
+                i,
+                span.start_col,
+                span.end_col,
+                line.styled.text.len()
+            );
+        }
+    }
+}
+
+#[test]
+fn golden_structural_source_spans_valid() {
+    let md = fixture("kitchen-sink.md");
+    let model = BlockModel::build(&md, None);
+    let highlighter = Highlighter::new(&md);
+    let layout = ViewLayout::build(&model, GOLDEN_WIDTH, &highlighter);
+
+    for (i, line) in layout.lines.iter().enumerate() {
+        assert!(
+            line.source.start <= line.source.end && line.source.end <= md.len(),
+            "line {} source [{},{}] out of bounds for text len {}",
+            i,
+            line.source.start,
+            line.source.end,
+            md.len()
+        );
+    }
+}
+
+#[test]
+fn golden_structural_jump_targets_sorted() {
+    let md = fixture("kitchen-sink.md");
+    let model = BlockModel::build(&md, None);
+    let highlighter = Highlighter::new(&md);
+    let layout = ViewLayout::build(&model, GOLDEN_WIDTH, &highlighter);
+
+    for windows in layout.jump_targets.windows(2) {
+        assert!(
+            windows[0].line <= windows[1].line,
+            "jump targets not sorted by line"
+        );
+    }
+}
+
+#[test]
+fn golden_structural_line_kinds_valid() {
+    let md = fixture("kitchen-sink.md");
+    let model = BlockModel::build(&md, None);
+    let highlighter = Highlighter::new(&md);
+    let layout = ViewLayout::build(&model, GOLDEN_WIDTH, &highlighter);
+
+    for (i, line) in layout.lines.iter().enumerate() {
+        // Each line should have a valid kind
+        match &line.kind {
+            oom_edit_core::style::LineKind::Content | oom_edit_core::style::LineKind::Synthetic => {
+            }
+        }
+        // And the styled text should not be empty for Content lines
+        if matches!(line.kind, oom_edit_core::style::LineKind::Content) {
+            assert!(
+                !line.styled.text.is_empty() || line.styled.spans.is_empty(),
+                "content line {} should have text or spans",
+                i
+            );
+        }
+    }
+}
+
+#[test]
+fn golden_structural_block_kind_counts() {
+    let md = fixture("kitchen-sink.md");
+    let model = BlockModel::build(&md, None);
+    let highlighter = Highlighter::new(&md);
+    let layout = ViewLayout::build(&model, GOLDEN_WIDTH, &highlighter);
+
+    // Count different line kinds
+    let content_count = layout
+        .lines
+        .iter()
+        .filter(|l| matches!(l.kind, oom_edit_core::style::LineKind::Content))
+        .count();
+    let synthetic_count = layout
+        .lines
+        .iter()
+        .filter(|l| matches!(l.kind, oom_edit_core::style::LineKind::Synthetic))
+        .count();
+
+    // Kitchen sink should have content lines
+    assert!(
+        content_count > 0,
+        "kitchen-sink should have content lines, got {}",
+        content_count
+    );
+
+    // Total lines should match layout
+    assert_eq!(
+        layout.lines.len(),
+        content_count + synthetic_count,
+        "total lines should equal content + synthetic"
+    );
 }

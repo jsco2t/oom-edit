@@ -186,30 +186,31 @@ fn test_ordered_list() {
     }
 }
 
+/// Recursively count the maximum list nesting depth.
+fn max_list_depth(blocks: &[Block]) -> usize {
+    let mut max_depth = 0;
+    for block in blocks {
+        if let BlockKind::List { items, .. } = &block.kind {
+            for item in items {
+                let child_depth = max_list_depth(&item.children) + 1;
+                max_depth = max_depth.max(child_depth);
+            }
+        }
+    }
+    max_depth
+}
+
 #[test]
 fn test_nested_lists_3_deep() {
     let text = "- level1\n  - level2\n    - level3\n      - level4";
     let model = BlockModel::build(text, None);
 
     assert_eq!(model.blocks.len(), 1);
-    match &model.blocks[0].kind {
-        BlockKind::List { items, .. } => {
-            assert_eq!(items.len(), 1);
-            // Level 2 item
-            if let BlockKind::List { items: level2, .. } = &items[0].children[0].kind {
-                assert_eq!(level2.len(), 1);
-                // Level 3 item
-                if let BlockKind::List { items: level3, .. } = &level2[0].children[0].kind {
-                    assert_eq!(level3.len(), 1);
-                    // Level 4 item
-                    if let BlockKind::List { items: level4, .. } = &level3[0].children[0].kind {
-                        assert_eq!(level4.len(), 1);
-                    }
-                }
-            }
-        }
-        _ => panic!("expected List, got {:?}", model.blocks[0].kind),
-    }
+    assert_eq!(
+        max_list_depth(&model.blocks),
+        4,
+        "should have 4 levels of list nesting"
+    );
 }
 
 #[test]
@@ -349,8 +350,10 @@ fn test_footnote_definition_and_reference() {
         .iter()
         .any(|b| matches!(&b.kind, BlockKind::FootnoteDef { label, .. } if label == "1"));
     assert!(
-        has_ref || has_def,
-        "expected footnote reference or definition"
+        has_ref && has_def,
+        "expected both footnote reference and definition, got ref={}, def={}",
+        has_ref,
+        has_def
     );
 }
 
@@ -430,7 +433,9 @@ fn test_links() {
 #[test]
 fn test_front_matter_passthrough() {
     let text = "---\ntitle: Test\n---\n\n# Heading";
-    let fm_span = Some(0..19); // "---\ntitle: Test\n---"
+    // Compute the front-matter span from the actual text
+    let fm_end = text.find("\n#").unwrap_or(text.len());
+    let fm_span = Some(0..fm_end);
     let model = BlockModel::build(text, fm_span);
 
     assert_eq!(model.blocks.len(), 2);

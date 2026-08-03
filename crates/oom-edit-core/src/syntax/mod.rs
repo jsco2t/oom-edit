@@ -180,24 +180,52 @@ impl Highlighter {
             return;
         }
 
-        // Sort edits by start offset (ascending)
+        // Sort edits by start offset (ascending).
         let mut sorted_edits: Vec<_> = edits.to_vec();
         sorted_edits.sort_by_key(|e| e.range.start);
 
-        // Apply to the markdown tree
-        for edit in &sorted_edits {
-            self.md_tree.edit(&tree_sitter::InputEdit {
-                start_byte: edit.range.start,
-                old_end_byte: edit.range.end,
-                new_end_byte: edit.range.start + edit.new_text_len,
-                start_position: byte_to_point(&self.text, edit.range.start),
-                old_end_position: byte_to_point(&self.text, edit.range.end),
-                new_end_position: byte_to_point(&self.text, edit.range.start + edit.new_text_len),
-            });
+        // Compute tree-edit positions from the OLD text (before applying edits).
+        // tree-sitter's InputEdit expects positions in the pre-edit text.
+        let old_text = self.text.clone();
+        let valid_edits: Vec<_> = sorted_edits
+            .into_iter()
+            .filter(|e| e.range.start < e.range.end)
+            .map(|edit| {
+                let start_byte = edit.range.start;
+                let old_end_byte = edit.range.end;
+                let new_end_byte = edit.range.start + edit.new_text_len;
+                tree_sitter::InputEdit {
+                    start_byte,
+                    old_end_byte,
+                    new_end_byte,
+                    start_position: byte_to_point(&old_text, start_byte),
+                    old_end_position: byte_to_point(&old_text, old_end_byte),
+                    new_end_position: byte_to_point(&old_text, new_end_byte),
+                }
+            })
+            .collect();
+
+        // Update the text by applying ALL edits (including backward-range ones
+        // that hjkl produces; the vim engine already applied them to the buffer,
+        // so the highlighter's text must stay in sync).
+        apply_edits_to_string(&mut self.text, edits);
+
+        if valid_edits.is_empty() {
+            // No valid tree edits (e.g., zero-length or backward-range edits),
+            // but the text changed. Do a full re-parse since the tree was never
+            // updated and is out of sync with the new text.
+            self.md_tree = self
+                .md_parser
+                .parse(&self.text, None)
+                .expect("full re-parse should succeed");
+            self.discover_injections();
+            return;
         }
 
-        // Update the text by applying edits (before re-parse, so tree positions match)
-        apply_edits_to_string(&mut self.text, &sorted_edits);
+        // Apply to the markdown tree
+        for edit in &valid_edits {
+            self.md_tree.edit(edit);
+        }
 
         // Re-parse incrementally with the updated text
         self.md_tree = self
@@ -806,14 +834,30 @@ fn apply_edits_to_string(text: &mut String, edits: &[TextEdit]) {
     let mut last_end = 0;
 
     for edit in edits {
-        let start = edit.range.start;
-        let end = edit.range.end;
+        let mut start = edit.range.start;
+        let mut end = edit.range.end;
+        // Normalize backward-range edits (hjkl produces these for some
+        // operations like Visual-mode X; the range represents the same
+        // character deletion/replacement, just with inverted bounds).
+        if start > end {
+            std::mem::swap(&mut start, &mut end);
+        }
         // Ensure we don't go out of bounds
         let start = start.min(text.len());
         let end = end.min(text.len());
 
+        // Skip if this edit is entirely before our current position
+        // (can happen when backward-range edits are sorted by original start)
+        if end < last_end {
+            continue;
+        }
+
         // Copy the unchanged prefix
-        result.push_str(&text[last_end..start]);
+        let copy_start = last_end.min(text.len());
+        let copy_end = start.min(text.len());
+        if copy_start < copy_end {
+            result.push_str(&text[copy_start..copy_end]);
+        }
         // Insert the new text
         result.push_str(&edit.new_text);
         last_end = end;

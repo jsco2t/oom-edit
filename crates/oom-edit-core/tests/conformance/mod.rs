@@ -1624,8 +1624,15 @@ fn v_m_chord_x() {
 #[test]
 fn v_m_chord_help() {
     let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, ":help");
-    // Should have emitted a Message effect
+    let effects = feed(&mut sess, ":help<Enter>");
+    // :help should emit HelpRequested effect
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, oom_edit_core::session::Effect::HelpRequested)),
+        ":help should emit HelpRequested effect, got: {:?}",
+        effects
+    );
 }
 
 #[test]
