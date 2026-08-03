@@ -188,43 +188,56 @@ impl Highlighter {
         // tree-sitter's InputEdit expects positions in the pre-edit text.
         let old_text = self.text.clone();
         let valid_edits: Vec<_> = sorted_edits
-            .into_iter()
-            .filter(|e| e.range.start < e.range.end)
-            .map(|edit| {
-                let start_byte = edit.range.start;
-                let old_end_byte = edit.range.end;
-                let new_end_byte = edit.range.start + edit.new_text_len;
-                tree_sitter::InputEdit {
-                    start_byte,
-                    old_end_byte,
-                    new_end_byte,
-                    start_position: byte_to_point(&old_text, start_byte),
-                    old_end_position: byte_to_point(&old_text, old_end_byte),
-                    new_end_position: byte_to_point(&old_text, new_end_byte),
+            .iter()
+            .filter_map(|edit| {
+                // Skip zero-length edits — they don't change the tree structure.
+                if edit.range.start == edit.range.end {
+                    return None;
                 }
+                let start_byte = edit.range.start;
+                let end_byte = edit.range.end;
+                // Normalize backward-range edits (hjkl produces these for
+                // operations like Visual-mode X; the range represents the
+                // same character deletion/replacement, just with inverted bounds).
+                let (a, b) = if start_byte < end_byte {
+                    (start_byte, end_byte)
+                } else {
+                    (end_byte, start_byte)
+                };
+                let new_end_byte = start_byte + edit.new_text_len;
+                Some(tree_sitter::InputEdit {
+                    start_byte: a,
+                    old_end_byte: b,
+                    new_end_byte,
+                    start_position: byte_to_point(&old_text, a),
+                    old_end_position: byte_to_point(&old_text, b),
+                    new_end_position: byte_to_point(&old_text, new_end_byte),
+                })
             })
             .collect();
 
-        // Update the text by applying ALL edits (including backward-range ones
-        // that hjkl produces; the vim engine already applied them to the buffer,
-        // so the highlighter's text must stay in sync).
-        apply_edits_to_string(&mut self.text, edits);
+        // Apply tree edits before updating text so tree-sitter positions
+        // remain valid against the old text.
+        for edit in &valid_edits {
+            self.md_tree.edit(edit);
+        }
+
+        // Update the text by applying ALL edits in sorted order (including
+        // backward-range ones that hjkl produces; the vim engine already
+        // applied them to the buffer, so the highlighter's text must stay
+        // in sync).
+        apply_edits_to_string(&mut self.text, &sorted_edits);
 
         if valid_edits.is_empty() {
-            // No valid tree edits (e.g., zero-length or backward-range edits),
-            // but the text changed. Do a full re-parse since the tree was never
-            // updated and is out of sync with the new text.
+            // No valid tree edits (e.g., zero-length edits only),
+            // but the text changed. Do a full re-parse since the tree
+            // was never updated and is out of sync with the new text.
             self.md_tree = self
                 .md_parser
                 .parse(&self.text, None)
                 .expect("full re-parse should succeed");
             self.discover_injections();
             return;
-        }
-
-        // Apply to the markdown tree
-        for edit in &valid_edits {
-            self.md_tree.edit(edit);
         }
 
         // Re-parse incrementally with the updated text
@@ -271,8 +284,16 @@ impl Highlighter {
             }];
         }
 
-        // Collect all spans from a single query run over the whole document
-        let all_spans = self.collect_all_spans();
+        // Compute the byte range covering all requested lines
+        let range_start = line_starts[start];
+        let range_end = if end < line_starts.len() {
+            line_starts[end]
+        } else {
+            text.len()
+        };
+
+        // Collect spans scoped to the requested byte range
+        let spans = self.collect_spans_in_range(range_start..range_end);
 
         let mut result = Vec::with_capacity(end - start);
 
@@ -293,8 +314,7 @@ impl Highlighter {
             let line_text = &text[line_start..line_end.min(text.len())];
 
             // Filter spans that overlap with this line's byte range
-            // all_spans uses absolute byte offsets as start_col/end_col
-            let mut spans: Vec<Span> = all_spans
+            let mut line_spans: Vec<Span> = spans
                 .iter()
                 .filter(|s| {
                     let abs_start = s.start_col;
@@ -309,28 +329,38 @@ impl Highlighter {
                 .collect();
 
             // Sort and merge spans
-            spans.sort_by_key(|s| s.start_col);
-            spans = merge_overlapping_spans(spans);
+            line_spans.sort_by_key(|s| s.start_col);
+            line_spans = merge_overlapping_spans(line_spans);
 
             result.push(StyledLine {
                 text: line_text.to_string(),
-                spans,
+                spans: line_spans,
             });
         }
 
         result
     }
 
-    /// Run the markdown highlight query once and collect all spans,
-    /// taking injections into account.
-    fn collect_all_spans(&self) -> Vec<Span> {
+    /// Collect spans scoped to a byte range, limiting the query to only
+    /// the requested region of the document.
+    fn collect_spans_in_range(&self, range: Range<usize>) -> Vec<Span> {
         let mut spans = Vec::new();
         let text = &self.text;
         let text_bytes = text.as_bytes();
-
-        let mut cursor = QueryCursor::new();
         let root = self.md_tree.root_node();
-        let mut matches = cursor.matches(&self.md_query, root, text_bytes);
+
+        // Get the smallest subtree covering the requested byte range
+        let end = range.end.min(text.len());
+        if range.start >= end {
+            return spans;
+        }
+        let subtree = root
+            .descendant_for_byte_range(range.start, end)
+            .expect("byte range must be within document");
+
+        // Run the markdown highlight query on the subtree
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&self.md_query, subtree, text_bytes);
 
         while let Some(m) = matches.next() {
             for capture in m.captures {
@@ -338,8 +368,8 @@ impl Highlighter {
                 let style = md_capture_to_style(capture_name);
                 let n = capture.node;
 
-                let start_col = n.start_byte();
-                let end_col = n.end_byte();
+                let start_col = n.start_byte().max(range.start);
+                let end_col = n.end_byte().min(range.end);
 
                 if start_col < end_col {
                     spans.push(Span {
@@ -351,26 +381,33 @@ impl Highlighter {
             }
         }
 
-        // Run inline query on inline nodes
-        self.collect_inline_spans(&mut spans, root, text);
+        // Collect inline spans only for nodes within the range
+        self.collect_inline_spans_in_range(&mut spans, subtree, text, &range);
 
-        // Check for injection overlaps
+        // Check for injection overlaps only for injections that overlap with the range
         for injection in &self.injections {
             let inj_start = injection.start;
             let inj_end = injection.end;
 
-            // Find nodes that overlap with this injection
+            // Skip injections that don't overlap with the requested range
+            if inj_end <= range.start || inj_start >= range.end {
+                continue;
+            }
+
+            let overlap_start = inj_start.max(range.start);
+            let overlap_end = inj_end.min(range.end);
+
             let mut inj_cursor = QueryCursor::new();
             let mut inj_parser = Parser::new();
             if inj_parser.set_language(&injection.language).is_ok() {
-                if let Some(inj_tree) = inj_parser.parse(&text[inj_start..inj_end], None) {
+                if let Some(inj_tree) = inj_parser.parse(&text[overlap_start..overlap_end], None) {
                     let inj_root = inj_tree.root_node();
 
                     while let Some(m) = inj_cursor
                         .matches(
                             &injection.query,
                             inj_root,
-                            &text.as_bytes()[inj_start..inj_end],
+                            &text.as_bytes()[overlap_start..overlap_end],
                         )
                         .next()
                     {
@@ -380,8 +417,8 @@ impl Highlighter {
                             let style = captures::capture_to_style(capture_name);
                             let inj_node = capture.node;
 
-                            let abs_start = inj_start + inj_node.start_byte();
-                            let abs_end = inj_start + inj_node.end_byte();
+                            let abs_start = overlap_start + inj_node.start_byte();
+                            let abs_end = overlap_start + inj_node.end_byte();
 
                             if abs_start < abs_end {
                                 spans.push(Span {
@@ -399,9 +436,14 @@ impl Highlighter {
         spans
     }
 
-    /// Collect inline spans by parsing inline regions with the markdown inline grammar.
-    fn collect_inline_spans(&self, spans: &mut Vec<Span>, node: tree_sitter::Node, text: &str) {
-        // Walk the tree to find inline nodes
+    /// Collect inline spans only for nodes within a byte range.
+    fn collect_inline_spans_in_range(
+        &self,
+        spans: &mut Vec<Span>,
+        node: tree_sitter::Node,
+        text: &str,
+        range: &Range<usize>,
+    ) {
         let mut cursor = node.walk();
         if !cursor.goto_first_child() {
             return;
@@ -410,9 +452,15 @@ impl Highlighter {
             let child = cursor.node();
             let kind = child.kind();
 
+            // Skip nodes entirely outside the range
+            if child.end_byte() <= range.start || child.start_byte() >= range.end {
+                cursor.goto_next_sibling();
+                continue;
+            }
+
             // Recurse into children
             if child.child_count() > 0 {
-                self.collect_inline_spans(spans, child, text);
+                self.collect_inline_spans_in_range(spans, child, text, range);
             }
 
             // For inline nodes, parse with the inline grammar
@@ -437,15 +485,15 @@ impl Highlighter {
                                 let capture_name =
                                     self.md_inline_query.capture_names()[capture.index as usize];
                                 let style = md_capture_to_style(capture_name);
-                                let n = capture.node;
+                                let inline_node = capture.node;
 
-                                let start_col = base_offset + n.start_byte();
-                                let end_col = base_offset + n.end_byte();
+                                let abs_start = base_offset + inline_node.start_byte();
+                                let abs_end = base_offset + inline_node.end_byte();
 
-                                if start_col < end_col {
+                                if abs_start < abs_end {
                                     spans.push(Span {
-                                        start_col,
-                                        end_col,
+                                        start_col: abs_start,
+                                        end_col: abs_end,
                                         style,
                                     });
                                 }

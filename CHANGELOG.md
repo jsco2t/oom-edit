@@ -12,8 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`oom-edit-core` crate**: embeddable markdown editing engine with Vim-style modal editing, tree-sitter syntax highlighting, and renderer-agnostic styling.
 - `EditorSession`: main editing session type with full key-routing (Normal, Insert, Visual, View modes).
 - `render_source(Viewport) -> SourceFrame`: renders highlighted source with cursor, Visual selections, and search-match ranges.
-- `render_view(width) -> &ViewLayout`: cached view layout with invalidation on edit, width change, or front-matter toggle.
-- `cursor_line()` / `view_cursor_line()`: exposes cursor position for host-owned scrolling.
+- `render_view(width) -> &ViewLayout`: cached view layout with invalidation on edit or width change.
+- `cursor()` / `view_cursor_line()`: exposes cursor position for host-owned scrolling.
 - `Effect::HelpRequested`: emitted when `:help` is invoked.
 - Public API re-exports in `lib.rs` — the `pub use` list is the complete API contract.
 - Rustdoc examples on `EditorSession::from_text`, `handle_key`, `render_source`, `render_view`.

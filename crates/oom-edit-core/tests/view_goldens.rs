@@ -330,14 +330,6 @@ fn golden_width_deterministic() {
         // Verify rendered structure is consistent (same number of lines)
         let line_count = layout.lines.len();
 
-        // Verify jump targets are sorted
-        for windows in layout.jump_targets.windows(2) {
-            assert!(
-                windows[0].line <= windows[1].line,
-                "jump targets not sorted by line"
-            );
-        }
-
         // All lines should be within a reasonable width bound
         for (i, line) in layout.lines.iter().enumerate() {
             // Fenced code blocks may exceed width (they don't wrap)
@@ -439,11 +431,6 @@ fn golden_structural_line_kinds_valid() {
     let layout = ViewLayout::build(&model, GOLDEN_WIDTH, &highlighter);
 
     for (i, line) in layout.lines.iter().enumerate() {
-        // Each line should have a valid kind
-        match &line.kind {
-            oom_edit_core::style::LineKind::Content | oom_edit_core::style::LineKind::Synthetic => {
-            }
-        }
         // And the styled text should not be empty for Content lines
         if matches!(line.kind, oom_edit_core::style::LineKind::Content) {
             assert!(

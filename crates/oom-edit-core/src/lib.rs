@@ -58,7 +58,5 @@ mod vim;
 
 pub use session::EditorSession;
 pub use session::{Effect, KeyCode, KeyCodeKind, KeyInput, Mode, Modifiers, Severity, Viewport};
-pub use style::{
-    JumpTarget, LineKind, SearchDirection, SemanticStyle, SourceFrame, Span, StyledLine,
-    TargetKind, ViewCursor, ViewLayout, ViewLine, ViewSearch,
-};
+pub use style::{SemanticStyle, SourceFrame, Span, StyledLine, ViewLayout};
+pub use syntax::Highlighter;

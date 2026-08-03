@@ -234,13 +234,16 @@ impl ViewState {
         }
     }
 
-    /// Get the layout, building it if necessary.
-    fn get_layout(&mut self, text: &str, highlighter: &Highlighter) -> &ViewLayout {
-        if self.layout_cache.is_none() {
+    /// Get the layout, building or rebuilding it if necessary.
+    ///
+    /// Rebuilds when the layout is missing or when `width` differs from
+    /// the width used for the last build (`last_width`).
+    fn get_layout(&mut self, text: &str, highlighter: &Highlighter, width: u16) -> &ViewLayout {
+        if self.layout_cache.is_none() || self.last_width != width {
             let model = BlockModel::build(text, None);
-            // Use a default width of 80 for the layout
-            // The actual width comes from the viewport in the TUI layer
-            self.layout_cache = Some(ViewLayout::build(&model, 80, highlighter));
+            let layout = ViewLayout::build(&model, width, highlighter);
+            self.layout_cache = Some(layout);
+            self.last_width = width;
         }
         self.layout_cache.as_ref().unwrap()
     }
@@ -495,11 +498,14 @@ impl EditorSession {
     }
 
     /// Return the view layout (building it if necessary), or `None` when not in View mode.
-    pub fn view_layout_mut(&mut self) -> Option<&ViewLayout> {
+    ///
+    /// The `width` parameter is used to rebuild the layout when the terminal
+    /// width changes. Pass the current terminal width on each call.
+    pub fn view_layout_mut(&mut self, width: u16) -> Option<&ViewLayout> {
         if self.mode == Mode::View {
             if let Some(ref mut vs) = self.view_state {
                 let text = self.vim.text();
-                Some(vs.get_layout(&text, &self.highlighter))
+                Some(vs.get_layout(&text, &self.highlighter, width))
             } else {
                 None
             }
@@ -548,7 +554,7 @@ impl EditorSession {
     ///
     /// The `Viewport.top_line` is owned by the host; the core does not
     /// modify it. The host keeps the cursor visible by adjusting
-    /// `top_line` based on `cursor_line()` output.
+    /// `top_line` based on [`Self::cursor`] output.
     ///
     /// # Example
     ///
@@ -638,8 +644,9 @@ impl EditorSession {
 
     /// Render the View mode layout for the given width.
     ///
-    /// Builds (or returns the cached layout for) a [`crate::style::ViewLayout`]
-    /// from the current document text, highlighter, and block model.
+    /// Builds (or returns a reference to the cached layout for) a
+    /// [`crate::style::ViewLayout`] from the current document text,
+    /// highlighter, and block model.
     ///
     /// The layout is invalidated on edits and width changes. Callers should
     /// pass the current terminal width on each call.
@@ -673,18 +680,11 @@ impl EditorSession {
             }
             vs.layout_cache.as_ref().unwrap()
         } else {
-            // This should never happen because we just created view_state above,
-            // but handle it gracefully by building a minimal layout.
-            let text = self.vim.text();
-            let model = BlockModel::build(&text, None);
-            let layout = ViewLayout::build(&model, 80, &self.highlighter);
-            self.view_state = Some(ViewState::with_layout(layout));
-            self.view_state
-                .as_ref()
-                .unwrap()
-                .layout_cache
-                .as_ref()
-                .unwrap()
+            // SAFETY: The block above always sets view_state to Some when it
+            // was None, so this branch is unreachable. Kept for borrow-checker
+            // compatibility; if the compiler ever allowed both paths, there
+            // would be conflicting borrows on self.
+            unreachable!("view_state was just set above")
         }
     }
 
@@ -708,7 +708,7 @@ impl EditorSession {
             let (edit_line, _edit_col) = if let Some(ref mut vs) = self.view_state {
                 let text = self.vim.text();
                 let cursor_line = vs.cursor.line;
-                let layout = vs.get_layout(&text, &self.highlighter);
+                let layout = vs.get_layout(&text, &self.highlighter, 80);
                 let cursor = ViewCursor::new(cursor_line);
                 nav::leave_view(&cursor, layout, &text)
             } else {
@@ -831,7 +831,7 @@ impl EditorSession {
 
             let text = self.vim.text();
             // Clone the layout to avoid holding a borrow on vs
-            let layout = vs.get_layout(&text, &self.highlighter).clone();
+            let layout = vs.get_layout(&text, &self.highlighter, 80).clone();
             let jump_targets = layout.jump_targets.clone();
             let max_view_lines = layout.lines.len();
 
@@ -948,7 +948,7 @@ impl EditorSession {
         let (edit_line, _edit_col) = if let Some(ref mut vs) = self.view_state {
             let text = self.vim.text();
             let cursor_line = vs.cursor.line;
-            let layout = vs.get_layout(&text, &self.highlighter);
+            let layout = vs.get_layout(&text, &self.highlighter, 80);
             let cursor = ViewCursor::new(cursor_line);
             nav::leave_view(&cursor, layout, &text)
         } else {

@@ -1,6 +1,6 @@
 //! Headless example: demonstrates `EditorSession` usage without any terminal
 //! dependencies. Builds a session from an embedded markdown string, plays a
-//! key script, renders source and view output, saves to a tempdir, and exits.
+//! key script, renders source and view output, and exits.
 //!
 //! This is the reference host application that proves `oom-edit-core` is
 //! embeddable (FR-8.4, SC-4).
