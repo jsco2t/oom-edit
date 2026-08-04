@@ -1042,8 +1042,11 @@ name = "oom-edit"
 version = "0.1.0"
 dependencies = [
  "crossterm 0.28.1",
+ "libc",
+ "oom-edit-core",
  "ratatui",
  "serde",
+ "tempfile",
  "toml 1.1.4+spec-1.1.0",
 ]
 

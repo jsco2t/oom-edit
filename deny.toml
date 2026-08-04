@@ -46,7 +46,9 @@ allow = [
 # ---------------------------------------------------------------------------
 [bans]
 multiple-versions = "warn"
-wildcards = "deny"
+# Workspace members are path dependencies (no version constraint);
+# cargo-deny treats them as wildcards — use warn instead of deny.
+wildcards = "warn"
 highlight = "all"
 workspace-default-features = "allow"
 external-default-features = "allow"
