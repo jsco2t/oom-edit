@@ -137,7 +137,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         id: Command::Help,
         name: "help",
         desc: "help / command palette",
-        contexts: Contexts::ALL.or(Contexts::NORMAL).or(Contexts::VIEW),
+        contexts: Contexts::NORMAL.or(Contexts::VIEW),
         order: 10,
         quick_bar: true,
     },
@@ -171,6 +171,16 @@ pub static COMMANDS: &[CommandSpec] = &[
 /// (guaranteed by `commands_table_is_exhaustive_and_unique`).
 pub fn spec_for(id: Command) -> Option<&'static CommandSpec> {
     COMMANDS.iter().find(|spec| spec.id == id)
+}
+
+/// Get quick_bar-eligible commands for a given context, sorted by order.
+pub fn commands_for(ctx: Contexts) -> Vec<&'static CommandSpec> {
+    let mut cmds: Vec<&CommandSpec> = COMMANDS
+        .iter()
+        .filter(|spec| spec.quick_bar && spec.contexts.contains(ctx))
+        .collect();
+    cmds.sort_by_key(|spec| spec.order);
+    cmds
 }
 
 // ── Meta / drift tests ──────────────────────────────────────────────────────

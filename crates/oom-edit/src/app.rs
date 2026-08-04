@@ -21,6 +21,7 @@ use oom_edit_core::session::{EditorSession, Effect, KeyCode, KeyCodeKind, KeyInp
 use crate::command::{keymap::PendingChord, Command, Keymap};
 use crate::overlay::Overlay;
 use crate::screens::editor::render_editor;
+use crate::widgets::status_bar;
 use crate::widgets::which_key;
 
 /// Scrolloff: keep this many lines of context around the cursor.
@@ -46,6 +47,8 @@ pub struct App {
     viewport_height: usize,
     /// Current time (injected by tick for testability of which-key delay gate).
     now: Instant,
+    /// Active transient message with TTL expiry.
+    transient: Option<status_bar::Transient>,
 }
 
 impl App {
@@ -61,14 +64,40 @@ impl App {
             keymap: Keymap::default(),
             viewport_height: 22,
             now: Instant::now(),
+            transient: None,
         }
     }
 
-    /// Advance internal timers (T11: no timers yet, but the method exists
-    /// for the event loop's tick step).
-    pub fn tick(&mut self, now: Instant) {
+    /// Advance internal timers. Returns the next poll deadline (if any).
+    ///
+    /// Advances `self.now`, expires any TTL'd transient messages, and
+    /// computes the minimum of transient expiry and which-key pending+150ms.
+    pub fn tick(&mut self, now: Instant) -> Option<Instant> {
         self.now = now;
-        // No timers in T11; status-message TTL handling arrives in T13.
+
+        // Expire any TTL'd transient.
+        let expired = self
+            .transient
+            .as_ref()
+            .map(|t| t.is_expired(now))
+            .unwrap_or(false);
+        if expired {
+            self.transient = None;
+            self.status_message.clear();
+        }
+
+        // Compute next deadline: min(transient.expires_at, which_key_pending+150ms).
+        let transient_deadline = self.transient.as_ref().map(|t| t.expires_at);
+        let which_key_deadline = self
+            .pending_chord
+            .since
+            .map(|s| s + std::time::Duration::from_millis(150));
+
+        transient_deadline
+            .into_iter()
+            .chain(which_key_deadline)
+            .min()
+            .filter(|d| *d > now)
     }
 
     /// Render the current frame.
@@ -84,6 +113,7 @@ impl App {
             &mut self.session,
             self.top_line,
             &self.status_message,
+            self.transient.as_ref(),
             area,
         );
 
@@ -163,7 +193,6 @@ impl App {
                     || matches!(key_input.code.kind, KeyCodeKind::Char('c') if key_input.mods.ctrl)
                 {
                     self.overlay.close();
-                    self.status_message = String::new();
                     // Don't fall through — Esc on palette is consumed.
                     return;
                 }
@@ -175,7 +204,10 @@ impl App {
                         self.execute_command(cmd);
                     } else {
                         self.overlay.close();
-                        self.status_message = "reference entry".to_string();
+                        self.set_transient(
+                            "reference entry".to_string(),
+                            oom_edit_core::session::Severity::Info,
+                        );
                     }
                     return;
                 }
@@ -229,16 +261,24 @@ impl App {
             Command::Save => match self.session.save(None, false) {
                 Ok(()) => {
                     self.session.save_point();
-                    self.status_message = "Saved".to_string();
+                    self.set_transient(
+                        "Saved".to_string(),
+                        oom_edit_core::session::Severity::Success,
+                    );
                 }
                 Err(e) => {
-                    self.status_message = format!("Save error: {e}");
+                    self.set_transient(
+                        format!("Save error: {e}"),
+                        oom_edit_core::session::Severity::Error,
+                    );
                 }
             },
             Command::Quit => {
                 if self.session.is_dirty() {
-                    self.status_message =
-                        "No write since last change (use :q! to override)".to_string();
+                    self.set_transient(
+                        "No write since last change (use :q! to override)".to_string(),
+                        oom_edit_core::session::Severity::Error,
+                    );
                 } else {
                     self.should_quit = true;
                 }
@@ -246,7 +286,10 @@ impl App {
             Command::CycleTheme => {
                 // T15: real theme cycling. For now, cycle the one-element list
                 // (functional no-op with correct plumbing).
-                self.status_message = "theme cycled (1 theme)".to_string();
+                self.set_transient(
+                    "theme cycled (1 theme)".to_string(),
+                    oom_edit_core::session::Severity::Info,
+                );
             }
         }
     }
@@ -262,13 +305,29 @@ impl App {
                 match self.session.save(path.as_deref(), force) {
                     Ok(()) => {
                         self.session.save_point();
-                        self.status_message = "Saved".to_string();
+                        let line_count = self.session.line_count();
+                        let file_name = self
+                            .session
+                            .document_ref()
+                            .path()
+                            .map(|p| {
+                                p.file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .to_string()
+                            })
+                            .unwrap_or_else(|| "buffer".to_string());
+                        let saved_msg = format!("Saved {file_name} ({line_count} lines)");
+                        self.set_transient(saved_msg, oom_edit_core::session::Severity::Success);
                         if then_quit {
                             self.should_quit = true;
                         }
                     }
                     Err(e) => {
-                        self.status_message = format!("Save error: {e}");
+                        self.set_transient(
+                            format!("Save error: {e}"),
+                            oom_edit_core::session::Severity::Error,
+                        );
                         if then_quit {
                             // Cannot quit with unsaved changes — keep going.
                         }
@@ -282,37 +341,50 @@ impl App {
                 if force || !self.session.is_dirty() {
                     self.should_quit = true;
                 } else {
-                    self.status_message =
-                        "No write since last change (use :q! to override)".to_string();
+                    self.set_transient(
+                        "No write since last change (use :q! to override)".to_string(),
+                        oom_edit_core::session::Severity::Error,
+                    );
                 }
             }
             Effect::OpenRequested { path, force } => {
                 if self.session.is_dirty() && !force {
-                    self.status_message =
-                        "No write since last change (use :e! to override)".to_string();
+                    self.set_transient(
+                        "No write since last change (use :e! to override)".to_string(),
+                        oom_edit_core::session::Severity::Error,
+                    );
                 } else {
                     // Rebuild session (FR V-X4).
                     match EditorSession::open(&path) {
                         Ok(new_session) => {
                             self.session = new_session;
                             self.top_line = 0;
-                            self.status_message = format!("Opened: {}", path.display());
+                            self.set_transient(
+                                format!("Opened: {}", path.display()),
+                                oom_edit_core::session::Severity::Info,
+                            );
                         }
                         Err(e) => {
-                            self.status_message = format!("Open error: {e}");
+                            self.set_transient(
+                                format!("Open error: {e}"),
+                                oom_edit_core::session::Severity::Error,
+                            );
                         }
                     }
                 }
             }
             Effect::ClipboardWrite(_text) => {
                 // T16: route to OSC 52 clipboard sink.
-                self.status_message = "yanked to register".to_string();
+                self.set_transient(
+                    "yanked to register".to_string(),
+                    oom_edit_core::session::Severity::Info,
+                );
             }
             Effect::ModeChanged(_) => {
                 // No action needed; render reads live state.
             }
-            Effect::Message { text, severity: _ } => {
-                self.status_message = text;
+            Effect::Message { text, severity } => {
+                self.set_transient(text.clone(), severity);
             }
             Effect::CursorMoved => {
                 // No action needed; scroll_follow handles visibility.
@@ -325,6 +397,15 @@ impl App {
                 self.overlay = Overlay::open_palette();
             }
         }
+    }
+
+    /// Set a transient status message with TTL expiry.
+    fn set_transient(&mut self, text: String, severity: oom_edit_core::session::Severity) {
+        self.transient = Some(status_bar::Transient {
+            text,
+            severity,
+            expires_at: self.now + status_bar::TRANSIENT_TTL,
+        });
     }
 
     /// Scroll-follow: clamp `top_line` so the cursor row is visible with
@@ -600,7 +681,11 @@ mod tests {
 
         // :q without ! should refuse on dirty buffer
         assert!(!app.should_quit);
-        assert!(app.status_message.contains("No write"));
+        assert!(app
+            .transient
+            .as_ref()
+            .map(|t| t.text.contains("No write"))
+            .unwrap_or(false));
     }
 
     /// App: scroll-follow keeps cursor visible.
@@ -688,8 +773,8 @@ mod tests {
         let w = KeyEvent::new(CrosstermKeyCode::Char('w'), KeyModifiers::NONE);
         app.handle_event(&Event::Key(w));
 
-        // Save without path should set a status message.
-        assert!(!app.status_message.is_empty());
+        // Save without path should set a transient message.
+        assert!(app.transient.is_some());
     }
 
     /// T12: Space-q quits clean buffer.
@@ -821,9 +906,12 @@ mod tests {
         let enter = KeyEvent::new(CrosstermKeyCode::Enter, KeyModifiers::NONE);
         app.handle_event(&Event::Key(enter));
 
-        // Palette should be closed and status should show reference entry.
+        // Palette should be closed and transient should show reference entry.
         assert!(!app.overlay.is_some());
-        assert_eq!(app.status_message, "reference entry");
+        assert_eq!(
+            app.transient.as_ref().map(|t| t.text.as_str()),
+            Some("reference entry")
+        );
     }
 
     /// T12: Which-key delay gate — hint doesn't show before 150ms.
@@ -926,11 +1014,16 @@ mod tests {
         app.handle_event(&Event::Key(t));
 
         // Should NOT show the "themes land in T15" placeholder.
+        let transient_text = app
+            .transient
+            .as_ref()
+            .map(|t| t.text.as_str())
+            .unwrap_or("");
         assert!(
-            !app.status_message.contains("T15"),
+            !transient_text.contains("T15"),
             "CycleTheme should be functional, not a T15 placeholder"
         );
-        // Should show a status message about cycling.
-        assert!(!app.status_message.is_empty());
+        // Should show a transient message about cycling.
+        assert!(app.transient.is_some());
     }
 }

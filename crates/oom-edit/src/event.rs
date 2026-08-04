@@ -1,9 +1,9 @@
 //! Event-loop driver: tick → draw → poll-with-deadline → dispatch (~20 FPS).
 //!
-//! The poll deadline is `FRAME_BUDGET` (status-message TTL will tighten this
-//! in T13; for now it is always `FRAME_BUDGET`). Key events with `kind == Press`
-//! only are dispatched; resize events are absorbed (the next draw uses the new
-//! size).
+//! The poll deadline is `min(FRAME_BUDGET, deadline)` where `deadline` is
+//! computed from transient TTL expiry and which-key pending+150ms (T13).
+//! Key events with `kind == Press` only are dispatched; resize events are
+//! absorbed (the next draw uses the new size).
 
 use std::io::Stdout;
 use std::time::{Duration, Instant};
@@ -21,7 +21,7 @@ pub const FRAME_BUDGET: Duration = Duration::from_millis(50);
 /// Run the main event loop until [`App::should_quit`] is set.
 ///
 /// The loop shape:
-/// 1. `app.tick(now)` — advance internal timers
+/// 1. `app.tick(now)` — advance internal timers, compute deadline
 /// 2. `terminal.draw(...)` — render the current frame
 /// 3. `event::poll(min(FRAME_BUDGET, deadline))` — wait for input
 /// 4. On event: dispatch to `app.handle_event`
@@ -31,16 +31,26 @@ pub fn run_event_loop(
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let now = Instant::now();
-        app.tick(now);
+        let deadline = app.tick(now);
         terminal.draw(|frame| app.render(frame))?;
 
         if app.should_quit {
             return Ok(());
         }
 
-        // Poll for events (no deadline tightening in T11; status-message TTL
-        // arrives in T13).
-        if event::poll(FRAME_BUDGET)? {
+        // Poll with deadline tightening: min(FRAME_BUDGET, deadline).
+        let poll_duration = deadline
+            .map(|d| {
+                let remaining = d.duration_since(now);
+                if remaining < FRAME_BUDGET {
+                    remaining
+                } else {
+                    FRAME_BUDGET
+                }
+            })
+            .unwrap_or(FRAME_BUDGET);
+
+        if event::poll(poll_duration)? {
             let ev = event::read()?;
             match &ev {
                 // Key press events only (ignore release/repeat).
