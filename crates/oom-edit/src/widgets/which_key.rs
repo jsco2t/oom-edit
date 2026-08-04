@@ -12,13 +12,11 @@ use ratatui::{style::Style, widgets::Paragraph, Frame};
 use crate::command::{keymap::Keymap, registry::Contexts};
 
 /// Which-key delay: 150ms after Space before the hint bar appears.
-#[allow(dead_code)]
 const WHICH_KEY_DELAY: Duration = Duration::from_millis(150);
 
 /// Should the which-key hint bar be shown right now?
 ///
 /// Pure gate: checks `pending.since` against `now`.
-#[allow(dead_code)]
 pub fn should_show(since: Option<Instant>, now: Instant) -> bool {
     since
         .map(|s| now.duration_since(s) >= WHICH_KEY_DELAY)
@@ -30,7 +28,6 @@ pub fn should_show(since: Option<Instant>, now: Instant) -> bool {
 /// Pure build: returns the continuations of Space for the given context,
 /// formatted as a hint string. Returns `None` if there are fewer than 2
 /// continuations (the ≥2 rows rule).
-#[allow(dead_code)]
 pub fn build_hint(km: &Keymap, ctx: Contexts) -> Option<String> {
     let conts = km.continuations_for(ctx);
     if conts.len() < 2 {
@@ -56,7 +53,6 @@ pub fn build_hint(km: &Keymap, ctx: Contexts) -> Option<String> {
 ///
 /// Thin render: creates a Paragraph widget positioned in the bottom-right
 /// corner of the body area.
-#[allow(dead_code)]
 pub fn render(frame: &mut Frame<'_>, area: ratatui::layout::Rect, text: &str) {
     let hint_width = text.len().min(area.width as usize) as u16;
     let hint_area = ratatui::layout::Rect::new(

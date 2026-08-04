@@ -197,6 +197,14 @@ pub struct PaletteState {
     last_was_reference: bool,
 }
 
+impl PaletteState {
+    /// Get the current filter text (test-only).
+    #[cfg(test)]
+    pub fn filter_text(&self) -> &str {
+        &self.filter
+    }
+}
+
 /// A single row in the palette.
 #[derive(Debug)]
 enum PaletteRow {
@@ -303,8 +311,9 @@ impl PaletteState {
                 return false;
             }
             KeyCodeKind::Enter => {
-                // Enter executes or marks reference.
-                return true;
+                // Enter executes or marks reference — pass through to caller
+                // which handles the execution logic.
+                return false;
             }
             KeyCodeKind::Up | KeyCodeKind::BackTab => {
                 self.selected = self.selected.saturating_sub(1);
