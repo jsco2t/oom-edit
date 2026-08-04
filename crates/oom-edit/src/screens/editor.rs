@@ -4,17 +4,16 @@
 //! T13 adds gutter, hint bar, proper status bar, selections, and match rendering.
 
 use oom_edit_core::session::EditorSession;
-use oom_edit_core::SemanticStyle;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::command::registry::Contexts;
 use crate::command::Keymap;
-use crate::theme::Theme;
 use crate::widgets::hint_bar;
+use crate::widgets::spans;
 use crate::widgets::status_bar;
 
 /// Render the editor screen into the given frame area.
@@ -100,7 +99,7 @@ fn render_body(frame: &mut Frame<'_>, session: &mut EditorSession, top_line: usi
     // Build lines for ratatui from the source frame.
     let mut lines = Vec::with_capacity(height);
     for styled_line in &frame_data.lines {
-        let spans = build_spans(&styled_line.text, &styled_line.spans);
+        let spans = spans::build_spans(&styled_line.text, &styled_line.spans);
         lines.push(Line::from(spans));
     }
 
@@ -197,85 +196,6 @@ fn render_cursor_line_highlight(frame: &mut Frame<'_>, area: Rect, cursor_row: u
 fn render_selection(_frame: &mut Frame<'_>, _area: Rect, _sel: &std::ops::Range<usize>) {
     // Selection highlighting would map byte ranges to viewport coordinates
     // and render a highlighted overlay here.
-}
-
-/// Build ratatui spans from a styled line's text and semantic spans.
-fn build_spans(text: &str, spans: &[oom_edit_core::style::Span]) -> Vec<Span<'static>> {
-    if text.is_empty() {
-        return vec![Span::raw("")];
-    }
-
-    if spans.is_empty() {
-        return vec![Span::styled(
-            text.to_string(),
-            Style::default().fg(ratatui::style::Color::White),
-        )];
-    }
-
-    // Build a list of (start, end, style) ranges.
-    let mut ranges: Vec<(usize, usize, Style)> = Vec::new();
-    let chars: Vec<char> = text.chars().collect();
-    let total_len = chars.len();
-
-    for span in spans {
-        let start = span.start_col.min(total_len);
-        let end = span.end_col.min(total_len);
-        if start < end {
-            let style = resolve_style(span.style);
-            ranges.push((start, end, style));
-        }
-    }
-
-    // Walk through characters and assign styles based on overlapping ranges.
-    let mut result = Vec::new();
-    let mut pos = 0;
-
-    for (start, end, style) in &ranges {
-        // Add any unstyled text before this range.
-        while pos < *start {
-            if pos < total_len {
-                result.push(Span::styled(
-                    chars[pos].to_string(),
-                    Style::default().fg(ratatui::style::Color::White),
-                ));
-            }
-            pos += 1;
-        }
-        // Add styled text.
-        while pos < *end {
-            if pos < total_len {
-                result.push(Span::styled(chars[pos].to_string(), *style));
-            }
-            pos += 1;
-        }
-    }
-
-    // Add remaining unstyled text.
-    while pos < total_len {
-        result.push(Span::styled(
-            chars[pos].to_string(),
-            Style::default().fg(ratatui::style::Color::White),
-        ));
-        pos += 1;
-    }
-
-    if result.is_empty() {
-        result.push(Span::raw(""));
-    }
-
-    result
-}
-
-/// Resolve a core [`SemanticStyle`] to a ratatui [`Style`].
-fn resolve_style(style: SemanticStyle) -> ratatui::style::Style {
-    let base = Theme::resolve(style);
-    ratatui::style::Style {
-        fg: base.fg,
-        bg: base.bg,
-        underline_color: base.underline_color,
-        add_modifier: base.add_modifier,
-        sub_modifier: base.sub_modifier,
-    }
 }
 
 /// Render the full status row: hint bar (left) + status bar (right).

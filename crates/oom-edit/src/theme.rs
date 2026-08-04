@@ -65,3 +65,62 @@ impl Theme {
 fn style_fg(fg: Color, modifiers: Modifier) -> Style {
     Style::default().fg(fg).add_modifier(modifiers)
 }
+
+// ── Theme completeness test ─────────────────────────────────────────────────
+
+/// Verify that every [`SemanticStyle`] variant maps to a non-empty ratatui Style.
+///
+/// This is a compile-time + runtime completeness check: if a variant is missing
+/// from the match in `Theme::resolve`, this won't compile. The runtime asserts
+/// that every resolved style carries at least one non-default property (fg, bg,
+/// or a modifier) so no signal is color-only.
+#[cfg(test)]
+#[test]
+fn theme_resolves_all_variants() {
+    // This list must stay in sync with the SemanticStyle enum.
+    let variants = [
+        SemanticStyle::Text,
+        SemanticStyle::Heading1,
+        SemanticStyle::Heading2,
+        SemanticStyle::Heading3,
+        SemanticStyle::Heading4,
+        SemanticStyle::Heading5,
+        SemanticStyle::Heading6,
+        SemanticStyle::Emphasis,
+        SemanticStyle::Strong,
+        SemanticStyle::Strikethrough,
+        SemanticStyle::CodeSpan,
+        SemanticStyle::CodeBlock,
+        SemanticStyle::Quote,
+        SemanticStyle::ListMarker,
+        SemanticStyle::Link,
+        SemanticStyle::LinkUrl,
+        SemanticStyle::Rule,
+        SemanticStyle::HtmlRaw,
+        SemanticStyle::FmDelimiter,
+        SemanticStyle::FmKey,
+        SemanticStyle::FmValue,
+        SemanticStyle::Keyword,
+        SemanticStyle::Function,
+        SemanticStyle::TypeName,
+        SemanticStyle::StringLit,
+        SemanticStyle::NumberLit,
+        SemanticStyle::Comment,
+        SemanticStyle::Operator,
+        SemanticStyle::Variable,
+        SemanticStyle::Punct,
+        SemanticStyle::Selection,
+        SemanticStyle::Match,
+        SemanticStyle::CursorLine,
+        SemanticStyle::Muted,
+    ];
+
+    for variant in &variants {
+        let style = Theme::resolve(*variant);
+        // Every style must carry at least one non-default property.
+        assert!(
+            style.fg.is_some() || style.bg.is_some() || !style.add_modifier.is_empty(),
+            "Theme::resolve({variant:?}) must carry at least one non-default property"
+        );
+    }
+}

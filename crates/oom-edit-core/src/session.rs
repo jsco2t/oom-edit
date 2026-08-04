@@ -699,6 +699,18 @@ impl EditorSession {
             .unwrap_or(0)
     }
 
+    /// Remap the view cursor from edit coordinates (used on resize).
+    ///
+    /// When the terminal width changes, the view layout re-wraps and view
+    /// line indices shift. This remaps the view cursor to the same content
+    /// line using the core's `enter_view` pure function.
+    pub fn remap_view_cursor_from_edit(&mut self, edit_line: usize, edit_col: usize) {
+        if let Some(ref mut vs) = self.view_state {
+            let layout = vs.layout_cache.as_ref().unwrap();
+            vs.cursor = nav::enter_view(edit_line, edit_col, layout);
+        }
+    }
+
     /// Toggle View mode. If in an editing mode, enter View. If in View,
     /// return to Normal.
     pub fn toggle_view(&mut self) -> Vec<Effect> {

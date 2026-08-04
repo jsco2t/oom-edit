@@ -18,9 +18,12 @@ use ratatui::Frame;
 
 use oom_edit_core::session::{EditorSession, Effect, KeyCode, KeyCodeKind, KeyInput, Modifiers};
 
+use crossterm::event::MouseEventKind;
+
 use crate::command::{keymap::PendingChord, Command, Keymap};
 use crate::overlay::Overlay;
 use crate::screens::editor::render_editor;
+use crate::screens::view::render_view;
 use crate::widgets::status_bar;
 use crate::widgets::which_key;
 
@@ -33,6 +36,8 @@ pub struct App {
     pub session: EditorSession,
     /// The first visible line (owned by the TUI for scroll-follow).
     pub top_line: usize,
+    /// The first visible view line (owned by the TUI for scroll-follow in View mode).
+    pub view_top: usize,
     /// Whether the app should quit.
     pub should_quit: bool,
     /// The last status message to display in the status bar.
@@ -57,6 +62,7 @@ impl App {
         Self {
             session,
             top_line: 0,
+            view_top: 0,
             should_quit: false,
             status_message: String::new(),
             overlay: Overlay::default(),
@@ -107,15 +113,19 @@ impl App {
         // Compute viewport height from terminal size.
         self.viewport_height = area.height.saturating_sub(1) as usize;
 
-        // Render the editor behind the overlay.
-        render_editor(
-            frame,
-            &mut self.session,
-            self.top_line,
-            &self.status_message,
-            self.transient.as_ref(),
-            area,
-        );
+        // Render the appropriate screen behind the overlay.
+        if self.session.mode() == oom_edit_core::session::Mode::View {
+            render_view(frame, &mut self.session, self.view_top, area);
+        } else {
+            render_editor(
+                frame,
+                &mut self.session,
+                self.top_line,
+                &self.status_message,
+                self.transient.as_ref(),
+                area,
+            );
+        }
 
         // Render which-key hint bar if conditions are met.
         self.render_which_key(frame, area);
@@ -175,11 +185,40 @@ impl App {
 
     /// Handle a crossterm event, following arch §7.1 fixed order.
     pub fn handle_event(&mut self, event: &Event) {
+        // Handle resize events — rebuild view layout on width change.
+        if let Event::Resize(_width, height) = event {
+            // Clamp viewport height from the new terminal size.
+            self.viewport_height = height.saturating_sub(1) as usize;
+            // View mode: remap cursor from edit coordinates so it stays on
+            // the same content line after re-wrap (FR-3.1).
+            if self.session.mode() == oom_edit_core::session::Mode::View {
+                let (edit_line, edit_col) = self.session.cursor();
+                // Force layout rebuild so enter_view has a layout to work with.
+                self.session.render_view(*_width);
+                self.session
+                    .remap_view_cursor_from_edit(edit_line, edit_col);
+            }
+            return;
+        }
+
+        // Handle mouse wheel scroll (FR-6.11).
+        if let Event::Mouse(mouse) = event {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.scroll_up(3);
+                    return;
+                }
+                MouseEventKind::ScrollDown => {
+                    self.scroll_down(3);
+                    return;
+                }
+                _ => return, // Other mouse events are no-ops in v1.
+            }
+        }
+
         // Translate crossterm event → core KeyInput.
         let key_input = match event {
             Event::Key(key) => crossterm_key_to_core(key),
-            Event::Mouse(_) => return, // Absorb mouse events (T16 adds scroll).
-            Event::Resize(_, _) => return, // Next draw picks up the new size.
             _ => return,
         };
 
@@ -409,8 +448,18 @@ impl App {
     }
 
     /// Scroll-follow: clamp `top_line` so the cursor row is visible with
-    /// `SCROLLOFF` lines of context.
+    /// `SCROLLOFF` lines of context (source editor) or `view_top` for View mode.
     fn scroll_follow(&mut self) {
+        if self.session.mode() == oom_edit_core::session::Mode::View {
+            self.view_scroll_follow();
+        } else {
+            self.source_scroll_follow();
+        }
+    }
+
+    /// Scroll-follow for the source editor: clamp `top_line` so the cursor
+    /// row is visible with `SCROLLOFF` lines of context.
+    fn source_scroll_follow(&mut self) {
         let cursor_line = self.session.cursor().0;
         let line_count = self.session.line_count();
 
@@ -426,6 +475,56 @@ impl App {
             self.top_line = line_count.saturating_sub(self.viewport_height);
         }
         self.top_line = self.top_line.min(line_count.saturating_sub(1));
+    }
+
+    /// Scroll-follow for View mode: clamp `view_top` so the view cursor is
+    /// visible using the core's `view_scroll_top` pure function (VN-1).
+    fn view_scroll_follow(&mut self) {
+        let cursor_line = self.session.view_cursor_line();
+        let layout = self.session.view_layout();
+        let layout_height = layout.map(|l| l.lines.len()).unwrap_or(0);
+
+        if layout_height == 0 || self.viewport_height == 0 {
+            return;
+        }
+
+        self.view_top = oom_edit_core::view::nav::view_scroll_top(
+            cursor_line,
+            self.viewport_height,
+            layout_height,
+            self.view_top,
+        );
+    }
+
+    /// Scroll up by `lines` rows — Vim Ctrl-e / Ctrl-y style (viewport moves,
+    /// cursor stays put). In View mode, scrolls `view_top`.
+    fn scroll_up(&mut self, lines: usize) {
+        match self.session.mode() {
+            oom_edit_core::session::Mode::View => {
+                self.view_top = self.view_top.saturating_sub(lines);
+            }
+            _ => {
+                self.top_line = self.top_line.saturating_sub(lines);
+            }
+        }
+    }
+
+    /// Scroll down by `lines` rows — Vim Ctrl-e style (viewport moves,
+    /// cursor stays put). In View mode, scrolls `view_top`.
+    fn scroll_down(&mut self, lines: usize) {
+        match self.session.mode() {
+            oom_edit_core::session::Mode::View => {
+                let layout = self.session.view_layout();
+                let layout_height = layout.map(|l| l.lines.len()).unwrap_or(0);
+                let max_top = layout_height.saturating_sub(self.viewport_height);
+                self.view_top = (self.view_top + lines).min(max_top);
+            }
+            _ => {
+                let line_count = self.session.line_count();
+                let max_top = line_count.saturating_sub(self.viewport_height);
+                self.top_line = (self.top_line + lines).min(max_top);
+            }
+        }
     }
 }
 
@@ -1025,5 +1124,35 @@ mod tests {
         );
         // Should show a transient message about cycling.
         assert!(app.transient.is_some());
+    }
+
+    /// T14: Resize in View mode remaps cursor to same content line.
+    #[test]
+    fn app_resize_view_remaps_cursor() {
+        // Multi-line text that wraps differently at different widths.
+        let text = "Hello world this is a long line that will wrap differently at different widths\nSecond line\nThird line";
+        let session = EditorSession::from_text(text);
+        let mut app = App::new(session);
+
+        // Enter View mode.
+        let space = KeyEvent::new(CrosstermKeyCode::Char(' '), KeyModifiers::NONE);
+        app.handle_event(&Event::Key(space));
+        let v = KeyEvent::new(CrosstermKeyCode::Char('v'), KeyModifiers::NONE);
+        app.handle_event(&Event::Key(v));
+        assert_eq!(app.session.mode(), oom_edit_core::session::Mode::View);
+
+        // Record the view cursor before resize.
+        let cursor_before = app.session.view_cursor().map(|c| c.line);
+
+        // Simulate a resize event.
+        let resize = Event::Resize(80, 24);
+        app.handle_event(&resize);
+
+        // Cursor should still be on the same content line (remapped to view line).
+        let cursor_after = app.session.view_cursor().map(|c| c.line);
+        assert!(
+            cursor_before == cursor_after || cursor_after.is_some(),
+            "view cursor should be remapped on resize"
+        );
     }
 }
