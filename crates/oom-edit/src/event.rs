@@ -73,7 +73,9 @@ pub fn run_event_loop(
                 }
                 // T16: Bracketed paste — paste event.
                 Event::Paste(text) => {
-                    app.session.insert_paste(text);
+                    if let Some(ref mut entry) = app.active_mut() {
+                        entry.session_mut().insert_paste(text);
+                    }
                     app.scroll_follow();
                 }
                 // Mouse events: absorb (T16 adds wheel scroll).

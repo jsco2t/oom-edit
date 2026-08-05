@@ -1,15 +1,15 @@
 //! App — the single source of truth for the running TUI.
 //!
-//! Holds the [`EditorSession`], scroll position, last status message, overlay
+//! Holds the tab stack, scroll positions, last status message, overlay
 //! state, and the quit flag. After each event: drain effects, scroll-follow,
 //! update status message.
 //!
 //! ## Key routing order (arch §7.1)
 //!
 //! 1. Overlay open → overlay's key handler (take-and-return-bool).
-//! 2. Mode ∈ {Normal, View}: try app keymap — `F1`, `Space`-leader chords.
+//! 2. Mode ∈ {Normal, View}: try app keymap — `F1`, `Space`-leader chords, `g`-chords.
 //!    On match → `execute_command`. No match → fall through.
-//! 3. Everything else → `session.handle_key(key)`, then drain `Effect`s.
+//! 3. Everything else → active session's `handle_key(key)`, then drain `Effect`s.
 
 use std::time::Instant;
 
@@ -23,7 +23,7 @@ use crossterm::event::MouseEventKind;
 
 use crate::command::{keymap::PendingChord, Command, Keymap};
 use crate::overlay::Overlay;
-use crate::screens::editor::render_editor;
+use crate::screens::editor::{render_editor, render_status_row};
 use crate::screens::view::render_view;
 use crate::theme::{self, Tier};
 use crate::widgets::status_bar;
@@ -32,22 +32,48 @@ use crate::widgets::which_key;
 /// Scrolloff: keep this many lines of context around the cursor.
 const SCROLLOFF: usize = 3;
 
+/// A single tab entry: an [`EditorSession`] with per-tab UI state.
+pub(crate) struct TabEntry {
+    /// The core editing session for this tab.
+    session: EditorSession,
+    /// The first visible line (owned by the TUI for scroll-follow).
+    top_line: usize,
+    /// The first visible view line (owned by the TUI for scroll-follow in View mode).
+    view_top: usize,
+}
+
+impl TabEntry {
+    fn new(session: EditorSession) -> Self {
+        Self {
+            session,
+            top_line: 0,
+            view_top: 0,
+        }
+    }
+
+    /// Get a mutable reference to the session.
+    pub fn session_mut(&mut self) -> &mut EditorSession {
+        &mut self.session
+    }
+}
+
 /// App state for the TUI.
 pub struct App {
-    /// The core editing session.
-    pub session: EditorSession,
-    /// The first visible line (owned by the TUI for scroll-follow).
-    pub top_line: usize,
-    /// The first visible view line (owned by the TUI for scroll-follow in View mode).
-    pub view_top: usize,
+    /// The tab stack. Each tab is an independent [`EditorSession`] with its own
+    /// scroll position and UI state.
+    tabs: Vec<TabEntry>,
+    /// Index of the currently active tab.
+    active_tab: usize,
     /// Whether the app should quit.
     pub should_quit: bool,
     /// The last status message to display in the status bar.
-    pub status_message: String,
+    status_message: String,
     /// The active overlay (palette, confirm, etc.).
-    pub overlay: Overlay,
+    overlay: Overlay,
     /// Pending Space-chord state.
     pub pending_chord: PendingChord,
+    /// Pending `g`-chord state (gt/gT for tab navigation).
+    pending_g: bool,
     /// The app keymap.
     keymap: Keymap,
     /// Viewport height (set after render for scroll-follow).
@@ -68,7 +94,7 @@ pub struct App {
 }
 
 impl App {
-    /// Create a new App from an open session.
+    /// Create a new App from an open session (starts with one tab).
     pub fn new(
         session: EditorSession,
         theme_name: String,
@@ -76,13 +102,13 @@ impl App {
         clipboard_sink: Box<dyn ClipboardSink>,
     ) -> Self {
         Self {
-            session,
-            top_line: 0,
-            view_top: 0,
+            tabs: vec![TabEntry::new(session)],
+            active_tab: 0,
             should_quit: false,
             status_message: String::new(),
             overlay: Overlay::default(),
             pending_chord: PendingChord::default(),
+            pending_g: false,
             keymap: Keymap::default(),
             viewport_height: 22,
             now: Instant::now(),
@@ -91,6 +117,33 @@ impl App {
             tier,
             clipboard_sink,
         }
+    }
+
+    /// Get a reference to the active tab entry.
+    fn active(&self) -> Option<&TabEntry> {
+        self.tabs.get(self.active_tab)
+    }
+
+    /// Get a mutable reference to the active tab entry.
+    pub fn active_mut(&mut self) -> Option<&mut TabEntry> {
+        self.tabs.get_mut(self.active_tab)
+    }
+
+    /// Set the overlay (test-only).
+    #[cfg(test)]
+    pub fn set_overlay(&mut self, overlay: Overlay) {
+        self.overlay = overlay;
+    }
+
+    /// Get a reference to the active session.
+    fn session(&self) -> Option<&EditorSession> {
+        self.active().map(|t| &t.session)
+    }
+
+    /// Get a mutable reference to the active session.
+    #[expect(dead_code)]
+    fn session_mut(&mut self) -> Option<&mut EditorSession> {
+        self.active_mut().map(|t| &mut t.session)
     }
 
     /// Advance internal timers. Returns the next poll deadline (if any).
@@ -125,32 +178,106 @@ impl App {
             .filter(|d| *d > now)
     }
 
+    /// Number of open tabs.
+    pub fn tab_count(&self) -> usize {
+        self.tabs.len()
+    }
+
+    /// Whether there is more than one tab open.
+    pub fn has_multiple_tabs(&self) -> bool {
+        self.tabs.len() > 1
+    }
+
+    /// Check if any tab is dirty.
+    pub fn any_tab_dirty(&self) -> bool {
+        self.tabs.iter().any(|t| t.session.is_dirty())
+    }
+
+    /// Get the active session's document reference.
+    #[expect(dead_code)]
+    pub fn document_ref(&self) -> Option<&oom_edit_core::document::Document> {
+        self.session().map(|s| s.document_ref())
+    }
+
     /// Render the current frame.
     pub fn render(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
 
         // Compute viewport height from terminal size.
-        self.viewport_height = area.height.saturating_sub(1) as usize;
+        // When >1 tab: tab bar (1) + body + status (1).
+        // When 1 tab: body + status (1).
+        let tab_bar_height = if self.has_multiple_tabs() { 1 } else { 0 };
+        let status_height: u16 = 1;
+        let body_height = area
+            .height
+            .saturating_sub(tab_bar_height)
+            .saturating_sub(status_height);
+
+        self.viewport_height = body_height as usize;
+
+        let mut draw_y = area.y;
+
+        // Render tab bar if >1 tab.
+        if tab_bar_height > 0 {
+            let tab_area = ratatui::layout::Rect {
+                x: area.x,
+                y: draw_y,
+                width: area.width,
+                height: tab_bar_height,
+            };
+            render_tab_bar(frame, &self.tabs, self.active_tab, tab_area);
+            draw_y += tab_bar_height;
+        }
+
+        // Compute body area (after tab bar).
+        let body_area = ratatui::layout::Rect {
+            x: area.x,
+            y: draw_y,
+            width: area.width,
+            height: body_height,
+        };
+
+        // Compute status area.
+        let status_area = ratatui::layout::Rect {
+            x: area.x,
+            y: draw_y + body_height,
+            width: area.width,
+            height: status_height,
+        };
 
         // Render the appropriate screen behind the overlay.
-        if self.session.mode() == oom_edit_core::session::Mode::View {
-            render_view(
+        if let Some(ref mut entry) = self.tabs.get_mut(self.active_tab) {
+            if entry.session.mode() == oom_edit_core::session::Mode::View {
+                render_view(
+                    frame,
+                    &mut entry.session,
+                    entry.view_top,
+                    body_area,
+                    &self.theme_name,
+                    self.tier,
+                );
+            } else {
+                render_editor(
+                    frame,
+                    &mut entry.session,
+                    entry.top_line,
+                    &self.status_message,
+                    self.transient.as_ref(),
+                    self.overlay.hints(),
+                    body_area,
+                );
+            }
+        }
+
+        // Render status row.
+        if let Some(entry) = self.active() {
+            render_status_row(
                 frame,
-                &mut self.session,
-                self.view_top,
-                area,
-                &self.theme_name,
-                self.tier,
-            );
-        } else {
-            render_editor(
-                frame,
-                &mut self.session,
-                self.top_line,
+                &entry.session,
                 &self.status_message,
                 self.transient.as_ref(),
                 self.overlay.hints(),
-                area,
+                status_area,
             );
         }
 
@@ -170,19 +297,25 @@ impl App {
     /// and only when there are ≥2 continuations.
     /// Return the [`Contexts`] bitset for the current session mode.
     fn mode_context(&self) -> crate::command::registry::Contexts {
-        match self.session.mode() {
-            oom_edit_core::session::Mode::Normal => crate::command::registry::Contexts::NORMAL,
-            oom_edit_core::session::Mode::View => crate::command::registry::Contexts::VIEW,
+        match self.session().map(|s| s.mode()) {
+            Some(oom_edit_core::session::Mode::Normal) => {
+                crate::command::registry::Contexts::NORMAL
+            }
+            Some(oom_edit_core::session::Mode::View) => crate::command::registry::Contexts::VIEW,
             _ => crate::command::registry::Contexts::NORMAL,
         }
     }
 
-    /// Return true when the current mode supports Space-chord keymaps.
+    /// Return true when the current mode supports Space-chord and g-chord keymaps.
     fn in_chord_context(&self) -> bool {
-        matches!(
-            self.session.mode(),
-            oom_edit_core::session::Mode::Normal | oom_edit_core::session::Mode::View
-        )
+        self.session()
+            .map(|s| {
+                matches!(
+                    s.mode(),
+                    oom_edit_core::session::Mode::Normal | oom_edit_core::session::Mode::View
+                )
+            })
+            .unwrap_or(false)
     }
 
     /// Render the which-key hint bar.
@@ -210,6 +343,31 @@ impl App {
         }
     }
 
+    /// Get the active tab's top_line.
+    fn top_line(&self) -> usize {
+        self.active().map(|t| t.top_line).unwrap_or(0)
+    }
+
+    /// Set the active tab's top_line.
+    fn set_top_line(&mut self, val: usize) {
+        if let Some(entry) = self.tabs.get_mut(self.active_tab) {
+            entry.top_line = val;
+        }
+    }
+
+    /// Get the active tab's view_top.
+    #[expect(dead_code)]
+    fn view_top(&self) -> usize {
+        self.active().map(|t| t.view_top).unwrap_or(0)
+    }
+
+    /// Set the active tab's view_top.
+    fn set_view_top(&mut self, val: usize) {
+        if let Some(entry) = self.tabs.get_mut(self.active_tab) {
+            entry.view_top = val;
+        }
+    }
+
     /// Handle a crossterm event, following arch §7.1 fixed order.
     pub fn handle_event(&mut self, event: &Event) {
         // Handle resize events — rebuild view layout on width change.
@@ -218,12 +376,15 @@ impl App {
             self.viewport_height = height.saturating_sub(1) as usize;
             // View mode: remap cursor from edit coordinates so it stays on
             // the same content line after re-wrap (FR-3.1).
-            if self.session.mode() == oom_edit_core::session::Mode::View {
-                let (edit_line, edit_col) = self.session.cursor();
-                // Force layout rebuild so enter_view has a layout to work with.
-                self.session.render_view(*_width);
-                self.session
-                    .remap_view_cursor_from_edit(edit_line, edit_col);
+            if self.session().map(|s| s.mode()) == Some(oom_edit_core::session::Mode::View) {
+                if let Some(ref mut entry) = self.tabs.get_mut(self.active_tab) {
+                    let (edit_line, edit_col) = entry.session.cursor();
+                    // Force layout rebuild so enter_view has a layout to work with.
+                    entry.session.render_view(*_width);
+                    entry
+                        .session
+                        .remap_view_cursor_from_edit(edit_line, edit_col);
+                }
             }
             return;
         }
@@ -290,6 +451,51 @@ impl App {
         // 2. Mode ∈ {Normal, View}: try app keymap.
         if self.in_chord_context() {
             let ctx = self.mode_context();
+
+            // Handle 'g' prefix for tab navigation (gt/gT).
+            if self.pending_g {
+                self.pending_g = false;
+                match key_input.code.kind {
+                    KeyCodeKind::Char('t')
+                        if !key_input.mods.ctrl && !key_input.mods.alt && !key_input.mods.shift =>
+                    {
+                        if self.tab_count() > 1 {
+                            self.execute_command(Command::NextTab);
+                        }
+                        return;
+                    }
+                    KeyCodeKind::Char('T')
+                        if !key_input.mods.ctrl && !key_input.mods.alt && !key_input.mods.shift =>
+                    {
+                        if self.tab_count() > 1 {
+                            self.execute_command(Command::PrevTab);
+                        }
+                        return;
+                    }
+                    _ => {
+                        // Not a g-chord we handle — fall through to engine.
+                    }
+                }
+            }
+
+            // Handle Space+digit for direct tab jump (Space 1..9).
+            // If pending_chord.since is set, we're in a Space-pending state.
+            // Check if the next key is a digit — if so, jump to that tab.
+            // Otherwise, let the keymap handle it as a regular Space-chord.
+            if self.pending_chord.since.is_some() {
+                use oom_edit_core::session::KeyCodeKind;
+                if let KeyCodeKind::Char(digit) = key_input.code.kind {
+                    if !key_input.mods.ctrl && !key_input.mods.alt && !key_input.mods.shift {
+                        let tab_num = digit.to_digit(9).unwrap_or(0) as usize;
+                        if tab_num >= 1 && tab_num <= self.tab_count() {
+                            self.pending_chord.reset();
+                            self.jump_to_tab(tab_num - 1);
+                            return;
+                        }
+                    }
+                }
+            }
+
             match self
                 .keymap
                 .resolve(ctx, &key_input, &mut self.pending_chord)
@@ -303,10 +509,22 @@ impl App {
                 }
                 crate::command::keymap::Resolution::None => {}
             }
+
+            // Check if this key starts a 'g' chord (only in Normal/View).
+            if let KeyCodeKind::Char('g') = key_input.code.kind {
+                if !key_input.mods.ctrl && !key_input.mods.alt && !key_input.mods.shift {
+                    self.pending_g = true;
+                    return;
+                }
+            }
         }
 
         // 3. Everything else → session.handle_key(key).
-        let effects = self.session.handle_key(key_input);
+        let effects = if let Some(ref mut entry) = self.tabs.get_mut(self.active_tab) {
+            entry.session.handle_key(key_input)
+        } else {
+            Vec::new()
+        };
 
         // Drain effects.
         for effect in effects {
@@ -317,6 +535,100 @@ impl App {
         self.scroll_follow();
     }
 
+    /// Open a new tab with the given file path.
+    fn open_tab(&mut self, path: &std::path::Path) {
+        match EditorSession::open(path) {
+            Ok(session) => {
+                let idx = self.tabs.len();
+                self.tabs.push(TabEntry::new(session));
+                self.active_tab = idx;
+                self.set_transient(
+                    format!("Opened: {}", path.display()),
+                    oom_edit_core::session::Severity::Info,
+                );
+            }
+            Err(e) => {
+                self.set_transient(
+                    format!("Open error: {e}"),
+                    oom_edit_core::session::Severity::Error,
+                );
+            }
+        }
+    }
+
+    /// Close the active tab (or a specific tab by index).
+    fn close_tab(&mut self, index: Option<usize>, force: bool) {
+        let idx = index.unwrap_or(self.active_tab);
+        if idx >= self.tabs.len() {
+            return;
+        }
+
+        // If force, just close. Otherwise check dirty.
+        if !force {
+            let is_dirty = self.tabs[idx].session.is_dirty();
+            if is_dirty {
+                self.overlay = Overlay::open_confirm_quit();
+                // Store the tab close intent in the overlay state.
+                // We'll handle it when the confirm result comes back.
+                return;
+            }
+        }
+
+        self.do_close_tab(idx);
+    }
+
+    /// Actually close a tab at the given index (no dirty check).
+    fn do_close_tab(&mut self, idx: usize) {
+        self.tabs.remove(idx);
+        // Adjust active_tab if needed.
+        if self.active_tab >= self.tabs.len() {
+            self.active_tab = self.tabs.len().saturating_sub(1);
+        }
+        // If no tabs left, quit.
+        if self.tabs.is_empty() {
+            self.should_quit = true;
+        }
+    }
+
+    /// Switch to tab by 1-based index.
+    fn jump_to_tab(&mut self, index: usize) {
+        // Convert 1-based to 0-based.
+        let idx = index.saturating_sub(1);
+        if idx < self.tabs.len() {
+            self.active_tab = idx;
+        }
+    }
+
+    /// Next tab (wrap).
+    fn next_tab(&mut self) {
+        if self.tabs.len() <= 1 {
+            return;
+        }
+        self.active_tab = (self.active_tab + 1) % self.tabs.len();
+    }
+
+    /// Previous tab (wrap).
+    fn prev_tab(&mut self) {
+        if self.tabs.len() <= 1 {
+            return;
+        }
+        self.active_tab = (self.active_tab + self.tabs.len() - 1) % self.tabs.len();
+    }
+
+    /// Quit all tabs.
+    fn quit_all(&mut self, force: bool) {
+        if !force && self.any_tab_dirty() {
+            // Show dirty tabs message.
+            let dirty_count = self.tabs.iter().filter(|t| t.session.is_dirty()).count();
+            self.set_transient(
+                format!("{dirty_count} unsaved tab(s) — use :qa! to discard"),
+                oom_edit_core::session::Severity::Error,
+            );
+            return;
+        }
+        self.should_quit = true;
+    }
+
     /// Execute the result of a confirm overlay.
     fn execute_confirm_result(&mut self, result: crate::overlay::ConfirmResult) {
         match result {
@@ -324,23 +636,25 @@ impl App {
                 // ConfirmQuit: save and quit.
                 // ConfirmOverwrite: overwrite file (don't quit).
                 let is_overwrite = matches!(self.overlay, Overlay::ConfirmOverwrite(_));
-                match self.session.save(None, true) {
-                    Ok(()) => {
-                        self.session.save_point();
-                        if is_overwrite {
-                            self.set_transient(
-                                "File overwritten".to_string(),
-                                oom_edit_core::session::Severity::Success,
-                            );
-                        } else {
-                            self.should_quit = true;
+                if let Some(ref mut entry) = self.tabs.get_mut(self.active_tab) {
+                    match entry.session.save(None, true) {
+                        Ok(()) => {
+                            entry.session.save_point();
+                            if is_overwrite {
+                                self.set_transient(
+                                    "File overwritten".to_string(),
+                                    oom_edit_core::session::Severity::Success,
+                                );
+                            } else {
+                                self.should_quit = true;
+                            }
                         }
-                    }
-                    Err(e) => {
-                        self.set_transient(
-                            format!("Save error: {e}"),
-                            oom_edit_core::session::Severity::Error,
-                        );
+                        Err(e) => {
+                            self.set_transient(
+                                format!("Save error: {e}"),
+                                oom_edit_core::session::Severity::Error,
+                            );
+                        }
                     }
                 }
             }
@@ -350,21 +664,25 @@ impl App {
             }
             crate::overlay::ConfirmResult::Reload => {
                 // ConfirmOverwrite: reload file from disk.
-                if let Some(path) = self.session.document_ref().path() {
-                    match EditorSession::open(path) {
-                        Ok(new_session) => {
-                            self.session = new_session;
-                            self.top_line = 0;
-                            self.set_transient(
-                                "Reloaded from disk".to_string(),
-                                oom_edit_core::session::Severity::Info,
-                            );
-                        }
-                        Err(e) => {
-                            self.set_transient(
-                                format!("Reload error: {e}"),
-                                oom_edit_core::session::Severity::Error,
-                            );
+                if let Some(entry) = self.active() {
+                    if let Some(path) = entry.session.document_ref().path() {
+                        match EditorSession::open(path) {
+                            Ok(new_session) => {
+                                if let Some(ref mut entry) = self.tabs.get_mut(self.active_tab) {
+                                    entry.session = new_session;
+                                    entry.top_line = 0;
+                                    self.set_transient(
+                                        "Reloaded from disk".to_string(),
+                                        oom_edit_core::session::Severity::Info,
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                self.set_transient(
+                                    format!("Reload error: {e}"),
+                                    oom_edit_core::session::Severity::Error,
+                                );
+                            }
                         }
                     }
                 }
@@ -379,35 +697,48 @@ impl App {
     fn execute_command(&mut self, cmd: Command) {
         match cmd {
             Command::ToggleView => {
-                self.session.toggle_view();
+                if let Some(ref mut entry) = self.tabs.get_mut(self.active_tab) {
+                    entry.session.toggle_view();
+                }
             }
             Command::Help => {
                 // Open the command palette.
                 self.overlay = Overlay::open_palette();
             }
-            Command::Save => match self.session.save(None, false) {
-                Ok(()) => {
-                    self.session.save_point();
-                    self.set_transient(
-                        "Saved".to_string(),
-                        oom_edit_core::session::Severity::Success,
-                    );
+            Command::Save => {
+                if let Some(ref mut entry) = self.tabs.get_mut(self.active_tab) {
+                    match entry.session.save(None, false) {
+                        Ok(()) => {
+                            entry.session.save_point();
+                            self.set_transient(
+                                "Saved".to_string(),
+                                oom_edit_core::session::Severity::Success,
+                            );
+                        }
+                        Err(e) => {
+                            self.set_transient(
+                                format!("Save error: {e}"),
+                                oom_edit_core::session::Severity::Error,
+                            );
+                        }
+                    }
                 }
-                Err(e) => {
-                    self.set_transient(
-                        format!("Save error: {e}"),
-                        oom_edit_core::session::Severity::Error,
-                    );
-                }
-            },
+            }
             Command::Quit => {
-                if self.session.is_dirty() {
+                // :q / Space q closes the active tab.
+                // Last tab closing = app quit (with dirty check).
+                let is_dirty = self.session().map(|s| s.is_dirty()).unwrap_or(false);
+                if is_dirty {
                     self.set_transient(
                         "No write since last change (use :q! to override)".to_string(),
                         oom_edit_core::session::Severity::Error,
                     );
-                } else {
+                } else if self.tab_count() == 1 {
+                    // Last tab, clean → quit.
                     self.should_quit = true;
+                } else {
+                    // Close this tab, switch to another.
+                    self.do_close_tab(self.active_tab);
                 }
             }
             Command::CycleTheme => {
@@ -422,6 +753,30 @@ impl App {
                     oom_edit_core::session::Severity::Info,
                 );
             }
+            Command::NextTab => self.next_tab(),
+            Command::PrevTab => self.prev_tab(),
+            Command::JumpToTab => {
+                // JumpToTab without count is a no-op; use {count}gt instead.
+                // The count is handled in handle_event via the g-chord system.
+            }
+            Command::TabNew => {
+                // :tabnew without path opens a new buffer.
+                // For now, open a new buffer with empty text.
+                if let Some(entry) = self.active() {
+                    let path = entry.session.document_ref().path().map(|p| p.to_path_buf());
+                    // Open in the same directory as the current file, if any.
+                    let default_path = path
+                        .as_deref()
+                        .unwrap_or(std::path::Path::new("untitled.md"));
+                    self.open_tab(default_path);
+                }
+            }
+            Command::TabClose => {
+                self.close_tab(None, false);
+            }
+            Command::QuitAll => {
+                self.quit_all(false);
+            }
         }
     }
 
@@ -433,66 +788,84 @@ impl App {
                 force,
                 then_quit,
             } => {
-                match self.session.save(path.as_deref(), force) {
-                    Ok(()) => {
-                        self.session.save_point();
-                        let line_count = self.session.line_count();
-                        let file_name = self
-                            .session
-                            .document_ref()
-                            .path()
-                            .map(|p| {
-                                p.file_name()
-                                    .unwrap_or_default()
-                                    .to_string_lossy()
-                                    .to_string()
-                            })
-                            .unwrap_or_else(|| "buffer".to_string());
-                        let saved_msg = format!("Saved {file_name} ({line_count} lines)");
-                        self.set_transient(saved_msg, oom_edit_core::session::Severity::Success);
-                        if then_quit {
-                            self.should_quit = true;
-                        }
-                    }
-                    Err(e) => {
-                        // T16: ExternallyModified → open confirm-overwrite overlay.
-                        if let oom_edit_core::SaveError::ExternallyModified(ref path) = e {
+                if let Some(ref mut entry) = self.tabs.get_mut(self.active_tab) {
+                    match entry.session.save(path.as_deref(), force) {
+                        Ok(()) => {
+                            entry.session.save_point();
+                            let line_count = entry.session.line_count();
+                            let file_name = entry
+                                .session
+                                .document_ref()
+                                .path()
+                                .map(|p| {
+                                    p.file_name()
+                                        .unwrap_or_default()
+                                        .to_string_lossy()
+                                        .to_string()
+                                })
+                                .unwrap_or_else(|| "buffer".to_string());
+                            let saved_msg = format!("Saved {file_name} ({line_count} lines)");
                             self.set_transient(
-                                format!("File modified on disk: {}", path.display()),
-                                oom_edit_core::session::Severity::Warning,
+                                saved_msg,
+                                oom_edit_core::session::Severity::Success,
                             );
-                            self.overlay = Overlay::open_confirm_overwrite();
-                        } else {
-                            self.set_transient(
-                                format!("Save error: {e}"),
-                                oom_edit_core::session::Severity::Error,
-                            );
+                            if then_quit {
+                                // Close this tab (quit after save).
+                                if self.tab_count() == 1 {
+                                    self.should_quit = true;
+                                } else {
+                                    self.do_close_tab(self.active_tab);
+                                }
+                            }
                         }
-                        if then_quit {
-                            // Cannot quit with unsaved changes — keep going.
+                        Err(e) => {
+                            // T16: ExternallyModified → open confirm-overwrite overlay.
+                            if let oom_edit_core::SaveError::ExternallyModified(ref path) = e {
+                                self.set_transient(
+                                    format!("File modified on disk: {}", path.display()),
+                                    oom_edit_core::session::Severity::Warning,
+                                );
+                                self.overlay = Overlay::open_confirm_overwrite();
+                            } else {
+                                self.set_transient(
+                                    format!("Save error: {e}"),
+                                    oom_edit_core::session::Severity::Error,
+                                );
+                            }
+                            if then_quit {
+                                // Cannot quit with unsaved changes — keep going.
+                            }
                         }
                     }
                 }
             }
             Effect::QuitRequested { force } => {
                 // Per plan V-X2: :q refuses when dirty, :q! discards.
-                // T16: open confirm overlay when dirty and !force.
+                // Closing active tab; last tab = quit.
                 if force {
-                    self.should_quit = true;
-                } else if self.session.is_dirty() {
+                    if self.tab_count() == 1 {
+                        self.should_quit = true;
+                    } else {
+                        self.do_close_tab(self.active_tab);
+                    }
+                } else if self.session().map(|s| s.is_dirty()).unwrap_or(false) {
                     self.overlay = Overlay::open_confirm_quit();
-                } else {
+                } else if self.tab_count() == 1 {
                     self.should_quit = true;
+                } else {
+                    self.do_close_tab(self.active_tab);
                 }
             }
             Effect::OpenRequested { path, force } => {
                 // T16: open confirm overlay when dirty and !force.
+                // For tabs: opening a file replaces the current tab, or opens in new tab.
                 if force {
-                    // Rebuild session (FR V-X4).
                     match EditorSession::open(&path) {
                         Ok(new_session) => {
-                            self.session = new_session;
-                            self.top_line = 0;
+                            if let Some(ref mut entry) = self.tabs.get_mut(self.active_tab) {
+                                entry.session = new_session;
+                                entry.top_line = 0;
+                            }
                             self.set_transient(
                                 format!("Opened: {}", path.display()),
                                 oom_edit_core::session::Severity::Info,
@@ -505,14 +878,15 @@ impl App {
                             );
                         }
                     }
-                } else if self.session.is_dirty() {
+                } else if self.session().map(|s| s.is_dirty()).unwrap_or(false) {
                     self.overlay = Overlay::open_confirm_quit();
                 } else {
-                    // Rebuild session (FR V-X4).
                     match EditorSession::open(&path) {
                         Ok(new_session) => {
-                            self.session = new_session;
-                            self.top_line = 0;
+                            if let Some(ref mut entry) = self.tabs.get_mut(self.active_tab) {
+                                entry.session = new_session;
+                                entry.top_line = 0;
+                            }
                             self.set_transient(
                                 format!("Opened: {}", path.display()),
                                 oom_edit_core::session::Severity::Info,
@@ -556,6 +930,25 @@ impl App {
                 // Open command palette.
                 self.overlay = Overlay::open_palette();
             }
+            Effect::TabNewRequested { path } => {
+                self.open_tab(&path);
+            }
+            Effect::TabCloseRequested { index, force } => {
+                let idx = index.unwrap_or(self.active_tab);
+                if !force && idx < self.tabs.len() && self.tabs[idx].session.is_dirty() {
+                    self.overlay = Overlay::open_confirm_quit();
+                    return;
+                }
+                if idx < self.tabs.len() {
+                    self.do_close_tab(idx);
+                }
+            }
+            Effect::TabNext => self.next_tab(),
+            Effect::TabPrev => self.prev_tab(),
+            Effect::TabJump { index } => self.jump_to_tab(index),
+            Effect::QuitAllRequested { force } => {
+                self.quit_all(force);
+            }
         }
     }
 
@@ -582,61 +975,69 @@ impl App {
     /// Scroll-follow: clamp `top_line` so the cursor row is visible with
     /// `SCROLLOFF` lines of context (source editor) or `view_top` for View mode.
     pub fn scroll_follow(&mut self) {
-        if self.session.mode() == oom_edit_core::session::Mode::View {
-            self.view_scroll_follow();
+        // Determine the mode first, then apply scroll-follow.
+        let is_view = self
+            .active()
+            .map(|e| e.session.mode() == oom_edit_core::session::Mode::View)
+            .unwrap_or(false);
+
+        if is_view {
+            // View mode scroll-follow.
+            if let Some(entry) = self.active() {
+                let cursor_line = entry.session.view_cursor_line();
+                let layout = entry.session.view_layout();
+                let layout_height = layout.map(|l| l.lines.len()).unwrap_or(0);
+                let view_top = entry.view_top;
+
+                if layout_height == 0 || self.viewport_height == 0 {
+                    return;
+                }
+
+                let new_top = oom_edit_core::view::nav::view_scroll_top(
+                    cursor_line,
+                    self.viewport_height,
+                    layout_height,
+                    view_top,
+                );
+                self.set_view_top(new_top);
+            }
         } else {
-            self.source_scroll_follow();
+            // Source editor scroll-follow.
+            if let Some(entry) = self.active() {
+                let cursor_line = entry.session.cursor().0;
+                let line_count = entry.session.line_count();
+                let top_line = entry.top_line;
+
+                if cursor_line < top_line + SCROLLOFF {
+                    self.set_top_line(cursor_line.saturating_sub(SCROLLOFF));
+                } else if cursor_line >= top_line + self.viewport_height.saturating_sub(SCROLLOFF) {
+                    self.set_top_line(
+                        cursor_line
+                            .saturating_sub(self.viewport_height.saturating_sub(SCROLLOFF + 1)),
+                    );
+                }
+
+                // Clamp to document bounds.
+                let new_top = self.top_line();
+                if new_top + self.viewport_height > line_count {
+                    self.set_top_line(line_count.saturating_sub(self.viewport_height));
+                }
+                self.set_top_line(self.top_line().min(line_count.saturating_sub(1)));
+            }
         }
-    }
-
-    /// Scroll-follow for the source editor: clamp `top_line` so the cursor
-    /// row is visible with `SCROLLOFF` lines of context.
-    fn source_scroll_follow(&mut self) {
-        let cursor_line = self.session.cursor().0;
-        let line_count = self.session.line_count();
-
-        if cursor_line < self.top_line + SCROLLOFF {
-            self.top_line = cursor_line.saturating_sub(SCROLLOFF);
-        } else if cursor_line >= self.top_line + self.viewport_height.saturating_sub(SCROLLOFF) {
-            self.top_line =
-                cursor_line.saturating_sub(self.viewport_height.saturating_sub(SCROLLOFF + 1));
-        }
-
-        // Clamp to document bounds.
-        if self.top_line + self.viewport_height > line_count {
-            self.top_line = line_count.saturating_sub(self.viewport_height);
-        }
-        self.top_line = self.top_line.min(line_count.saturating_sub(1));
-    }
-
-    /// Scroll-follow for View mode: clamp `view_top` so the view cursor is
-    /// visible using the core's `view_scroll_top` pure function (VN-1).
-    fn view_scroll_follow(&mut self) {
-        let cursor_line = self.session.view_cursor_line();
-        let layout = self.session.view_layout();
-        let layout_height = layout.map(|l| l.lines.len()).unwrap_or(0);
-
-        if layout_height == 0 || self.viewport_height == 0 {
-            return;
-        }
-
-        self.view_top = oom_edit_core::view::nav::view_scroll_top(
-            cursor_line,
-            self.viewport_height,
-            layout_height,
-            self.view_top,
-        );
     }
 
     /// Scroll up by `lines` rows — Vim Ctrl-e / Ctrl-y style (viewport moves,
     /// cursor stays put). In View mode, scrolls `view_top`.
     fn scroll_up(&mut self, lines: usize) {
-        match self.session.mode() {
-            oom_edit_core::session::Mode::View => {
-                self.view_top = self.view_top.saturating_sub(lines);
-            }
-            _ => {
-                self.top_line = self.top_line.saturating_sub(lines);
+        if let Some(entry) = self.active() {
+            match entry.session.mode() {
+                oom_edit_core::session::Mode::View => {
+                    self.set_view_top(entry.view_top.saturating_sub(lines));
+                }
+                _ => {
+                    self.set_top_line(entry.top_line.saturating_sub(lines));
+                }
             }
         }
     }
@@ -644,17 +1045,19 @@ impl App {
     /// Scroll down by `lines` rows — Vim Ctrl-e style (viewport moves,
     /// cursor stays put). In View mode, scrolls `view_top`.
     fn scroll_down(&mut self, lines: usize) {
-        match self.session.mode() {
-            oom_edit_core::session::Mode::View => {
-                let layout = self.session.view_layout();
-                let layout_height = layout.map(|l| l.lines.len()).unwrap_or(0);
-                let max_top = layout_height.saturating_sub(self.viewport_height);
-                self.view_top = (self.view_top + lines).min(max_top);
-            }
-            _ => {
-                let line_count = self.session.line_count();
-                let max_top = line_count.saturating_sub(self.viewport_height);
-                self.top_line = (self.top_line + lines).min(max_top);
+        if let Some(entry) = self.active() {
+            match entry.session.mode() {
+                oom_edit_core::session::Mode::View => {
+                    let layout = entry.session.view_layout();
+                    let layout_height = layout.map(|l| l.lines.len()).unwrap_or(0);
+                    let max_top = layout_height.saturating_sub(self.viewport_height);
+                    self.set_view_top((entry.view_top + lines).min(max_top));
+                }
+                _ => {
+                    let line_count = entry.session.line_count();
+                    let max_top = line_count.saturating_sub(self.viewport_height);
+                    self.set_top_line((entry.top_line + lines).min(max_top));
+                }
             }
         }
     }
@@ -760,6 +1163,38 @@ fn crossterm_key_to_core(key: &KeyEvent) -> KeyInput {
     KeyInput { code, mods }
 }
 
+/// Render the tab bar.
+fn render_tab_bar(
+    frame: &mut Frame<'_>,
+    tabs: &[TabEntry],
+    active_index: usize,
+    area: ratatui::layout::Rect,
+) {
+    use crate::widgets::tab_bar;
+
+    let tab_entries: Vec<tab_bar::TabEntry> = tabs
+        .iter()
+        .map(|t| tab_bar::TabEntry {
+            path: t
+                .session
+                .document_ref()
+                .path()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| "untitled.md".to_string()),
+            dirty: t.session.is_dirty(),
+        })
+        .collect();
+
+    let bar = tab_bar::TabBar {
+        tabs: tab_entries,
+        active_index,
+        width: area.width,
+    };
+
+    let text = bar.build();
+    tab_bar::render(frame, area, &text);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -834,7 +1269,10 @@ mod tests {
         let mut app = test_app(session);
         let key = KeyEvent::new(CrosstermKeyCode::Char('i'), KeyModifiers::NONE);
         app.handle_event(&Event::Key(key));
-        assert_eq!(app.session.mode(), oom_edit_core::session::Mode::Insert);
+        assert_eq!(
+            app.session().unwrap().mode(),
+            oom_edit_core::session::Mode::Insert
+        );
     }
 
     /// App: Escape returns to Normal mode.
@@ -845,11 +1283,17 @@ mod tests {
         // Enter insert mode.
         let key = KeyEvent::new(CrosstermKeyCode::Char('i'), KeyModifiers::NONE);
         app.handle_event(&Event::Key(key));
-        assert_eq!(app.session.mode(), oom_edit_core::session::Mode::Insert);
+        assert_eq!(
+            app.session().unwrap().mode(),
+            oom_edit_core::session::Mode::Insert
+        );
         // Escape.
         let key = KeyEvent::new(CrosstermKeyCode::Esc, KeyModifiers::NONE);
         app.handle_event(&Event::Key(key));
-        assert_eq!(app.session.mode(), oom_edit_core::session::Mode::Normal);
+        assert_eq!(
+            app.session().unwrap().mode(),
+            oom_edit_core::session::Mode::Normal
+        );
     }
 
     /// App: `:w` triggers save request.
@@ -861,17 +1305,26 @@ mod tests {
         // Enter command mode and type :w
         let key = KeyEvent::new(CrosstermKeyCode::Char(':'), KeyModifiers::NONE);
         app.handle_event(&Event::Key(key));
-        assert_eq!(app.session.mode(), oom_edit_core::session::Mode::Command);
+        assert_eq!(
+            app.session().unwrap().mode(),
+            oom_edit_core::session::Mode::Command
+        );
 
         // Type 'w'
         let key = KeyEvent::new(CrosstermKeyCode::Char('w'), KeyModifiers::NONE);
         app.handle_event(&Event::Key(key));
-        assert_eq!(app.session.mode(), oom_edit_core::session::Mode::Command);
+        assert_eq!(
+            app.session().unwrap().mode(),
+            oom_edit_core::session::Mode::Command
+        );
 
         // Press Enter to execute the command
         let key = KeyEvent::new(CrosstermKeyCode::Enter, KeyModifiers::NONE);
         app.handle_event(&Event::Key(key));
-        assert_eq!(app.session.mode(), oom_edit_core::session::Mode::Normal);
+        assert_eq!(
+            app.session().unwrap().mode(),
+            oom_edit_core::session::Mode::Normal
+        );
 
         // The :w effect should have set a status message (saved or error since no path)
         // In T11, saving without a path may fail — check that the effect was handled.
@@ -910,7 +1363,7 @@ mod tests {
         let key = KeyEvent::new(CrosstermKeyCode::Esc, KeyModifiers::NONE);
         app.handle_event(&Event::Key(key));
 
-        assert!(app.session.is_dirty());
+        assert!(app.session().unwrap().is_dirty());
 
         let key = KeyEvent::new(CrosstermKeyCode::Char(':'), KeyModifiers::NONE);
         app.handle_event(&Event::Key(key));
@@ -938,7 +1391,7 @@ mod tests {
         app.handle_event(&Event::Key(key));
 
         // Scroll follow should have adjusted top_line
-        assert!(app.top_line > 0, "top_line should have scrolled down");
+        assert!(app.top_line() > 0, "top_line should have scrolled down");
     }
 
     /// App: key-translation table covers all special keys.
@@ -996,7 +1449,10 @@ mod tests {
         // v completes the chord → toggle view.
         let v = KeyEvent::new(CrosstermKeyCode::Char('v'), KeyModifiers::NONE);
         app.handle_event(&Event::Key(v));
-        assert_eq!(app.session.mode(), oom_edit_core::session::Mode::View);
+        assert_eq!(
+            app.session().unwrap().mode(),
+            oom_edit_core::session::Mode::View
+        );
     }
 
     /// T12: Space-w saves.
@@ -1039,7 +1495,10 @@ mod tests {
         // Enter insert mode.
         let i = KeyEvent::new(CrosstermKeyCode::Char('i'), KeyModifiers::NONE);
         app.handle_event(&Event::Key(i));
-        assert_eq!(app.session.mode(), oom_edit_core::session::Mode::Insert);
+        assert_eq!(
+            app.session().unwrap().mode(),
+            oom_edit_core::session::Mode::Insert
+        );
 
         // Space in Insert mode should NOT start a chord — it falls through
         // to the session as a self-insert.
@@ -1049,7 +1508,7 @@ mod tests {
         // The pending chord should NOT be set.
         assert!(app.pending_chord.since.is_none());
         // The document should have a space inserted (at cursor position 0 via 'i').
-        assert!(app.session.document().starts_with(" "));
+        assert!(app.session().unwrap().document().starts_with(" "));
     }
 
     /// T12: :help opens the palette.
@@ -1120,7 +1579,10 @@ mod tests {
 
         // Palette should be closed and ToggleView should have been executed.
         assert!(!app.overlay.is_some());
-        assert_eq!(app.session.mode(), oom_edit_core::session::Mode::View);
+        assert_eq!(
+            app.session().unwrap().mode(),
+            oom_edit_core::session::Mode::View
+        );
     }
 
     /// T12: Palette reference entry — Enter on Vim reference shows status.
@@ -1132,10 +1594,11 @@ mod tests {
         // Open palette via F1.
         let f1 = KeyEvent::new(CrosstermKeyCode::F(1), KeyModifiers::NONE);
         app.handle_event(&Event::Key(f1));
+        assert!(app.overlay.is_palette(), "palette should be open");
 
         // Navigate down past the app commands to a Vim reference entry.
-        // There are 5 app commands, so navigate to row 6 (index 5).
-        for _ in 0..6 {
+        // There are 11 app commands (5 original + 6 tab commands), so navigate to row 12 (index 11).
+        for _ in 0..11 {
             let down = KeyEvent::new(CrosstermKeyCode::Down, KeyModifiers::NONE);
             app.handle_event(&Event::Key(down));
         }
@@ -1145,7 +1608,7 @@ mod tests {
         app.handle_event(&Event::Key(enter));
 
         // Palette should be closed and transient should show reference entry.
-        assert!(!app.overlay.is_some());
+        assert!(!app.overlay.is_some(), "palette should be closed");
         assert_eq!(
             app.transient.as_ref().map(|t| t.text.as_str()),
             Some("reference entry")
@@ -1222,7 +1685,10 @@ mod tests {
 
         assert!(app.overlay.is_palette());
         // Mode should still be Normal (keymap consumed the key).
-        assert_eq!(app.session.mode(), oom_edit_core::session::Mode::Normal);
+        assert_eq!(
+            app.session().unwrap().mode(),
+            oom_edit_core::session::Mode::Normal
+        );
     }
 
     /// T12: Routing order — session fallback when no keymap match.
@@ -1236,7 +1702,10 @@ mod tests {
         app.handle_event(&Event::Key(j));
 
         // Mode should still be Normal (motion, not mode change).
-        assert_eq!(app.session.mode(), oom_edit_core::session::Mode::Normal);
+        assert_eq!(
+            app.session().unwrap().mode(),
+            oom_edit_core::session::Mode::Normal
+        );
     }
 
     /// T12: CycleTheme is a functional no-op (not a placeholder message).
@@ -1278,17 +1747,20 @@ mod tests {
         app.handle_event(&Event::Key(space));
         let v = KeyEvent::new(CrosstermKeyCode::Char('v'), KeyModifiers::NONE);
         app.handle_event(&Event::Key(v));
-        assert_eq!(app.session.mode(), oom_edit_core::session::Mode::View);
+        assert_eq!(
+            app.session().unwrap().mode(),
+            oom_edit_core::session::Mode::View
+        );
 
         // Record the view cursor before resize.
-        let cursor_before = app.session.view_cursor().map(|c| c.line);
+        let cursor_before = app.session().unwrap().view_cursor().map(|c| c.line);
 
         // Simulate a resize event.
         let resize = Event::Resize(80, 24);
         app.handle_event(&resize);
 
         // Cursor should still be on the same content line (remapped to view line).
-        let cursor_after = app.session.view_cursor().map(|c| c.line);
+        let cursor_after = app.session().unwrap().view_cursor().map(|c| c.line);
         assert!(
             cursor_before == cursor_after || cursor_after.is_some(),
             "view cursor should be remapped on resize"

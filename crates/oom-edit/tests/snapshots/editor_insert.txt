@@ -20,5 +20,5 @@
   20Another heading.
   21
   22More text here.
-  23
+F1 help  F1 help                                           INSERT (new) 1:1  4%
 F1 help  F1 help                                           INSERT (new) 1:1  4%

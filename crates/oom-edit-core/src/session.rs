@@ -144,6 +144,32 @@ pub enum Effect {
     /// The TUI opens its command palette with the Vim reference section.
     /// Headless hosts may ignore this effect.
     HelpRequested,
+    /// A new tab was requested (from `:tabnew {path}`).
+    TabNewRequested {
+        /// File path to open in the new tab.
+        path: std::path::PathBuf,
+    },
+    /// Close a tab (from `:tabclose` or `:tabclose!`).
+    TabCloseRequested {
+        /// Tab index to close; `None` = active tab.
+        index: Option<usize>,
+        /// Force close (discard unsaved changes).
+        force: bool,
+    },
+    /// Switch to the next tab (from `gt`).
+    TabNext,
+    /// Switch to the previous tab (from `gT`).
+    TabPrev,
+    /// Jump to a specific tab by 1-based index (from `{count}gt`).
+    TabJump {
+        /// 1-based tab index.
+        index: usize,
+    },
+    /// Quit all tabs (from `:qa` or `:qa!`).
+    QuitAllRequested {
+        /// Force quit (discard unsaved changes).
+        force: bool,
+    },
 }
 
 // ── Severity ───────────────────────────────────────────────────────────────
@@ -1097,6 +1123,23 @@ impl EditorSession {
                 vec![Effect::ModeChanged(Mode::View)]
             }
             "help" => vec![Effect::HelpRequested],
+            "qa" => vec![Effect::QuitAllRequested { force: args.1 }],
+            "tabnew" => {
+                if let Some(path) = args.0 {
+                    vec![Effect::TabNewRequested {
+                        path: std::path::PathBuf::from(path),
+                    }]
+                } else {
+                    vec![Effect::Message {
+                        text: ":tabnew requires a file path".to_string(),
+                        severity: Severity::Warning,
+                    }]
+                }
+            }
+            "tabclose" => vec![Effect::TabCloseRequested {
+                index: None,
+                force: args.1,
+            }],
             _ => vec![Effect::Message {
                 text: format!("Unknown command: {}", base),
                 severity: Severity::Warning,

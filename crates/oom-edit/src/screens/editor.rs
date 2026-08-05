@@ -134,7 +134,7 @@ fn render_body(frame: &mut Frame<'_>, session: &mut EditorSession, top_line: usi
 
     // Draw cursor.
     let (cursor_row, cursor_col) = frame_data.cursor;
-    let row = (text_area.y + cursor_row).min(text_area.y + text_area.height - 1);
+    let row = (text_area.y + cursor_row).min(text_area.y + text_area.height.saturating_sub(1));
     let col = text_area.x + cursor_col.min(text_area.width.saturating_sub(1));
     frame.set_cursor_position(ratatui::layout::Position::new(col, row));
 
@@ -207,7 +207,7 @@ fn render_selection(_frame: &mut Frame<'_>, _area: Rect, _sel: &std::ops::Range<
 }
 
 /// Render the full status row: hint bar (left) + status bar (right).
-fn render_status_row(
+pub fn render_status_row(
     frame: &mut Frame<'_>,
     session: &EditorSession,
     _status_msg: &str,

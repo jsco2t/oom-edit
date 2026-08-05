@@ -20,5 +20,5 @@
  +19Another heading.
  +20
  +21More text here.
- +22
+o overwrite · r reload · Esc cancel                        NORMAL (new) 1:1  4%
 o overwrite · r reload · Esc cancel                        NORMAL (new) 1:1  4%

@@ -12,13 +12,13 @@
  +11```rust        │  save                 save           │
  +12fn main() {    │  quit                 quit           │
  +13    println!("H│  cycle-theme          cycle theme    │
- +14}              │  h, ←                 Char/line movem│
- +15```            │  j, ↓                 Line down, pres│
+ +14}              │  next-tab             next tab       │
+ +15```            │  prev-tab             previous tab   │
  +16               └──────────────────────────────────────┘
  +17---
  +18
  +19Another heading.
  +20
  +21More text here.
- +22
+↑↓ navigate · type to filter · Enter execute · Esc close   NORMAL (new) 1:1  4%
 ↑↓ navigate · type to filter · Enter execute · Esc close   NORMAL (new) 1:1  4%

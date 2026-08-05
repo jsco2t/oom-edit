@@ -686,7 +686,7 @@ fn golden_confirm_quit() {
 fn golden_confirm_overwrite() {
     let mut app = test_app(kitchen_sink());
     // Open confirm-overwrite overlay directly.
-    app.overlay = crate::overlay::Overlay::open_confirm_overwrite();
+    app.set_overlay(crate::overlay::Overlay::open_confirm_overwrite());
     let lines = render_app_lines(80, 24, |frame| {
         app.render(frame);
     });
@@ -929,7 +929,7 @@ fn drift_render_without_panic_across_sizes() {
         // Editor with palette overlay.
         {
             let mut app = test_app(kitchen);
-            app.overlay = Overlay::open_palette();
+            app.set_overlay(Overlay::open_palette());
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _ = render_app_lines(*w, *h, |frame| {
                     app.render(frame);
@@ -941,7 +941,7 @@ fn drift_render_without_panic_across_sizes() {
         // Editor with confirm-quit overlay.
         {
             let mut app = test_app(kitchen);
-            app.overlay = Overlay::open_confirm_quit();
+            app.set_overlay(Overlay::open_confirm_quit());
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _ = render_app_lines(*w, *h, |frame| {
                     app.render(frame);
@@ -953,7 +953,7 @@ fn drift_render_without_panic_across_sizes() {
         // Editor with confirm-overwrite overlay.
         {
             let mut app = test_app(kitchen);
-            app.overlay = Overlay::open_confirm_overwrite();
+            app.set_overlay(Overlay::open_confirm_overwrite());
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _ = render_app_lines(*w, *h, |frame| {
                     app.render(frame);
