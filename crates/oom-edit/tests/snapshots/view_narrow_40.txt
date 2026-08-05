@@ -1,0 +1,6 @@
+█ Simple Document
+
+Just some plain text here.
+
+No lists, no code blocks, no
+blockquotes.

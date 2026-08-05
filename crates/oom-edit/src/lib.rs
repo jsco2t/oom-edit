@@ -30,6 +30,8 @@ pub(crate) mod config;
 pub(crate) mod event;
 pub(crate) mod overlay;
 pub(crate) mod screens;
+#[cfg(test)]
+pub(crate) mod snapshot_tests;
 pub(crate) mod terminal_guard;
 pub(crate) mod theme;
 pub(crate) mod widgets;

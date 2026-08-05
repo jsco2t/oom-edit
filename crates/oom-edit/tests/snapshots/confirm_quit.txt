@@ -1,0 +1,24 @@
+   1x---
+  +1title: Kitchen Sink
+  +2author: Test
+  +3---
+  +4
+  +5# Heading One
+  +6
+  +7Some **bold** and *italic* text with `inline code` and a [link](https://exam
+  +8               ┌ Quit? ───────────────────────────────┐
+  +9> A blockquote │ith **emphasis** inside.              │
+ +10               │  Save and quit?    [y/w]             │
+ +11```rust        │  Quit without save [n]               │
+ +12fn main() {    │  Cancel            [Esc]             │
+ +13    println!("H│llo!");                               │
+ +14}              └──────────────────────────────────────┘
+ +15```
+ +16
+ +17---
+ +18
+ +19Another heading.
+ +20
+ +21More text here.
+ +22
+y/w save+quit · n quit · Esc cancel                        NORMAL (new) [+] 1:1

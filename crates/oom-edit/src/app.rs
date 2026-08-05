@@ -57,6 +57,9 @@ pub struct App {
     /// Active transient message with TTL expiry.
     transient: Option<status_bar::Transient>,
     /// Active theme name (for CycleTheme).
+    #[cfg(test)]
+    pub theme_name: String,
+    #[cfg(not(test))]
     theme_name: String,
     /// Active capability tier.
     tier: Tier,
@@ -557,6 +560,17 @@ impl App {
     }
 
     /// Set a transient status message with TTL expiry.
+    #[cfg(test)]
+    pub fn set_transient(&mut self, text: String, severity: oom_edit_core::session::Severity) {
+        self.transient = Some(status_bar::Transient {
+            text,
+            severity,
+            expires_at: self.now + status_bar::TRANSIENT_TTL,
+        });
+    }
+
+    /// Set a transient status message with TTL expiry.
+    #[cfg(not(test))]
     fn set_transient(&mut self, text: String, severity: oom_edit_core::session::Severity) {
         self.transient = Some(status_bar::Transient {
             text,
@@ -1279,5 +1293,32 @@ mod tests {
             cursor_before == cursor_after || cursor_after.is_some(),
             "view cursor should be remapped on resize"
         );
+    }
+
+    /// T17: Render — basic render doesn't hang and produces output.
+    #[test]
+    fn app_render_basic() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let session = EditorSession::from_text("hello");
+        let mut app = test_app(session);
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                app.render(frame);
+            })
+            .unwrap();
+
+        let content = terminal.backend().buffer().content();
+        // Convert last line to string and check status bar renders.
+        let last_line: String = content[content.len() - 80..]
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(last_line.contains("NORMAL"));
     }
 }

@@ -207,7 +207,7 @@ impl PaletteState {
 
 /// A single row in the palette.
 #[derive(Debug)]
-enum PaletteRow {
+pub(crate) enum PaletteRow {
     /// An executable app command.
     Command {
         id: Command,
@@ -226,7 +226,7 @@ enum PaletteRow {
 
 impl PaletteState {
     /// Build the full row list from the registry and Vim reference table.
-    fn build_rows(&self, ctx: Contexts, km: &Keymap) -> Vec<PaletteRow> {
+    pub(crate) fn build_rows(&self, ctx: Contexts, km: &Keymap) -> Vec<PaletteRow> {
         let mut rows = Vec::new();
 
         // App commands section.

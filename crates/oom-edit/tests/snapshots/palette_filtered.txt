@@ -1,0 +1,24 @@
+   1---
+  +1title: Kitchen Sink
+  +2author: Test
+  +3---
+  +4
+  +5# Heading One  ┌ Command Palette ─────────────────────┐
+  +6               │                                      │
+  +7Some **bold** a│> savalic* text with `inline code` and│a [link](https://exam
+  +8               │                                      │
+  +9> A blockquote │▸ toggle-view          toggle view    │
+ +10               │  save                 save           │
+ +11```rust        │  w                    Word forward (V│
+ +12fn main() {    │  W                    WORD forward (w│
+ +13    println!("H│  ^                    First non-blank│
+ +14}              │  $                    End-of-line (la│
+ +15```            │  /pattern⏎            Forward search │
+ +16               └──────────────────────────────────────┘
+ +17---
+ +18
+ +19Another heading.
+ +20
+ +21More text here.
+ +22
+↑↓ navigate · type to filter · Enter execute · Esc close   NORMAL (new) 1:1  4%
