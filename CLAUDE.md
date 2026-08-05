@@ -56,7 +56,7 @@ A change is complete only when **all** of the following hold — no exceptions, 
 6. **All** tests pass — `make test`, the entire suite, not just the new tests.
 7. If dependencies changed: `make deny` and `make audit` pass and `vendor/` + `Cargo.lock` are updated in the same change.
 
-`make check` runs the core gate (fmt-check + lint + build + test). If `make check` is red, the change is not done — regardless of how done it feels.
+`make check` runs the core gate (fmt-check + lint + build + test + deny + audit). If `make check` is red, the change is not done — regardless of how done it feels.
 
 ## No deferred work
 
@@ -77,7 +77,7 @@ The canonical targets (all cargo invocations use `--offline --locked` except `ve
 | `make test-all`               | Tests + example builds                                           |
 | `make fmt` / `make fmt-check` | Auto-format / format check (CI gate)                             |
 | `make lint` / `make lint-fix` | `cargo clippy -- -D warnings` (CI gate) / apply safe suggestions |
-| `make check`                  | fmt-check + lint + build + test — **the local CI gate**          |
+| `make check`                  | fmt-check + lint + build + test + deny + audit — **the local CI gate** |
 | `make deny` / `make audit`    | License/ban/advisory checks (CI gates)                           |
 | `make doc`                    | `cargo doc --no-deps`                                            |
 | `make vendor`                 | Re-vendor deps (the only target that needs network)              |

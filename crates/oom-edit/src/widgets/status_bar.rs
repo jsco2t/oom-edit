@@ -63,6 +63,8 @@ pub struct StatusBar {
     pub path: String,
     /// Whether the buffer is dirty.
     pub dirty: bool,
+    /// Whether the file is new (never saved — FR V-X5).
+    pub is_new: bool,
     /// Cursor position (line, col) — 1-based for display.
     pub cursor_line: usize,
     /// Total line count (for percentage calculation).
@@ -110,6 +112,10 @@ impl StatusBar {
         // File path (just the file name, not the full path).
         let display_name = self.path.split('/').next_back().unwrap_or(&self.path);
         left.push_str(display_name);
+
+        if self.is_new {
+            left.push_str(" [new file]");
+        }
 
         if self.dirty {
             left.push_str(" [+]");
@@ -539,6 +545,7 @@ mod tests {
             mode: Mode::Command,
             path: "test.md".to_string(),
             dirty: false,
+            is_new: false,
             cursor_line: 1,
             line_count: 10,
             command_line: Some("w".to_string()),
@@ -556,6 +563,7 @@ mod tests {
             mode: Mode::Normal,
             path: "test.md".to_string(),
             dirty: false,
+            is_new: false,
             cursor_line: 1,
             line_count: 10,
             command_line: None,
@@ -573,6 +581,7 @@ mod tests {
             mode: Mode::Normal,
             path: "test.md".to_string(),
             dirty: true,
+            is_new: false,
             cursor_line: 1,
             line_count: 10,
             command_line: None,
@@ -594,6 +603,7 @@ mod tests {
             mode: Mode::Normal,
             path: "test.md".to_string(),
             dirty: false,
+            is_new: false,
             cursor_line: 1,
             line_count: 10,
             command_line: None,
@@ -615,6 +625,7 @@ mod tests {
             mode: Mode::Normal,
             path: "test.md".to_string(),
             dirty: false,
+            is_new: false,
             cursor_line: 1,
             line_count: 10,
             command_line: None,
@@ -637,6 +648,7 @@ mod tests {
             mode: Mode::Normal,
             path: "test.md".to_string(),
             dirty: false,
+            is_new: false,
             cursor_line: 1,
             line_count: 10,
             command_line: None,

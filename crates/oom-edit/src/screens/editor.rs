@@ -26,6 +26,7 @@ pub fn render_editor(
     top_line: usize,
     status_msg: &str,
     transient: Option<&status_bar::Transient>,
+    overlay_hints: &str,
     area: Rect,
 ) {
     let status_height: u16 = 1;
@@ -46,7 +47,14 @@ pub fn render_editor(
     };
 
     render_body(frame, session, top_line, body_area);
-    render_status_row(frame, session, status_msg, transient, status_area);
+    render_status_row(
+        frame,
+        session,
+        status_msg,
+        transient,
+        overlay_hints,
+        status_area,
+    );
 }
 
 /// Render the editor body (gutter + source lines + cursor + selections).
@@ -204,6 +212,7 @@ fn render_status_row(
     session: &EditorSession,
     _status_msg: &str,
     transient: Option<&status_bar::Transient>,
+    overlay_hints: &str,
     area: Rect,
 ) {
     let mode = session.mode();
@@ -225,6 +234,7 @@ fn render_status_row(
         mode,
         path,
         dirty,
+        is_new: session.document_ref().is_new(),
         cursor_line: cursor.0 + 1, // 1-based for display
         line_count: session.line_count(),
         command_line: command_line.clone(),
@@ -258,7 +268,7 @@ fn render_status_row(
                 width: hint_width,
                 height: 1,
             };
-            hint_bar::render(frame, hint_area, &hint_text, "");
+            hint_bar::render(frame, hint_area, &hint_text, overlay_hints);
         }
 
         // Status bar on right.

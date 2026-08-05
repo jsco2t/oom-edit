@@ -396,6 +396,81 @@ impl VimCore {
         self.editor.buffer_mut().set_cursor(pos);
     }
 
+    /// Insert text at the current cursor position (for paste operations).
+    ///
+    /// This inserts the text directly into the buffer without going through
+    /// the hjkl input pipeline, so it counts as a single undo step.
+    /// Returns the edits for the highlighter.
+    pub(crate) fn insert_text(&mut self, text: &str) -> Vec<TextEdit> {
+        let buffer = self.editor.buffer_mut();
+        let cursor = buffer.cursor();
+        let line = cursor.row;
+        let col = cursor.col;
+
+        // Get the current line text using rope_line_str helper
+        let current_line = {
+            let rope = buffer.rope();
+            hjkl_buffer::rope_line_str(&rope, line)
+        };
+
+        // Convert col (character index) to byte offset within the line
+        let byte_offset: usize = current_line.chars().take(col).map(|c| c.len_utf8()).sum();
+
+        // Calculate global byte offset
+        let mut global_offset = 0;
+        for i in 0..line {
+            let rope = buffer.rope();
+            let l = hjkl_buffer::rope_line_str(&rope, i);
+            global_offset += l.len() + 1; // +1 for newline
+        }
+        global_offset += byte_offset;
+
+        // Insert the text at the byte offset
+        let full_text = buffer.as_string();
+        let mut new_text = full_text[..global_offset].to_string();
+        new_text.push_str(text);
+        new_text.push_str(&full_text[global_offset..]);
+
+        // Replace the entire buffer
+        buffer.replace_all(&new_text);
+
+        // Move cursor forward by the inserted text length (in chars)
+        let char_len = text.chars().count();
+        let new_line = if text.contains('\n') {
+            // If multi-line, cursor goes to the end of the last line of pasted text
+            let new_lines: Vec<&str> = new_text.split('\n').collect();
+            let last_line_idx = new_lines.len().saturating_sub(1).min(new_lines.len() - 1);
+            // Cursor at end of the last line of pasted text
+            let last_line = new_lines[last_line_idx];
+            (last_line_idx, last_line.chars().count())
+        } else {
+            // Single line: advance col within the same line
+            let max_col = new_text
+                .split('\n')
+                .nth(line)
+                .map(|l| l.chars().count())
+                .unwrap_or(0);
+            (line, (col + char_len).min(max_col))
+        };
+
+        buffer.set_cursor(hjkl_buffer::Position {
+            row: new_line.0,
+            col: new_line.1,
+        });
+
+        // Collect the content edits for the highlighter
+        let edits = self.drain_content_edits();
+        if edits.is_empty() {
+            vec![TextEdit {
+                range: global_offset..global_offset,
+                new_text_len: text.len(),
+                new_text: text.to_string(),
+            }]
+        } else {
+            edits
+        }
+    }
+
     // ── Internal helpers ─────────────────────────────────────────────
 
     /// Normalize <C-[> (Ctrl+LeftBracket) to Esc.

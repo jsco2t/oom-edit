@@ -4,11 +4,14 @@
 //! computed from transient TTL expiry and which-key pending+150ms (T13).
 //! Key events with `kind == Press` only are dispatched; resize events are
 //! absorbed (the next draw uses the new size).
+//!
+//! T16: Bracketed paste is enabled on startup via crossterm.
 
 use std::io::Stdout;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{self, EnableBracketedPaste, Event, KeyEventKind};
+use crossterm::execute;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
@@ -25,16 +28,27 @@ pub const FRAME_BUDGET: Duration = Duration::from_millis(50);
 /// 2. `terminal.draw(...)` — render the current frame
 /// 3. `event::poll(min(FRAME_BUDGET, deadline))` — wait for input
 /// 4. On event: dispatch to `app.handle_event`
+///
+/// T16: Bracketed paste is enabled before the loop starts.
 pub fn run_event_loop(
     mut app: App,
     mut terminal: Terminal<CrosstermBackend<Stdout>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // T16: Enable bracketed paste mode.
+    // If this fails, we continue without it (some terminals don't support it).
+    let stdout = std::io::stdout();
+    if let Err(e) = execute!(stdout.lock(), EnableBracketedPaste) {
+        eprintln!("oom-edit: warning: failed to enable bracketed paste: {e}");
+    }
+
     loop {
         let now = Instant::now();
         let deadline = app.tick(now);
         terminal.draw(|frame| app.render(frame))?;
 
         if app.should_quit {
+            // T16: Disable bracketed paste on clean exit.
+            let _ = execute!(stdout.lock(), crossterm::event::DisableBracketedPaste);
             return Ok(());
         }
 
@@ -56,6 +70,11 @@ pub fn run_event_loop(
                 // Key press events only (ignore release/repeat).
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     app.handle_event(&ev);
+                }
+                // T16: Bracketed paste — paste event.
+                Event::Paste(text) => {
+                    app.session.insert_paste(text);
+                    app.scroll_follow();
                 }
                 // Mouse events: absorb (T16 adds wheel scroll).
                 Event::Mouse(_) => {

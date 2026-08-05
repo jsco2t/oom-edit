@@ -12,7 +12,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-use crate::theme::Theme;
+use crate::theme::{self, Tier};
 use crate::widgets::spans;
 
 /// Render the View-mode screen into the given frame area.
@@ -24,6 +24,8 @@ pub fn render_view(
     session: &mut EditorSession,
     view_top: usize,
     area: Rect,
+    theme_name: &str,
+    tier: Tier,
 ) {
     let height = area.height.max(1) as usize;
     let width = area.width;
@@ -52,8 +54,9 @@ pub fn render_view(
 
         // Apply view-cursor selection highlight (VN-1).
         if i == cursor_line {
-            // Full-line Selection highlight.
-            let sel_style = Theme::resolve(oom_edit_core::SemanticStyle::Selection);
+            // Full-line Selection highlight using theme.
+            let sel_style =
+                theme::get_theme(theme_name).style(tier, oom_edit_core::SemanticStyle::Selection);
             lines.push(Line::styled(
                 format!("{}{}", view_line.styled.text, " ".repeat(80)),
                 sel_style,

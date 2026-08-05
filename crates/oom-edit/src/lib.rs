@@ -24,7 +24,9 @@
 
 pub(crate) mod app;
 pub(crate) mod args;
+pub(crate) mod clipboard;
 pub(crate) mod command;
+pub(crate) mod config;
 pub(crate) mod event;
 pub(crate) mod overlay;
 pub(crate) mod screens;
@@ -33,6 +35,8 @@ pub(crate) mod theme;
 pub(crate) mod widgets;
 
 pub use args::{Args, ParseOutcome};
+pub use config::Config;
+pub use theme::{EnvParts, Tier};
 
 use std::io::stdout;
 
@@ -56,6 +60,44 @@ use crate::terminal_guard::TerminalGuard;
 /// Returns an error if terminal setup fails. File-open errors are reported
 /// as status messages (the session opens with a new buffer for missing paths).
 pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    // Load config (never fails — warns to stderr on malformed config).
+    let config = Config::load();
+
+    // Build EnvParts from environment for the selection ladder.
+    let env = EnvParts {
+        oom_edit_theme: std::env::var("OOM_EDIT_THEME")
+            .ok()
+            .map(|s| Box::leak(s.into_boxed_str()) as &'static str),
+        no_color: std::env::var("NO_COLOR").is_ok(),
+        term: std::env::var("TERM")
+            .ok()
+            .map(|s| Box::leak(s.into_boxed_str()) as &'static str),
+        colorterm: std::env::var("COLORTERM")
+            .ok()
+            .map(|s| Box::leak(s.into_boxed_str()) as &'static str),
+        colorfgbg: std::env::var("COLORFGBG")
+            .ok()
+            .map(|s| Box::leak(s.into_boxed_str()) as &'static str),
+    };
+
+    // Resolve theme through the selection ladder.
+    let (theme_name, is_light) = theme::resolve_theme(
+        args.theme.as_deref(),
+        config.theme.mode.as_deref(),
+        Some(&config.theme.dark),
+        Some(&config.theme.light),
+        &env,
+    );
+
+    // Determine tier.
+    let tier = env.effective_tier();
+
+    // Announce theme to stderr before entering alternate screen (hidlins pattern).
+    eprintln!(
+        "oom-edit: theme={theme_name} tier={tier:?}{}",
+        if is_light { " light" } else { " dark" }
+    );
+
     // Build the App (open file) BEFORE touching the terminal.
     let session = match &args.path {
         Some(path) => match EditorSession::open(path) {
@@ -68,7 +110,12 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         None => EditorSession::from_text(""),
     };
 
-    let app = App::new(session);
+    let app = App::new(
+        session,
+        theme_name,
+        tier,
+        Box::new(crate::clipboard::Osc52Clipboard::stdout()),
+    );
 
     // Enter raw mode + alternate screen + install panic/signal hooks.
     let _guard = TerminalGuard::new()?;

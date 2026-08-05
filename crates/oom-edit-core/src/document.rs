@@ -391,6 +391,18 @@ impl Document {
         self.path = Some(path);
     }
 
+    /// Check if this document was opened from a nonexistent path (new file).
+    ///
+    /// Per FR-6.10: opening a nonexistent path creates a new-buffer session
+    /// with empty text and the path retained. This method returns `true` when
+    /// the file has never been saved.
+    pub fn is_new(&self) -> bool {
+        // A document is "new" if it has a path but was never saved (no metadata).
+        // When opening an existing file, last_len and last_mtime are set.
+        // When creating a new buffer, they are None.
+        self.path.is_some() && self.last_len.is_none()
+    }
+
     /// Update the text content. Called after buffer edits.
     pub fn set_text(&mut self, text: &str) {
         // Normalize to LF

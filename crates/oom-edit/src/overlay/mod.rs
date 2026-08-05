@@ -6,14 +6,16 @@
 //!
 //! `centered()` returns the preferred geometry; `clear()` resets state.
 
+pub mod confirm;
 pub mod palette;
 
+pub use confirm::{ConfirmOverwrite, ConfirmQuit, ConfirmResult};
 pub use palette::PaletteState;
 
 use crate::command::Command;
 
 /// An active overlay slot. Only one overlay can be open at a time.
-#[derive(Debug, Default)]
+#[derive(Default, Debug)]
 pub enum Overlay {
     /// No overlay is open.
     #[default]
@@ -21,11 +23,9 @@ pub enum Overlay {
     /// The command palette (FR-6.6/6.7).
     Palette(PaletteState),
     /// Confirm quit overlay (T16).
-    #[allow(dead_code)]
-    ConfirmQuit,
+    ConfirmQuit(ConfirmQuit),
     /// Confirm overwrite overlay (T16).
-    #[allow(dead_code)]
-    ConfirmOverwrite,
+    ConfirmOverwrite(ConfirmOverwrite),
 }
 
 impl Overlay {
@@ -41,8 +41,19 @@ impl Overlay {
     }
 
     /// Open the command palette.
+    #[allow(dead_code)]
     pub fn open_palette() -> Self {
         Overlay::Palette(PaletteState::default())
+    }
+
+    /// Open the confirm-quit overlay.
+    pub fn open_confirm_quit() -> Self {
+        Overlay::ConfirmQuit(ConfirmQuit::new())
+    }
+
+    /// Open the confirm-overwrite overlay.
+    pub fn open_confirm_overwrite() -> Self {
+        Overlay::ConfirmOverwrite(ConfirmOverwrite::new())
     }
 
     /// Close the current overlay, returning the old value.
@@ -54,16 +65,19 @@ impl Overlay {
     pub fn handle_key(&mut self, key: &oom_edit_core::session::KeyInput) -> bool {
         match self {
             Overlay::Palette(p) => p.handle_key(key),
-            Overlay::ConfirmQuit => false,
-            Overlay::ConfirmOverwrite => false,
+            Overlay::ConfirmQuit(q) => q.handle_key(key),
+            Overlay::ConfirmOverwrite(o) => o.handle_key(key),
             Overlay::None => false,
         }
     }
 
     /// Render the overlay.
     pub fn render(&self, frame: &mut ratatui::Frame<'_>) {
-        if let Overlay::Palette(p) = self {
-            p.render(frame);
+        match self {
+            Overlay::Palette(p) => p.render(frame),
+            Overlay::ConfirmQuit(q) => q.render(frame),
+            Overlay::ConfirmOverwrite(o) => o.render(frame),
+            Overlay::None => {}
         }
     }
 
@@ -72,19 +86,18 @@ impl Overlay {
     pub fn geometry(&self) -> (u16, u16) {
         match self {
             Overlay::Palette(p) => p.geometry(),
-            Overlay::ConfirmQuit => (40, 7),
-            Overlay::ConfirmOverwrite => (40, 7),
+            Overlay::ConfirmQuit(q) => q.geometry(),
+            Overlay::ConfirmOverwrite(o) => o.geometry(),
             Overlay::None => (0, 0),
         }
     }
 
     /// Hint string for the bottom bar.
-    #[allow(dead_code)]
     pub fn hints(&self) -> &'static str {
         match self {
             Overlay::Palette(p) => p.hints(),
-            Overlay::ConfirmQuit => "y/n to confirm",
-            Overlay::ConfirmOverwrite => "y/n to confirm",
+            Overlay::ConfirmQuit(_) => "y/w save+quit · n quit · Esc cancel",
+            Overlay::ConfirmOverwrite(_) => "o overwrite · r reload · Esc cancel",
             Overlay::None => "",
         }
     }
@@ -95,6 +108,15 @@ impl Overlay {
             p.selected_command()
         } else {
             None
+        }
+    }
+
+    /// Get the confirm result (if a confirm overlay is open).
+    pub fn confirm_result(&self) -> Option<ConfirmResult> {
+        match self {
+            Overlay::ConfirmQuit(q) => Some(q.result()),
+            Overlay::ConfirmOverwrite(o) => Some(o.result()),
+            _ => None,
         }
     }
 }

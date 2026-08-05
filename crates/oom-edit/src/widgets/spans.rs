@@ -4,7 +4,7 @@ use oom_edit_core::SemanticStyle;
 use ratatui::style::Style;
 use ratatui::text::Span;
 
-use crate::theme::Theme;
+use crate::theme;
 
 /// Build ratatui spans from a styled line's text and semantic spans.
 pub fn build_spans<'a>(text: &'a str, spans: &'a [oom_edit_core::style::Span]) -> Vec<Span<'a>> {
@@ -75,7 +75,8 @@ pub fn build_spans<'a>(text: &'a str, spans: &'a [oom_edit_core::style::Span]) -
 
 /// Resolve a core [`SemanticStyle`] to a ratatui [`Style`].
 pub fn resolve_style(style: SemanticStyle) -> ratatui::style::Style {
-    let base = Theme::resolve(style);
+    #[allow(deprecated)]
+    let base = theme::resolve(style);
     ratatui::style::Style {
         fg: base.fg,
         bg: base.bg,

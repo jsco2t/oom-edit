@@ -16,6 +16,7 @@ use std::time::Instant;
 use crossterm::event::{Event, KeyCode as CrosstermKeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 
+use oom_edit_core::clipboard::ClipboardSink;
 use oom_edit_core::session::{EditorSession, Effect, KeyCode, KeyCodeKind, KeyInput, Modifiers};
 
 use crossterm::event::MouseEventKind;
@@ -24,6 +25,7 @@ use crate::command::{keymap::PendingChord, Command, Keymap};
 use crate::overlay::Overlay;
 use crate::screens::editor::render_editor;
 use crate::screens::view::render_view;
+use crate::theme::{self, Tier};
 use crate::widgets::status_bar;
 use crate::widgets::which_key;
 
@@ -54,11 +56,22 @@ pub struct App {
     now: Instant,
     /// Active transient message with TTL expiry.
     transient: Option<status_bar::Transient>,
+    /// Active theme name (for CycleTheme).
+    theme_name: String,
+    /// Active capability tier.
+    tier: Tier,
+    /// Clipboard sink for OSC 52 clipboard writes (T16).
+    clipboard_sink: Box<dyn ClipboardSink>,
 }
 
 impl App {
     /// Create a new App from an open session.
-    pub fn new(session: EditorSession) -> Self {
+    pub fn new(
+        session: EditorSession,
+        theme_name: String,
+        tier: Tier,
+        clipboard_sink: Box<dyn ClipboardSink>,
+    ) -> Self {
         Self {
             session,
             top_line: 0,
@@ -71,6 +84,9 @@ impl App {
             viewport_height: 22,
             now: Instant::now(),
             transient: None,
+            theme_name,
+            tier,
+            clipboard_sink,
         }
     }
 
@@ -115,7 +131,14 @@ impl App {
 
         // Render the appropriate screen behind the overlay.
         if self.session.mode() == oom_edit_core::session::Mode::View {
-            render_view(frame, &mut self.session, self.view_top, area);
+            render_view(
+                frame,
+                &mut self.session,
+                self.view_top,
+                area,
+                &self.theme_name,
+                self.tier,
+            );
         } else {
             render_editor(
                 frame,
@@ -123,6 +146,7 @@ impl App {
                 self.top_line,
                 &self.status_message,
                 self.transient.as_ref(),
+                self.overlay.hints(),
                 area,
             );
         }
@@ -236,9 +260,12 @@ impl App {
                     return;
                 }
 
-                // Enter on palette: execute command or mark reference.
+                // Enter on confirm overlay: execute the confirm result.
                 if matches!(key_input.code.kind, KeyCodeKind::Enter) {
-                    if let Some(cmd) = self.overlay.selected_command() {
+                    if let Some(result) = self.overlay.confirm_result() {
+                        self.execute_confirm_result(result);
+                        self.overlay.close();
+                    } else if let Some(cmd) = self.overlay.selected_command() {
                         self.overlay.close();
                         self.execute_command(cmd);
                     } else {
@@ -287,6 +314,64 @@ impl App {
         self.scroll_follow();
     }
 
+    /// Execute the result of a confirm overlay.
+    fn execute_confirm_result(&mut self, result: crate::overlay::ConfirmResult) {
+        match result {
+            crate::overlay::ConfirmResult::Confirm => {
+                // ConfirmQuit: save and quit.
+                // ConfirmOverwrite: overwrite file (don't quit).
+                let is_overwrite = matches!(self.overlay, Overlay::ConfirmOverwrite(_));
+                match self.session.save(None, true) {
+                    Ok(()) => {
+                        self.session.save_point();
+                        if is_overwrite {
+                            self.set_transient(
+                                "File overwritten".to_string(),
+                                oom_edit_core::session::Severity::Success,
+                            );
+                        } else {
+                            self.should_quit = true;
+                        }
+                    }
+                    Err(e) => {
+                        self.set_transient(
+                            format!("Save error: {e}"),
+                            oom_edit_core::session::Severity::Error,
+                        );
+                    }
+                }
+            }
+            crate::overlay::ConfirmResult::Quit => {
+                // ConfirmQuit: quit without saving.
+                self.should_quit = true;
+            }
+            crate::overlay::ConfirmResult::Reload => {
+                // ConfirmOverwrite: reload file from disk.
+                if let Some(path) = self.session.document_ref().path() {
+                    match EditorSession::open(path) {
+                        Ok(new_session) => {
+                            self.session = new_session;
+                            self.top_line = 0;
+                            self.set_transient(
+                                "Reloaded from disk".to_string(),
+                                oom_edit_core::session::Severity::Info,
+                            );
+                        }
+                        Err(e) => {
+                            self.set_transient(
+                                format!("Reload error: {e}"),
+                                oom_edit_core::session::Severity::Error,
+                            );
+                        }
+                    }
+                }
+            }
+            crate::overlay::ConfirmResult::Cancel => {
+                // Cancel: do nothing, stay in current state.
+            }
+        }
+    }
+
     /// Execute a command from the registry.
     fn execute_command(&mut self, cmd: Command) {
         match cmd {
@@ -323,10 +408,14 @@ impl App {
                 }
             }
             Command::CycleTheme => {
-                // T15: real theme cycling. For now, cycle the one-element list
-                // (functional no-op with correct plumbing).
+                let next = theme::cycle_theme(&self.theme_name);
+                self.theme_name = next.to_string();
+                // Persist to config.
+                if let Err(e) = crate::config::Config::load().save() {
+                    eprintln!("oom-edit: failed to save config: {e}");
+                }
                 self.set_transient(
-                    "theme cycled (1 theme)".to_string(),
+                    format!("theme: {next}"),
                     oom_edit_core::session::Severity::Info,
                 );
             }
@@ -363,10 +452,19 @@ impl App {
                         }
                     }
                     Err(e) => {
-                        self.set_transient(
-                            format!("Save error: {e}"),
-                            oom_edit_core::session::Severity::Error,
-                        );
+                        // T16: ExternallyModified → open confirm-overwrite overlay.
+                        if let oom_edit_core::SaveError::ExternallyModified(ref path) = e {
+                            self.set_transient(
+                                format!("File modified on disk: {}", path.display()),
+                                oom_edit_core::session::Severity::Warning,
+                            );
+                            self.overlay = Overlay::open_confirm_overwrite();
+                        } else {
+                            self.set_transient(
+                                format!("Save error: {e}"),
+                                oom_edit_core::session::Severity::Error,
+                            );
+                        }
                         if then_quit {
                             // Cannot quit with unsaved changes — keep going.
                         }
@@ -375,23 +473,37 @@ impl App {
             }
             Effect::QuitRequested { force } => {
                 // Per plan V-X2: :q refuses when dirty, :q! discards.
-                // The core emits QuitRequested{force} — if force is false
-                // and we're dirty, we refuse. T16 adds the confirm overlay.
-                if force || !self.session.is_dirty() {
+                // T16: open confirm overlay when dirty and !force.
+                if force {
                     self.should_quit = true;
+                } else if self.session.is_dirty() {
+                    self.overlay = Overlay::open_confirm_quit();
                 } else {
-                    self.set_transient(
-                        "No write since last change (use :q! to override)".to_string(),
-                        oom_edit_core::session::Severity::Error,
-                    );
+                    self.should_quit = true;
                 }
             }
             Effect::OpenRequested { path, force } => {
-                if self.session.is_dirty() && !force {
-                    self.set_transient(
-                        "No write since last change (use :e! to override)".to_string(),
-                        oom_edit_core::session::Severity::Error,
-                    );
+                // T16: open confirm overlay when dirty and !force.
+                if force {
+                    // Rebuild session (FR V-X4).
+                    match EditorSession::open(&path) {
+                        Ok(new_session) => {
+                            self.session = new_session;
+                            self.top_line = 0;
+                            self.set_transient(
+                                format!("Opened: {}", path.display()),
+                                oom_edit_core::session::Severity::Info,
+                            );
+                        }
+                        Err(e) => {
+                            self.set_transient(
+                                format!("Open error: {e}"),
+                                oom_edit_core::session::Severity::Error,
+                            );
+                        }
+                    }
+                } else if self.session.is_dirty() {
+                    self.overlay = Overlay::open_confirm_quit();
                 } else {
                     // Rebuild session (FR V-X4).
                     match EditorSession::open(&path) {
@@ -412,8 +524,14 @@ impl App {
                     }
                 }
             }
-            Effect::ClipboardWrite(_text) => {
+            Effect::ClipboardWrite(text) => {
                 // T16: route to OSC 52 clipboard sink.
+                if let Err(e) = self.clipboard_sink.copy(&text) {
+                    self.set_transient(
+                        format!("Clipboard error: {e}"),
+                        oom_edit_core::session::Severity::Warning,
+                    );
+                }
                 self.set_transient(
                     "yanked to register".to_string(),
                     oom_edit_core::session::Severity::Info,
@@ -449,7 +567,7 @@ impl App {
 
     /// Scroll-follow: clamp `top_line` so the cursor row is visible with
     /// `SCROLLOFF` lines of context (source editor) or `view_top` for View mode.
-    fn scroll_follow(&mut self) {
+    pub fn scroll_follow(&mut self) {
         if self.session.mode() == oom_edit_core::session::Mode::View {
             self.view_scroll_follow();
         } else {
@@ -631,6 +749,17 @@ fn crossterm_key_to_core(key: &KeyEvent) -> KeyInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oom_edit_core::clipboard::RecordingClipboardSink;
+
+    /// Create a test App with a recording clipboard sink.
+    fn test_app(session: EditorSession) -> App {
+        App::new(
+            session,
+            "default-dark".to_string(),
+            Tier::TrueColor,
+            Box::new(RecordingClipboardSink::default()),
+        )
+    }
 
     /// Key translation: `i` → Char('i'), no mods.
     #[test]
@@ -688,7 +817,7 @@ mod tests {
     #[test]
     fn app_handle_event_enters_insert() {
         let session = EditorSession::from_text("hello");
-        let mut app = App::new(session);
+        let mut app = test_app(session);
         let key = KeyEvent::new(CrosstermKeyCode::Char('i'), KeyModifiers::NONE);
         app.handle_event(&Event::Key(key));
         assert_eq!(app.session.mode(), oom_edit_core::session::Mode::Insert);
@@ -698,7 +827,7 @@ mod tests {
     #[test]
     fn app_handle_event_escapes_to_normal() {
         let session = EditorSession::from_text("hello");
-        let mut app = App::new(session);
+        let mut app = test_app(session);
         // Enter insert mode.
         let key = KeyEvent::new(CrosstermKeyCode::Char('i'), KeyModifiers::NONE);
         app.handle_event(&Event::Key(key));
@@ -713,7 +842,7 @@ mod tests {
     #[test]
     fn app_handle_event_save_requested() {
         let session = EditorSession::from_text("hello");
-        let mut app = App::new(session);
+        let mut app = test_app(session);
 
         // Enter command mode and type :w
         let key = KeyEvent::new(CrosstermKeyCode::Char(':'), KeyModifiers::NONE);
@@ -739,7 +868,7 @@ mod tests {
     #[test]
     fn app_handle_event_quit_clean() {
         let session = EditorSession::from_text("hello");
-        let mut app = App::new(session);
+        let mut app = test_app(session);
 
         let key = KeyEvent::new(CrosstermKeyCode::Char(':'), KeyModifiers::NONE);
         app.handle_event(&Event::Key(key));
@@ -757,7 +886,7 @@ mod tests {
     #[test]
     fn app_handle_event_quit_dirty_refuses() {
         let session = EditorSession::from_text("hello");
-        let mut app = App::new(session);
+        let mut app = test_app(session);
 
         // Edit the document to make it dirty
         let key = KeyEvent::new(CrosstermKeyCode::Char('i'), KeyModifiers::NONE);
@@ -778,13 +907,9 @@ mod tests {
         let key = KeyEvent::new(CrosstermKeyCode::Enter, KeyModifiers::NONE);
         app.handle_event(&Event::Key(key));
 
-        // :q without ! should refuse on dirty buffer
+        // :q without ! should open confirm-quit overlay on dirty buffer
         assert!(!app.should_quit);
-        assert!(app
-            .transient
-            .as_ref()
-            .map(|t| t.text.contains("No write"))
-            .unwrap_or(false));
+        assert!(app.overlay.is_some());
     }
 
     /// App: scroll-follow keeps cursor visible.
@@ -792,7 +917,7 @@ mod tests {
     fn app_scroll_follow_basic() {
         let text: String = (0..100).map(|i| format!("line {i}\n")).collect();
         let session = EditorSession::from_text(&text);
-        let mut app = App::new(session);
+        let mut app = test_app(session);
 
         // Go to line 50
         let key = KeyEvent::new(CrosstermKeyCode::Char('G'), KeyModifiers::NONE);
@@ -837,7 +962,7 @@ mod tests {
     #[test]
     fn app_f1_opens_palette() {
         let session = EditorSession::from_text("hello");
-        let mut app = App::new(session);
+        let mut app = test_app(session);
         let key = KeyEvent::new(CrosstermKeyCode::F(1), KeyModifiers::NONE);
         app.handle_event(&Event::Key(key));
         assert!(app.overlay.is_palette());
@@ -847,7 +972,7 @@ mod tests {
     #[test]
     fn app_space_v_toggles_view() {
         let session = EditorSession::from_text("hello");
-        let mut app = App::new(session);
+        let mut app = test_app(session);
 
         // Space starts pending chord.
         let space = KeyEvent::new(CrosstermKeyCode::Char(' '), KeyModifiers::NONE);
@@ -864,7 +989,7 @@ mod tests {
     #[test]
     fn app_space_w_saves() {
         let session = EditorSession::from_text("hello");
-        let mut app = App::new(session);
+        let mut app = test_app(session);
 
         let space = KeyEvent::new(CrosstermKeyCode::Char(' '), KeyModifiers::NONE);
         app.handle_event(&Event::Key(space));
@@ -880,7 +1005,7 @@ mod tests {
     #[test]
     fn app_space_q_quits() {
         let session = EditorSession::from_text("hello");
-        let mut app = App::new(session);
+        let mut app = test_app(session);
 
         let space = KeyEvent::new(CrosstermKeyCode::Char(' '), KeyModifiers::NONE);
         app.handle_event(&Event::Key(space));
@@ -895,7 +1020,7 @@ mod tests {
     #[test]
     fn app_space_in_insert_self_inserts() {
         let session = EditorSession::from_text("hello");
-        let mut app = App::new(session);
+        let mut app = test_app(session);
 
         // Enter insert mode.
         let i = KeyEvent::new(CrosstermKeyCode::Char('i'), KeyModifiers::NONE);
@@ -917,7 +1042,7 @@ mod tests {
     #[test]
     fn app_help_requested_opens_palette() {
         let session = EditorSession::from_text("hello");
-        let mut app = App::new(session);
+        let mut app = test_app(session);
 
         // Simulate :help by directly triggering HelpRequested effect.
         app.handle_effect(Effect::HelpRequested);
@@ -928,7 +1053,7 @@ mod tests {
     #[test]
     fn app_esc_closes_palette() {
         let session = EditorSession::from_text("hello");
-        let mut app = App::new(session);
+        let mut app = test_app(session);
 
         // Open palette via F1.
         let f1 = KeyEvent::new(CrosstermKeyCode::F(1), KeyModifiers::NONE);
@@ -945,7 +1070,7 @@ mod tests {
     #[test]
     fn app_palette_filter_narrows() {
         let session = EditorSession::from_text("hello");
-        let mut app = App::new(session);
+        let mut app = test_app(session);
 
         // Open palette via F1.
         let f1 = KeyEvent::new(CrosstermKeyCode::F(1), KeyModifiers::NONE);
@@ -968,7 +1093,7 @@ mod tests {
     #[test]
     fn app_palette_execute_command() {
         let session = EditorSession::from_text("hello");
-        let mut app = App::new(session);
+        let mut app = test_app(session);
 
         // Open palette via F1.
         let f1 = KeyEvent::new(CrosstermKeyCode::F(1), KeyModifiers::NONE);
@@ -988,7 +1113,7 @@ mod tests {
     #[test]
     fn app_palette_reference_entry() {
         let session = EditorSession::from_text("hello");
-        let mut app = App::new(session);
+        let mut app = test_app(session);
 
         // Open palette via F1.
         let f1 = KeyEvent::new(CrosstermKeyCode::F(1), KeyModifiers::NONE);
@@ -1017,7 +1142,7 @@ mod tests {
     #[test]
     fn app_which_key_delay_gate() {
         let session = EditorSession::from_text("hello");
-        let mut app = App::new(session);
+        let mut app = test_app(session);
 
         // Press Space to start pending chord.
         let space = KeyEvent::new(CrosstermKeyCode::Char(' '), KeyModifiers::NONE);
@@ -1049,7 +1174,7 @@ mod tests {
     #[test]
     fn app_routing_overlay_precedence() {
         let session = EditorSession::from_text("hello");
-        let mut app = App::new(session);
+        let mut app = test_app(session);
 
         // Open palette.
         let f1 = KeyEvent::new(CrosstermKeyCode::F(1), KeyModifiers::NONE);
@@ -1075,7 +1200,7 @@ mod tests {
     #[test]
     fn app_routing_keymap_precedence() {
         let session = EditorSession::from_text("hello");
-        let mut app = App::new(session);
+        let mut app = test_app(session);
 
         // F1 should open the palette (keymap dispatch), NOT go to session.
         let f1 = KeyEvent::new(CrosstermKeyCode::F(1), KeyModifiers::NONE);
@@ -1090,7 +1215,7 @@ mod tests {
     #[test]
     fn app_routing_session_fallback() {
         let session = EditorSession::from_text("hello");
-        let mut app = App::new(session);
+        let mut app = test_app(session);
 
         // 'j' is not a keymap trigger — should fall through to session.
         let j = KeyEvent::new(CrosstermKeyCode::Down, KeyModifiers::NONE);
@@ -1104,7 +1229,7 @@ mod tests {
     #[test]
     fn app_cycle_theme_is_functional_noop() {
         let session = EditorSession::from_text("hello");
-        let mut app = App::new(session);
+        let mut app = test_app(session);
 
         // Space-t should trigger CycleTheme.
         let space = KeyEvent::new(CrosstermKeyCode::Char(' '), KeyModifiers::NONE);
@@ -1132,7 +1257,7 @@ mod tests {
         // Multi-line text that wraps differently at different widths.
         let text = "Hello world this is a long line that will wrap differently at different widths\nSecond line\nThird line";
         let session = EditorSession::from_text(text);
-        let mut app = App::new(session);
+        let mut app = test_app(session);
 
         // Enter View mode.
         let space = KeyEvent::new(CrosstermKeyCode::Char(' '), KeyModifiers::NONE);

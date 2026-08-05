@@ -68,7 +68,76 @@ lint-fix: ## Apply safe clippy suggestions
 # Check — the local CI gate
 # ---------------------------------------------------------------------------
 .PHONY: check
-check: fmt-check lint build test ## Run fmt-check + lint + build + test
+check: ## Run fmt-check + lint + build + test + deny + audit (with summary)
+	@PASS=0; FAIL=0; \
+	fmt_ok=true; \
+	lint_ok=true; \
+	build_ok=true; \
+	test_ok=true; \
+	deny_ok=true; \
+	audit_ok=true; \
+	echo "=== oom-edit CI gate ==="; \
+	echo ""; \
+	echo "fmt-check"; \
+	if cargo fmt --all -- --check 2>&1; then \
+		echo "[PASS] fmt-check"; PASS=$$((PASS + 1)); \
+	else \
+		echo "[FAIL] fmt-check"; FAIL=$$((FAIL + 1)); fmt_ok=false; \
+	fi; \
+	echo ""; \
+	echo "lint"; \
+	if cargo clippy --workspace --all-targets --offline --locked -- -D warnings 2>&1; then \
+		echo "[PASS] lint"; PASS=$$((PASS + 1)); \
+	else \
+		echo "[FAIL] lint"; FAIL=$$((FAIL + 1)); lint_ok=false; \
+	fi; \
+	echo ""; \
+	echo "build"; \
+	if cargo build --workspace --offline --locked 2>&1; then \
+		echo "[PASS] build"; PASS=$$((PASS + 1)); \
+	else \
+		echo "[FAIL] build"; FAIL=$$((FAIL + 1)); build_ok=false; \
+	fi; \
+	echo ""; \
+	echo "test"; \
+	if cargo test --workspace --offline --locked 2>&1; then \
+		echo "[PASS] test"; PASS=$$((PASS + 1)); \
+	else \
+		echo "[FAIL] test"; FAIL=$$((FAIL + 1)); test_ok=false; \
+	fi; \
+	echo ""; \
+	echo "deny"; \
+	if cargo deny check 2>&1; then \
+		echo "[PASS] deny"; PASS=$$((PASS + 1)); \
+	else \
+		echo "[FAIL] deny"; FAIL=$$((FAIL + 1)); deny_ok=false; \
+	fi; \
+	echo ""; \
+	echo "audit"; \
+	if cargo audit 2>&1; then \
+		echo "[PASS] audit"; PASS=$$((PASS + 1)); \
+	else \
+		echo "[FAIL] audit"; FAIL=$$((FAIL + 1)); audit_ok=false; \
+	fi; \
+	echo ""; \
+	echo "=== Summary ==="; \
+	echo "  Passed: $$PASS"; \
+	echo "  Failed: $$FAIL"; \
+	if [ $$FAIL -gt 0 ]; then \
+		echo ""; \
+		echo "Failed checks:"; \
+		[ "$$fmt_ok" = false ]    && echo "  - fmt-check"; \
+		[ "$$lint_ok" = false ]   && echo "  - lint"; \
+		[ "$$build_ok" = false ]  && echo "  - build"; \
+		[ "$$test_ok" = false ]   && echo "  - test"; \
+		[ "$$deny_ok" = false ]   && echo "  - deny"; \
+		[ "$$audit_ok" = false ]  && echo "  - audit"; \
+		echo ""; \
+		exit 1; \
+	fi; \
+	echo ""; \
+	echo "All checks passed."; \
+	exit 0
 
 # ---------------------------------------------------------------------------
 # Supply-chain audit

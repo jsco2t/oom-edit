@@ -40,6 +40,7 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod clipboard;
 pub mod document;
 pub mod error;
 pub mod frontmatter;
@@ -56,6 +57,8 @@ mod vim;
 // These re-exports form the public API of `oom-edit-core`. Nothing more
 // is exported publicly; this `pub use` list *is* the API contract (FR-8.3).
 
+pub use clipboard::{ClipboardError, ClipboardSink, RecordingClipboardSink};
+pub use error::{OpenError, SaveError};
 pub use session::EditorSession;
 pub use session::{Effect, KeyCode, KeyCodeKind, KeyInput, Mode, Modifiers, Severity, Viewport};
 pub use style::{SemanticStyle, SourceFrame, Span, StyledLine, ViewLayout};

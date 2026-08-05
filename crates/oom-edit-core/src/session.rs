@@ -529,6 +529,33 @@ impl EditorSession {
         self.save_point = self.vim.save_point();
     }
 
+    /// Insert text at the current cursor position as a single paste operation.
+    ///
+    /// This is used for bracketed paste (FR-5.5): the text is inserted as one
+    /// undo step with no per-character processing. The text is always inserted
+    /// in Insert mode — if not in Insert mode, no action is taken.
+    ///
+    /// Returns `Effect::Edited` if text was inserted, `Effect::Message` if
+    /// ignored (not in Insert mode).
+    pub fn insert_paste(&mut self, text: &str) -> Vec<Effect> {
+        // Only paste in Insert mode (FR-5.5)
+        if self.mode != Mode::Insert {
+            return vec![Effect::Message {
+                text: "paste only works in insert mode".to_string(),
+                severity: Severity::Info,
+            }];
+        }
+
+        let edits = self.vim.insert_text(text);
+        // Apply edits to the highlighter
+        self.highlighter.apply_edit(&edits);
+        // Invalidate view layout cache on edit
+        if let Some(ref mut vs) = self.view_state {
+            vs.invalidate();
+        }
+        vec![Effect::Edited]
+    }
+
     /// Return the number of lines in the document.
     pub fn line_count(&self) -> usize {
         // Count newlines + 1 (at least one line)

@@ -24,7 +24,7 @@ Engineering plans live outside this repo in the project notebook:
 
 ```bash
 make help          # list all targets
-make check         # fmt + lint + build + test — the CI gate
+make check         # fmt + lint + build + test + deny + audit — the CI gate
 make run           # run the editor
 make run ARGS=file.md   # open a file
 ```
