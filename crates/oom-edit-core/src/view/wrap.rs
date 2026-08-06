@@ -207,12 +207,28 @@ fn find_wrap_point(chars: &[char], start: usize, max_cols: usize) -> usize {
             if chars[i] == ' ' {
                 return i;
             }
+            // If the word ends at the boundary, include it and any zero-width
+            // suffix characters before wrapping.
+            let mut word_end = i + 1;
+            while word_end < chars.len() && chars[word_end].width().unwrap_or(0) == 0 {
+                word_end += 1;
+            }
+            let candidate: String = chars[start..word_end].iter().collect();
+            if candidate.width() > max_cols {
+                if last_space > start && chars[last_space] == ' ' {
+                    return last_space;
+                }
+                return if i == start { word_end } else { i };
+            }
+            if word_end >= chars.len() || chars[word_end] == ' ' {
+                return word_end;
+            }
             // If the last recorded space is strictly before the current position
             // and is actually a space character, prefer breaking at the space
             if last_space > start && last_space < i && chars[last_space] == ' ' {
                 return last_space;
             }
-            return i + 1;
+            return word_end;
         }
     }
 
@@ -241,6 +257,107 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].text, "hello");
         assert_eq!(result[1].text, "world");
+    }
+
+    #[test]
+    fn wrap_word_ends_exactly_at_width() {
+        let input = StyledLine {
+            text: "abcde fghi x".to_string(),
+            spans: Vec::new(),
+        };
+
+        let result = wrap_lines(&input, 10, 0);
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].text, "abcde fghi");
+        assert_eq!(result[1].text, "x");
+    }
+
+    #[test]
+    fn wrap_word_ends_at_width_eol() {
+        let input = StyledLine {
+            text: "abcde fghi".to_string(),
+            spans: Vec::new(),
+        };
+        let chars: Vec<char> = input.text.chars().collect();
+
+        assert_eq!(find_wrap_point(&chars, 0, 10), chars.len());
+        assert_eq!(wrap_lines(&input, 10, 0), vec![input]);
+    }
+
+    #[test]
+    fn wrap_word_mid_boundary_still_backtracks() {
+        let input = StyledLine {
+            text: "abcde fghij x".to_string(),
+            spans: Vec::new(),
+        };
+
+        let result = wrap_lines(&input, 10, 0);
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].text, "abcde");
+        assert_eq!(result[1].text, "fghij x");
+    }
+
+    #[test]
+    fn wrap_word_with_zero_width_suffix_ends_at_width() {
+        let input = StyledLine {
+            text: "abcde fghi\u{301} x".to_string(),
+            spans: Vec::new(),
+        };
+
+        let result = wrap_lines(&input, 10, 0);
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].text, "abcde fghi\u{301}");
+        assert_eq!(text_width(&result[0].text), 10);
+        assert_eq!(result[1].text, "x");
+    }
+
+    #[test]
+    fn wrap_overlong_word_keeps_zero_width_suffix_with_base() {
+        let input = StyledLine {
+            text: "abcdefghij\u{301}k".to_string(),
+            spans: Vec::new(),
+        };
+
+        let result = wrap_lines(&input, 10, 0);
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].text, "abcdefghij\u{301}");
+        assert_eq!(text_width(&result[0].text), 10);
+        assert_eq!(result[1].text, "k");
+    }
+
+    #[test]
+    fn wrap_variation_selector_respects_display_width() {
+        let input = StyledLine {
+            text: "abcdefghi*\u{fe0f} x".to_string(),
+            spans: Vec::new(),
+        };
+
+        let result = wrap_lines(&input, 10, 0);
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].text, "abcdefghi");
+        assert_eq!(result[1].text, "*\u{fe0f} x");
+        assert!(result.iter().all(|line| text_width(&line.text) <= 10));
+    }
+
+    #[test]
+    fn wrap_overwide_variation_sequence_makes_progress() {
+        let input = StyledLine {
+            text: "*\u{fe0f}x".to_string(),
+            spans: Vec::new(),
+        };
+        let chars: Vec<char> = input.text.chars().collect();
+
+        assert!(find_wrap_point(&chars, 0, 1) > 0);
+        let result = wrap_lines(&input, 1, 0);
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].text, "*\u{fe0f}");
+        assert_eq!(result[1].text, "x");
     }
 
     #[test]

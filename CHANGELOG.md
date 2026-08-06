@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Words that end exactly at the View wrap boundary no longer wrap prematurely to the next line.
 - Semantic highlight spans now consistently use character indices, fixing non-ASCII styling alignment in source highlighting, fenced code, front matter, tables, and wrapped View content.
 - Fenced-code and front-matter injections now use their grammar-specific highlight queries, preserve full-region parse context for partial viewports, and keep language styles visible over the Markdown code-block fallback.
 - Injection discovery now reuses compiled queries and avoids cloning the document text and Markdown syntax tree after every edit.
