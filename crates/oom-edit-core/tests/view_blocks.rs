@@ -15,9 +15,13 @@ fn fixture(name: &str) -> String {
 }
 
 fn view_layout(text: &str) -> ViewLayout {
+    view_layout_at_width(text, 80)
+}
+
+fn view_layout_at_width(text: &str, width: u16) -> ViewLayout {
     let model = BlockModel::build(text, None);
     let highlighter = Highlighter::new(text);
-    ViewLayout::build(&model, 80, &highlighter)
+    ViewLayout::build(&model, width, &highlighter)
 }
 
 /// Assert that a block's span points at non-empty source text.
@@ -80,6 +84,40 @@ fn test_headings() {
             _ => panic!("expected Heading, got {:?}", block.kind),
         }
     }
+}
+
+#[test]
+fn heading_jump_target_wrapping() {
+    let layout = view_layout_at_width(
+        "Intro paragraph.\n\n# This is a heading that wraps across multiple lines",
+        20,
+    );
+
+    assert_eq!(layout.jump_targets.len(), 1);
+    let first_heading_line = layout
+        .lines
+        .iter()
+        .position(|line| line.styled.text.starts_with("█ "))
+        .expect("rendered heading should have a first line");
+    assert_eq!(
+        layout.lines[first_heading_line + 1].source,
+        layout.lines[first_heading_line].source,
+        "heading should wrap onto another rendered line",
+    );
+    assert_eq!(layout.jump_targets[0].line, first_heading_line);
+}
+
+#[test]
+fn heading_jump_target_no_wrap() {
+    let layout = view_layout_at_width("Intro paragraph.\n\n# Short heading", 80);
+
+    assert_eq!(layout.jump_targets.len(), 1);
+    let first_heading_line = layout
+        .lines
+        .iter()
+        .position(|line| line.styled.text == "█ Short heading")
+        .expect("rendered heading should be present");
+    assert_eq!(layout.jump_targets[0].line, first_heading_line);
 }
 
 // ── Paragraph tests ────────────────────────────────────────────────────────

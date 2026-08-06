@@ -261,6 +261,7 @@ impl<'a> ViewLayoutBuilder<'a> {
         };
 
         // Wrap the heading
+        let jump_line = self.lines.len();
         let wrapped = wrap_lines(&combined, self.width, 0);
         for line in wrapped {
             self.make_content_line(line, source.clone());
@@ -268,7 +269,7 @@ impl<'a> ViewLayoutBuilder<'a> {
 
         // Register heading as jump target
         self.jump_targets.push(JumpTarget {
-            line: self.lines.len() - 1,
+            line: jump_line,
             kind: TargetKind::Heading(level),
         });
     }
