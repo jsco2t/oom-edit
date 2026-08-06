@@ -20,5 +20,5 @@
  +19Another heading.
  +20
  +21More text here.
- NORMAL (new) ✗ externally modified 1:1  4% Top─────────────────────────────────
+ +22
  NORMAL (new) ✗ externally modified 1:1  4% Top─────────────────────────────────

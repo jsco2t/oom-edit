@@ -20,5 +20,5 @@
  +14Another heading.
  +15
  +16More text here.
-F1 help  F1 help                                           NORMAL (new) 6:1  26%
+ +17
 F1 help  F1 help                                           NORMAL (new) 6:1  26%

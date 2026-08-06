@@ -20,5 +20,5 @@
  +19Another heading.
  +20
  +21More text here.
-F1 help  F1 help                                           VISUAL (new) 1:1  4%
+ +22
 F1 help  F1 help                                           VISUAL (new) 1:1  4%

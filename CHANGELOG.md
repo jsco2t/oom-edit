@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Edit mode now renders a single status row and uses the reclaimed row for editor content.
 - Nested links, headings, and footnotes in lists and blockquotes now retain document-level View metadata, use sequential link markers, and finalize footer panels only once.
 - Words that end exactly at the View wrap boundary no longer wrap prematurely to the next line.
 - Semantic highlight spans now consistently use character indices, fixing non-ASCII styling alignment in source highlighting, fenced code, front matter, tables, and wrapped View content.

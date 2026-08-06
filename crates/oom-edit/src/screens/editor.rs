@@ -18,43 +18,14 @@ use crate::widgets::status_bar;
 
 /// Render the editor screen into the given frame area.
 ///
-/// The `area` is the full terminal rect; the body occupies the top portion
-/// and the status row occupies the bottom line.
+/// The `area` is the editor body rect; the application owns surrounding UI.
 pub fn render_editor(
     frame: &mut Frame<'_>,
     session: &mut EditorSession,
     top_line: usize,
-    status_msg: &str,
-    transient: Option<&status_bar::Transient>,
-    overlay_hints: &str,
     area: Rect,
 ) {
-    let status_height: u16 = 1;
-    let body_height = area.height.saturating_sub(status_height);
-
-    let body_area = Rect {
-        x: area.x,
-        y: area.y,
-        width: area.width,
-        height: body_height,
-    };
-
-    let status_area = Rect {
-        x: area.x,
-        y: area.y + body_height,
-        width: area.width,
-        height: status_height,
-    };
-
-    render_body(frame, session, top_line, body_area);
-    render_status_row(
-        frame,
-        session,
-        status_msg,
-        transient,
-        overlay_hints,
-        status_area,
-    );
+    render_body(frame, session, top_line, area);
 }
 
 /// Render the editor body (gutter + source lines + cursor + selections).
@@ -300,6 +271,37 @@ fn mode_to_context(mode: oom_edit_core::session::Mode) -> Contexts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    #[test]
+    fn render_editor_uses_full_area_height() {
+        let text = (1..=20)
+            .map(|line| format!("line {line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut session = EditorSession::from_text(&text);
+        let backend = TestBackend::new(40, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_editor(frame, &mut session, 0, area);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let last_row: String = buffer.content()[19 * 40..20 * 40]
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(
+            last_row.contains("line 20"),
+            "expected the final editor-area row to be rendered, got {last_row:?}"
+        );
+    }
 
     #[test]
     fn mode_to_context_normal() {

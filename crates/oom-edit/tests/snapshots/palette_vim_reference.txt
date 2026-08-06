@@ -20,5 +20,5 @@
  +19Another heading.
  +20
  +21More text here.
-↑↓ navigate · type to filter · Enter execute · Esc close   NORMAL (new) 1:1  4%
+ +22
 ↑↓ navigate · type to filter · Enter execute · Esc close   NORMAL (new) 1:1  4%

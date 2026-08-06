@@ -257,15 +257,7 @@ impl App {
                     self.tier,
                 );
             } else {
-                render_editor(
-                    frame,
-                    &mut entry.session,
-                    entry.top_line,
-                    &self.status_message,
-                    self.transient.as_ref(),
-                    self.overlay.hints(),
-                    body_area,
-                );
+                render_editor(frame, &mut entry.session, entry.top_line, body_area);
             }
         }
 

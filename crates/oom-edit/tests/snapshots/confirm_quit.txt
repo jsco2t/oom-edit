@@ -20,5 +20,5 @@
  +19Another heading.
  +20
  +21More text here.
-y/w save+quit · n quit · Esc cancel                        NORMAL (new) [+] 1:1
+ +22
 y/w save+quit · n quit · Esc cancel                        NORMAL (new) [+] 1:1
