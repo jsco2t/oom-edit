@@ -345,7 +345,14 @@ impl Highlighter {
                 })
                 .collect();
 
-            let line_spans = merge_overlapping_spans(line_spans);
+            let mut line_spans = merge_overlapping_spans(line_spans);
+            line_spans.sort_by_key(|span| span.start_col);
+            debug_assert!(
+                line_spans
+                    .windows(2)
+                    .all(|pair| pair[0].end_col <= pair[1].start_col),
+                "highlight_lines produced overlapping spans on line {line_idx}: {line_spans:?}"
+            );
 
             result.push(StyledLine {
                 text: line_text.to_string(),
@@ -747,7 +754,8 @@ pub fn highlight_snippet(lang: &str, text: &str) -> Vec<StyledLine> {
             })
             .collect();
 
-        let spans = merge_overlapping_spans(spans);
+        let mut spans = merge_overlapping_spans(spans);
+        spans.sort_by_key(|span| span.start_col);
 
         result.push(StyledLine {
             text: line_text.to_string(),
@@ -1096,6 +1104,13 @@ fn merge_overlapping_spans(spans: Vec<RankedSpan>) -> Vec<Span> {
             style: winner.span.style,
         });
     }
+
+    debug_assert!(
+        merged
+            .windows(2)
+            .all(|pair| pair[0].end_col <= pair[1].start_col),
+        "merge_overlapping_spans produced overlapping output: {merged:?}"
+    );
 
     merged
 }
@@ -2024,59 +2039,166 @@ mod tests {
     }
 
     #[test]
-    fn merge_overlapping_spans_uses_explicit_later_priority() {
+    fn merge_same_style_overlap() {
         let merged = merge_overlapping_spans(vec![
-            RankedSpan {
-                span: Span {
-                    start_col: 0,
-                    end_col: 20,
-                    style: SemanticStyle::CodeBlock,
-                },
-                priority: 0,
-            },
-            RankedSpan {
-                span: Span {
-                    start_col: 2,
-                    end_col: 4,
-                    style: SemanticStyle::Keyword,
-                },
-                priority: 1,
-            },
-            RankedSpan {
-                span: Span {
-                    start_col: 3,
-                    end_col: 5,
-                    style: SemanticStyle::Comment,
-                },
-                priority: 2,
-            },
+            ranked_span(0, 10, SemanticStyle::Heading1, 0),
+            ranked_span(5, 15, SemanticStyle::Heading1, 1),
+        ]);
+
+        assert_eq!(merged, vec![span(0, 15, SemanticStyle::Heading1)]);
+    }
+
+    #[test]
+    fn merge_different_style_overlap_later_wins() {
+        let merged = merge_overlapping_spans(vec![
+            ranked_span(0, 10, SemanticStyle::Heading1, 0),
+            ranked_span(5, 8, SemanticStyle::Emphasis, 1),
         ]);
 
         assert_eq!(
             merged,
             vec![
-                Span {
-                    start_col: 0,
-                    end_col: 2,
-                    style: SemanticStyle::CodeBlock,
-                },
-                Span {
-                    start_col: 2,
-                    end_col: 3,
-                    style: SemanticStyle::Keyword,
-                },
-                Span {
-                    start_col: 3,
-                    end_col: 5,
-                    style: SemanticStyle::Comment,
-                },
-                Span {
-                    start_col: 5,
-                    end_col: 20,
-                    style: SemanticStyle::CodeBlock,
-                },
+                span(0, 5, SemanticStyle::Heading1),
+                span(5, 8, SemanticStyle::Emphasis),
+                span(8, 10, SemanticStyle::Heading1),
             ]
         );
+    }
+
+    #[test]
+    fn merge_later_fully_covers_earlier() {
+        let merged = merge_overlapping_spans(vec![
+            ranked_span(2, 5, SemanticStyle::Heading1, 0),
+            ranked_span(0, 10, SemanticStyle::Emphasis, 1),
+        ]);
+
+        assert_eq!(merged, vec![span(0, 10, SemanticStyle::Emphasis)]);
+    }
+
+    #[test]
+    fn merge_triple_nested() {
+        let merged = merge_overlapping_spans(vec![
+            ranked_span(0, 20, SemanticStyle::Heading1, 0),
+            ranked_span(2, 4, SemanticStyle::Emphasis, 1),
+            ranked_span(3, 5, SemanticStyle::Strong, 2),
+        ]);
+
+        assert_eq!(
+            merged,
+            vec![
+                span(0, 2, SemanticStyle::Heading1),
+                span(2, 3, SemanticStyle::Emphasis),
+                span(3, 5, SemanticStyle::Strong),
+                span(5, 20, SemanticStyle::Heading1),
+            ]
+        );
+        assert!(merged
+            .windows(2)
+            .all(|pair| pair[0].end_col <= pair[1].start_col));
+    }
+
+    #[test]
+    fn merge_adjacent_same_style() {
+        let merged = merge_overlapping_spans(vec![
+            ranked_span(0, 5, SemanticStyle::Heading1, 0),
+            ranked_span(5, 10, SemanticStyle::Heading1, 1),
+        ]);
+
+        assert_eq!(merged, vec![span(0, 10, SemanticStyle::Heading1)]);
+    }
+
+    #[test]
+    fn merge_adjacent_different_style() {
+        let merged = merge_overlapping_spans(vec![
+            ranked_span(0, 5, SemanticStyle::Heading1, 0),
+            ranked_span(5, 10, SemanticStyle::Emphasis, 1),
+        ]);
+
+        assert_eq!(
+            merged,
+            vec![
+                span(0, 5, SemanticStyle::Heading1),
+                span(5, 10, SemanticStyle::Emphasis),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_no_overlap() {
+        let merged = merge_overlapping_spans(vec![
+            ranked_span(0, 3, SemanticStyle::Heading1, 0),
+            ranked_span(5, 8, SemanticStyle::Emphasis, 1),
+        ]);
+
+        assert_eq!(
+            merged,
+            vec![
+                span(0, 3, SemanticStyle::Heading1),
+                span(5, 8, SemanticStyle::Emphasis),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_empty_and_single() {
+        assert!(merge_overlapping_spans(Vec::new()).is_empty());
+
+        let single = span(0, 5, SemanticStyle::Heading1);
+        assert_eq!(
+            merge_overlapping_spans(vec![RankedSpan {
+                span: single.clone(),
+                priority: 7,
+            }]),
+            vec![single]
+        );
+    }
+
+    #[test]
+    fn merge_priority_survives_start_sort_pressure() {
+        let merged = merge_overlapping_spans(vec![
+            ranked_span(10, 20, SemanticStyle::Heading1, 0),
+            ranked_span(0, 15, SemanticStyle::Emphasis, 1),
+        ]);
+
+        assert_eq!(
+            merged,
+            vec![
+                span(0, 15, SemanticStyle::Emphasis),
+                span(15, 20, SemanticStyle::Heading1),
+            ]
+        );
+    }
+
+    #[test]
+    fn highlight_lines_spans_non_overlapping() {
+        let text = "---\ntitle: Span contract\nenabled: true\n---\n# Hello *world*\n\n```rust\nfn main() {}\n```\n";
+        let lines = Highlighter::new(text).highlight_lines(0..usize::MAX);
+
+        for (line_index, line) in lines.iter().enumerate() {
+            assert!(
+                line.spans
+                    .windows(2)
+                    .all(|pair| pair[0].end_col <= pair[1].start_col),
+                "spans must be non-overlapping on line {line_index}: {:?}",
+                line.spans
+            );
+        }
+
+        let heading = &lines[4];
+        let world_col = heading.text.find("world").expect("emphasized word");
+        assert!(heading.spans.iter().any(|span| {
+            span.start_col <= world_col
+                && span.end_col > world_col
+                && span.style == SemanticStyle::Emphasis
+        }));
+
+        let rust = &lines[7];
+        let fn_col = rust.text.find("fn").expect("Rust function keyword");
+        assert!(rust.spans.iter().any(|span| {
+            span.start_col <= fn_col
+                && span.end_col > fn_col
+                && span.style == SemanticStyle::Keyword
+        }));
     }
 
     #[test]
@@ -2288,6 +2410,24 @@ mod tests {
                             &fresh[i].text,
                             "line {} text mismatch after edit",
                             i
+                        );
+                        prop_assert!(
+                            incremental[i]
+                                .spans
+                                .windows(2)
+                                .all(|pair| pair[0].end_col <= pair[1].start_col),
+                            "incremental spans overlap on line {}: {:?}",
+                            i,
+                            incremental[i].spans
+                        );
+                        prop_assert!(
+                            fresh[i]
+                                .spans
+                                .windows(2)
+                                .all(|pair| pair[0].end_col <= pair[1].start_col),
+                            "fresh spans overlap on line {}: {:?}",
+                            i,
+                            fresh[i].spans
                         );
                         prop_assert_eq!(
                             incremental[i].spans.len(),
@@ -2593,6 +2733,26 @@ mod tests {
             }
         }
         lines
+    }
+
+    fn span(start_col: usize, end_col: usize, style: SemanticStyle) -> Span {
+        Span {
+            start_col,
+            end_col,
+            style,
+        }
+    }
+
+    fn ranked_span(
+        start_col: usize,
+        end_col: usize,
+        style: SemanticStyle,
+        priority: usize,
+    ) -> RankedSpan {
+        RankedSpan {
+            span: span(start_col, end_col, style),
+            priority,
+        }
     }
 
     fn span_text(line: &StyledLine, span: &Span) -> String {
