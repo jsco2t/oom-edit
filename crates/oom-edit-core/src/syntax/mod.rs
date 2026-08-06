@@ -189,31 +189,7 @@ impl Highlighter {
         let old_text = self.text.clone();
         let valid_edits: Vec<_> = sorted_edits
             .iter()
-            .filter_map(|edit| {
-                // Skip zero-length edits — they don't change the tree structure.
-                if edit.range.start == edit.range.end {
-                    return None;
-                }
-                let start_byte = edit.range.start;
-                let end_byte = edit.range.end;
-                // Normalize backward-range edits (hjkl produces these for
-                // operations like Visual-mode X; the range represents the
-                // same character deletion/replacement, just with inverted bounds).
-                let (a, b) = if start_byte < end_byte {
-                    (start_byte, end_byte)
-                } else {
-                    (end_byte, start_byte)
-                };
-                let new_end_byte = start_byte + edit.new_text_len;
-                Some(tree_sitter::InputEdit {
-                    start_byte: a,
-                    old_end_byte: b,
-                    new_end_byte,
-                    start_position: byte_to_point(&old_text, a),
-                    old_end_position: byte_to_point(&old_text, b),
-                    new_end_position: byte_to_point(&old_text, new_end_byte),
-                })
-            })
+            .filter_map(|edit| input_edit(&old_text, edit))
             .collect();
 
         // Apply tree edits before updating text so tree-sitter positions
@@ -835,6 +811,36 @@ fn md_capture_to_style(capture: &str) -> SemanticStyle {
 
 // ── Helper: byte offset → (row, col) ───────────────────────────────────────
 
+/// Construct a tree-sitter edit from a replacement against `old_text`.
+fn input_edit(old_text: &str, edit: &TextEdit) -> Option<tree_sitter::InputEdit> {
+    // Skip zero-length edits — they don't change the tree structure.
+    if edit.range.start == edit.range.end {
+        return None;
+    }
+
+    let start_byte = edit.range.start;
+    let end_byte = edit.range.end;
+    // Normalize backward-range edits (hjkl produces these for operations like
+    // Visual-mode X; the range represents the same character deletion or
+    // replacement, just with inverted bounds).
+    let (a, b) = if start_byte < end_byte {
+        (start_byte, end_byte)
+    } else {
+        (end_byte, start_byte)
+    };
+    let new_end_byte = a + edit.new_text_len;
+    let start_position = byte_to_point(old_text, a);
+
+    Some(tree_sitter::InputEdit {
+        start_byte: a,
+        old_end_byte: b,
+        new_end_byte,
+        start_position,
+        old_end_position: byte_to_point(old_text, b),
+        new_end_position: compute_new_end_point(start_position, &edit.new_text),
+    })
+}
+
 /// Convert a byte offset in `text` to a `(row, col)` point.
 fn byte_to_point(text: &str, byte: usize) -> Point {
     let mut row = 0usize;
@@ -843,6 +849,22 @@ fn byte_to_point(text: &str, byte: usize) -> Point {
         if i >= byte {
             break;
         }
+        if c == '\n' {
+            row += 1;
+            col = 0;
+        } else {
+            col += c.len_utf8();
+        }
+    }
+    Point::new(row, col)
+}
+
+/// Compute the `Point` where replacement text ends, given the `Point`
+/// where the replacement starts.
+fn compute_new_end_point(start: Point, new_text: &str) -> Point {
+    let mut row = start.row;
+    let mut col = start.column;
+    for c in new_text.chars() {
         if c == '\n' {
             row += 1;
             col = 0;
@@ -964,6 +986,101 @@ mod tests {
     use proptest::prelude::*;
 
     #[test]
+    fn new_end_point_empty_text() {
+        assert_eq!(
+            compute_new_end_point(Point::new(3, 5), ""),
+            Point::new(3, 5)
+        );
+    }
+
+    #[test]
+    fn new_end_point_single_char() {
+        assert_eq!(
+            compute_new_end_point(Point::new(0, 0), "x"),
+            Point::new(0, 1)
+        );
+    }
+
+    #[test]
+    fn new_end_point_newline() {
+        assert_eq!(
+            compute_new_end_point(Point::new(2, 10), "\n"),
+            Point::new(3, 0)
+        );
+    }
+
+    #[test]
+    fn new_end_point_multi_line() {
+        assert_eq!(
+            compute_new_end_point(Point::new(0, 0), "abc\ndef\n"),
+            Point::new(2, 0)
+        );
+    }
+
+    #[test]
+    fn new_end_point_multi_line_with_trailing_text() {
+        assert_eq!(
+            compute_new_end_point(Point::new(2, 10), "abc\ndef"),
+            Point::new(3, 3)
+        );
+    }
+
+    #[test]
+    fn new_end_point_multibyte_utf8() {
+        assert_eq!(
+            compute_new_end_point(Point::new(0, 0), "a\u{00e9}b"),
+            Point::new(0, 4)
+        );
+    }
+
+    #[test]
+    fn forward_range_input_edit_regression() {
+        let edit = TextEdit {
+            range: 6..12,
+            new_text_len: 3,
+            new_text: "abc".to_string(),
+        };
+        let actual = input_edit("first\nsecond line\n", &edit).expect("non-empty edit");
+
+        assert_eq!(actual.start_byte, 6);
+        assert_eq!(actual.old_end_byte, 12);
+        assert_eq!(actual.new_end_byte, 9);
+        assert_eq!(actual.start_position, Point::new(1, 0));
+        assert_eq!(actual.old_end_position, Point::new(1, 6));
+        assert_eq!(actual.new_end_position, Point::new(1, 3));
+    }
+
+    #[test]
+    fn backward_range_input_edit_uses_normalized_start() {
+        let edit = TextEdit {
+            range: Range { start: 12, end: 6 },
+            new_text_len: 3,
+            new_text: "abc".to_string(),
+        };
+        let actual = input_edit("first\nsecond line\n", &edit).expect("non-empty edit");
+
+        assert_eq!(actual.start_byte, 6);
+        assert_eq!(actual.old_end_byte, 12);
+        assert_eq!(actual.new_end_byte, 9);
+        assert_eq!(actual.start_position, Point::new(1, 0));
+        assert_eq!(actual.old_end_position, Point::new(1, 6));
+        assert_eq!(actual.new_end_position, Point::new(1, 3));
+    }
+
+    #[test]
+    fn replacement_input_edit_uses_new_text_for_end_position() {
+        let edit = TextEdit {
+            range: 5..6,
+            new_text_len: 1,
+            new_text: "\n".to_string(),
+        };
+        let actual = input_edit("alpha beta\n", &edit).expect("non-empty edit");
+
+        assert_eq!(actual.new_end_byte, 6);
+        assert_eq!(actual.new_end_position, Point::new(1, 0));
+    }
+
+    #[test]
     fn highlighter_new_parses_simple_markdown() {
         let h = Highlighter::new("# Hello\n\nWorld\n");
         let lines = h.highlight_lines(0..3);
@@ -1073,6 +1190,82 @@ mod tests {
 
         let after = h.highlight_lines(0..1);
         assert_eq!(after[0].text, "# ");
+    }
+
+    #[test]
+    fn backward_range_delete_incremental() {
+        let lines = assert_edit_matches_fresh(
+            "# Heading\n\nParagraph with *emphasis* here.\n",
+            TextEdit {
+                range: Range { start: 10, end: 5 },
+                new_text_len: 0,
+                new_text: String::new(),
+            },
+        );
+
+        assert!(!lines.is_empty());
+    }
+
+    #[test]
+    fn backward_range_replace_incremental() {
+        let lines = assert_edit_matches_fresh(
+            "# Heading\n\nParagraph with *emphasis* here.\n",
+            TextEdit {
+                range: Range { start: 10, end: 5 },
+                new_text_len: 3,
+                new_text: "abc".to_string(),
+            },
+        );
+
+        assert!(!lines.is_empty());
+    }
+
+    #[test]
+    fn newline_insertion_incremental() {
+        let initial = "Paragraph with *emphasis* here.\n";
+        let before_line_count = Highlighter::new(initial).highlight_lines(0..100).len();
+        let lines = assert_edit_matches_fresh(
+            initial,
+            TextEdit {
+                range: 15..15,
+                new_text_len: 1,
+                new_text: "\n".to_string(),
+            },
+        );
+
+        assert_eq!(lines.len(), before_line_count + 1);
+    }
+
+    #[test]
+    fn newline_replacement_incremental() {
+        let initial = "Paragraph with *emphasis* here.\n";
+        let before_line_count = Highlighter::new(initial).highlight_lines(0..100).len();
+        let lines = assert_edit_matches_fresh(
+            initial,
+            TextEdit {
+                range: 14..15,
+                new_text_len: 1,
+                new_text: "\n".to_string(),
+            },
+        );
+
+        assert_eq!(lines.len(), before_line_count + 1);
+    }
+
+    #[test]
+    fn multi_line_paste_incremental() {
+        let initial = "# Heading\n\nParagraph here.\n";
+        let before_line_count = Highlighter::new(initial).highlight_lines(0..100).len();
+        let lines = assert_edit_matches_fresh(
+            initial,
+            TextEdit {
+                range: 12..21,
+                new_text_len: 20,
+                new_text: "first\n**bold**\nlast\n".to_string(),
+            },
+        );
+
+        assert_eq!(lines.len(), before_line_count + 3);
     }
 
     #[test]
@@ -1257,7 +1450,7 @@ mod tests {
         })]
 
         #[test]
-        fn incremental_equivalence_proptest(
+        fn proptest_with_backward_and_newlines(
             text in r"[\x20-\x7E\n]{10,500}",
             edit_ops in proptest::collection::vec(
                 proptest::collection::vec(proptest::prelude::any::<u8>(), 1..5),
@@ -1272,25 +1465,35 @@ mod tests {
                     let edit_start = (byte as usize) % (current_text.len() + 1);
                     let insert_len = ((byte.wrapping_add(1)) as usize) % 10;
                     let new_text: String = (0..insert_len)
-                        .map(|i| ((byte.wrapping_add(i as u8)) % 95 + 32) as char)
+                        .map(|i| {
+                            if byte.wrapping_add(i as u8).is_multiple_of(5) {
+                                '\n'
+                            } else {
+                                ((byte.wrapping_add(i as u8)) % 95 + 32) as char
+                            }
+                        })
                         .collect();
 
                     let edit_end = (edit_start + ((byte.wrapping_add(10)) as usize) % current_text.len().max(1)).min(current_text.len());
+                    let normalized_start = edit_start.min(edit_end);
+                    let normalized_end = edit_start.max(edit_end);
+                    let range = if byte % 2 == 0 {
+                        normalized_start..normalized_end
+                    } else {
+                        normalized_end..normalized_start
+                    };
 
                     let edit = TextEdit {
-                        range: edit_start..edit_end,
+                        range,
                         new_text_len: new_text.len(),
                         new_text: new_text.clone(),
                     };
 
                     highlighter.apply_edit(std::slice::from_ref(&edit));
 
-                    if edit_end > current_text.len() {
-                        continue;
-                    }
-                    let start = edit_start.min(current_text.len());
-                    let end = edit_end.min(current_text.len());
-                    current_text.replace_range(start..end, &new_text);
+                    current_text.replace_range(normalized_start..normalized_end, &new_text);
+
+                    prop_assert_eq!(highlighter.text(), &current_text);
 
                     let incremental = highlighter.highlight_lines(0..1000);
                     let fresh = Highlighter::new(&current_text).highlight_lines(0..1000);
@@ -1479,5 +1682,21 @@ mod tests {
         doc.push_str("```rust\nfn main() {}\n```\n\n");
         doc.push_str("- item 1\n- item 2\n");
         doc
+    }
+
+    fn assert_edit_matches_fresh(initial: &str, edit: TextEdit) -> Vec<StyledLine> {
+        let mut expected_text = initial.to_string();
+        let start = edit.range.start.min(edit.range.end);
+        let end = edit.range.start.max(edit.range.end);
+        expected_text.replace_range(start..end, &edit.new_text);
+
+        let mut highlighter = Highlighter::new(initial);
+        highlighter.apply_edit(&[edit]);
+
+        assert_eq!(highlighter.text(), expected_text);
+        let incremental = highlighter.highlight_lines(0..1000);
+        let fresh = Highlighter::new(&expected_text).highlight_lines(0..1000);
+        assert_eq!(incremental, fresh);
+        incremental
     }
 }
