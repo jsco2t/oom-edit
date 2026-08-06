@@ -435,7 +435,9 @@ impl Highlighter {
 
             // Skip nodes entirely outside the range
             if child.end_byte() <= range.start || child.start_byte() >= range.end {
-                cursor.goto_next_sibling();
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
                 continue;
             }
 
@@ -964,6 +966,9 @@ mod tests {
     #[cfg(test)]
     use proptest::prelude::*;
 
+    const VIEWPORT_MARKDOWN: &str =
+        "# Heading\n\nIntro paragraph.\n\nMiddle paragraph.\n\n```rust\nfn main() {}\n```\nTail paragraph.\n";
+
     #[test]
     fn new_end_point_empty_text() {
         assert_eq!(
@@ -1288,6 +1293,63 @@ mod tests {
         let h = Highlighter::new("line1\nline2\n");
         let lines = h.highlight_lines(2..2);
         assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn viewport_partial_range_no_hang() {
+        let h = Highlighter::new(VIEWPORT_MARKDOWN);
+        let lines = h.highlight_lines(0..2);
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].text, "# Heading");
+        assert_eq!(lines[1].text, "");
+    }
+
+    #[test]
+    fn viewport_mid_range_no_hang() {
+        let h = Highlighter::new(VIEWPORT_MARKDOWN);
+        let lines = h.highlight_lines(3..5);
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].text, "");
+        assert_eq!(lines[1].text, "Middle paragraph.");
+    }
+
+    #[test]
+    fn viewport_last_line_only() {
+        let h = Highlighter::new("# Heading\none\ntwo\nthree\nlast");
+        let lines = h.highlight_lines(4..5);
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text, "last");
+    }
+
+    #[test]
+    fn viewport_with_inline_at_boundary() {
+        let h = Highlighter::new("# Heading\n\n*emphasis* and `code`\nTrailing block.\n");
+        let lines = h.highlight_lines(0..3);
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[2].text, "*emphasis* and `code`");
+        assert_eq!(lines[2].spans.len(), 6);
+        assert!(lines[2]
+            .spans
+            .iter()
+            .any(|span| span.style == SemanticStyle::Emphasis));
+        assert!(lines[2]
+            .spans
+            .iter()
+            .any(|span| span.style == SemanticStyle::CodeSpan));
+    }
+
+    #[test]
+    fn viewport_excludes_all_nodes() {
+        let h = Highlighter::new("# Heading\n\nParagraph.\n");
+        let lines = h.highlight_lines(100..200);
+
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].text.is_empty());
+        assert!(lines[0].spans.is_empty());
     }
 
     #[test]
