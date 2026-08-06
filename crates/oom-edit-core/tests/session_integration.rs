@@ -8,6 +8,8 @@ use oom_edit_core::session::{
 };
 use oom_edit_core::style::SemanticStyle;
 
+const VIEW_EXIT_TEXT: &str = "first paragraph\n\nsecond paragraph\n\nthird paragraph";
+
 fn key(ch: char) -> KeyInput {
     KeyInput {
         code: KeyCode {
@@ -22,6 +24,22 @@ fn key_special(kind: KeyCodeKind) -> KeyInput {
         code: KeyCode { kind },
         mods: Modifiers::default(),
     }
+}
+
+fn move_view_cursor_to_text(session: &mut EditorSession, needle: &str) {
+    session.toggle_view();
+    let target_line = session
+        .render_view(80)
+        .lines
+        .iter()
+        .position(|line| line.styled.text.contains(needle))
+        .unwrap_or_else(|| panic!("rendered View should contain {needle:?}"));
+
+    for _ in 0..target_line {
+        session.handle_key(key_special(KeyCodeKind::Down));
+    }
+
+    assert_eq!(session.view_cursor_line(), target_line);
 }
 
 // ── Basic session operations ────────────────────────────────────────────────
@@ -288,6 +306,104 @@ fn toggle_view_from_view_returns_to_normal() {
         "toggle_view from View should emit ModeChanged(Normal)"
     );
     assert!(matches!(session.mode(), Mode::Normal));
+}
+
+#[test]
+fn view_i_enters_insert() {
+    let mut session = EditorSession::from_text(VIEW_EXIT_TEXT);
+    move_view_cursor_to_text(&mut session, "second paragraph");
+
+    let effects = session.handle_key(key('i'));
+
+    assert_eq!(session.mode(), Mode::Insert);
+    assert_eq!(session.cursor(), (2, 0));
+    assert_eq!(session.document(), VIEW_EXIT_TEXT);
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::ModeChanged(Mode::Insert))));
+}
+
+#[test]
+fn view_a_enters_insert_after() {
+    let mut session = EditorSession::from_text(VIEW_EXIT_TEXT);
+    move_view_cursor_to_text(&mut session, "second paragraph");
+
+    let effects = session.handle_key(key('a'));
+
+    assert_eq!(session.mode(), Mode::Insert);
+    assert_eq!(session.cursor(), (2, 1));
+    assert_eq!(session.document(), VIEW_EXIT_TEXT);
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::ModeChanged(Mode::Insert))));
+}
+
+#[test]
+fn view_o_opens_line_below() {
+    let mut session = EditorSession::from_text(VIEW_EXIT_TEXT);
+    move_view_cursor_to_text(&mut session, "second paragraph");
+    let original_line_count = session.line_count();
+
+    let effects = session.handle_key(key('o'));
+
+    assert_eq!(session.mode(), Mode::Insert);
+    assert_eq!(session.cursor(), (3, 0));
+    assert_eq!(session.line_count(), original_line_count + 1);
+    assert_eq!(
+        session.document(),
+        "first paragraph\n\nsecond paragraph\n\n\nthird paragraph"
+    );
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::ModeChanged(Mode::Insert))));
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::Edited)));
+}
+
+#[test]
+fn view_iao_distinct_behavior() {
+    let outcomes = ['i', 'a', 'o'].map(|action| {
+        let mut session = EditorSession::from_text(VIEW_EXIT_TEXT);
+        move_view_cursor_to_text(&mut session, "second paragraph");
+        session.handle_key(key(action));
+        (session.cursor(), session.line_count())
+    });
+
+    assert_ne!(outcomes[0], outcomes[1]);
+    assert_ne!(outcomes[0], outcomes[2]);
+    assert_ne!(outcomes[1], outcomes[2]);
+}
+
+#[test]
+fn view_search_accepts_exit_action_letters() {
+    let original = "# Opening\n## radio signal\n## Closing";
+    let mut session = EditorSession::from_text(original);
+    session.toggle_view();
+    let target_line = session
+        .render_view(80)
+        .lines
+        .iter()
+        .position(|line| line.styled.text.contains("radio signal"))
+        .expect("rendered View should contain the unique search target");
+
+    session.handle_key(key('/'));
+    for ch in "radio".chars() {
+        session.handle_key(key(ch));
+    }
+    session.handle_key(key_special(KeyCodeKind::Enter));
+
+    assert_eq!(session.mode(), Mode::View);
+    assert_eq!(
+        session
+            .view_search()
+            .expect("submitted View search should be retained")
+            .pattern,
+        "radio"
+    );
+    assert_eq!(session.view_cursor_line(), target_line);
+    assert_eq!(session.document(), original);
+    assert!(!session.is_dirty());
 }
 
 // ── Dirty flag ──────────────────────────────────────────────────────────────

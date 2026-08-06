@@ -1279,7 +1279,7 @@ fn v_m_view_enter_i() {
     let mut sess = session(FIXTURE_3LINES);
     feed(&mut sess, ":view<Enter>");
     feed(&mut sess, "i");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Normal);
+    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Insert);
 }
 
 #[test]
@@ -1287,7 +1287,7 @@ fn v_m_view_enter_a() {
     let mut sess = session(FIXTURE_3LINES);
     feed(&mut sess, ":view<Enter>");
     feed(&mut sess, "a");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Normal);
+    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Insert);
 }
 
 #[test]
@@ -1295,7 +1295,7 @@ fn v_m_view_enter_o() {
     let mut sess = session(FIXTURE_3LINES);
     feed(&mut sess, ":view<Enter>");
     feed(&mut sess, "o");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Normal);
+    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Insert);
 }
 
 #[test]
@@ -2575,6 +2575,12 @@ fn vn6_n_repeat_search() {
             mods: Modifiers::default(),
         });
     }
+    sess.handle_key(KeyInput {
+        code: KeyCode {
+            kind: KeyCodeKind::Enter,
+        },
+        mods: Modifiers::default(),
+    });
     // Press n to repeat
     let effects = sess.handle_key(KeyInput {
         code: KeyCode {
@@ -2612,7 +2618,7 @@ fn fr_1_6_i_exit_to_edit() {
     });
     assert!(effects
         .iter()
-        .any(|e| matches!(e, Effect::ModeChanged(oom_edit_core::session::Mode::Normal))));
+        .any(|e| matches!(e, Effect::ModeChanged(oom_edit_core::session::Mode::Insert))));
 }
 
 #[test]
@@ -2627,7 +2633,7 @@ fn fr_1_6_a_exit_to_edit() {
     });
     assert!(effects
         .iter()
-        .any(|e| matches!(e, Effect::ModeChanged(oom_edit_core::session::Mode::Normal))));
+        .any(|e| matches!(e, Effect::ModeChanged(oom_edit_core::session::Mode::Insert))));
 }
 
 #[test]
@@ -2642,7 +2648,7 @@ fn fr_1_6_o_exit_to_edit() {
     });
     assert!(effects
         .iter()
-        .any(|e| matches!(e, Effect::ModeChanged(oom_edit_core::session::Mode::Normal))));
+        .any(|e| matches!(e, Effect::ModeChanged(oom_edit_core::session::Mode::Insert))));
 }
 
 #[test]

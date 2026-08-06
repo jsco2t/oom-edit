@@ -213,6 +213,31 @@ use crate::syntax::Highlighter;
 use crate::view::nav;
 use crate::view::BlockModel;
 
+/// Vim action applied after mapping a View cursor back to source editing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewExitAction {
+    Insert,
+    Append,
+    OpenBelow,
+}
+
+impl ViewExitAction {
+    fn key(self) -> KeyInput {
+        let action = match self {
+            Self::Insert => 'i',
+            Self::Append => 'a',
+            Self::OpenBelow => 'o',
+        };
+
+        KeyInput {
+            code: KeyCode {
+                kind: KeyCodeKind::Char(action),
+            },
+            mods: Modifiers::default(),
+        }
+    }
+}
+
 // ── ViewState ──────────────────────────────────────────────────────────────
 
 /// State for View mode (read-only rendered view).
@@ -229,6 +254,8 @@ struct ViewState {
     cursor: ViewCursor,
     /// Active search state (if in search mode).
     search: Option<ViewSearch>,
+    /// Whether typed characters are currently extending the search pattern.
+    search_input_active: bool,
     /// Whether the front-matter panel is collapsed.
     fm_collapsed: bool,
     /// Accumulated numeric count for navigation commands.
@@ -243,6 +270,7 @@ impl ViewState {
             last_width: 0,
             cursor: ViewCursor::new(0),
             search: None,
+            search_input_active: false,
             fm_collapsed: false,
             count: 0,
         }
@@ -255,6 +283,7 @@ impl ViewState {
             last_width: 0, // Will be set on first render_view call
             cursor: ViewCursor::new(0),
             search: None,
+            search_input_active: false,
             fm_collapsed: false,
             count: 0,
         }
@@ -282,6 +311,7 @@ impl ViewState {
     /// Clear search state.
     fn clear_search(&mut self) {
         self.search = None;
+        self.search_input_active = false;
     }
 }
 
@@ -805,6 +835,7 @@ impl EditorSession {
                 last_width: 0,
                 cursor,
                 search: None,
+                search_input_active: false,
                 fm_collapsed: false,
                 count: 0,
             });
@@ -854,16 +885,24 @@ impl EditorSession {
 
     /// Handle keys in View mode (FR-1.6: read-only, most keys are no-ops).
     fn handle_view_mode_key(&mut self, key: KeyInput) -> Vec<Effect> {
+        if self
+            .view_state
+            .as_ref()
+            .is_some_and(|vs| vs.search_input_active)
+        {
+            return self.handle_view_search_input(key);
+        }
+
         // FR-1.6 exception: i/a/o in View jump to editing at mapped position
         match key.code.kind {
             KeyCodeKind::Char('i') if !key.mods.ctrl && !key.mods.alt && !key.mods.shift => {
-                return self.exit_view_to_edit(0);
+                return self.exit_view_to_edit(ViewExitAction::Insert);
             }
             KeyCodeKind::Char('a') if !key.mods.ctrl && !key.mods.alt && !key.mods.shift => {
-                return self.exit_view_to_edit(1);
+                return self.exit_view_to_edit(ViewExitAction::Append);
             }
             KeyCodeKind::Char('o') if !key.mods.ctrl && !key.mods.alt && !key.mods.shift => {
-                return self.exit_view_to_edit(self.line_count());
+                return self.exit_view_to_edit(ViewExitAction::OpenBelow);
             }
             KeyCodeKind::Esc => {
                 return self.toggle_view();
@@ -925,6 +964,7 @@ impl EditorSession {
                     if new_search.pattern.is_empty() {
                         // Search mode activated but no pattern yet
                         vs.search = Some(new_search);
+                        vs.search_input_active = true;
                     } else {
                         // Pattern entered, perform search
                         vs.search = Some(new_search.clone());
@@ -941,29 +981,6 @@ impl EditorSession {
                     }
                 } else {
                     vs.clear_search();
-                }
-            } else if let Some(ref mut search_state) = vs.search {
-                // Check if we're in search mode and need to accumulate pattern
-                if let KeyCodeKind::Char(c) = key.code.kind {
-                    if c.is_ascii_alphanumeric() || c == ' ' || c == '.' || c == '_' {
-                        search_state.pattern.push(c);
-                        // Perform search with updated pattern
-                        if let Some(match_line) = nav::find_next_match(
-                            search_state,
-                            &cursor,
-                            &layout,
-                            &text,
-                            search_state.direction(),
-                        ) {
-                            vs.cursor.line = match_line;
-                            effects.push(Effect::CursorMoved);
-                        }
-                        return effects;
-                    } else if key.code.kind == KeyCodeKind::Esc {
-                        // Escape exits search mode
-                        vs.clear_search();
-                        return effects;
-                    }
                 }
             }
 
@@ -1004,13 +1021,56 @@ impl EditorSession {
         }
     }
 
-    /// Exit View mode and enter Normal mode at a mapped edit position.
-    ///
-    /// `offset` is the column offset to apply after mapping:
-    /// - 0: start of line (i key)
-    /// - 1: after character (a key)
-    /// - line_count: next line after current (o key)
-    fn exit_view_to_edit(&mut self, _offset: usize) -> Vec<Effect> {
+    /// Handle pattern entry while a View search prompt is active.
+    fn handle_view_search_input(&mut self, key: KeyInput) -> Vec<Effect> {
+        match key.code.kind {
+            KeyCodeKind::Esc => {
+                if let Some(vs) = self.view_state.as_mut() {
+                    vs.clear_search();
+                }
+                Vec::new()
+            }
+            KeyCodeKind::Enter => {
+                if let Some(vs) = self.view_state.as_mut() {
+                    vs.search_input_active = false;
+                }
+                Vec::new()
+            }
+            KeyCodeKind::Char(c)
+                if !key.mods.ctrl
+                    && !key.mods.alt
+                    && !key.mods.shift
+                    && (c.is_ascii_alphanumeric() || c == ' ' || c == '.' || c == '_') =>
+            {
+                let mut effects = Vec::new();
+                if let Some(vs) = self.view_state.as_mut() {
+                    let cursor = vs.cursor;
+                    let text = self.vim.text();
+                    let layout = vs.get_layout(&text, &self.highlighter, 80).clone();
+                    let search_state = vs
+                        .search
+                        .as_mut()
+                        .expect("active View search input must have search state");
+                    search_state.pattern.push(c);
+                    if let Some(match_line) = nav::find_next_match(
+                        search_state,
+                        &cursor,
+                        &layout,
+                        &text,
+                        search_state.direction(),
+                    ) {
+                        vs.cursor.line = match_line;
+                        effects.push(Effect::CursorMoved);
+                    }
+                }
+                effects
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Exit View mode at the mapped edit position, then apply a Vim action.
+    fn exit_view_to_edit(&mut self, action: ViewExitAction) -> Vec<Effect> {
         let (edit_line, _edit_col) = if let Some(ref mut vs) = self.view_state {
             let text = self.vim.text();
             let cursor_line = vs.cursor.line;
@@ -1026,10 +1086,13 @@ impl EditorSession {
             vs.clear_search();
             vs.count = 0;
         }
+
+        // View is session-owned while the wrapped Vim engine remains in
+        // Normal mode. Restore the session's engine-owned mode before feeding
+        // the complete command so i/a/o retain the engine's cursor, edit,
+        // indentation, and effect behavior.
         self.mode = Mode::Normal;
-        let mut effects = vec![Effect::ModeChanged(Mode::Normal)];
-        effects.push(Effect::CursorMoved);
-        effects
+        self.handle_key(action.key())
     }
 
     /// Process an ex command text and produce effects.
