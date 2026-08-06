@@ -17,6 +17,8 @@ use ratatui::{
     Frame,
 };
 
+use crate::theme::{Theme, Tier, UiSlot};
+
 /// Minimum width for `n:filename` format.
 #[expect(dead_code)]
 const TAB_BAR_WIDE_MIN: u16 = 8;
@@ -55,7 +57,7 @@ pub struct TabBarText {
 
 impl TabBar {
     /// Build the tab bar text. Pure function — no rendering.
-    pub fn build(&self) -> TabBarText {
+    pub fn build(&self, theme: &Theme, tier: Tier) -> TabBarText {
         if self.tabs.is_empty() {
             return TabBarText::default();
         }
@@ -73,13 +75,9 @@ impl TabBar {
             let is_active = i == self.active_index;
 
             let style = if is_active {
-                ratatui::style::Style::default()
-                    .fg(ratatui::style::Color::White)
-                    .add_modifier(ratatui::style::Modifier::BOLD)
+                theme.ui_style(tier, UiSlot::TabActive)
             } else {
-                ratatui::style::Style::default()
-                    .fg(ratatui::style::Color::Gray)
-                    .add_modifier(ratatui::style::Modifier::DIM)
+                theme.ui_style(tier, UiSlot::TabInactive)
             };
 
             spans.push(Span::styled(label, style));
@@ -88,7 +86,7 @@ impl TabBar {
             if i < self.tabs.len() - 1 {
                 spans.push(Span::styled(
                     "│",
-                    ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray),
+                    theme.ui_style(tier, UiSlot::TabSeparator),
                 ));
             }
         }
@@ -185,6 +183,7 @@ pub fn render(frame: &mut Frame<'_>, area: ratatui::layout::Rect, text: &TabBarT
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::{DEFAULT_DARK, DEFAULT_LIGHT};
 
     #[test]
     fn build_empty_tab_bar() {
@@ -193,7 +192,7 @@ mod tests {
             active_index: 0,
             width: 80,
         };
-        let text = bar.build();
+        let text = bar.build(&DEFAULT_DARK, Tier::TrueColor);
         assert!(text.spans.is_empty());
     }
 
@@ -213,7 +212,7 @@ mod tests {
             active_index: 0,
             width: 40,
         };
-        let text = bar.build();
+        let text = bar.build(&DEFAULT_DARK, Tier::TrueColor);
         assert!(!text.spans.is_empty());
         let full_text: String = text.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(full_text.contains("1:file1.md"));
@@ -236,7 +235,7 @@ mod tests {
             active_index: 0,
             width: 12,
         };
-        let text = bar.build();
+        let text = bar.build(&DEFAULT_DARK, Tier::TrueColor);
         assert!(!text.spans.is_empty());
         // With width=12 and 2 tabs, tab_width = (12-2)/2 = 5.
         // The tight format [n:filename] would be truncated to fit.
@@ -259,7 +258,7 @@ mod tests {
             active_index: 0,
             width: 5,
         };
-        let text = bar.build();
+        let text = bar.build(&DEFAULT_DARK, Tier::TrueColor);
         assert!(!text.spans.is_empty());
         let full_text: String = text.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(full_text.contains("1"));
@@ -282,14 +281,58 @@ mod tests {
             active_index: 1,
             width: 40,
         };
-        let text = bar.build();
+        let text = bar.build(&DEFAULT_DARK, Tier::TrueColor);
         assert_eq!(text.spans.len(), 3); // tab1, separator, tab2
                                          // The second tab (index 1) should be bold.
         assert_eq!(
             text.spans[2].style,
-            ratatui::style::Style::default()
-                .fg(ratatui::style::Color::White)
-                .add_modifier(ratatui::style::Modifier::BOLD)
+            DEFAULT_DARK.ui_style(Tier::TrueColor, UiSlot::TabActive)
+        );
+    }
+
+    #[test]
+    fn build_uses_selected_theme_and_tier() {
+        let bar = TabBar {
+            tabs: vec![
+                TabEntry {
+                    path: "active.md".to_string(),
+                    dirty: false,
+                },
+                TabEntry {
+                    path: "inactive.md".to_string(),
+                    dirty: false,
+                },
+            ],
+            active_index: 0,
+            width: 40,
+        };
+
+        let light = bar.build(&DEFAULT_LIGHT, Tier::TrueColor);
+        let monochrome = bar.build(&DEFAULT_DARK, Tier::Monochrome);
+
+        assert_eq!(
+            light.spans[0].style,
+            DEFAULT_LIGHT.ui_style(Tier::TrueColor, UiSlot::TabActive)
+        );
+        assert_eq!(
+            monochrome.spans[0].style,
+            DEFAULT_DARK.ui_style(Tier::Monochrome, UiSlot::TabActive)
+        );
+        assert_eq!(
+            light.spans[1].style,
+            DEFAULT_LIGHT.ui_style(Tier::TrueColor, UiSlot::TabSeparator)
+        );
+        assert_eq!(
+            monochrome.spans[1].style,
+            DEFAULT_DARK.ui_style(Tier::Monochrome, UiSlot::TabSeparator)
+        );
+        assert_eq!(
+            light.spans[2].style,
+            DEFAULT_LIGHT.ui_style(Tier::TrueColor, UiSlot::TabInactive)
+        );
+        assert_eq!(
+            monochrome.spans[2].style,
+            DEFAULT_DARK.ui_style(Tier::Monochrome, UiSlot::TabInactive)
         );
     }
 }

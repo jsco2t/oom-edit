@@ -14,6 +14,7 @@ use ratatui::{
 };
 
 use crate::command::{Command, Contexts, Keymap};
+use crate::theme::{Theme, Tier};
 
 // ── Vim reference table ─────────────────────────────────────────────────────
 
@@ -341,7 +342,7 @@ impl PaletteState {
     }
 
     /// Render the palette.
-    pub fn render(&self, frame: &mut Frame<'_>) {
+    pub fn render(&self, frame: &mut Frame<'_>, theme: &Theme, tier: Tier) {
         let area = centered_area(40, 12, frame.area());
         let block = Block::default()
             .borders(Borders::ALL)
@@ -373,7 +374,7 @@ impl PaletteState {
                     ..
                 } => {
                     let style = if *disabled {
-                        Style::default().fg(ratatui::style::Color::DarkGray)
+                        theme.style(tier, oom_edit_core::SemanticStyle::Muted)
                     } else {
                         Style::default()
                     };
@@ -389,7 +390,7 @@ impl PaletteState {
                     let prefix = if is_selected { "▸ " } else { "  " };
                     Line::styled(
                         format!("{}{:<20} {:<35} {}", prefix, keys, desc, row_id),
-                        Style::default().fg(ratatui::style::Color::DarkGray),
+                        theme.style(tier, oom_edit_core::SemanticStyle::Muted),
                     )
                 }
             };

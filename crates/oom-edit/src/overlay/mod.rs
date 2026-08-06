@@ -13,6 +13,7 @@ pub use confirm::{ConfirmOverwrite, ConfirmQuit, ConfirmResult};
 pub use palette::PaletteState;
 
 use crate::command::Command;
+use crate::theme::{Theme, Tier};
 
 /// An active overlay slot. Only one overlay can be open at a time.
 #[derive(Default, Debug)]
@@ -72,9 +73,9 @@ impl Overlay {
     }
 
     /// Render the overlay.
-    pub fn render(&self, frame: &mut ratatui::Frame<'_>) {
+    pub fn render(&self, frame: &mut ratatui::Frame<'_>, theme: &Theme, tier: Tier) {
         match self {
-            Overlay::Palette(p) => p.render(frame),
+            Overlay::Palette(p) => p.render(frame, theme, tier),
             Overlay::ConfirmQuit(q) => q.render(frame),
             Overlay::ConfirmOverwrite(o) => o.render(frame),
             Overlay::None => {}

@@ -19,6 +19,8 @@ use ratatui::{
 
 use oom_edit_core::session::{Mode, Severity};
 
+use crate::theme::{Theme, Tier, UiSlot};
+
 /// Status bar transient message TTL: 4 seconds.
 pub const TRANSIENT_TTL: Duration = Duration::from_secs(4);
 
@@ -87,7 +89,7 @@ pub struct StatusBarText {
 
 impl StatusBar {
     /// Build the status bar text. Pure function — no rendering.
-    pub fn build(&self, transient: Option<&Transient>) -> StatusBarText {
+    pub fn build(&self, transient: Option<&Transient>, theme: &Theme, tier: Tier) -> StatusBarText {
         // Command-line takeover: when in Command mode or View-search,
         // the entire row becomes the command line.
         if let Some(ref cmdline) = self.command_line {
@@ -104,7 +106,10 @@ impl StatusBar {
 
         // Mode badge.
         let badge = mode_badge(self.mode);
-        spans.push(Span::styled(badge, mode_badge_style(self.mode)));
+        spans.push(Span::styled(
+            badge,
+            mode_badge_style(self.mode, theme, tier),
+        ));
 
         // Left region: file + dirty + transient messages.
         let mut left = String::new();
@@ -188,29 +193,15 @@ fn mode_badge(mode: Mode) -> &'static str {
 }
 
 /// Return the style for a mode badge.
-fn mode_badge_style(mode: Mode) -> Style {
-    let (fg, modifier) = match mode {
-        Mode::Normal => (ratatui::style::Color::White, ratatui::style::Modifier::BOLD),
-        Mode::Insert => (ratatui::style::Color::Green, ratatui::style::Modifier::BOLD),
-        Mode::Visual => (
-            ratatui::style::Color::Yellow,
-            ratatui::style::Modifier::BOLD,
-        ),
-        Mode::VisualLine => (
-            ratatui::style::Color::Yellow,
-            ratatui::style::Modifier::BOLD,
-        ),
-        Mode::VisualBlock => (
-            ratatui::style::Color::Yellow,
-            ratatui::style::Modifier::BOLD,
-        ),
-        Mode::Command => (
-            ratatui::style::Color::Magenta,
-            ratatui::style::Modifier::BOLD,
-        ),
-        Mode::View => (ratatui::style::Color::Cyan, ratatui::style::Modifier::BOLD),
+fn mode_badge_style(mode: Mode, theme: &Theme, tier: Tier) -> Style {
+    let slot = match mode {
+        Mode::Normal => UiSlot::BadgeNormal,
+        Mode::Insert => UiSlot::BadgeInsert,
+        Mode::Visual | Mode::VisualLine | Mode::VisualBlock => UiSlot::BadgeVisual,
+        Mode::Command => UiSlot::BadgeCommand,
+        Mode::View => UiSlot::BadgeView,
     };
-    Style::default().fg(fg).add_modifier(modifier)
+    theme.ui_style(tier, slot)
 }
 
 /// Build the ruler text: `line:col  n%` with Top/Bot at extremes.
@@ -331,6 +322,7 @@ pub fn gutter_width(line_count: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::{DEFAULT_DARK, DEFAULT_LIGHT};
 
     // ── Mode badge ──────────────────────────────────────────────────────
 
@@ -343,6 +335,39 @@ mod tests {
         assert_eq!(mode_badge(Mode::VisualBlock), " V-BLOCK ");
         assert_eq!(mode_badge(Mode::Command), " :CMD ");
         assert_eq!(mode_badge(Mode::View), " VIEW ");
+    }
+
+    #[test]
+    fn mode_badge_uses_selected_theme_and_tier() {
+        let cases = [
+            (Mode::Normal, UiSlot::BadgeNormal),
+            (Mode::Insert, UiSlot::BadgeInsert),
+            (Mode::Visual, UiSlot::BadgeVisual),
+            (Mode::VisualLine, UiSlot::BadgeVisual),
+            (Mode::VisualBlock, UiSlot::BadgeVisual),
+            (Mode::Command, UiSlot::BadgeCommand),
+            (Mode::View, UiSlot::BadgeView),
+        ];
+
+        for (mode, slot) in cases {
+            assert_eq!(
+                mode_badge_style(mode, &DEFAULT_DARK, Tier::TrueColor),
+                DEFAULT_DARK.ui_style(Tier::TrueColor, slot)
+            );
+            assert_eq!(
+                mode_badge_style(mode, &DEFAULT_LIGHT, Tier::TrueColor),
+                DEFAULT_LIGHT.ui_style(Tier::TrueColor, slot)
+            );
+            assert_eq!(
+                mode_badge_style(mode, &DEFAULT_DARK, Tier::Monochrome),
+                DEFAULT_DARK.ui_style(Tier::Monochrome, slot)
+            );
+        }
+
+        assert_ne!(
+            mode_badge_style(Mode::Normal, &DEFAULT_DARK, Tier::TrueColor),
+            mode_badge_style(Mode::Normal, &DEFAULT_LIGHT, Tier::TrueColor)
+        );
     }
 
     // ── Severity glyph ──────────────────────────────────────────────────
@@ -550,7 +575,7 @@ mod tests {
             line_count: 10,
             command_line: Some("w".to_string()),
         };
-        let text = sb.build(None);
+        let text = sb.build(None, &DEFAULT_DARK, Tier::TrueColor);
         assert!(text.cmdline.is_some());
         assert_eq!(text.cmdline.as_deref(), Some(":w"));
         assert!(text.cmdline_cursor);
@@ -568,7 +593,7 @@ mod tests {
             line_count: 10,
             command_line: None,
         };
-        let text = sb.build(None);
+        let text = sb.build(None, &DEFAULT_DARK, Tier::TrueColor);
         assert!(text.cmdline.is_none());
         assert!(!text.spans.is_empty());
     }
@@ -613,7 +638,7 @@ mod tests {
             line_count: 10,
             command_line: None,
         };
-        let text = sb.build(None);
+        let text = sb.build(None, &DEFAULT_DARK, Tier::TrueColor);
         let full_text: String = text.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(full_text.contains("[+]"));
     }
@@ -635,7 +660,7 @@ mod tests {
             line_count: 10,
             command_line: None,
         };
-        let text = sb.build(Some(&transient));
+        let text = sb.build(Some(&transient), &DEFAULT_DARK, Tier::TrueColor);
         let full_text: String = text.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(full_text.contains("read-only view"));
     }
@@ -657,7 +682,7 @@ mod tests {
             line_count: 10,
             command_line: None,
         };
-        let text = sb.build(Some(&transient));
+        let text = sb.build(Some(&transient), &DEFAULT_DARK, Tier::TrueColor);
         let full_text: String = text.spans.iter().map(|s| s.content.as_ref()).collect();
         // FR-6.2: error message renders with ✗ even on monochrome
         assert!(full_text.contains("\u{2717}"));
@@ -680,7 +705,7 @@ mod tests {
             line_count: 10,
             command_line: None,
         };
-        let text = sb.build(Some(&transient));
+        let text = sb.build(Some(&transient), &DEFAULT_DARK, Tier::TrueColor);
         let full_text: String = text.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(full_text.contains("\u{26a0}"));
     }

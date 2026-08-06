@@ -12,7 +12,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-use crate::theme::{self, Tier};
+use crate::theme::{Theme, Tier};
 use crate::widgets::spans;
 
 /// Render the View-mode screen into the given frame area.
@@ -24,7 +24,7 @@ pub fn render_view(
     session: &mut EditorSession,
     view_top: usize,
     area: Rect,
-    theme_name: &str,
+    theme: &Theme,
     tier: Tier,
 ) {
     let height = area.height.max(1) as usize;
@@ -50,13 +50,13 @@ pub fn render_view(
 
     for i in view_top..view_bottom {
         let view_line = &layout.lines[i];
-        let spans = spans::build_spans(&view_line.styled.text, &view_line.styled.spans);
+        let spans =
+            spans::build_spans(&view_line.styled.text, &view_line.styled.spans, theme, tier);
 
         // Apply view-cursor selection highlight (VN-1).
         if i == cursor_line {
             // Full-line Selection highlight using theme.
-            let sel_style =
-                theme::get_theme(theme_name).style(tier, oom_edit_core::SemanticStyle::Selection);
+            let sel_style = theme.style(tier, oom_edit_core::SemanticStyle::Selection);
             lines.push(Line::styled(
                 format!("{}{}", view_line.styled.text, " ".repeat(80)),
                 sel_style,
@@ -82,20 +82,21 @@ pub fn render_view(
 
 #[cfg(test)]
 mod tests {
+    use crate::theme::{Tier, DEFAULT_DARK};
     use crate::widgets::spans;
 
     /// View screen: build_spans with empty text returns a single empty span.
     #[test]
     fn build_view_spans_empty_text() {
-        let spans = spans::build_spans("", &[]);
+        let spans = spans::build_spans("", &[], &DEFAULT_DARK, Tier::TrueColor);
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].content, "");
     }
 
-    /// View screen: build_spans with no spans returns unstyled white text.
+    /// View screen: build_spans with no spans returns theme-styled fallback text.
     #[test]
     fn build_view_spans_no_spans() {
-        let spans = spans::build_spans("hello", &[]);
+        let spans = spans::build_spans("hello", &[], &DEFAULT_DARK, Tier::TrueColor);
         assert_eq!(spans.len(), 1);
         assert!(spans[0].style.fg.is_some());
     }
@@ -108,7 +109,7 @@ mod tests {
             end_col: 5,
             style: oom_edit_core::SemanticStyle::Heading1,
         }];
-        let result = spans::build_spans("hello", &spans);
+        let result = spans::build_spans("hello", &spans, &DEFAULT_DARK, Tier::TrueColor);
         // Should produce 5 spans (one per character), all styled.
         assert!(!result.is_empty());
     }

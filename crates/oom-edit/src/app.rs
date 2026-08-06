@@ -25,7 +25,7 @@ use crate::command::{keymap::PendingChord, Command, Keymap};
 use crate::overlay::Overlay;
 use crate::screens::editor::{render_editor, render_status_row};
 use crate::screens::view::render_view;
-use crate::theme::{self, Tier};
+use crate::theme::{self, Theme, Tier};
 use crate::widgets::status_bar;
 use crate::widgets::which_key;
 
@@ -207,6 +207,7 @@ impl App {
     /// Render the current frame.
     pub fn render(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
+        let active_theme = theme::get_theme(&self.theme_name);
 
         // Compute viewport height from terminal size.
         // When >1 tab: tab bar (1) + body + status (1).
@@ -227,7 +228,14 @@ impl App {
                 width: area.width,
                 height: tab_bar_height,
             };
-            render_tab_bar(frame, &self.tabs, self.active_tab, tab_area);
+            render_tab_bar(
+                frame,
+                &self.tabs,
+                self.active_tab,
+                tab_area,
+                active_theme,
+                self.tier,
+            );
             draw_y += tab_bar_height;
         }
 
@@ -255,11 +263,18 @@ impl App {
                     &mut entry.session,
                     entry.view_top,
                     body_area,
-                    &self.theme_name,
+                    active_theme,
                     self.tier,
                 );
             } else {
-                render_editor(frame, &mut entry.session, entry.top_line, body_area);
+                render_editor(
+                    frame,
+                    &mut entry.session,
+                    entry.top_line,
+                    body_area,
+                    active_theme,
+                    self.tier,
+                );
             }
         }
 
@@ -268,10 +283,11 @@ impl App {
             render_status_row(
                 frame,
                 &entry.session,
-                &self.status_message,
                 self.transient.as_ref(),
                 self.overlay.hints(),
                 status_area,
+                active_theme,
+                self.tier,
             );
         }
 
@@ -280,7 +296,7 @@ impl App {
 
         // Render overlay on top if open.
         if self.overlay.is_some() {
-            self.overlay.render(frame);
+            self.overlay.render(frame, active_theme, self.tier);
         }
     }
 
@@ -1171,6 +1187,8 @@ fn render_tab_bar(
     tabs: &[TabEntry],
     active_index: usize,
     area: ratatui::layout::Rect,
+    theme: &Theme,
+    tier: Tier,
 ) {
     use crate::widgets::tab_bar;
 
@@ -1193,7 +1211,7 @@ fn render_tab_bar(
         width: area.width,
     };
 
-    let text = bar.build();
+    let text = bar.build(theme, tier);
     tab_bar::render(frame, area, &text);
 }
 
@@ -1824,6 +1842,130 @@ mod tests {
             (view_top..view_top + app.viewport_height).contains(&cursor),
             "remapped View cursor should remain visible below the tab bar"
         );
+    }
+
+    #[test]
+    fn app_render_propagates_light_theme_to_editor_status_and_tabs() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(
+            EditorSession::from_text("first\nplain"),
+            "default-light".to_string(),
+            Tier::TrueColor,
+            Box::new(RecordingClipboardSink::default()),
+        );
+        app.tabs
+            .push(TabEntry::new(EditorSession::from_text("second")));
+        let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
+
+        terminal.draw(|frame| app.render(frame)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let theme = &theme::DEFAULT_LIGHT;
+        let text_style = theme.style(Tier::TrueColor, oom_edit_core::SemanticStyle::Text);
+        let cursor_style = theme.ui_style(Tier::TrueColor, theme::UiSlot::CursorLine);
+        let cursor_cell = buffer.cell((4, 1)).expect("cursor-line document cell");
+        assert_eq!(
+            cursor_cell.fg,
+            text_style.fg.expect("light text foreground")
+        );
+        assert_eq!(
+            cursor_cell.bg,
+            cursor_style.bg.expect("light cursor-line background")
+        );
+        assert_eq!(
+            buffer.cell((4, 2)).expect("plain document cell").fg,
+            text_style.fg.expect("light text foreground")
+        );
+
+        assert_eq!(
+            buffer.cell((0, 0)).expect("active tab cell").fg,
+            theme
+                .ui_style(Tier::TrueColor, theme::UiSlot::TabActive)
+                .fg
+                .expect("active tab foreground")
+        );
+        let separator_x = (0..80)
+            .find(|x| {
+                buffer
+                    .cell((*x, 0))
+                    .is_some_and(|cell| cell.symbol() == "│")
+            })
+            .expect("tab separator");
+        assert_eq!(
+            buffer
+                .cell((separator_x, 0))
+                .expect("tab separator cell")
+                .fg,
+            theme
+                .ui_style(Tier::TrueColor, theme::UiSlot::TabSeparator)
+                .fg
+                .expect("tab separator foreground")
+        );
+        assert_eq!(
+            buffer
+                .cell((separator_x + 1, 0))
+                .expect("inactive tab cell")
+                .fg,
+            theme
+                .ui_style(Tier::TrueColor, theme::UiSlot::TabInactive)
+                .fg
+                .expect("inactive tab foreground")
+        );
+
+        let status_x = (0..80)
+            .find(|x| {
+                buffer
+                    .cell((*x, 9))
+                    .is_some_and(|cell| cell.symbol() == "N")
+            })
+            .expect("normal mode badge");
+        assert_eq!(
+            buffer.cell((status_x, 9)).expect("mode badge cell").fg,
+            theme
+                .ui_style(Tier::TrueColor, theme::UiSlot::BadgeNormal)
+                .fg
+                .expect("mode badge foreground")
+        );
+    }
+
+    #[test]
+    fn app_render_propagates_monochrome_tier_to_palette() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(
+            EditorSession::from_text("text"),
+            "default-dark".to_string(),
+            Tier::Monochrome,
+            Box::new(RecordingClipboardSink::default()),
+        );
+        app.overlay = Overlay::open_palette();
+        for ch in "beginning".chars() {
+            app.handle_event(&Event::Key(KeyEvent::new(
+                CrosstermKeyCode::Char(ch),
+                KeyModifiers::NONE,
+            )));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal.draw(|frame| app.render(frame)).unwrap();
+
+        let muted =
+            theme::DEFAULT_DARK.style(Tier::Monochrome, oom_edit_core::SemanticStyle::Muted);
+        let buffer = terminal.backend().buffer();
+        let muted_cell = (8..16)
+            .flat_map(|y| (20..58).map(move |x| (x, y)))
+            .filter_map(|position| buffer.cell(position))
+            .find(|cell| {
+                cell.symbol() != " "
+                    && cell.fg == muted.fg.expect("monochrome muted foreground")
+                    && cell.modifier.contains(muted.add_modifier)
+            })
+            .expect("monochrome muted palette row");
+
+        assert!(muted_cell.modifier.contains(muted.add_modifier));
     }
 
     /// T17: Render — basic render doesn't hang and produces output.

@@ -12,6 +12,7 @@ use ratatui::Frame;
 
 use crate::command::registry::Contexts;
 use crate::command::Keymap;
+use crate::theme::{Theme, Tier, UiSlot};
 use crate::widgets::hint_bar;
 use crate::widgets::spans;
 use crate::widgets::status_bar;
@@ -24,12 +25,21 @@ pub fn render_editor(
     session: &mut EditorSession,
     top_line: usize,
     area: Rect,
+    theme: &Theme,
+    tier: Tier,
 ) {
-    render_body(frame, session, top_line, area);
+    render_body(frame, session, top_line, area, theme, tier);
 }
 
 /// Render the editor body (gutter + source lines + cursor + selections).
-fn render_body(frame: &mut Frame<'_>, session: &mut EditorSession, top_line: usize, area: Rect) {
+fn render_body(
+    frame: &mut Frame<'_>,
+    session: &mut EditorSession,
+    top_line: usize,
+    area: Rect,
+    theme: &Theme,
+    tier: Tier,
+) {
     let height = area.height.max(1) as usize;
 
     let vp = oom_edit_core::session::Viewport {
@@ -78,7 +88,7 @@ fn render_body(frame: &mut Frame<'_>, session: &mut EditorSession, top_line: usi
     // Build lines for ratatui from the source frame.
     let mut lines = Vec::with_capacity(height);
     for styled_line in &frame_data.lines {
-        let spans = spans::build_spans(&styled_line.text, &styled_line.spans);
+        let spans = spans::build_spans(&styled_line.text, &styled_line.spans, theme, tier);
         lines.push(Line::from(spans));
     }
 
@@ -100,7 +110,7 @@ fn render_body(frame: &mut Frame<'_>, session: &mut EditorSession, top_line: usi
             | oom_edit_core::session::Mode::VisualBlock
     ) && cursor_row < height
     {
-        render_cursor_line_highlight(frame, text_area, cursor_row);
+        render_cursor_line_highlight(frame, text_area, cursor_row, theme, tier);
     }
 
     // Draw cursor.
@@ -152,7 +162,13 @@ fn render_gutter(
 }
 
 /// Render cursor line highlight in Normal/Visual modes.
-fn render_cursor_line_highlight(frame: &mut Frame<'_>, area: Rect, cursor_row: usize) {
+fn render_cursor_line_highlight(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    cursor_row: usize,
+    theme: &Theme,
+    tier: Tier,
+) {
     let row = area.y + cursor_row as u16;
     if row < area.y + area.height {
         let highlight_area = Rect {
@@ -161,7 +177,7 @@ fn render_cursor_line_highlight(frame: &mut Frame<'_>, area: Rect, cursor_row: u
             width: area.width,
             height: 1,
         };
-        let style = Style::default().bg(ratatui::style::Color::DarkGray);
+        let style = theme.ui_style(tier, UiSlot::CursorLine);
         // Render a blank rectangle with the cursor line background.
         let paragraph = Paragraph::new("").style(style);
         frame.render_widget(paragraph, highlight_area);
@@ -181,10 +197,11 @@ fn render_selection(_frame: &mut Frame<'_>, _area: Rect, _sel: &std::ops::Range<
 pub fn render_status_row(
     frame: &mut Frame<'_>,
     session: &EditorSession,
-    _status_msg: &str,
     transient: Option<&status_bar::Transient>,
     overlay_hints: &str,
     area: Rect,
+    theme: &Theme,
+    tier: Tier,
 ) {
     let mode = session.mode();
     let ctx = mode_to_context(mode);
@@ -211,7 +228,7 @@ pub fn render_status_row(
         command_line: command_line.clone(),
     };
 
-    let status_text = status.build(transient);
+    let status_text = status.build(transient, theme, tier);
 
     // Split area: hint bar on left (when no transient and no command line),
     // status bar on right (or full width when transient/command line active).
@@ -271,6 +288,7 @@ fn mode_to_context(mode: oom_edit_core::session::Mode) -> Contexts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::DEFAULT_DARK;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -287,7 +305,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render_editor(frame, &mut session, 0, area);
+                render_editor(frame, &mut session, 0, area, &DEFAULT_DARK, Tier::TrueColor);
             })
             .unwrap();
 
@@ -301,6 +319,31 @@ mod tests {
             last_row.contains("line 20"),
             "expected the final editor-area row to be rendered, got {last_row:?}"
         );
+    }
+
+    #[test]
+    fn cursor_line_preserves_semantic_foreground() {
+        let semantic_style =
+            DEFAULT_DARK.style(Tier::TrueColor, oom_edit_core::SemanticStyle::Heading1);
+        let cursor_style = DEFAULT_DARK.ui_style(Tier::TrueColor, UiSlot::CursorLine);
+        let mut terminal = Terminal::new(TestBackend::new(3, 1)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                frame.render_widget(Paragraph::new(Line::styled("abc", semantic_style)), area);
+                render_cursor_line_highlight(frame, area, 0, &DEFAULT_DARK, Tier::TrueColor);
+            })
+            .unwrap();
+
+        let cell = terminal
+            .backend()
+            .buffer()
+            .cell((0, 0))
+            .expect("rendered cursor-line cell");
+        assert_eq!(cell.fg, semantic_style.fg.expect("semantic foreground"));
+        assert_eq!(cell.bg, cursor_style.bg.expect("cursor-line background"));
+        assert!(cell.modifier.contains(cursor_style.add_modifier));
     }
 
     #[test]

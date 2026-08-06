@@ -50,6 +50,14 @@ pub enum UiSlot {
     Gutter,
     /// Gutter current-line highlight.
     GutterCurrent,
+    /// Full-width cursor-line chrome in the source editor.
+    CursorLine,
+    /// Active tab label.
+    TabActive,
+    /// Inactive tab label.
+    TabInactive,
+    /// Separator between tab labels.
+    TabSeparator,
 }
 
 // ── Palette tiers ───────────────────────────────────────────────────────────
@@ -61,7 +69,8 @@ pub enum Palette {
     TrueColor {
         /// Semantic style → (foreground, modifiers).
         semantic: &'static [(SemanticStyle, Color, Modifier)],
-        /// UI slot → (foreground, background, modifiers).
+        /// UI slot → (foreground, background, modifiers). `Reset` foreground
+        /// inherits the styled cell's existing semantic foreground.
         ui: &'static [(UiSlot, Color, Option<Color>, Modifier)],
     },
     /// 16-color ANSI palette.
@@ -108,7 +117,12 @@ impl Palette {
             Palette::TrueColor { ui, .. } | Palette::Color16 { ui, .. } => {
                 for &(s, fg, bg, modif) in ui.iter() {
                     if s == slot {
-                        let mut s = Style::default().fg(fg).add_modifier(modif);
+                        let mut s = Style::default().add_modifier(modif);
+                        // Reset is the palette sentinel for chrome that must
+                        // preserve an existing cell's semantic foreground.
+                        if fg != Color::Reset {
+                            s = s.fg(fg);
+                        }
                         if let Some(bg) = bg {
                             s = s.bg(bg);
                         }
@@ -425,6 +439,15 @@ pub static DEFAULT_DARK: Theme = Theme {
             (UiSlot::StatusError, Color::Red, None, Modifier::empty()),
             (UiSlot::Gutter, Color::DarkGray, None, Modifier::DIM),
             (UiSlot::GutterCurrent, Color::Yellow, None, Modifier::BOLD),
+            (
+                UiSlot::CursorLine,
+                Color::Reset,
+                Some(Color::DarkGray),
+                Modifier::DIM,
+            ),
+            (UiSlot::TabActive, Color::White, None, Modifier::BOLD),
+            (UiSlot::TabInactive, Color::Gray, None, Modifier::DIM),
+            (UiSlot::TabSeparator, Color::DarkGray, None, Modifier::DIM),
         ],
     },
     color16: Palette::Color16 {
@@ -488,6 +511,15 @@ pub static DEFAULT_DARK: Theme = Theme {
             (UiSlot::StatusError, Color::Red, None, Modifier::empty()),
             (UiSlot::Gutter, Color::DarkGray, None, Modifier::DIM),
             (UiSlot::GutterCurrent, Color::Yellow, None, Modifier::BOLD),
+            (
+                UiSlot::CursorLine,
+                Color::Reset,
+                Some(Color::DarkGray),
+                Modifier::DIM,
+            ),
+            (UiSlot::TabActive, Color::White, None, Modifier::BOLD),
+            (UiSlot::TabInactive, Color::Gray, None, Modifier::DIM),
+            (UiSlot::TabSeparator, Color::DarkGray, None, Modifier::DIM),
         ],
     },
     monochrome: Palette::Monochrome {
@@ -542,6 +574,10 @@ pub static DEFAULT_DARK: Theme = Theme {
             (UiSlot::StatusError, Modifier::empty()),
             (UiSlot::Gutter, Modifier::DIM),
             (UiSlot::GutterCurrent, Modifier::BOLD),
+            (UiSlot::CursorLine, Modifier::REVERSED),
+            (UiSlot::TabActive, Modifier::BOLD),
+            (UiSlot::TabInactive, Modifier::DIM),
+            (UiSlot::TabSeparator, Modifier::DIM),
         ],
     },
 };
@@ -607,6 +643,15 @@ pub static DEFAULT_LIGHT: Theme = Theme {
             (UiSlot::StatusError, Color::Red, None, Modifier::empty()),
             (UiSlot::Gutter, Color::Gray, None, Modifier::DIM),
             (UiSlot::GutterCurrent, Color::Yellow, None, Modifier::BOLD),
+            (
+                UiSlot::CursorLine,
+                Color::Reset,
+                Some(Color::Gray),
+                Modifier::DIM,
+            ),
+            (UiSlot::TabActive, Color::Black, None, Modifier::BOLD),
+            (UiSlot::TabInactive, Color::Gray, None, Modifier::DIM),
+            (UiSlot::TabSeparator, Color::Gray, None, Modifier::DIM),
         ],
     },
     color16: Palette::Color16 {
@@ -666,6 +711,15 @@ pub static DEFAULT_LIGHT: Theme = Theme {
             (UiSlot::StatusError, Color::Red, None, Modifier::empty()),
             (UiSlot::Gutter, Color::Gray, None, Modifier::DIM),
             (UiSlot::GutterCurrent, Color::Yellow, None, Modifier::BOLD),
+            (
+                UiSlot::CursorLine,
+                Color::Reset,
+                Some(Color::Gray),
+                Modifier::DIM,
+            ),
+            (UiSlot::TabActive, Color::Black, None, Modifier::BOLD),
+            (UiSlot::TabInactive, Color::Gray, None, Modifier::DIM),
+            (UiSlot::TabSeparator, Color::Gray, None, Modifier::DIM),
         ],
     },
     monochrome: Palette::Monochrome {
@@ -720,6 +774,10 @@ pub static DEFAULT_LIGHT: Theme = Theme {
             (UiSlot::StatusError, Modifier::empty()),
             (UiSlot::Gutter, Modifier::DIM),
             (UiSlot::GutterCurrent, Modifier::BOLD),
+            (UiSlot::CursorLine, Modifier::REVERSED),
+            (UiSlot::TabActive, Modifier::BOLD),
+            (UiSlot::TabInactive, Modifier::DIM),
+            (UiSlot::TabSeparator, Modifier::DIM),
         ],
     },
 };
@@ -780,6 +838,10 @@ pub static ACCESSIBLE: Theme = Theme {
             (UiSlot::StatusError, Modifier::empty()),
             (UiSlot::Gutter, Modifier::DIM),
             (UiSlot::GutterCurrent, Modifier::BOLD),
+            (UiSlot::CursorLine, Modifier::REVERSED),
+            (UiSlot::TabActive, Modifier::BOLD),
+            (UiSlot::TabInactive, Modifier::DIM),
+            (UiSlot::TabSeparator, Modifier::DIM),
         ],
     },
     color16: Palette::Monochrome {
@@ -834,6 +896,10 @@ pub static ACCESSIBLE: Theme = Theme {
             (UiSlot::StatusError, Modifier::empty()),
             (UiSlot::Gutter, Modifier::DIM),
             (UiSlot::GutterCurrent, Modifier::BOLD),
+            (UiSlot::CursorLine, Modifier::REVERSED),
+            (UiSlot::TabActive, Modifier::BOLD),
+            (UiSlot::TabInactive, Modifier::DIM),
+            (UiSlot::TabSeparator, Modifier::DIM),
         ],
     },
     monochrome: Palette::Monochrome {
@@ -888,23 +954,15 @@ pub static ACCESSIBLE: Theme = Theme {
             (UiSlot::StatusError, Modifier::empty()),
             (UiSlot::Gutter, Modifier::DIM),
             (UiSlot::GutterCurrent, Modifier::BOLD),
+            (UiSlot::CursorLine, Modifier::REVERSED),
+            (UiSlot::TabActive, Modifier::BOLD),
+            (UiSlot::TabInactive, Modifier::DIM),
+            (UiSlot::TabSeparator, Modifier::DIM),
         ],
     },
 };
 
 // ── Legacy compatibility ────────────────────────────────────────────────────
-
-/// Resolve a [`SemanticStyle`] to a ratatui [`Style`] using the default-dark
-/// TrueColor palette. Kept for backwards compatibility with code that called
-/// `Theme::resolve()`.
-///
-/// # Deprecated
-///
-/// Use [`Theme::style`] on a specific theme instead.
-#[deprecated(since = "0.1.0", note = "Use Theme::style() instead")]
-pub fn resolve(style: SemanticStyle) -> Style {
-    DEFAULT_DARK.truecolor.resolve_semantic(style)
-}
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
@@ -1046,6 +1104,10 @@ mod tests {
             UiSlot::StatusError,
             UiSlot::Gutter,
             UiSlot::GutterCurrent,
+            UiSlot::CursorLine,
+            UiSlot::TabActive,
+            UiSlot::TabInactive,
+            UiSlot::TabSeparator,
         ];
 
         for (name, theme) in &themes {
@@ -1283,15 +1345,6 @@ mod tests {
 
     // ── Legacy compatibility ────────────────────────────────────────────
 
-    /// Verify the deprecated `resolve` still works (backwards compat).
-    #[test]
-    #[allow(deprecated)]
-    fn legacy_resolve_works() {
-        let style = resolve(SemanticStyle::Heading1);
-        assert!(style.fg.is_some());
-        assert!(style.add_modifier.contains(Modifier::BOLD));
-    }
-
     // ── Slot completeness ───────────────────────────────────────────────
 
     /// Every UiSlot variant is covered in every tier of every built-in theme.
@@ -1318,6 +1371,10 @@ mod tests {
             UiSlot::StatusError,
             UiSlot::Gutter,
             UiSlot::GutterCurrent,
+            UiSlot::CursorLine,
+            UiSlot::TabActive,
+            UiSlot::TabInactive,
+            UiSlot::TabSeparator,
         ];
 
         for (name, theme) in &themes {
@@ -1345,5 +1402,123 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn default_dark_chrome_preserves_previous_colors() {
+        let theme = &DEFAULT_DARK;
+
+        for tier in [Tier::TrueColor, Tier::Color16] {
+            assert_eq!(
+                theme.ui_style(tier, UiSlot::CursorLine).bg,
+                Some(Color::DarkGray)
+            );
+            assert_eq!(theme.ui_style(tier, UiSlot::CursorLine).fg, None);
+            assert_eq!(
+                theme.ui_style(tier, UiSlot::TabActive).fg,
+                Some(Color::White)
+            );
+            assert_eq!(
+                theme.ui_style(tier, UiSlot::TabInactive).fg,
+                Some(Color::Gray)
+            );
+            assert_eq!(
+                theme.ui_style(tier, UiSlot::TabSeparator).fg,
+                Some(Color::DarkGray)
+            );
+        }
+    }
+
+    #[test]
+    fn default_light_chrome_and_text_use_light_palette() {
+        let dark = &DEFAULT_DARK;
+        let light = &DEFAULT_LIGHT;
+
+        assert_ne!(
+            dark.style(Tier::TrueColor, SemanticStyle::Text).fg,
+            light.style(Tier::TrueColor, SemanticStyle::Text).fg
+        );
+        assert_ne!(
+            dark.ui_style(Tier::TrueColor, UiSlot::TabActive).fg,
+            light.ui_style(Tier::TrueColor, UiSlot::TabActive).fg
+        );
+        assert_ne!(
+            dark.ui_style(Tier::TrueColor, UiSlot::CursorLine).bg,
+            light.ui_style(Tier::TrueColor, UiSlot::CursorLine).bg
+        );
+    }
+
+    #[test]
+    fn chrome_slots_retain_non_color_modifiers() {
+        let slots = [
+            UiSlot::CursorLine,
+            UiSlot::TabActive,
+            UiSlot::TabInactive,
+            UiSlot::TabSeparator,
+        ];
+
+        for theme in [&DEFAULT_DARK, &DEFAULT_LIGHT, &ACCESSIBLE] {
+            for tier in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
+                for slot in slots {
+                    assert!(
+                        !theme.ui_style(tier, slot).add_modifier.is_empty(),
+                        "{slot:?} must retain a modifier for {} at {tier:?}",
+                        theme.name
+                    );
+                }
+            }
+        }
+    }
+
+    fn rust_files_below(directory: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(directory).expect("read TUI source directory") {
+            let path = entry.expect("read TUI source entry").path();
+            if path.is_dir() {
+                rust_files_below(&path, files);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                files.push(path);
+            }
+        }
+    }
+
+    fn hardcoded_color_lines(source: &str) -> Vec<usize> {
+        source
+            .lines()
+            .enumerate()
+            .filter_map(|(index, line)| line.contains("Color::").then_some(index + 1))
+            .collect()
+    }
+
+    #[test]
+    fn hardcoded_color_detector_rejects_color_literal() {
+        assert_eq!(
+            hardcoded_color_lines("let style = Style::default().fg(Color::Red);"),
+            vec![1]
+        );
+        assert_eq!(hardcoded_color_lines("ratatui::style::Color::Red"), vec![1]);
+    }
+
+    #[test]
+    fn test_no_hardcoded_colors_outside_theme() {
+        let source_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_files_below(&source_root, &mut files);
+
+        let mut violations = Vec::new();
+        for path in files {
+            if path.file_name().is_some_and(|name| name == "theme.rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("read TUI Rust source");
+            for line in hardcoded_color_lines(&source) {
+                violations.push(format!("{}:{line}", path.display()));
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "hardcoded colors must be defined only in theme.rs:\n{}",
+            violations.join("\n")
+        );
     }
 }
