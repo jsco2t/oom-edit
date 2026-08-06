@@ -760,7 +760,8 @@ impl EditorSession {
     pub fn remap_view_cursor_from_edit(&mut self, edit_line: usize, edit_col: usize) {
         if let Some(ref mut vs) = self.view_state {
             let layout = vs.layout_cache.as_ref().unwrap();
-            vs.cursor = nav::enter_view(edit_line, edit_col, layout);
+            let text = self.vim.text();
+            vs.cursor = nav::enter_view(edit_line, edit_col, layout, &text);
         }
     }
 
@@ -797,7 +798,7 @@ impl EditorSession {
             let text = self.vim.text();
             let model = BlockModel::build(&text, None);
             let layout = ViewLayout::build(&model, 80, &self.highlighter);
-            let cursor = nav::enter_view(edit_line, edit_col, &layout);
+            let cursor = nav::enter_view(edit_line, edit_col, &layout, &text);
 
             self.view_state = Some(ViewState {
                 layout_cache: Some(layout),

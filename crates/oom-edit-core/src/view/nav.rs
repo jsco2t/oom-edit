@@ -94,19 +94,60 @@ impl ViewSearch {
 ///
 /// VP-3: If the edit cursor is beyond the last content line, the view
 /// cursor clamps to the last view line.
-pub fn enter_view(edit_line: usize, _edit_col: usize, layout: &ViewLayout) -> ViewCursor {
-    // Count content lines up to and including edit_line
-    let mut view_line_idx = 0;
-    let mut doc_line = 0usize;
+///
+/// `text` is the full document text, needed to convert source byte offsets
+/// to document line numbers.
+pub fn enter_view(
+    edit_line: usize,
+    edit_col: usize,
+    layout: &ViewLayout,
+    text: &str,
+) -> ViewCursor {
+    let last_doc_line = text.bytes().filter(|byte| *byte == b'\n').count();
+    if edit_line > last_doc_line {
+        return ViewCursor::new(layout.lines.len().saturating_sub(1));
+    }
 
-    for view_line in &layout.lines {
-        if view_line.kind == LineKind::Content {
-            if doc_line == edit_line {
-                return ViewCursor::new(view_line_idx);
+    let edit_offset = doc_position_to_byte_offset(edit_line, edit_col, text);
+
+    if let Some(idx) = layout.lines.iter().position(|view_line| {
+        view_line.kind == LineKind::Content
+            && (view_line.source.contains(&edit_offset) || view_line.source.start == edit_offset)
+    }) {
+        return ViewCursor::new(idx);
+    }
+
+    if let Some(idx) = layout.lines.iter().position(|view_line| {
+        view_line.kind == LineKind::Content
+            && view_line.source.end == edit_offset
+            && view_line
+                .source
+                .end
+                .checked_sub(1)
+                .and_then(|end| text.as_bytes().get(end))
+                .is_some_and(|byte| *byte != b'\n')
+    }) {
+        return ViewCursor::new(idx);
+    }
+
+    let nearest_after = layout
+        .lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, view_line)| {
+            if view_line.kind != LineKind::Content {
+                return None;
             }
-            doc_line += 1;
-            view_line_idx += 1;
-        }
+
+            let source_line = source_to_doc_line(&view_line.source, text);
+            (source_line > edit_line
+                || (source_line == edit_line && view_line.source.start >= edit_offset))
+                .then_some((idx, view_line.source.start))
+        })
+        .min_by_key(|(idx, source_start)| (*source_start, *idx));
+
+    if let Some((idx, _)) = nearest_after {
+        return ViewCursor::new(idx);
     }
 
     // edit_line is beyond the document — clamp to last view line
@@ -159,6 +200,26 @@ pub fn leave_view(view_cursor: &ViewCursor, layout: &ViewLayout, text: &str) -> 
 fn source_to_doc_line(source: &Range<usize>, text: &str) -> usize {
     let start = source.start.min(text.len());
     text[..start].chars().filter(|&c| c == '\n').count()
+}
+
+/// Convert a 0-based document position to a byte offset, clamping positions
+/// beyond the line or document to the nearest valid offset.
+fn doc_position_to_byte_offset(line: usize, col: usize, text: &str) -> usize {
+    let line_start = text
+        .split_inclusive('\n')
+        .take(line)
+        .map(str::len)
+        .sum::<usize>();
+    let line_text = &text[line_start..];
+    let line_text = line_text
+        .split_once('\n')
+        .map_or(line_text, |(line_text, _)| line_text);
+    let col_offset = line_text
+        .char_indices()
+        .nth(col)
+        .map_or(line_text.len(), |(offset, _)| offset);
+
+    line_start + col_offset
 }
 
 // ── VN-2: view_scroll_top — pure scroll position calculation ──────────────
@@ -735,4 +796,150 @@ fn find_next_by_kind<'a>(
         .filter(|t| t.line > cursor.line)
         .nth(count.saturating_sub(1))
         .copied()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::style::{StyledLine, ViewLine};
+
+    #[test]
+    fn enter_view_skips_synthetic_lines() {
+        let text = "hello\nworld";
+        let layout = layout_with_lines(vec![
+            view_line(LineKind::Content, 0..5),
+            view_line(LineKind::Synthetic, 0..5),
+            view_line(LineKind::Content, 6..11),
+        ]);
+
+        assert_eq!(enter_view(1, 0, &layout, text), ViewCursor::new(2));
+    }
+
+    #[test]
+    fn enter_view_wrapped_content_line() {
+        let text = "hello\nworld";
+        let layout = layout_with_lines(vec![
+            view_line(LineKind::Content, 0..5),
+            view_line(LineKind::Content, 0..5),
+            view_line(LineKind::Content, 0..5),
+            view_line(LineKind::Content, 6..11),
+        ]);
+
+        assert_eq!(enter_view(0, 0, &layout, text), ViewCursor::new(0));
+        assert_eq!(enter_view(1, 0, &layout, text), ViewCursor::new(3));
+    }
+
+    #[test]
+    fn enter_view_combined() {
+        let text = "hello\nworld";
+        let layout = layout_with_lines(vec![
+            view_line(LineKind::Content, 0..5),
+            view_line(LineKind::Content, 0..5),
+            view_line(LineKind::Synthetic, 0..5),
+            view_line(LineKind::Content, 6..11),
+        ]);
+
+        assert_eq!(enter_view(1, 0, &layout, text), ViewCursor::new(3));
+    }
+
+    #[test]
+    fn enter_view_clamp_beyond_end() {
+        let text = "hello\nworld";
+        let layout = layout_with_lines(vec![
+            view_line(LineKind::Content, 0..5),
+            view_line(LineKind::Synthetic, 0..5),
+            view_line(LineKind::Content, 6..11),
+            view_line(LineKind::Content, 6..11),
+            view_line(LineKind::Synthetic, 6..11),
+        ]);
+
+        assert_eq!(enter_view(2, 0, &layout, text), ViewCursor::new(4));
+    }
+
+    #[test]
+    fn enter_view_matches_multiline_source_range() {
+        let text = "first\nsecond\n\nthird";
+        let layout = layout_with_lines(vec![
+            view_line(LineKind::Content, 0..12),
+            view_line(LineKind::Synthetic, 0..12),
+            view_line(LineKind::Content, 14..19),
+        ]);
+
+        assert_eq!(enter_view(1, 0, &layout, text), ViewCursor::new(0));
+        assert_eq!(enter_view(1, 6, &layout, text), ViewCursor::new(0));
+    }
+
+    #[test]
+    fn enter_view_uses_nearest_content_after_blank_line() {
+        let text = "first\n\nthird\n\nfifth";
+        let layout = layout_with_lines(vec![
+            view_line(LineKind::Content, 0..6),
+            view_line(LineKind::Synthetic, 0..6),
+            view_line(LineKind::Content, 7..13),
+            view_line(LineKind::Synthetic, 7..13),
+            view_line(LineKind::Content, 14..19),
+        ]);
+
+        assert_eq!(enter_view(1, 0, &layout, text), ViewCursor::new(2));
+    }
+
+    #[test]
+    fn enter_view_prefers_containing_range_in_deferred_content() {
+        let text = "[^a]: definition\nlater paragraph";
+        let layout = layout_with_lines(vec![
+            view_line(LineKind::Content, 17..32),
+            view_line(LineKind::Content, 0..16),
+        ]);
+
+        assert_eq!(enter_view(0, 5, &layout, text), ViewCursor::new(1));
+    }
+
+    #[test]
+    fn enter_view_prefers_range_start_at_adjacent_block_boundary() {
+        let text = "# H\nparagraph";
+        let layout = layout_with_lines(vec![
+            view_line(LineKind::Content, 0..4),
+            view_line(LineKind::Synthetic, 0..4),
+            view_line(LineKind::Content, 4..13),
+        ]);
+
+        assert_eq!(enter_view(1, 0, &layout, text), ViewCursor::new(2));
+    }
+
+    #[test]
+    fn doc_position_to_byte_offset_handles_utf8_columns() {
+        let text = "aéz\n日x";
+
+        assert_eq!(doc_position_to_byte_offset(0, 2, text), 3);
+        assert_eq!(doc_position_to_byte_offset(1, 1, text), 8);
+    }
+
+    #[test]
+    fn enter_view_uses_nearest_source_when_layout_is_not_source_ordered() {
+        let text = "first\n\nsecond\n\nthird";
+        let layout = layout_with_lines(vec![
+            view_line(LineKind::Content, 15..20),
+            view_line(LineKind::Content, 7..13),
+        ]);
+
+        assert_eq!(enter_view(1, 0, &layout, text), ViewCursor::new(1));
+    }
+
+    fn layout_with_lines(lines: Vec<ViewLine>) -> ViewLayout {
+        ViewLayout {
+            lines,
+            ..ViewLayout::default()
+        }
+    }
+
+    fn view_line(kind: LineKind, source: Range<usize>) -> ViewLine {
+        ViewLine {
+            styled: StyledLine {
+                text: String::new(),
+                spans: Vec::new(),
+            },
+            source,
+            kind,
+        }
+    }
 }
