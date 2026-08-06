@@ -24,6 +24,27 @@ pub struct LangDef {
     pub language_fn: fn() -> tree_sitter::Language,
 }
 
+impl LangDef {
+    /// Return this registry language's grammar-specific highlight query.
+    pub(crate) fn highlights_query(&self) -> &'static str {
+        match self.name {
+            "markdown" => tree_sitter_md::HIGHLIGHT_QUERY_BLOCK,
+            "markdown_inline" => tree_sitter_md::HIGHLIGHT_QUERY_INLINE,
+            "rust" => tree_sitter_rust::HIGHLIGHTS_QUERY,
+            "python" => tree_sitter_python::HIGHLIGHTS_QUERY,
+            "javascript" => tree_sitter_javascript::HIGHLIGHT_QUERY,
+            "typescript" => tree_sitter_typescript::HIGHLIGHTS_QUERY,
+            "go" => tree_sitter_go::HIGHLIGHTS_QUERY,
+            "bash" => tree_sitter_bash::HIGHLIGHT_QUERY,
+            "json" => tree_sitter_json::HIGHLIGHTS_QUERY,
+            "c" => tree_sitter_c::HIGHLIGHT_QUERY,
+            "yaml" => tree_sitter_yaml::HIGHLIGHTS_QUERY,
+            "toml" => tree_sitter_toml_ng::HIGHLIGHTS_QUERY,
+            name => unreachable!("unregistered language definition: {name}"),
+        }
+    }
+}
+
 // ── The registry ────────────────────────────────────────────────────────────
 
 /// The complete language registry. New languages are added by appending a row
@@ -156,6 +177,16 @@ mod tests {
             let mut parser = tree_sitter::Parser::new();
             let _ = parser.set_language(&lang_obj);
             // If set_language panics, the language is invalid
+        }
+    }
+
+    #[test]
+    fn all_language_highlight_queries_compile() {
+        for lang in LANGUAGES {
+            let language = (lang.language_fn)();
+            tree_sitter::Query::new(&language, lang.highlights_query()).unwrap_or_else(|error| {
+                panic!("{} highlight query should compile: {error}", lang.name)
+            });
         }
     }
 

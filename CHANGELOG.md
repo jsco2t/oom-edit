@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Fenced-code and front-matter injections now use their grammar-specific highlight queries, preserve full-region parse context for partial viewports, and keep language styles visible over the Markdown code-block fallback.
+- Injection discovery now reuses compiled queries and avoids cloning the document text and Markdown syntax tree after every edit.
+
 ## [0.1.0] — 2026-08-03
 
 ### Added

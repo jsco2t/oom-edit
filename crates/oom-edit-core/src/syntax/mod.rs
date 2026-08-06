@@ -12,7 +12,7 @@ mod languages;
 pub use captures::capture_to_style;
 pub use languages::{find_by_alias, find_by_name, resolve_language, LangDef, LANGUAGES};
 
-use std::ops::Range;
+use std::{collections::HashMap, ops::Range, sync::Arc};
 
 use tree_sitter::{Parser, Point, Query, QueryCursor, StreamingIterator, Tree};
 
@@ -67,19 +67,6 @@ const MD_INLINE_QUERY: &str = r#"
 (link_title) @link.title
 "#;
 
-// ── Injection highlight queries ─────────────────────────────────────────────
-
-/// Minimal highlight query for languages that don't ship a bundled one.
-/// Covers at least: keywords, strings, comments, numbers, functions, types.
-const MINIMAL_QUERY: &str = r#"
-(keyword) @keyword
-(string) @string
-(comment) @comment
-(number) @number
-(function) @function
-(type) @type
-"#;
-
 // ── Injection region ────────────────────────────────────────────────────────
 
 /// A region inside the markdown document that should be highlighted with a
@@ -93,10 +80,36 @@ struct Injection {
     /// The tree-sitter language to use for highlighting.
     language: tree_sitter::Language,
     /// The query to run for this language (wrapped in Arc for sharing).
-    query: std::sync::Arc<Query>,
+    query: Arc<Query>,
+    /// Canonical registry language name used for context-sensitive styling.
+    language_name: &'static str,
+    /// Whether this region is front matter or a fenced code block.
+    kind: InjectionKind,
     /// For fence blocks: the language tag from the info string.
     #[allow(dead_code)]
     fence_lang: Option<String>,
+}
+
+/// Immutable metadata collected from the markdown tree before injection
+/// queries are resolved through the mutable cache.
+struct InjectionMeta {
+    start: usize,
+    end: usize,
+    language: &'static LangDef,
+    kind: InjectionKind,
+    fence_lang: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RankedSpan {
+    span: Span,
+    priority: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InjectionKind {
+    FrontMatter,
+    Fence,
 }
 
 #[cfg(test)]
@@ -130,6 +143,8 @@ pub struct Highlighter {
     md_parser: Parser,
     /// Injection regions (front matter, fenced code blocks).
     injections: Vec<Injection>,
+    /// Compiled injection queries, keyed by canonical registry language name.
+    query_cache: HashMap<&'static str, Arc<Query>>,
     /// Most recent parser route, exposed only to regression tests.
     #[cfg(test)]
     last_parse_path: ParsePath,
@@ -166,6 +181,7 @@ impl Highlighter {
             md_inline_query: inline_query,
             md_parser: parser,
             injections: Vec::new(),
+            query_cache: HashMap::new(),
             #[cfg(test)]
             last_parse_path: ParsePath::Full,
         };
@@ -295,23 +311,25 @@ impl Highlighter {
             let line_text = &text[line_start..line_end.min(text.len())];
 
             // Filter spans that overlap with this line's byte range
-            let mut line_spans: Vec<Span> = spans
+            let line_spans: Vec<RankedSpan> = spans
                 .iter()
-                .filter(|s| {
+                .enumerate()
+                .filter(|(_, s)| {
                     let abs_start = s.start_col;
                     let abs_end = s.end_col;
                     abs_start < line_end && abs_end > line_start
                 })
-                .map(|s| Span {
-                    start_col: s.start_col.saturating_sub(line_start),
-                    end_col: s.end_col.saturating_sub(line_start),
-                    style: s.style,
+                .map(|(priority, s)| RankedSpan {
+                    span: Span {
+                        start_col: s.start_col.max(line_start) - line_start,
+                        end_col: s.end_col.min(line_end) - line_start,
+                        style: s.style,
+                    },
+                    priority,
                 })
                 .collect();
 
-            // Sort and merge spans
-            line_spans.sort_by_key(|s| s.start_col);
-            line_spans = merge_overlapping_spans(line_spans);
+            let line_spans = merge_overlapping_spans(line_spans);
 
             result.push(StyledLine {
                 text: line_text.to_string(),
@@ -375,41 +393,52 @@ impl Highlighter {
                 continue;
             }
 
-            let overlap_start = inj_start.max(range.start);
-            let overlap_end = inj_end.min(range.end);
-
             let mut inj_cursor = QueryCursor::new();
             let mut inj_parser = Parser::new();
             if inj_parser.set_language(&injection.language).is_ok() {
-                if let Some(inj_tree) = inj_parser.parse(&text[overlap_start..overlap_end], None) {
+                if let Some(inj_tree) = inj_parser.parse(&text[inj_start..inj_end], None) {
                     let inj_root = inj_tree.root_node();
+                    let relative_start = range.start.saturating_sub(inj_start);
+                    let relative_end = range.end.saturating_sub(inj_start).min(inj_end - inj_start);
+                    inj_cursor.set_byte_range(relative_start..relative_end);
+                    let injection_bytes = &text.as_bytes()[inj_start..inj_end];
+                    let mut matches =
+                        inj_cursor.matches(&injection.query, inj_root, injection_bytes);
+                    let mut injection_spans = Vec::new();
 
-                    while let Some(m) = inj_cursor
-                        .matches(
-                            &injection.query,
-                            inj_root,
-                            &text.as_bytes()[overlap_start..overlap_end],
-                        )
-                        .next()
-                    {
+                    while let Some(m) = matches.next() {
                         for capture in m.captures {
                             let capture_name =
                                 injection.query.capture_names()[capture.index as usize];
-                            let style = captures::capture_to_style(capture_name);
                             let inj_node = capture.node;
+                            let style = injection_capture_to_style(
+                                injection.kind,
+                                injection.language_name,
+                                capture_name,
+                                inj_node.kind(),
+                            );
 
-                            let abs_start = overlap_start + inj_node.start_byte();
-                            let abs_end = overlap_start + inj_node.end_byte();
+                            let abs_start = inj_start + inj_node.start_byte();
+                            let abs_end = inj_start + inj_node.end_byte();
+                            let clipped_start = abs_start.max(range.start);
+                            let clipped_end = abs_end.min(range.end);
 
-                            if abs_start < abs_end {
-                                spans.push(Span {
-                                    start_col: abs_start,
-                                    end_col: abs_end,
+                            if clipped_start < clipped_end {
+                                injection_spans.push(Span {
+                                    start_col: clipped_start,
+                                    end_col: clipped_end,
                                     style,
                                 });
                             }
                         }
                     }
+                    injection_spans.sort_by_key(|span| {
+                        matches!(
+                            span.style,
+                            SemanticStyle::FmKey | SemanticStyle::FmDelimiter
+                        )
+                    });
+                    spans.extend(injection_spans);
                 }
             }
         }
@@ -494,38 +523,69 @@ impl Highlighter {
 
     /// Discover all injection regions in the document.
     fn discover_injections(&mut self) {
-        self.injections.clear();
-
-        // Clone the tree to avoid borrow checker issues
-        let tree = self.md_tree.clone();
-        let text = self.text.clone();
-
-        self.walk_for_injections(tree.root_node(), &text);
+        let metadata = self.collect_injection_metadata();
+        self.build_injections(metadata);
     }
 
-    /// Walk the markdown tree and collect injection regions.
+    /// Collect injection ranges and language identities without mutating the
+    /// highlighter or cloning its text and markdown tree.
+    fn collect_injection_metadata(&self) -> Vec<InjectionMeta> {
+        let mut metadata = Vec::new();
+        Self::walk_for_injections(self.md_tree.root_node(), &self.text, &mut metadata);
+        metadata
+    }
+
+    /// Resolve injection metadata through the compiled-query cache.
+    fn build_injections(&mut self, metadata: Vec<InjectionMeta>) {
+        self.injections.clear();
+
+        for meta in metadata {
+            let language = (meta.language.language_fn)();
+            let query = if let Some(cached) = self.query_cache.get(meta.language.name) {
+                Arc::clone(cached)
+            } else {
+                let compiled = Arc::new(
+                    Query::new(&language, meta.language.highlights_query())
+                        .expect("registered injection highlight query should compile"),
+                );
+                self.query_cache
+                    .insert(meta.language.name, Arc::clone(&compiled));
+                compiled
+            };
+
+            self.injections.push(Injection {
+                start: meta.start,
+                end: meta.end,
+                language,
+                query,
+                language_name: meta.language.name,
+                kind: meta.kind,
+                fence_lang: meta.fence_lang,
+            });
+        }
+    }
+
+    /// Walk the markdown tree and collect immutable injection metadata.
     /// Uses a recursive approach to avoid cursor lifetime issues.
-    fn walk_for_injections(&mut self, node: tree_sitter::Node, text: &str) {
-        let kind = node.kind().to_string();
+    fn walk_for_injections(node: tree_sitter::Node, text: &str, metadata: &mut Vec<InjectionMeta>) {
+        let kind = node.kind();
 
         // Check for front matter (minus_metadata / plus_metadata)
         if kind == "minus_metadata" || kind == "plus_metadata" {
             let is_yaml = kind == "minus_metadata";
-            let lang = if is_yaml {
-                tree_sitter_yaml::LANGUAGE.into()
-            } else {
-                tree_sitter_toml_ng::LANGUAGE.into()
-            };
+            let language_name = if is_yaml { "yaml" } else { "toml" };
+            let language = languages::find_by_name(language_name)
+                .expect("front-matter language should exist in the registry");
+            let delimiter = if is_yaml { "---" } else { "+++" };
+            let content_range = front_matter_content_range(&node, text, delimiter);
 
-            if let Ok(query) = Query::new(&lang, get_highlight_query(&lang)) {
-                self.injections.push(Injection {
-                    start: node.start_byte(),
-                    end: node.end_byte(),
-                    language: lang,
-                    query: std::sync::Arc::new(query),
-                    fence_lang: None,
-                });
-            }
+            metadata.push(InjectionMeta {
+                start: content_range.start,
+                end: content_range.end,
+                language,
+                kind: InjectionKind::FrontMatter,
+                fence_lang: None,
+            });
             return; // Don't recurse into front matter
         }
 
@@ -533,17 +593,14 @@ impl Highlighter {
         if kind == "fenced_code_block" {
             if let Some(info_string) = find_info_string(&node, text) {
                 if let Some(lang_def) = languages::find_by_alias(&info_string) {
-                    let lang = (lang_def.language_fn)();
-                    if let Ok(query) = Query::new(&lang, get_highlight_query(&lang)) {
-                        if let Some(content) = find_code_fence_content(&node) {
-                            self.injections.push(Injection {
-                                start: content.start_byte(),
-                                end: content.end_byte(),
-                                language: lang,
-                                query: std::sync::Arc::new(query),
-                                fence_lang: Some(info_string),
-                            });
-                        }
+                    if let Some(content) = find_code_fence_content(&node) {
+                        metadata.push(InjectionMeta {
+                            start: content.start_byte(),
+                            end: content.end_byte(),
+                            language: lang_def,
+                            kind: InjectionKind::Fence,
+                            fence_lang: Some(info_string),
+                        });
                     }
                 }
             }
@@ -560,7 +617,7 @@ impl Highlighter {
         let mut cursor = node.walk();
         if cursor.goto_first_child() {
             loop {
-                self.walk_for_injections(cursor.node(), text);
+                Self::walk_for_injections(cursor.node(), text, metadata);
                 if !cursor.goto_next_sibling() {
                     break;
                 }
@@ -586,15 +643,13 @@ pub fn highlight_snippet(lang: &str, text: &str) -> Vec<StyledLine> {
         }];
     }
 
-    let lang_def = languages::find_by_alias(lang);
-    let lang_obj = lang_def.map(|d| (d.language_fn)());
-
-    let Some(lang_obj) = lang_obj else {
+    let Some(lang_def) = languages::find_by_alias(lang) else {
         // Unknown language — return unstyled
         return highlight_lines_for_text(text);
     };
+    let lang_obj = (lang_def.language_fn)();
 
-    let query = Query::new(&lang_obj, get_highlight_query(&lang_obj)).ok();
+    let query = Query::new(&lang_obj, lang_def.highlights_query()).ok();
     let Some(query) = query else {
         return highlight_lines_for_text(text);
     };
@@ -658,18 +713,21 @@ pub fn highlight_snippet(lang: &str, text: &str) -> Vec<StyledLine> {
         };
         let line_text = &text[line_start..line_end.min(text.len())];
 
-        let mut spans: Vec<Span> = all_spans
+        let spans: Vec<RankedSpan> = all_spans
             .iter()
-            .filter(|s| s.start_col < line_end && s.end_col > line_start)
-            .map(|s| Span {
-                start_col: s.start_col.saturating_sub(line_start),
-                end_col: s.end_col.saturating_sub(line_start),
-                style: s.style,
+            .enumerate()
+            .filter(|(_, s)| s.start_col < line_end && s.end_col > line_start)
+            .map(|(priority, s)| RankedSpan {
+                span: Span {
+                    start_col: s.start_col.max(line_start) - line_start,
+                    end_col: s.end_col.min(line_end) - line_start,
+                    style: s.style,
+                },
+                priority,
             })
             .collect();
 
-        spans.sort_by_key(|s| s.start_col);
-        spans = merge_overlapping_spans(spans);
+        let spans = merge_overlapping_spans(spans);
 
         result.push(StyledLine {
             text: line_text.to_string(),
@@ -731,16 +789,60 @@ fn find_code_fence_content<'a>(node: &tree_sitter::Node<'a>) -> Option<tree_sitt
     None
 }
 
-// ── Helper: get highlight query for a language ─────────────────────────────
+/// Return the parseable body of a front-matter node, excluding its opening
+/// and closing Markdown delimiter lines.
+fn front_matter_content_range(
+    node: &tree_sitter::Node,
+    text: &str,
+    delimiter: &str,
+) -> Range<usize> {
+    let node_start = node.start_byte();
+    let node_end = node.end_byte();
+    let node_text = &text[node_start..node_end];
+    let content_start = node_text
+        .find('\n')
+        .map_or(node_end, |newline| node_start + newline + 1);
+    let trimmed = node_text.trim_end_matches(['\r', '\n']);
+    let closing_start = trimmed.rfind('\n').map_or(0, |newline| newline + 1);
+    let closing_line = trimmed[closing_start..].trim_end_matches('\r');
+    let content_end = if closing_line == delimiter {
+        node_start + closing_start
+    } else {
+        node_end
+    };
 
-/// Get the highlight query source for a given tree-sitter language.
-fn get_highlight_query(_lang: &tree_sitter::Language) -> &'static str {
-    // Use the minimal query for all injected languages.
-    // The grammar crates' bundled queries would require build-time
-    // embedding which is complex; the minimal query covers the
-    // required categories (keywords, strings, comments, numbers,
-    // functions, types).
-    MINIMAL_QUERY
+    content_start.min(content_end)..content_end
+}
+
+// ── Helper: markdown capture → SemanticStyle ────────────────────────────────
+
+/// Map injected-language captures, preserving the dedicated front-matter
+/// key/value style slots required by FR-4.2.
+fn injection_capture_to_style(
+    kind: InjectionKind,
+    language_name: &str,
+    capture: &str,
+    node_kind: &str,
+) -> SemanticStyle {
+    if kind == InjectionKind::FrontMatter {
+        let capture = capture.strip_prefix('@').unwrap_or(capture);
+        if capture.starts_with("property")
+            || (language_name == "toml" && capture.starts_with("type"))
+            || (language_name == "toml" && node_kind == "quoted_key")
+        {
+            return SemanticStyle::FmKey;
+        }
+        return match captures::capture_to_style(capture) {
+            SemanticStyle::StringLit
+            | SemanticStyle::NumberLit
+            | SemanticStyle::TypeName
+            | SemanticStyle::Variable
+            | SemanticStyle::Text => SemanticStyle::FmValue,
+            style => style,
+        };
+    }
+
+    captures::capture_to_style(capture)
 }
 
 // ── Helper: markdown capture → SemanticStyle ────────────────────────────────
@@ -920,37 +1022,44 @@ fn apply_edit_to_string(text: &mut String, edit: &TextEdit) {
 
 // ── Helper: merge overlapping spans ─────────────────────────────────────────
 
-/// Merge overlapping or adjacent spans, keeping the later span (higher style
-/// priority) when they overlap. Spans must be sorted by `start_col` before
-/// calling.
-fn merge_overlapping_spans(mut spans: Vec<Span>) -> Vec<Span> {
-    if spans.len() <= 1 {
-        return spans;
-    }
-
-    // Sort by start_col, then by end_col descending (wider spans first)
-    spans.sort_by_key(|s| s.start_col);
-
-    let mut merged: Vec<Span> = Vec::with_capacity(spans.len());
-
-    for span in spans {
-        if let Some(last) = merged.last_mut() {
-            if span.start_col < last.end_col {
-                // Overlapping — keep both spans (don't merge)
-                merged.push(span);
-            } else if span.start_col == last.end_col {
-                // Adjacent — merge if same style
-                if last.style == span.style {
-                    last.end_col = span.end_col;
-                } else {
-                    merged.push(span);
-                }
-            } else {
-                merged.push(span);
-            }
-        } else {
-            merged.push(span);
+/// Resolve overlaps using explicit collection-order priority, where later
+/// captures override earlier, broader captures. Adjacent intervals with the
+/// same winning style are coalesced.
+fn merge_overlapping_spans(spans: Vec<RankedSpan>) -> Vec<Span> {
+    let mut boundaries = Vec::with_capacity(spans.len() * 2);
+    for ranked in &spans {
+        if ranked.span.start_col < ranked.span.end_col {
+            boundaries.push(ranked.span.start_col);
+            boundaries.push(ranked.span.end_col);
         }
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+
+    let mut merged: Vec<Span> = Vec::new();
+    for interval in boundaries.windows(2) {
+        let start = interval[0];
+        let end = interval[1];
+        let Some(winner) = spans
+            .iter()
+            .filter(|ranked| ranked.span.start_col <= start && ranked.span.end_col >= end)
+            .max_by_key(|ranked| ranked.priority)
+        else {
+            continue;
+        };
+
+        if let Some(previous) = merged.last_mut() {
+            if previous.end_col == start && previous.style == winner.span.style {
+                previous.end_col = end;
+                continue;
+            }
+        }
+
+        merged.push(Span {
+            start_col: start,
+            end_col: end,
+            style: winner.span.style,
+        });
     }
 
     merged
@@ -1331,7 +1440,10 @@ mod tests {
 
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[2].text, "*emphasis* and `code`");
-        assert_eq!(lines[2].spans.len(), 6);
+        assert!(lines[2]
+            .spans
+            .windows(2)
+            .all(|pair| pair[0].end_col <= pair[1].start_col));
         assert!(lines[2]
             .spans
             .iter()
@@ -1574,6 +1686,277 @@ mod tests {
         let lines = h.highlight_lines(0..8);
         // Document has 7 lines (ends with \n)
         assert_eq!(lines.len(), 7);
+    }
+
+    #[test]
+    fn injection_viewport_mid_fence() {
+        let text = long_rust_fence_for_test();
+        let partial = assert_viewport_matches_full(text, 6..11);
+        let line_starts = line_start_indices(text);
+        let viewport_bytes = line_starts[6]..line_starts[11];
+        let highlighter = Highlighter::new(text);
+        let spans = highlighter.collect_spans_in_range(viewport_bytes.clone());
+
+        assert!(
+            partial[0]
+                .spans
+                .iter()
+                .any(|span| span.style == SemanticStyle::Comment),
+            "a viewport beginning inside a block comment must retain its opening context"
+        );
+        assert!(spans.iter().all(|span| {
+            span.start_col >= viewport_bytes.start && span.end_col <= viewport_bytes.end
+        }));
+        assert!(spans.iter().any(|span| {
+            span.style == SemanticStyle::Comment && span.start_col == viewport_bytes.start
+        }));
+    }
+
+    #[test]
+    fn injection_viewport_end_fence() {
+        let text = long_rust_fence_for_test();
+        let partial = assert_viewport_matches_full(text, 1..7);
+        let line_starts = line_start_indices(text);
+        let viewport_bytes = line_starts[1]..line_starts[7];
+        let highlighter = Highlighter::new(text);
+        let spans = highlighter.collect_spans_in_range(viewport_bytes.clone());
+
+        assert_eq!(partial.len(), 6);
+        assert!(partial
+            .iter()
+            .any(|line| line.spans.iter().any(|span| matches!(
+                span.style,
+                SemanticStyle::Keyword | SemanticStyle::NumberLit
+            ))));
+        assert!(spans.iter().all(|span| {
+            span.start_col >= viewport_bytes.start && span.end_col <= viewport_bytes.end
+        }));
+        assert!(spans.iter().any(|span| {
+            span.style == SemanticStyle::Comment && span.end_col == viewport_bytes.end
+        }));
+    }
+
+    #[test]
+    fn injection_viewport_front_matter_partial() {
+        let text = "---\n\
+                    title: Injection viewport\n\
+                    owner: editor-team\n\
+                    description: |\n\
+                      first visible scalar line\n\
+                      second visible scalar line\n\
+                    tags: [rust, markdown]\n\
+                    enabled: true\n\
+                    ---\n\
+                    # Body\n";
+        let partial = assert_viewport_matches_full(text, 4..10);
+
+        assert!(partial.iter().any(|line| line
+            .spans
+            .iter()
+            .any(|span| span.style == SemanticStyle::FmKey)));
+        assert!(partial.iter().any(|line| line
+            .spans
+            .iter()
+            .any(|span| span.style == SemanticStyle::FmValue)));
+    }
+
+    #[test]
+    fn injection_after_edit_correct() {
+        let initial = long_rust_fence_for_test();
+        let insertion_offset = initial.find("let answer").expect("Rust assignment");
+        let inserted = "pub ";
+        let mut expected = initial.to_string();
+        expected.insert_str(insertion_offset, inserted);
+
+        let mut highlighter = Highlighter::new(initial);
+        highlighter.apply_edit(&[TextEdit {
+            range: insertion_offset..insertion_offset,
+            new_text_len: inserted.len(),
+            new_text: inserted.to_string(),
+        }]);
+
+        assert_eq!(
+            highlighter.highlight_lines(0..1000),
+            Highlighter::new(&expected).highlight_lines(0..1000)
+        );
+    }
+
+    #[test]
+    fn injection_queries_are_shared_and_reused_after_edit() {
+        let text = "```rust\nfn first() {}\n```\n\n```rust\nfn second() {}\n```\n";
+        let mut highlighter = Highlighter::new(text);
+
+        assert_eq!(highlighter.injections.len(), 2);
+        assert_eq!(highlighter.query_cache.len(), 1);
+        assert!(Arc::ptr_eq(
+            &highlighter.injections[0].query,
+            &highlighter.injections[1].query
+        ));
+        let cached_query = Arc::clone(
+            highlighter
+                .query_cache
+                .get("rust")
+                .expect("Rust query should be cached"),
+        );
+
+        let insertion_offset = text.find("first").expect("first function name");
+        highlighter.apply_edit(&[TextEdit {
+            range: insertion_offset..insertion_offset,
+            new_text_len: 1,
+            new_text: "x".to_string(),
+        }]);
+
+        assert_eq!(highlighter.query_cache.len(), 1);
+        assert!(Arc::ptr_eq(
+            &cached_query,
+            highlighter
+                .query_cache
+                .get("rust")
+                .expect("Rust query should remain cached")
+        ));
+        assert!(highlighter
+            .injections
+            .iter()
+            .all(|injection| Arc::ptr_eq(&cached_query, &injection.query)));
+    }
+
+    #[test]
+    fn fenced_language_spans_override_code_block_fallback() {
+        let highlighter = Highlighter::new("```rust\nfn main() {}\n```\n");
+        let lines = highlighter.highlight_lines(0..3);
+        let code_line = &lines[1];
+
+        assert!(code_line
+            .spans
+            .windows(2)
+            .all(|pair| pair[0].end_col <= pair[1].start_col));
+        assert!(code_line.spans.iter().any(|span| {
+            span.start_col == 0 && span.end_col == 2 && span.style == SemanticStyle::Keyword
+        }));
+    }
+
+    #[test]
+    fn yaml_fence_uses_code_styles_not_front_matter_styles() {
+        let highlighter = Highlighter::new("```yaml\nkey: value\n```\n");
+        let lines = highlighter.highlight_lines(0..3);
+
+        assert!(lines[1]
+            .spans
+            .iter()
+            .all(|span| !matches!(span.style, SemanticStyle::FmKey | SemanticStyle::FmValue)));
+        assert!(lines[1]
+            .spans
+            .iter()
+            .any(|span| span.style == SemanticStyle::StringLit));
+    }
+
+    #[test]
+    fn toml_front_matter_quoted_keys_use_key_style() {
+        let text = "+++\n\"display name\" = \"oom\"\ndatabase.\"user name\" = \"editor\"\n+++\n";
+        let highlighter = Highlighter::new(text);
+        let lines = highlighter.highlight_lines(0..4);
+
+        for (line_index, expected_key) in [(1, "\"display name\""), (2, "\"user name\"")] {
+            let line = &lines[line_index];
+            assert!(
+                line.spans.iter().any(|span| {
+                    span.style == SemanticStyle::FmKey
+                        && &line.text[span.start_col..span.end_col] == expected_key
+                }),
+                "expected {expected_key:?} to be an FmKey in {line:?}"
+            );
+            assert!(line
+                .spans
+                .iter()
+                .any(|span| span.style == SemanticStyle::FmValue));
+        }
+    }
+
+    #[test]
+    fn yaml_front_matter_internal_punctuation_is_not_a_delimiter() {
+        let text = "---\ndefaults: &defaults\n  enabled: true\ncopy: *defaults\n---\n";
+        let highlighter = Highlighter::new(text);
+        let lines = highlighter.highlight_lines(0..5);
+
+        assert!(lines[0]
+            .spans
+            .iter()
+            .any(|span| span.style == SemanticStyle::FmDelimiter));
+        assert!(lines[4]
+            .spans
+            .iter()
+            .any(|span| span.style == SemanticStyle::FmDelimiter));
+
+        for (line_index, marker) in [(1, '&'), (3, '*')] {
+            let line = &lines[line_index];
+            let marker_col = line.text.find(marker).expect("YAML marker");
+            assert!(line.spans.iter().any(|span| {
+                span.style == SemanticStyle::Punct
+                    && span.start_col <= marker_col
+                    && span.end_col > marker_col
+            }));
+            assert!(line.spans.iter().all(|span| {
+                span.style != SemanticStyle::FmDelimiter
+                    || marker_col < span.start_col
+                    || marker_col >= span.end_col
+            }));
+        }
+    }
+
+    #[test]
+    fn merge_overlapping_spans_uses_explicit_later_priority() {
+        let merged = merge_overlapping_spans(vec![
+            RankedSpan {
+                span: Span {
+                    start_col: 0,
+                    end_col: 20,
+                    style: SemanticStyle::CodeBlock,
+                },
+                priority: 0,
+            },
+            RankedSpan {
+                span: Span {
+                    start_col: 2,
+                    end_col: 4,
+                    style: SemanticStyle::Keyword,
+                },
+                priority: 1,
+            },
+            RankedSpan {
+                span: Span {
+                    start_col: 3,
+                    end_col: 5,
+                    style: SemanticStyle::Comment,
+                },
+                priority: 2,
+            },
+        ]);
+
+        assert_eq!(
+            merged,
+            vec![
+                Span {
+                    start_col: 0,
+                    end_col: 2,
+                    style: SemanticStyle::CodeBlock,
+                },
+                Span {
+                    start_col: 2,
+                    end_col: 3,
+                    style: SemanticStyle::Keyword,
+                },
+                Span {
+                    start_col: 3,
+                    end_col: 5,
+                    style: SemanticStyle::Comment,
+                },
+                Span {
+                    start_col: 5,
+                    end_col: 20,
+                    style: SemanticStyle::CodeBlock,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -1854,6 +2237,42 @@ mod tests {
         );
     }
 
+    #[cfg(debug_assertions)]
+    #[test]
+    fn timing_sanity_injection_heavy_edit() {
+        let fixture = injection_heavy_fixture_for_test(12);
+        let insertion_offset = fixture.find("fn rust_0").expect("first Rust fence") + 3;
+        let mut highlighter = Highlighter::new(&fixture);
+        let insert = TextEdit {
+            range: insertion_offset..insertion_offset,
+            new_text_len: 1,
+            new_text: "x".to_string(),
+        };
+        let delete = TextEdit {
+            range: insertion_offset..insertion_offset + 1,
+            new_text_len: 0,
+            new_text: String::new(),
+        };
+
+        for _ in 0..3 {
+            highlighter.apply_edit(std::slice::from_ref(&insert));
+            highlighter.apply_edit(std::slice::from_ref(&delete));
+        }
+
+        let iterations = 20;
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            highlighter.apply_edit(std::slice::from_ref(&insert));
+            highlighter.apply_edit(std::slice::from_ref(&delete));
+        }
+        let average = start.elapsed() / (iterations * 2);
+
+        assert!(
+            average < std::time::Duration::from_millis(50),
+            "apply_edit on an injection-heavy document averaged {average:?}; expected <50ms in debug mode"
+        );
+    }
+
     #[test]
     fn no_panic_empty_file() {
         let h = Highlighter::new("");
@@ -1957,6 +2376,74 @@ mod tests {
         doc.push_str("```rust\nfn main() {}\n```\n\n");
         doc.push_str("- item 1\n- item 2\n");
         doc
+    }
+
+    fn long_rust_fence_for_test() -> &'static str {
+        "Before\n\
+         ```rust\n\
+         fn main() {\n\
+             let answer = 42;\n\
+             let label = \"value\";\n\
+             /* block comment begins\n\
+                and continues here\n\
+                before ending here */\n\
+             let doubled = answer * 2;\n\
+             if doubled > 42 {\n\
+                 println!(\"{label}: {doubled}\");\n\
+             }\n\
+         }\n\
+         ```\n\
+         After\n"
+    }
+
+    #[cfg(debug_assertions)]
+    fn injection_heavy_fixture_for_test(repetitions: usize) -> String {
+        let mut document = String::new();
+        for index in 0..repetitions {
+            document.push_str(&format!("```rust\nfn rust_{index}() {{}}\n```\n\n"));
+            document.push_str(&format!("```python\nprint({index})\n```\n\n"));
+            document.push_str(&format!("```yaml\nvalue: {index}\n```\n\n"));
+            document.push_str(&format!("```toml\nvalue = {index}\n```\n\n"));
+            document.push_str(&format!(
+                "```javascript\nfunction value{index}() {{ return {index}; }}\n```\n\n"
+            ));
+        }
+        document
+    }
+
+    fn assert_viewport_matches_full(text: &str, viewport: Range<usize>) -> Vec<StyledLine> {
+        let highlighter = Highlighter::new(text);
+        let full = language_spans_only(highlighter.highlight_lines(0..text.lines().count()));
+        let partial = language_spans_only(highlighter.highlight_lines(viewport.clone()));
+
+        assert_eq!(partial, full[viewport].to_vec());
+        partial
+    }
+
+    fn language_spans_only(mut lines: Vec<StyledLine>) -> Vec<StyledLine> {
+        for line in &mut lines {
+            line.spans.retain(|span| {
+                matches!(
+                    span.style,
+                    SemanticStyle::Keyword
+                        | SemanticStyle::Function
+                        | SemanticStyle::TypeName
+                        | SemanticStyle::StringLit
+                        | SemanticStyle::NumberLit
+                        | SemanticStyle::Comment
+                        | SemanticStyle::Operator
+                        | SemanticStyle::Variable
+                        | SemanticStyle::Punct
+                        | SemanticStyle::FmKey
+                        | SemanticStyle::FmValue
+                )
+            });
+            for span in &mut line.spans {
+                span.start_col = span.start_col.min(line.text.len());
+                span.end_col = span.end_col.min(line.text.len());
+            }
+        }
+        lines
     }
 
     fn assert_edit_matches_fresh(initial: &str, edit: TextEdit) -> Vec<StyledLine> {
