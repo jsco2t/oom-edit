@@ -71,7 +71,7 @@
 
 use std::ops::Range;
 
-use hjkl_buffer::View;
+use hjkl_buffer::{ContentEdit, View};
 use hjkl_engine::types::{DefaultHost, Options};
 use hjkl_engine::{Editor, PlannedInput, SpecialKey, VimMode as HjklVimMode};
 use hjkl_vim::{feed_input, install_vim_discipline, VimEditorExt};
@@ -471,6 +471,44 @@ impl VimCore {
         }
     }
 
+    /// Apply the engine's right-to-left multi-split operation for syntax
+    /// regression tests, then translate its emitted content edits through the
+    /// same wrapper path used by normal key handling.
+    #[cfg(test)]
+    pub(crate) fn split_lines_for_test(
+        &mut self,
+        row: usize,
+        cols: Vec<usize>,
+        inserted_spaces: Vec<bool>,
+    ) -> Vec<TextEdit> {
+        self.editor.mutate_edit(hjkl_buffer::Edit::SplitLines {
+            row,
+            cols,
+            inserted_spaces,
+        });
+        self.drain_content_edits()
+    }
+
+    /// Apply a sequence of single-character engine replacements for syntax
+    /// regression tests, then translate the accumulated content-edit batch
+    /// through the normal wrapper drain path.
+    #[cfg(test)]
+    pub(crate) fn replace_chars_for_test(
+        &mut self,
+        replacements: &[(usize, usize, char)],
+    ) -> Vec<TextEdit> {
+        use hjkl_buffer::{Edit, Position};
+
+        for &(row, col, replacement) in replacements {
+            self.editor.mutate_edit(Edit::Replace {
+                start: Position::new(row, col),
+                end: Position::new(row, col + 1),
+                with: replacement.to_string(),
+            });
+        }
+        self.drain_content_edits()
+    }
+
     // ── Internal helpers ─────────────────────────────────────────────
 
     /// Normalize <C-[> (Ctrl+LeftBracket) to Esc.
@@ -555,13 +593,17 @@ impl VimCore {
         let hjkl_edits = self.editor.take_content_edits();
         let text = self.editor.buffer().as_string();
         hjkl_edits
-            .into_iter()
-            .map(|ce| {
-                let new_text = text[ce.start_byte..ce.new_end_byte].to_string();
+            .iter()
+            .enumerate()
+            .map(|(index, ce)| {
+                let new_text = replacement_text_from_final_buffer(&text, &hjkl_edits, index);
                 TextEdit {
                     range: ce.start_byte..ce.old_end_byte,
-                    new_text_len: ce.new_end_byte - ce.start_byte,
-                    new_text,
+                    new_text_len: ce
+                        .new_end_byte
+                        .checked_sub(ce.start_byte)
+                        .expect("hjkl replacement end must not precede its start"),
+                    new_text: new_text.to_string(),
                 }
             })
             .collect()
@@ -621,6 +663,44 @@ impl VimCore {
             }
         }
     }
+}
+
+/// Extract one sequential edit's replacement from the engine's final buffer.
+///
+/// hjkl emits fan-out batches in the order they must be consumed, while the
+/// buffer text available after the command already contains every edit. Later
+/// entries located before `edit` have therefore shifted its replacement in
+/// the final text even though a sequential consumer has not applied them yet.
+/// Rebase by those later entries' net byte deltas without changing batch order.
+fn replacement_text_from_final_buffer<'a>(
+    final_text: &'a str,
+    edits: &[ContentEdit],
+    index: usize,
+) -> &'a str {
+    let edit = &edits[index];
+    if edit.start_byte == edit.new_end_byte {
+        return "";
+    }
+
+    let shift = edits[index + 1..]
+        .iter()
+        .filter(|later| later.start_byte < edit.start_byte)
+        .fold(0_i128, |total, later| {
+            total + later.new_end_byte as i128 - later.old_end_byte as i128
+        });
+    let rebased_start = usize::try_from(edit.start_byte as i128 + shift)
+        .expect("hjkl replacement start must remain non-negative after rebasing");
+    let rebased_end = usize::try_from(edit.new_end_byte as i128 + shift)
+        .expect("hjkl replacement end must remain non-negative after rebasing");
+
+    final_text
+        .get(rebased_start..rebased_end)
+        .unwrap_or_else(|| {
+            panic!(
+                "hjkl replacement range {rebased_start}..{rebased_end} is not a valid UTF-8 slice of the {}-byte final buffer",
+                final_text.len()
+            )
+        })
 }
 
 // ── UndoMark ───────────────────────────────────────────────────────────────

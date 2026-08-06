@@ -173,41 +173,26 @@ impl Highlighter {
     /// This is the FR-4.4 incremental highlighting path: only the affected
     /// trees are re-parsed, keeping keystroke latency within NFR-3 budget.
     ///
-    /// Edits are applied in order (sorted by start offset) and
-    /// injection regions are re-resolved for changed ranges.
+    /// Edits are applied in their incoming sequential order and injection
+    /// regions are re-resolved after the batch.
     pub fn apply_edit(&mut self, edits: &[TextEdit]) {
         if edits.is_empty() {
             return;
         }
 
-        // Sort edits by start offset (ascending).
-        let mut sorted_edits: Vec<_> = edits.to_vec();
-        sorted_edits.sort_by_key(|e| e.range.start);
-
-        // Compute tree-edit positions from the OLD text (before applying edits).
-        // tree-sitter's InputEdit expects positions in the pre-edit text.
-        let old_text = self.text.clone();
-        let valid_edits: Vec<_> = sorted_edits
+        let contains_insertion = edits
             .iter()
-            .filter_map(|edit| input_edit(&old_text, edit))
-            .collect();
+            .any(|edit| edit.range.start == edit.range.end && !edit.new_text.is_empty());
+        let mut working_text = self.text.clone();
 
-        // Apply tree edits before updating text so tree-sitter positions
-        // remain valid against the old text.
-        for edit in &valid_edits {
-            self.md_tree.edit(edit);
-        }
-
-        // Update the text by applying ALL edits in sorted order (including
-        // backward-range ones that hjkl produces; the vim engine already
-        // applied them to the buffer, so the highlighter's text must stay
-        // in sync).
-        apply_edits_to_string(&mut self.text, &sorted_edits);
-
-        if valid_edits.is_empty() {
-            // No valid tree edits (e.g., zero-length edits only),
-            // but the text changed. Do a full re-parse since the tree
-            // was never updated and is out of sync with the new text.
+        if contains_insertion {
+            // I1 fallback: do not partially edit the retained tree when one
+            // entry must be skipped. Apply the whole sequential text batch and
+            // perform exactly one coherent full reparse.
+            for edit in edits {
+                apply_edit_to_string(&mut working_text, edit);
+            }
+            self.text = working_text;
             self.md_tree = self
                 .md_parser
                 .parse(&self.text, None)
@@ -216,11 +201,24 @@ impl Highlighter {
             return;
         }
 
-        // Re-parse incrementally with the updated text
+        let mut tree_was_edited = false;
+        for edit in edits {
+            // Every coordinate is relative to the document produced by the
+            // preceding entry, so compute and apply the tree edit before
+            // applying the identical replacement to the working text.
+            if let Some(tree_edit) = input_edit(&working_text, edit) {
+                self.md_tree.edit(&tree_edit);
+                tree_was_edited = true;
+            }
+            apply_edit_to_string(&mut working_text, edit);
+        }
+        self.text = working_text;
+
+        let old_tree = tree_was_edited.then_some(&self.md_tree);
         self.md_tree = self
             .md_parser
-            .parse(&self.text, Some(&self.md_tree))
-            .expect("incremental re-parse should succeed");
+            .parse(&self.text, old_tree)
+            .expect("re-parse should succeed");
 
         // Re-discover injections
         self.discover_injections();
@@ -813,7 +811,8 @@ fn md_capture_to_style(capture: &str) -> SemanticStyle {
 
 /// Construct a tree-sitter edit from a replacement against `old_text`.
 fn input_edit(old_text: &str, edit: &TextEdit) -> Option<tree_sitter::InputEdit> {
-    // Skip zero-length edits — they don't change the tree structure.
+    // Insertions currently take the full-reparse path, and true no-ops do not
+    // require a tree edit.
     if edit.range.start == edit.range.end {
         return None;
     }
@@ -893,49 +892,21 @@ fn line_start_indices(text: &str) -> Vec<usize> {
 
 // ── Helper: apply edits to a string ─────────────────────────────────────────
 
-/// Apply a list of sorted, non-overlapping text edits to a string.
-/// Edits must be sorted by `range.start` in ascending order.
-fn apply_edits_to_string(text: &mut String, edits: &[TextEdit]) {
-    if edits.is_empty() {
-        return;
-    }
-
-    let mut result = String::with_capacity(text.len());
-    let mut last_end = 0;
-
-    for edit in edits {
-        let mut start = edit.range.start;
-        let mut end = edit.range.end;
-        // Normalize backward-range edits (hjkl produces these for some
-        // operations like Visual-mode X; the range represents the same
-        // character deletion/replacement, just with inverted bounds).
-        if start > end {
-            std::mem::swap(&mut start, &mut end);
-        }
-        // Ensure we don't go out of bounds
-        let start = start.min(text.len());
-        let end = end.min(text.len());
-
-        // Skip if this edit is entirely before our current position
-        // (can happen when backward-range edits are sorted by original start)
-        if end < last_end {
-            continue;
-        }
-
-        // Copy the unchanged prefix
-        let copy_start = last_end.min(text.len());
-        let copy_end = start.min(text.len());
-        if copy_start < copy_end {
-            result.push_str(&text[copy_start..copy_end]);
-        }
-        // Insert the new text
-        result.push_str(&edit.new_text);
-        last_end = end;
-    }
-
-    // Copy the remaining suffix
-    result.push_str(&text[last_end..]);
-    *text = result;
+/// Apply one sequential replacement to the current document state.
+fn apply_edit_to_string(text: &mut String, edit: &TextEdit) {
+    assert_eq!(
+        edit.new_text_len,
+        edit.new_text.len(),
+        "TextEdit replacement length must match its UTF-8 byte length"
+    );
+    let start = edit.range.start.min(edit.range.end);
+    let end = edit.range.start.max(edit.range.end);
+    assert!(
+        end <= text.len() && text.is_char_boundary(start) && text.is_char_boundary(end),
+        "TextEdit range {start}..{end} is not a valid UTF-8 slice of the {}-byte working document",
+        text.len()
+    );
+    text.replace_range(start..end, &edit.new_text);
 }
 
 // ── Helper: merge overlapping spans ─────────────────────────────────────────
@@ -981,6 +952,7 @@ fn merge_overlapping_spans(mut spans: Vec<Span>) -> Vec<Span> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vim::{KeyCode, KeyCodeKind, KeyInput, Modifiers, VimCore, VimEffect};
 
     #[cfg(test)]
     use proptest::prelude::*;
@@ -1078,6 +1050,139 @@ mod tests {
 
         assert_eq!(actual.new_end_byte, 6);
         assert_eq!(actual.new_end_position, Point::new(1, 0));
+    }
+
+    #[test]
+    fn vim_batch_bottom_up_deletions_match_fresh_highlighting() {
+        let mut vim = VimCore::new("## Heading\n- item\n> quote");
+        let mut highlighter = Highlighter::new(&vim.text());
+
+        apply_vim_key(&mut vim, &mut highlighter, ctrl_char_key('v'));
+        apply_vim_key(&mut vim, &mut highlighter, char_key('j'));
+        apply_vim_key(&mut vim, &mut highlighter, char_key('j'));
+        apply_vim_key(&mut vim, &mut highlighter, char_key('l'));
+        let edits = apply_vim_key(&mut vim, &mut highlighter, char_key('x'));
+
+        assert_eq!(vim.text(), " Heading\nitem\nquote");
+        assert_eq!(edits.len(), 3);
+        assert!(edits.iter().all(|edit| edit.new_text.is_empty()));
+        assert!(edits
+            .windows(2)
+            .all(|pair| pair[0].range.start > pair[1].range.start));
+    }
+
+    #[test]
+    fn vim_batch_visual_block_insertions_rebase_replacement_slices() {
+        let mut vim = VimCore::new("# aa\n- bb\n> cc");
+        let mut highlighter = Highlighter::new(&vim.text());
+        let mut edits = Vec::new();
+
+        edits.extend(apply_vim_key(
+            &mut vim,
+            &mut highlighter,
+            ctrl_char_key('v'),
+        ));
+        edits.extend(apply_vim_key(&mut vim, &mut highlighter, char_key('j')));
+        edits.extend(apply_vim_key(&mut vim, &mut highlighter, char_key('j')));
+        edits.extend(apply_vim_key(&mut vim, &mut highlighter, char_key('I')));
+        edits.extend(apply_vim_key(&mut vim, &mut highlighter, char_key('X')));
+        edits.extend(apply_vim_key(
+            &mut vim,
+            &mut highlighter,
+            special_key(KeyCodeKind::Esc),
+        ));
+
+        assert_eq!(vim.text(), "X# aa\nX- bb\nX> cc");
+        assert_eq!(edits.len(), 3);
+        assert_eq!(
+            edits
+                .iter()
+                .map(|edit| edit.new_text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["X", "X", "X"]
+        );
+    }
+
+    #[test]
+    fn vim_batch_same_row_splits_stay_right_to_left() {
+        let mut vim = VimCore::new("# abcdef");
+        let mut highlighter = Highlighter::new(&vim.text());
+
+        let edits = vim.split_lines_for_test(0, vec![2, 4], vec![false, false]);
+        highlighter.apply_edit(&edits);
+        assert_vim_highlighting_matches_fresh(&vim, &highlighter);
+
+        assert_eq!(vim.text(), "# \nab\ncdef");
+        assert_eq!(edits.len(), 2);
+        assert_eq!(
+            edits
+                .iter()
+                .map(|edit| edit.range.start)
+                .collect::<Vec<_>>(),
+            vec![4, 2]
+        );
+        assert_eq!(
+            edits
+                .iter()
+                .map(|edit| edit.new_text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["\n", "\n"]
+        );
+    }
+
+    #[test]
+    fn vim_batch_multibyte_replacements_preserve_different_byte_deltas() {
+        let mut vim = VimCore::new("café\ncafe\ncaff");
+        let mut highlighter = Highlighter::new(&vim.text());
+
+        let edits = vim.replace_chars_for_test(&[(2, 3, 'x'), (1, 3, 'x'), (0, 3, 'x')]);
+        highlighter.apply_edit(&edits);
+        assert_vim_highlighting_matches_fresh(&vim, &highlighter);
+
+        assert_eq!(vim.text(), "cafx\ncafx\ncafx");
+        assert_eq!(edits.len(), 3);
+        assert_eq!(
+            edits
+                .iter()
+                .map(|edit| {
+                    edit.new_text_len as isize - (edit.range.end - edit.range.start) as isize
+                })
+                .collect::<Vec<_>>(),
+            vec![0, 0, -1]
+        );
+        assert_eq!(
+            edits
+                .iter()
+                .map(|edit| edit.new_text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["x", "x", "x"]
+        );
+    }
+
+    #[test]
+    fn insertion_containing_batch_applies_every_replacement_sequentially() {
+        let mut highlighter = Highlighter::new("# alpha\n");
+        let edits = [
+            TextEdit {
+                range: 2..3,
+                new_text_len: 0,
+                new_text: String::new(),
+            },
+            TextEdit {
+                range: 6..6,
+                new_text_len: 2,
+                new_text: "**".to_string(),
+            },
+        ];
+
+        highlighter.apply_edit(&edits);
+
+        let expected = "# lpha**\n";
+        assert_eq!(highlighter.text(), expected);
+        assert_eq!(
+            highlighter.highlight_lines(0..1000),
+            Highlighter::new(expected).highlight_lines(0..1000)
+        );
     }
 
     #[test]
@@ -1698,5 +1803,60 @@ mod tests {
         let fresh = Highlighter::new(&expected_text).highlight_lines(0..1000);
         assert_eq!(incremental, fresh);
         incremental
+    }
+
+    fn char_key(c: char) -> KeyInput {
+        KeyInput {
+            code: KeyCode {
+                kind: KeyCodeKind::Char(c),
+            },
+            mods: Modifiers::default(),
+        }
+    }
+
+    fn ctrl_char_key(c: char) -> KeyInput {
+        KeyInput {
+            code: KeyCode {
+                kind: KeyCodeKind::Char(c),
+            },
+            mods: Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            },
+        }
+    }
+
+    fn special_key(kind: KeyCodeKind) -> KeyInput {
+        KeyInput {
+            code: KeyCode { kind },
+            mods: Modifiers::default(),
+        }
+    }
+
+    fn apply_vim_key(
+        vim: &mut VimCore,
+        highlighter: &mut Highlighter,
+        key: KeyInput,
+    ) -> Vec<TextEdit> {
+        let mut applied = Vec::new();
+        for effect in vim.handle_key(key) {
+            if let VimEffect::Edited { edits } = effect {
+                highlighter.apply_edit(&edits);
+                applied.extend(edits);
+            }
+        }
+        if !applied.is_empty() {
+            assert_vim_highlighting_matches_fresh(vim, highlighter);
+        }
+        applied
+    }
+
+    fn assert_vim_highlighting_matches_fresh(vim: &VimCore, highlighter: &Highlighter) {
+        let expected = vim.text();
+        assert_eq!(highlighter.text(), expected);
+        assert_eq!(
+            highlighter.highlight_lines(0..1000),
+            Highlighter::new(&expected).highlight_lines(0..1000)
+        );
     }
 }
