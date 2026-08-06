@@ -32,6 +32,11 @@ use crate::widgets::which_key;
 /// Scrolloff: keep this many lines of context around the cursor.
 const SCROLLOFF: usize = 3;
 
+fn body_height(total_height: u16, has_multiple_tabs: bool) -> u16 {
+    let tab_bar_height = u16::from(has_multiple_tabs);
+    total_height.saturating_sub(tab_bar_height + 1)
+}
+
 /// A single tab entry: an [`EditorSession`] with per-tab UI state.
 pub(crate) struct TabEntry {
     /// The core editing session for this tab.
@@ -208,10 +213,7 @@ impl App {
         // When 1 tab: body + status (1).
         let tab_bar_height = if self.has_multiple_tabs() { 1 } else { 0 };
         let status_height: u16 = 1;
-        let body_height = area
-            .height
-            .saturating_sub(tab_bar_height)
-            .saturating_sub(status_height);
+        let body_height = body_height(area.height, self.has_multiple_tabs());
 
         self.viewport_height = body_height as usize;
 
@@ -364,19 +366,27 @@ impl App {
     pub fn handle_event(&mut self, event: &Event) {
         // Handle resize events — rebuild view layout on width change.
         if let Event::Resize(_width, height) = event {
-            // Clamp viewport height from the new terminal size.
-            self.viewport_height = height.saturating_sub(1) as usize;
+            // Clamp viewport height using the same chrome rows as render().
+            self.viewport_height = body_height(*height, self.has_multiple_tabs()) as usize;
             // View mode: remap cursor from edit coordinates so it stays on
             // the same content line after re-wrap (FR-3.1).
             if self.session().map(|s| s.mode()) == Some(oom_edit_core::session::Mode::View) {
                 if let Some(ref mut entry) = self.tabs.get_mut(self.active_tab) {
-                    let (edit_line, edit_col) = entry.session.cursor();
+                    let text = entry.session.document();
+                    let (edit_line, edit_col) =
+                        match (entry.session.view_cursor(), entry.session.view_layout()) {
+                            (Some(cursor), Some(layout)) => {
+                                oom_edit_core::view::nav::leave_view(&cursor, layout, &text)
+                            }
+                            _ => entry.session.cursor(),
+                        };
                     // Force layout rebuild so enter_view has a layout to work with.
                     entry.session.render_view(*_width);
                     entry
                         .session
                         .remap_view_cursor_from_edit(edit_line, edit_col);
                 }
+                self.scroll_follow();
             }
             return;
         }
@@ -1730,7 +1740,7 @@ mod tests {
     #[test]
     fn app_resize_view_remaps_cursor() {
         // Multi-line text that wraps differently at different widths.
-        let text = "Hello world this is a long line that will wrap differently at different widths\nSecond line\nThird line";
+        let text = "# Intro\n\nThis opening paragraph is deliberately long enough to wrap at forty columns but not at eighty columns.\n\n## Target heading\n\nThis trailing paragraph is also deliberately long enough to make the narrow layout visibly different.\n";
         let session = EditorSession::from_text(text);
         let mut app = test_app(session);
 
@@ -1744,18 +1754,75 @@ mod tests {
             oom_edit_core::session::Mode::View
         );
 
-        // Record the view cursor before resize.
-        let cursor_before = app.session().unwrap().view_cursor().map(|c| c.line);
+        // Navigate to the target heading in View mode.
+        let down = KeyEvent::new(CrosstermKeyCode::Down, KeyModifiers::NONE);
+        let content_line = |app: &App| {
+            let session = app.session().unwrap();
+            let cursor = session.view_cursor_line();
+            let source_start = session.view_layout().unwrap().lines[cursor].source.start;
+            text[..source_start]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count()
+        };
+        while content_line(&app) < 4 {
+            app.handle_event(&Event::Key(down));
+        }
+        assert_eq!(content_line(&app), 4);
+        let wide_line_count = app.session().unwrap().view_layout().unwrap().lines.len();
 
-        // Simulate a resize event.
-        let resize = Event::Resize(80, 24);
+        // Simulate a narrow resize that changes wrapping.
+        let resize = Event::Resize(40, 6);
         app.handle_event(&resize);
 
-        // Cursor should still be on the same content line (remapped to view line).
-        let cursor_after = app.session().unwrap().view_cursor().map(|c| c.line);
+        let narrow_line_count = app.session().unwrap().view_layout().unwrap().lines.len();
         assert!(
-            cursor_before == cursor_after || cursor_after.is_some(),
-            "view cursor should be remapped on resize"
+            narrow_line_count > wide_line_count,
+            "narrow resize should reflow the View layout"
+        );
+        assert_eq!(
+            content_line(&app),
+            4,
+            "view cursor should remain on the target heading's logical source line"
+        );
+        let cursor = app.session().unwrap().view_cursor_line();
+        let view_top = app.active().unwrap().view_top;
+        assert!(
+            (view_top..view_top + app.viewport_height).contains(&cursor),
+            "remapped View cursor should remain visible after resize"
+        );
+    }
+
+    #[test]
+    fn app_resize_with_tabs_keeps_view_cursor_visible() {
+        let text = "# Intro\n\nThis opening paragraph is deliberately long enough to wrap at forty columns but not at eighty columns.\n\n## Target heading\n\nThis trailing paragraph is also deliberately long enough to make the narrow layout visibly different.\n";
+        let mut app = test_app(EditorSession::from_text(text));
+
+        let space = KeyEvent::new(CrosstermKeyCode::Char(' '), KeyModifiers::NONE);
+        app.handle_event(&Event::Key(space));
+        let v = KeyEvent::new(CrosstermKeyCode::Char('v'), KeyModifiers::NONE);
+        app.handle_event(&Event::Key(v));
+
+        let wide_line_count = app.session().unwrap().view_layout().unwrap().lines.len();
+        let down = KeyEvent::new(CrosstermKeyCode::Down, KeyModifiers::NONE);
+        for _ in 0..wide_line_count {
+            app.handle_event(&Event::Key(down));
+        }
+        assert_eq!(
+            app.session().unwrap().view_cursor_line(),
+            wide_line_count - 1
+        );
+
+        app.tabs
+            .push(TabEntry::new(EditorSession::from_text("second tab")));
+        app.handle_event(&Event::Resize(40, 6));
+
+        assert_eq!(app.viewport_height, 4);
+        let cursor = app.session().unwrap().view_cursor_line();
+        let view_top = app.active().unwrap().view_top;
+        assert!(
+            (view_top..view_top + app.viewport_height).contains(&cursor),
+            "remapped View cursor should remain visible below the tab bar"
         );
     }
 
