@@ -99,6 +99,14 @@ struct Injection {
     fence_lang: Option<String>,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParsePath {
+    Full,
+    Incremental,
+    Skipped,
+}
+
 // ── Highlighter ─────────────────────────────────────────────────────────────
 
 /// Incremental tree-sitter highlighter for markdown documents.
@@ -122,6 +130,9 @@ pub struct Highlighter {
     md_parser: Parser,
     /// Injection regions (front matter, fenced code blocks).
     injections: Vec<Injection>,
+    /// Most recent parser route, exposed only to regression tests.
+    #[cfg(test)]
+    last_parse_path: ParsePath,
 }
 
 impl Highlighter {
@@ -155,6 +166,8 @@ impl Highlighter {
             md_inline_query: inline_query,
             md_parser: parser,
             injections: Vec::new(),
+            #[cfg(test)]
+            last_parse_path: ParsePath::Full,
         };
 
         // Discover injection regions
@@ -180,26 +193,12 @@ impl Highlighter {
             return;
         }
 
-        let contains_insertion = edits
-            .iter()
-            .any(|edit| edit.range.start == edit.range.end && !edit.new_text.is_empty());
-        let mut working_text = self.text.clone();
-
-        if contains_insertion {
-            // I1 fallback: do not partially edit the retained tree when one
-            // entry must be skipped. Apply the whole sequential text batch and
-            // perform exactly one coherent full reparse.
-            for edit in edits {
-                apply_edit_to_string(&mut working_text, edit);
-            }
-            self.text = working_text;
-            self.md_tree = self
-                .md_parser
-                .parse(&self.text, None)
-                .expect("full re-parse should succeed");
-            self.discover_injections();
-            return;
+        #[cfg(test)]
+        {
+            self.last_parse_path = ParsePath::Skipped;
         }
+
+        let mut working_text = self.text.clone();
 
         let mut tree_was_edited = false;
         for edit in edits {
@@ -214,11 +213,19 @@ impl Highlighter {
         }
         self.text = working_text;
 
-        let old_tree = tree_was_edited.then_some(&self.md_tree);
+        if !tree_was_edited {
+            return;
+        }
+
+        let old_tree = Some(&self.md_tree);
         self.md_tree = self
             .md_parser
             .parse(&self.text, old_tree)
             .expect("re-parse should succeed");
+        #[cfg(test)]
+        {
+            self.last_parse_path = ParsePath::Incremental;
+        }
 
         // Re-discover injections
         self.discover_injections();
@@ -811,9 +818,9 @@ fn md_capture_to_style(capture: &str) -> SemanticStyle {
 
 /// Construct a tree-sitter edit from a replacement against `old_text`.
 fn input_edit(old_text: &str, edit: &TextEdit) -> Option<tree_sitter::InputEdit> {
-    // Insertions currently take the full-reparse path, and true no-ops do not
-    // require a tree edit.
-    if edit.range.start == edit.range.end {
+    // Skip true no-ops while allowing insertions through to the incremental
+    // parse path.
+    if edit.range.start == edit.range.end && edit.new_text_len == 0 {
         return None;
     }
 
@@ -1053,6 +1060,23 @@ mod tests {
     }
 
     #[test]
+    fn insertion_produces_valid_input_edit() {
+        let edit = TextEdit {
+            range: 8..8,
+            new_text_len: 3,
+            new_text: "abc".to_string(),
+        };
+        let actual = input_edit("# title\nbody\n", &edit).expect("insertion edit");
+
+        assert_eq!(actual.start_byte, 8);
+        assert_eq!(actual.old_end_byte, 8);
+        assert_eq!(actual.new_end_byte, 11);
+        assert_eq!(actual.start_position, Point::new(1, 0));
+        assert_eq!(actual.old_end_position, Point::new(1, 0));
+        assert_eq!(actual.new_end_position, Point::new(1, 3));
+    }
+
+    #[test]
     fn vim_batch_bottom_up_deletions_match_fresh_highlighting() {
         let mut vim = VimCore::new("## Heading\n- item\n> quote");
         let mut highlighter = Highlighter::new(&vim.text());
@@ -1179,6 +1203,7 @@ mod tests {
 
         let expected = "# lpha**\n";
         assert_eq!(highlighter.text(), expected);
+        assert_eq!(highlighter.last_parse_path, ParsePath::Incremental);
         assert_eq!(
             highlighter.highlight_lines(0..1000),
             Highlighter::new(expected).highlight_lines(0..1000)
@@ -1266,19 +1291,102 @@ mod tests {
     }
 
     #[test]
-    fn highlighter_applies_edit_incrementally() {
-        let mut h = Highlighter::new("# Hello\n\nWorld\n");
-        let before = h.highlight_lines(0..3);
+    fn insertion_incremental_equivalence() {
+        let initial = "# Heading\n\nParagraph with *emphasis*.\n";
+        let lines = assert_edit_matches_fresh(
+            initial,
+            TextEdit {
+                range: 4..4,
+                new_text_len: 1,
+                new_text: "x".to_string(),
+            },
+        );
 
-        // Insert a character
-        h.apply_edit(&[TextEdit {
-            range: 2..2,
-            new_text_len: 1,
-            new_text: "x".to_string(),
-        }]);
+        assert_eq!(lines[0].text, "# Hexading");
+    }
 
-        let after = h.highlight_lines(0..3);
-        assert_eq!(after[0].text.len(), before[0].text.len() + 1);
+    #[test]
+    fn multi_char_insertion_incremental() {
+        let initial = "# Heading\n\nParagraph.\n";
+        let inserted = "hello world";
+        let lines = assert_edit_matches_fresh(
+            initial,
+            TextEdit {
+                range: 0..0,
+                new_text_len: inserted.len(),
+                new_text: inserted.to_string(),
+            },
+        );
+
+        assert_eq!(lines[0].text, "hello world# Heading");
+    }
+
+    #[test]
+    fn noop_edit_still_filtered() {
+        let initial = "# Heading\n\nParagraph.\n";
+        let edit = TextEdit {
+            range: 5..5,
+            new_text_len: 0,
+            new_text: String::new(),
+        };
+        assert!(input_edit(initial, &edit).is_none());
+
+        let mut highlighter = Highlighter::new(initial);
+        highlighter.apply_edit(&[edit]);
+
+        assert_eq!(highlighter.text(), initial);
+        assert_eq!(highlighter.last_parse_path, ParsePath::Skipped);
+        assert_eq!(
+            highlighter.highlight_lines(0..1000),
+            Highlighter::new(initial).highlight_lines(0..1000)
+        );
+    }
+
+    #[test]
+    fn insertion_in_fenced_block() {
+        let initial = "```rust\nfn main() {\n}\n```\n";
+        let insertion_offset = initial.find("}\n").expect("closing brace");
+        let inserted = "    let answer = 42;\n";
+        let edit = TextEdit {
+            range: insertion_offset..insertion_offset,
+            new_text_len: inserted.len(),
+            new_text: inserted.to_string(),
+        };
+        let mut expected_text = initial.to_string();
+        expected_text.insert_str(insertion_offset, inserted);
+
+        let mut highlighter = Highlighter::new(initial);
+        highlighter.apply_edit(&[edit]);
+        let fresh = Highlighter::new(&expected_text);
+
+        let lines = highlighter.highlight_lines(0..1000);
+        assert_eq!(highlighter.last_parse_path, ParsePath::Incremental);
+        assert_eq!(lines, fresh.highlight_lines(0..1000));
+        let injection_ranges = highlighter
+            .injections
+            .iter()
+            .map(|injection| {
+                (
+                    injection.start,
+                    injection.end,
+                    injection.fence_lang.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let fresh_injection_ranges = fresh
+            .injections
+            .iter()
+            .map(|injection| {
+                (
+                    injection.start,
+                    injection.end,
+                    injection.fence_lang.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(lines[2].text, "    let answer = 42;");
+        assert_eq!(injection_ranges, fresh_injection_ranges);
     }
 
     #[test]
@@ -1799,6 +1907,7 @@ mod tests {
         highlighter.apply_edit(&[edit]);
 
         assert_eq!(highlighter.text(), expected_text);
+        assert_eq!(highlighter.last_parse_path, ParsePath::Incremental);
         let incremental = highlighter.highlight_lines(0..1000);
         let fresh = Highlighter::new(&expected_text).highlight_lines(0..1000);
         assert_eq!(incremental, fresh);
@@ -1854,6 +1963,7 @@ mod tests {
     fn assert_vim_highlighting_matches_fresh(vim: &VimCore, highlighter: &Highlighter) {
         let expected = vim.text();
         assert_eq!(highlighter.text(), expected);
+        assert_eq!(highlighter.last_parse_path, ParsePath::Incremental);
         assert_eq!(
             highlighter.highlight_lines(0..1000),
             Highlighter::new(&expected).highlight_lines(0..1000)
