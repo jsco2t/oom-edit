@@ -21,7 +21,23 @@ fn cargo_tree_output() -> String {
         .output()
         .expect("cargo tree should run");
 
-    String::from_utf8_lossy(&output.stdout).into_owned()
+    assert!(
+        output.status.success(),
+        "cargo tree failed with status {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        !stdout.is_empty(),
+        "cargo tree produced no output — dependency check is vacuous"
+    );
+    assert!(
+        stdout.contains("oom-edit-core"),
+        "cargo tree output does not contain the requested root package"
+    );
+    stdout
 }
 
 /// Check that the cargo tree output does not contain any of the banned patterns.
