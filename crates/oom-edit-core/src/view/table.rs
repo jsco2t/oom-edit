@@ -46,14 +46,7 @@ pub fn render_table(
     for row_cells in &cells {
         for (ci, cell) in row_cells.iter().enumerate() {
             let w = cell.display_width;
-            if w > col_widths[ci] && w <= CELL_CAP {
-                col_widths[ci] = w;
-            } else if w > CELL_CAP {
-                // Column needs wrapping — use CELL_CAP as the display width
-                col_widths[ci] = CELL_CAP;
-            } else if w > col_widths[ci] {
-                col_widths[ci] = w;
-            }
+            col_widths[ci] = col_widths[ci].max(w.min(CELL_CAP));
         }
     }
 
@@ -99,10 +92,9 @@ pub fn render_table(
         source_span.clone(),
     ));
 
-    // Assign source span to all lines (VP-1: content span)
+    // Assign a default Text span to lines that have no semantic spans.
     for line in &mut lines {
-        line.spans.clear();
-        if !line.text.is_empty() {
+        if line.spans.is_empty() && !line.text.is_empty() {
             line.spans.push(Span {
                 start_col: 0,
                 end_col: line.text.chars().count(),
@@ -198,7 +190,7 @@ fn build_separator_row(alignments: &[TableAlignment], col_widths: &[usize]) -> S
             _ => "┤",
         };
         // Draw the separator line content
-        let dashes = "─".repeat(w);
+        let dashes = "─".repeat(w + 2);
         text.push_str(&dashes);
         text.push_str(sep);
     }
@@ -320,6 +312,85 @@ mod tests {
     }
 
     #[test]
+    fn separator_width_matches_border() {
+        let header = vec![make_inlines(&["Name", "Age"])];
+        let rows = vec![vec![make_inlines(&["Alice", "30"])]];
+        let alignments = vec![TableAlignment::Left, TableAlignment::Left];
+        let lines = render_table(&alignments, &header, &rows, 0..100);
+
+        let top_width = lines[0].text.chars().count();
+        let separator_width = lines[2].text.chars().count();
+        let bottom_width = lines[4].text.chars().count();
+        assert_eq!(
+            top_width, separator_width,
+            "separator width ({separator_width}) must match top border width ({top_width})"
+        );
+        assert_eq!(
+            top_width, bottom_width,
+            "bottom border width ({bottom_width}) must match top border width ({top_width})"
+        );
+    }
+
+    #[test]
+    fn header_row_has_strong_style() {
+        let header = vec![make_inlines(&["Name", "Age"])];
+        let rows = vec![vec![make_inlines(&["Alice", "30"])]];
+        let alignments = vec![TableAlignment::Left, TableAlignment::Left];
+        let lines = render_table(&alignments, &header, &rows, 0..100);
+
+        let header_line = &lines[1];
+        assert!(
+            header_line
+                .spans
+                .iter()
+                .any(|span| span.style == SemanticStyle::Strong),
+            "header row should have Strong style, got spans: {:?}",
+            header_line.spans
+        );
+    }
+
+    #[test]
+    fn body_row_has_text_style_and_not_strong() {
+        let header = vec![make_inlines(&["Name", "Age"])];
+        let rows = vec![vec![make_inlines(&["Alice", "30"])]];
+        let alignments = vec![TableAlignment::Left, TableAlignment::Left];
+        let lines = render_table(&alignments, &header, &rows, 0..100);
+
+        let body_line = &lines[3];
+        assert!(
+            body_line
+                .spans
+                .iter()
+                .any(|span| span.style == SemanticStyle::Text),
+            "body row should have Text style, got spans: {:?}",
+            body_line.spans
+        );
+        assert!(
+            body_line
+                .spans
+                .iter()
+                .all(|span| span.style != SemanticStyle::Strong),
+            "body row should not have Strong style"
+        );
+    }
+
+    #[test]
+    fn column_width_capped_at_cell_cap() {
+        let long = "x".repeat(60);
+        let header = vec![make_inlines(&[&long])];
+        let rows = vec![vec![make_inlines(&["short"])]];
+        let alignments = vec![TableAlignment::Left];
+        let lines = render_table(&alignments, &header, &rows, 0..100);
+
+        let border_width = lines[0].text.chars().count();
+        assert_eq!(
+            border_width,
+            CELL_CAP + 4,
+            "border width should be CELL_CAP + 4 for a single column"
+        );
+    }
+
+    #[test]
     fn rendered_unicode_table_spans_cover_complete_rows_in_character_indices() {
         let header = vec![make_inlines(&["café", "東京🙂"])];
         let rows = vec![vec![make_inlines(&["résumé", "大阪🚀"])]];
@@ -327,24 +398,38 @@ mod tests {
 
         let lines = render_table(&alignments, &header, &rows, 0..100);
 
-        for line in &lines {
+        for (line_index, line) in lines.iter().enumerate() {
             let char_count = line.text.chars().count();
             assert_eq!(
                 line.spans.len(),
                 1,
-                "rendered table row should have exactly one full-row span: {:?}",
+                "rendered table row should have exactly one span: {:?}",
                 line.text
             );
-            for span in &line.spans {
+            let span = &line.spans[0];
+            assert!(span.start_col <= span.end_col);
+            assert!(
+                span.end_col <= char_count,
+                "span [{}, {}) exceeds {char_count} chars in {:?}",
+                span.start_col,
+                span.end_col,
+                line.text
+            );
+            if line_index == 1 {
+                assert_eq!(span.style, SemanticStyle::Strong);
+                assert_eq!(span.start_col, 1);
+                assert_eq!(span.end_col, char_count - 1);
+                let content: String = line
+                    .text
+                    .chars()
+                    .skip(1)
+                    .take(char_count.saturating_sub(2))
+                    .collect();
+                assert_eq!(span_text(line, span), content);
+            } else {
                 assert_eq!(span.style, SemanticStyle::Text);
-                assert!(span.start_col <= span.end_col);
-                assert!(
-                    span.end_col <= char_count,
-                    "span [{}, {}) exceeds {char_count} chars in {:?}",
-                    span.start_col,
-                    span.end_col,
-                    line.text
-                );
+                assert_eq!(span.start_col, 0);
+                assert_eq!(span.end_col, char_count);
                 assert_eq!(span_text(line, span), line.text);
             }
         }
