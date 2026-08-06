@@ -6,7 +6,9 @@
 //!
 //! See tasks/T03-vim-wrapper-conformance-1.md for the full acceptance criteria.
 
-use oom_edit_core::session::{EditorSession, Effect, KeyCode, KeyCodeKind, KeyInput, Modifiers};
+use oom_edit_core::session::{
+    EditorSession, Effect, KeyCode, KeyCodeKind, KeyInput, Modifiers, Severity,
+};
 
 // ── Key-notation parser ────────────────────────────────────────────────────
 
@@ -1264,6 +1266,95 @@ fn v_m_command_view() {
     // `:view` requires Enter to execute the ex command
     feed(&mut sess, ":view<Enter>");
     assert_eq!(mode(&sess), oom_edit_core::session::Mode::View);
+}
+
+#[test]
+fn v_m_command_view_initializes_view_state() {
+    let mut sess = session("# First\n\nFirst paragraph.\n\n## Second\n\nSecond paragraph.");
+
+    let effects = feed(&mut sess, ":view<Enter>");
+    assert_eq!(mode(&sess), oom_edit_core::session::Mode::View);
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::ModeChanged(oom_edit_core::session::Mode::View)
+    )));
+    assert!(sess.view_cursor().is_some());
+    assert!(sess.view_layout().is_some());
+
+    let rendered = sess
+        .render_view(40)
+        .lines
+        .iter()
+        .map(|line| line.styled.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("First"));
+    assert!(rendered.contains("Second paragraph."));
+
+    let initial_view_line = sess.view_cursor_line();
+    let navigation_effects = feed(&mut sess, "<Tab>");
+    assert!(sess.view_cursor_line() > initial_view_line);
+    assert!(navigation_effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::CursorMoved)));
+
+    let exit_effects = feed(&mut sess, "Esc");
+    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Normal);
+    assert!(exit_effects.iter().any(|effect| matches!(
+        effect,
+        Effect::ModeChanged(oom_edit_core::session::Mode::Normal)
+    )));
+    assert_eq!(sess.cursor(), (4, 0));
+}
+
+#[test]
+fn v_m_command_line_jump_bare_number() {
+    let mut requested_line = session(FIXTURE_3LINES);
+    feed(&mut requested_line, ":2");
+    let effects = feed(&mut requested_line, "<Enter>");
+    assert_eq!(requested_line.cursor(), (1, 0));
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::CursorMoved)));
+    assert!(!effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::Message { .. })));
+
+    let mut first_line = session(FIXTURE_3LINES);
+    feed(&mut first_line, "G");
+    feed(&mut first_line, ":1");
+    let effects = feed(&mut first_line, "<Enter>");
+    assert_eq!(first_line.cursor(), (0, 0));
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::CursorMoved)));
+
+    let mut past_eof = session(FIXTURE_5LINES);
+    feed(&mut past_eof, ":");
+    feed(&mut past_eof, "4");
+    feed(&mut past_eof, "2");
+    let effects = feed(&mut past_eof, "<Enter>");
+    assert_eq!(past_eof.cursor(), (4, 0));
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::CursorMoved)));
+
+    let mut zero = session(FIXTURE_3LINES);
+    feed(&mut zero, "G");
+    let cursor_before = zero.cursor();
+    feed(&mut zero, ":0");
+    let effects = feed(&mut zero, "<Enter>");
+    assert_eq!(zero.cursor(), cursor_before);
+    assert!(!effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::CursorMoved)));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Message {
+            severity: Severity::Warning,
+            ..
+        }
+    )));
 }
 
 #[test]

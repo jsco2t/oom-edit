@@ -1131,18 +1131,21 @@ impl EditorSession {
                 force: false,
                 then_quit: false,
             }],
-            _ if !args.0.is_none() && base.chars().all(|c| c.is_ascii_digit()) => {
-                // :{number} — jump to line
-                if let Ok(line) = base.parse::<usize>() {
-                    vec![Effect::Message {
-                        text: format!("Jump to line {}", line + 1),
-                        severity: Severity::Info,
-                    }]
-                } else {
-                    vec![Effect::Message {
+            _ if args.0.is_none()
+                && !base.is_empty()
+                && base.chars().all(|c| c.is_ascii_digit()) =>
+            {
+                // :{number} — jump to a 1-based line, clamped at EOF.
+                match base.parse::<usize>() {
+                    Ok(0) | Err(_) => vec![Effect::Message {
                         text: format!("Invalid line number: {}", base),
                         severity: Severity::Warning,
-                    }]
+                    }],
+                    Ok(line) => {
+                        let row = line.min(self.line_count()) - 1;
+                        self.vim.jump_to(row, 0);
+                        vec![Effect::CursorMoved]
+                    }
                 }
             }
             "s" | "substitute" => {
@@ -1183,8 +1186,11 @@ impl EditorSession {
                 severity: Severity::Info,
             }],
             "view" => {
-                self.mode = Mode::View;
-                vec![Effect::ModeChanged(Mode::View)]
+                // Build the canonical ViewState rather than only changing mode.
+                // Ex commands execute while still in Command mode, so this takes
+                // toggle_view's entry branch. Its ModeChanged effect also prevents
+                // handle_command_mode_key from resetting the mode to Normal.
+                self.toggle_view()
             }
             "help" => vec![Effect::HelpRequested],
             "qa" => vec![Effect::QuitAllRequested { force: args.1 }],
