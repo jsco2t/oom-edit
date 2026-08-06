@@ -178,6 +178,36 @@ impl<'a> ViewLayoutBuilder<'a> {
         }
     }
 
+    fn render_block_into(
+        &mut self,
+        block: &Block,
+        prefix: &str,
+        available_width: u16,
+        prefix_style: Option<SemanticStyle>,
+    ) {
+        let parent_width = self.width;
+        let first_child_line = self.lines.len();
+        self.width = available_width;
+        self.render_block(block);
+        self.width = parent_width;
+
+        let prefix_char_len = prefix.chars().count();
+        for view_line in &mut self.lines[first_child_line..] {
+            view_line.styled.text.insert_str(0, prefix);
+            for span in &mut view_line.styled.spans {
+                span.start_col += prefix_char_len;
+                span.end_col += prefix_char_len;
+            }
+            if let Some(style) = prefix_style {
+                view_line.styled.spans.push(Span {
+                    start_col: 0,
+                    end_col: prefix_char_len,
+                    style,
+                });
+            }
+        }
+    }
+
     // ── VW-1: Headings ───────────────────────────────────────────────
 
     fn render_heading(&mut self, level: u8, inlines: &[Inline], source: &Range<usize>) {
@@ -468,28 +498,11 @@ impl<'a> ViewLayoutBuilder<'a> {
         let prefix = format!("{}{} ", indent, bullet);
         let prefix_char_len = prefix.chars().count();
 
-        // Render children and prepend list item prefix to each line
+        let available_width = self.width.saturating_sub(prefix_char_len as u16);
+
+        // Render children into this builder so document-level metadata is shared.
         for child in &item.children {
-            let child_layout = ViewLayout::build(
-                &BlockModel {
-                    blocks: vec![child.clone()],
-                },
-                self.width.saturating_sub(prefix_char_len as u16),
-                self.highlighter,
-            );
-
-            for view_line in &child_layout.lines {
-                let mut text = prefix.clone();
-                text.push_str(&view_line.styled.text);
-
-                let mut spans = view_line.styled.spans.clone();
-                for span in &mut spans {
-                    span.start_col += prefix_char_len;
-                    span.end_col += prefix_char_len;
-                }
-
-                self.make_content_line(StyledLine { text, spans }, view_line.source.clone());
-            }
+            self.render_block_into(child, &prefix, available_width, None);
         }
     }
 
@@ -506,33 +519,12 @@ impl<'a> ViewLayoutBuilder<'a> {
             .saturating_sub(quote_prefix.chars().count() as u16);
 
         for child in children {
-            // Render child at reduced width, then prepend quote prefix
-            let child_layout = ViewLayout::build(
-                &BlockModel {
-                    blocks: vec![child.clone()],
-                },
+            self.render_block_into(
+                child,
+                quote_prefix,
                 reduced_width,
-                self.highlighter,
+                Some(SemanticStyle::Quote),
             );
-
-            for view_line in &child_layout.lines {
-                let mut text = quote_prefix.to_string();
-                text.push_str(&view_line.styled.text);
-
-                let mut spans = view_line.styled.spans.clone();
-                for span in &mut spans {
-                    span.start_col += quote_prefix.chars().count();
-                    span.end_col += quote_prefix.chars().count();
-                }
-                // Add quote style to prefix
-                spans.push(Span {
-                    start_col: 0,
-                    end_col: quote_prefix.chars().count(),
-                    style: SemanticStyle::Quote,
-                });
-
-                self.make_content_line(StyledLine { text, spans }, view_line.source.clone());
-            }
         }
     }
 

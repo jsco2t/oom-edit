@@ -1,6 +1,8 @@
 //! Tests for the view module (block model).
 
+use oom_edit_core::style::LineKind;
 use oom_edit_core::view::{Block, BlockKind, BlockModel, Inline};
+use oom_edit_core::{Highlighter, ViewLayout};
 use std::path::Path;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -10,6 +12,12 @@ fn fixture(name: &str) -> String {
         .join("tests/fixtures")
         .join(name);
     std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("fixture not found: {name}"))
+}
+
+fn view_layout(text: &str) -> ViewLayout {
+    let model = BlockModel::build(text, None);
+    let highlighter = Highlighter::new(text);
+    ViewLayout::build(&model, 80, &highlighter)
 }
 
 /// Assert that a block's span points at non-empty source text.
@@ -267,6 +275,151 @@ fn test_blockquote() {
         }
         _ => panic!("expected BlockQuote, got {:?}", model.blocks[0].kind),
     }
+}
+
+// ── Nested block metadata regressions ─────────────────────────────────────
+
+#[test]
+fn link_inside_list_item_in_index() {
+    let layout = view_layout("- See [Rust](https://www.rust-lang.org/).");
+
+    assert_eq!(
+        layout.link_index,
+        vec![(0, "https://www.rust-lang.org/".to_string())]
+    );
+    assert!(layout
+        .lines
+        .iter()
+        .any(|line| line.styled.text.contains("Rust [0]")));
+}
+
+#[test]
+fn link_inside_blockquote_in_index() {
+    let layout = view_layout("> Read [the guide](https://example.com/guide).");
+
+    assert_eq!(
+        layout.link_index,
+        vec![(0, "https://example.com/guide".to_string())]
+    );
+    assert!(layout
+        .lines
+        .iter()
+        .any(|line| line.styled.text.contains("the guide [0]")));
+}
+
+#[test]
+fn heading_inside_blockquote_jump_target() {
+    let layout = view_layout("> # Nested heading");
+
+    assert_eq!(layout.jump_targets.len(), 1);
+    let target = &layout.jump_targets[0];
+    assert_eq!(layout.lines[target.line].styled.text, "┃ █ Nested heading");
+}
+
+#[test]
+fn nested_link_markers_sequential() {
+    let layout = view_layout(
+        "[outside](https://example.com/0)\n\n- [first](https://example.com/1)\n- [second](https://example.com/2)\n\n> [quoted](https://example.com/3)",
+    );
+
+    assert_eq!(
+        layout.link_index,
+        vec![
+            (0, "https://example.com/0".to_string()),
+            (1, "https://example.com/1".to_string()),
+            (2, "https://example.com/2".to_string()),
+            (3, "https://example.com/3".to_string()),
+        ]
+    );
+
+    for expected in ["outside [0]", "first [1]", "second [2]", "quoted [3]"] {
+        assert!(
+            layout
+                .lines
+                .iter()
+                .filter(|line| line.kind == LineKind::Content)
+                .any(|line| line.styled.text.contains(expected)),
+            "content lines should contain {expected}"
+        );
+    }
+}
+
+#[test]
+fn nested_container_metadata_is_preserved_recursively() {
+    let layout = view_layout("> - [deep link](https://example.com/deep)\n>   > # Deep heading");
+
+    assert_eq!(
+        layout.link_index,
+        vec![(0, "https://example.com/deep".to_string())]
+    );
+    assert!(layout
+        .lines
+        .iter()
+        .any(|line| line.styled.text == "┃ • deep link [0]"));
+    assert_eq!(layout.jump_targets.len(), 1);
+    assert_eq!(
+        layout.lines[layout.jump_targets[0].line].styled.text,
+        "┃ • ┃ █ Deep heading"
+    );
+}
+
+#[test]
+fn no_spurious_link_panel_in_nested() {
+    let layout =
+        view_layout("Before.\n\n- [nested](https://example.com/nested)\n\nAfter nested content.");
+    let after_line = layout
+        .lines
+        .iter()
+        .position(|line| line.styled.text == "After nested content.")
+        .expect("trailing paragraph should be rendered");
+    let link_panels: Vec<_> = layout
+        .lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.styled.text.contains("links"))
+        .collect();
+
+    assert_eq!(link_panels.len(), 1);
+    assert!(link_panels[0].0 > after_line);
+    assert_eq!(link_panels[0].1.styled.text, "─ links ─");
+}
+
+#[test]
+fn nested_footnotes_are_finalized_once_at_document_end() {
+    let layout = view_layout(
+        "- Listed note[^list].\n\n  [^list]: From a list item.\n\n> Quoted note[^quote].\n>\n> [^quote]: From a blockquote.\n\nAfter nested footnotes.",
+    );
+    let after_line = layout
+        .lines
+        .iter()
+        .position(|line| line.styled.text == "After nested footnotes.")
+        .expect("trailing paragraph should be rendered");
+    let footnote_panels: Vec<_> = layout
+        .lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.styled.text == "─ footnotes ─")
+        .collect();
+
+    assert_eq!(footnote_panels.len(), 1);
+    assert!(footnote_panels[0].0 > after_line);
+
+    let line_position = |text: &str| {
+        layout
+            .lines
+            .iter()
+            .position(|line| line.styled.text == text)
+            .unwrap_or_else(|| panic!("expected rendered line {text:?}"))
+    };
+    let list_marker = line_position("[list]: ");
+    let list_body = line_position("From a list item.");
+    let quote_marker = line_position("[quote]: ");
+    let quote_body = line_position("From a blockquote.");
+
+    assert!(footnote_panels[0].0 < list_marker);
+    assert!(list_marker < list_body);
+    assert!(list_body < quote_marker);
+    assert!(quote_marker < quote_body);
 }
 
 // ── Table tests ────────────────────────────────────────────────────────────
