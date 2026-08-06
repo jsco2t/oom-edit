@@ -106,6 +106,18 @@ struct RankedSpan {
     priority: usize,
 }
 
+/// A semantic span expressed in absolute UTF-8 byte offsets.
+///
+/// Tree-sitter and all range/intersection processing use byte coordinates.
+/// This private type keeps those values distinct from the character-indexed
+/// public [`Span`] type until a [`StyledLine`] is constructed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ByteSpan {
+    start_byte: usize,
+    end_byte: usize,
+    style: SemanticStyle,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InjectionKind {
     FrontMatter,
@@ -315,17 +327,21 @@ impl Highlighter {
                 .iter()
                 .enumerate()
                 .filter(|(_, s)| {
-                    let abs_start = s.start_col;
-                    let abs_end = s.end_col;
+                    let abs_start = s.start_byte;
+                    let abs_end = s.end_byte;
                     abs_start < line_end && abs_end > line_start
                 })
-                .map(|(priority, s)| RankedSpan {
-                    span: Span {
-                        start_col: s.start_col.max(line_start) - line_start,
-                        end_col: s.end_col.min(line_end) - line_start,
-                        style: s.style,
-                    },
-                    priority,
+                .map(|(priority, s)| {
+                    let relative_start = s.start_byte.max(line_start) - line_start;
+                    let relative_end = s.end_byte.min(line_end) - line_start;
+                    RankedSpan {
+                        span: Span {
+                            start_col: byte_offset_to_char_index(line_text, relative_start),
+                            end_col: byte_offset_to_char_index(line_text, relative_end),
+                            style: s.style,
+                        },
+                        priority,
+                    }
                 })
                 .collect();
 
@@ -342,7 +358,7 @@ impl Highlighter {
 
     /// Collect spans scoped to a byte range, limiting the query to only
     /// the requested region of the document.
-    fn collect_spans_in_range(&self, range: Range<usize>) -> Vec<Span> {
+    fn collect_spans_in_range(&self, range: Range<usize>) -> Vec<ByteSpan> {
         let mut spans = Vec::new();
         let text = &self.text;
         let text_bytes = text.as_bytes();
@@ -367,13 +383,13 @@ impl Highlighter {
                 let style = md_capture_to_style(capture_name);
                 let n = capture.node;
 
-                let start_col = n.start_byte().max(range.start);
-                let end_col = n.end_byte().min(range.end);
+                let start_byte = n.start_byte().max(range.start);
+                let end_byte = n.end_byte().min(range.end);
 
-                if start_col < end_col {
-                    spans.push(Span {
-                        start_col,
-                        end_col,
+                if start_byte < end_byte {
+                    spans.push(ByteSpan {
+                        start_byte,
+                        end_byte,
                         style,
                     });
                 }
@@ -424,9 +440,9 @@ impl Highlighter {
                             let clipped_end = abs_end.min(range.end);
 
                             if clipped_start < clipped_end {
-                                injection_spans.push(Span {
-                                    start_col: clipped_start,
-                                    end_col: clipped_end,
+                                injection_spans.push(ByteSpan {
+                                    start_byte: clipped_start,
+                                    end_byte: clipped_end,
                                     style,
                                 });
                             }
@@ -449,7 +465,7 @@ impl Highlighter {
     /// Collect inline spans only for nodes within a byte range.
     fn collect_inline_spans_in_range(
         &self,
-        spans: &mut Vec<Span>,
+        spans: &mut Vec<ByteSpan>,
         node: tree_sitter::Node,
         text: &str,
         range: &Range<usize>,
@@ -503,9 +519,9 @@ impl Highlighter {
                                 let abs_end = base_offset + inline_node.end_byte();
 
                                 if abs_start < abs_end {
-                                    spans.push(Span {
-                                        start_col: abs_start,
-                                        end_col: abs_end,
+                                    spans.push(ByteSpan {
+                                        start_byte: abs_start,
+                                        end_byte: abs_end,
                                         style,
                                     });
                                 }
@@ -670,7 +686,7 @@ pub fn highlight_snippet(lang: &str, text: &str) -> Vec<StyledLine> {
     let mut cursor = QueryCursor::new();
 
     // Collect all spans from the query
-    let mut all_spans: Vec<Span> = Vec::new();
+    let mut all_spans: Vec<ByteSpan> = Vec::new();
     let mut matches = cursor.matches(&query, root, text_bytes);
 
     while let Some(m) = matches.next() {
@@ -681,9 +697,9 @@ pub fn highlight_snippet(lang: &str, text: &str) -> Vec<StyledLine> {
             let start = node.start_byte();
             let end = node.end_byte();
             if start < end {
-                all_spans.push(Span {
-                    start_col: start,
-                    end_col: end,
+                all_spans.push(ByteSpan {
+                    start_byte: start,
+                    end_byte: end,
                     style,
                 });
             }
@@ -716,14 +732,18 @@ pub fn highlight_snippet(lang: &str, text: &str) -> Vec<StyledLine> {
         let spans: Vec<RankedSpan> = all_spans
             .iter()
             .enumerate()
-            .filter(|(_, s)| s.start_col < line_end && s.end_col > line_start)
-            .map(|(priority, s)| RankedSpan {
-                span: Span {
-                    start_col: s.start_col.max(line_start) - line_start,
-                    end_col: s.end_col.min(line_end) - line_start,
-                    style: s.style,
-                },
-                priority,
+            .filter(|(_, s)| s.start_byte < line_end && s.end_byte > line_start)
+            .map(|(priority, s)| {
+                let relative_start = s.start_byte.max(line_start) - line_start;
+                let relative_end = s.end_byte.min(line_end) - line_start;
+                RankedSpan {
+                    span: Span {
+                        start_col: byte_offset_to_char_index(line_text, relative_start),
+                        end_col: byte_offset_to_char_index(line_text, relative_end),
+                        style: s.style,
+                    },
+                    priority,
+                }
             })
             .collect();
 
@@ -918,7 +938,22 @@ fn md_capture_to_style(capture: &str) -> SemanticStyle {
     SemanticStyle::Text
 }
 
-// ── Helper: byte offset → (row, col) ───────────────────────────────────────
+// ── Helpers: byte offsets ──────────────────────────────────────────────────
+
+/// Convert a UTF-8 byte offset within one line to a character index.
+#[inline]
+fn byte_offset_to_char_index(text: &str, byte_offset: usize) -> usize {
+    if byte_offset == 0 {
+        return 0;
+    }
+    if byte_offset >= text.len() {
+        return text.chars().count();
+    }
+
+    text.char_indices()
+        .take_while(|(index, _)| *index < byte_offset)
+        .count()
+}
 
 /// Construct a tree-sitter edit from a replacement against `old_text`.
 fn input_edit(old_text: &str, edit: &TextEdit) -> Option<tree_sitter::InputEdit> {
@@ -1127,6 +1162,23 @@ mod tests {
     }
 
     #[test]
+    fn byte_offset_to_char_index_handles_utf8_and_boundaries() {
+        assert_eq!(byte_offset_to_char_index("ascii", 0), 0);
+        assert_eq!(byte_offset_to_char_index("ascii", 3), 3);
+        assert_eq!(byte_offset_to_char_index("ascii", 5), 5);
+        assert_eq!(byte_offset_to_char_index("ascii", usize::MAX), 5);
+
+        let mixed = "aé界🙂z";
+        assert_eq!(byte_offset_to_char_index(mixed, 0), 0);
+        assert_eq!(byte_offset_to_char_index(mixed, 1), 1);
+        assert_eq!(byte_offset_to_char_index(mixed, 3), 2);
+        assert_eq!(byte_offset_to_char_index(mixed, 6), 3);
+        assert_eq!(byte_offset_to_char_index(mixed, 10), 4);
+        assert_eq!(byte_offset_to_char_index(mixed, mixed.len()), 5);
+        assert_eq!(byte_offset_to_char_index(mixed, mixed.len() + 10), 5);
+    }
+
+    #[test]
     fn forward_range_input_edit_regression() {
         let edit = TextEdit {
             range: 6..12,
@@ -1330,6 +1382,74 @@ mod tests {
         let lines = h.highlight_lines(0..3);
         assert_eq!(lines.len(), 3);
         assert!(!lines[0].spans.is_empty(), "heading line should have spans");
+    }
+
+    #[test]
+    fn non_ascii_heading_span_uses_character_indices() {
+        let text = "# café\n";
+        let lines = Highlighter::new(text).highlight_lines(0..1);
+        let heading = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.style == SemanticStyle::Heading1)
+            .expect("heading should have a Heading1 span");
+
+        assert_eq!(heading.start_col, 0);
+        assert_eq!(heading.end_col, "# café".chars().count());
+        assert_ne!(heading.end_col, "# café".len());
+    }
+
+    #[test]
+    fn non_ascii_fenced_string_span_uses_character_indices() {
+        let text = "```rust\nlet x = \"über\";\n```\n";
+        let lines = Highlighter::new(text).highlight_lines(0..3);
+        let code_line = &lines[1];
+        let string_span = code_line
+            .spans
+            .iter()
+            .find(|span| span.style == SemanticStyle::StringLit)
+            .expect("Rust string literal should be highlighted");
+
+        assert_eq!(string_span.start_col, 8);
+        assert_eq!(string_span.end_col, 14);
+        assert_eq!(span_text(code_line, string_span), "\"über\"");
+    }
+
+    #[test]
+    fn non_ascii_standalone_snippet_span_uses_character_indices() {
+        let lines = highlight_snippet("rust", "let café = \"über\";\n");
+        let code_line = &lines[0];
+        let string_span = code_line
+            .spans
+            .iter()
+            .find(|span| span.style == SemanticStyle::StringLit)
+            .expect("Rust string literal should be highlighted");
+
+        assert_eq!(string_span.start_col, 11);
+        assert_eq!(string_span.end_col, 17);
+        assert_eq!(span_text(code_line, string_span), "\"über\"");
+    }
+
+    #[test]
+    fn non_ascii_yaml_front_matter_spans_use_character_indices() {
+        let text = "---\ntítulo: café\n---\n";
+        let lines = Highlighter::new(text).highlight_lines(0..3);
+        let yaml_line = &lines[1];
+        let key_span = yaml_line
+            .spans
+            .iter()
+            .find(|span| span.style == SemanticStyle::FmKey)
+            .expect("YAML key should be highlighted");
+        let value_span = yaml_line
+            .spans
+            .iter()
+            .find(|span| span.style == SemanticStyle::FmValue)
+            .expect("YAML value should be highlighted");
+
+        assert_eq!(span_text(yaml_line, key_span), "título");
+        assert_eq!(key_span.end_col, "título".chars().count());
+        assert_eq!(span_text(yaml_line, value_span), "café");
+        assert_eq!(value_span.end_col, yaml_line.text.chars().count());
     }
 
     #[test]
@@ -1705,10 +1825,10 @@ mod tests {
             "a viewport beginning inside a block comment must retain its opening context"
         );
         assert!(spans.iter().all(|span| {
-            span.start_col >= viewport_bytes.start && span.end_col <= viewport_bytes.end
+            span.start_byte >= viewport_bytes.start && span.end_byte <= viewport_bytes.end
         }));
         assert!(spans.iter().any(|span| {
-            span.style == SemanticStyle::Comment && span.start_col == viewport_bytes.start
+            span.style == SemanticStyle::Comment && span.start_byte == viewport_bytes.start
         }));
     }
 
@@ -1729,10 +1849,10 @@ mod tests {
                 SemanticStyle::Keyword | SemanticStyle::NumberLit
             ))));
         assert!(spans.iter().all(|span| {
-            span.start_col >= viewport_bytes.start && span.end_col <= viewport_bytes.end
+            span.start_byte >= viewport_bytes.start && span.end_byte <= viewport_bytes.end
         }));
         assert!(spans.iter().any(|span| {
-            span.style == SemanticStyle::Comment && span.end_col == viewport_bytes.end
+            span.style == SemanticStyle::Comment && span.end_byte == viewport_bytes.end
         }));
     }
 
@@ -2203,6 +2323,34 @@ mod tests {
                 }
             }
         }
+
+        #[test]
+        fn all_highlight_spans_stay_within_unicode_character_bounds(
+            random_chars in proptest::collection::vec(any::<char>(), 0..128)
+        ) {
+            let random_text: String = random_chars.into_iter().collect();
+            let text = format!("# é{random_text}\n");
+            let lines = Highlighter::new(&text).highlight_lines(0..usize::MAX);
+
+            for (line_index, line) in lines.iter().enumerate() {
+                let char_count = line.text.chars().count();
+                for span in &line.spans {
+                    prop_assert!(
+                        span.start_col <= span.end_col,
+                        "line {line_index} has reversed span [{}, {})",
+                        span.start_col,
+                        span.end_col
+                    );
+                    prop_assert!(
+                        span.end_col <= char_count,
+                        "line {line_index} span [{}, {}) exceeds {char_count} characters in {:?}",
+                        span.start_col,
+                        span.end_col,
+                        line.text
+                    );
+                }
+            }
+        }
     }
 
     #[cfg(debug_assertions)]
@@ -2438,12 +2586,21 @@ mod tests {
                         | SemanticStyle::FmValue
                 )
             });
+            let char_count = line.text.chars().count();
             for span in &mut line.spans {
-                span.start_col = span.start_col.min(line.text.len());
-                span.end_col = span.end_col.min(line.text.len());
+                span.start_col = span.start_col.min(char_count);
+                span.end_col = span.end_col.min(char_count);
             }
         }
         lines
+    }
+
+    fn span_text(line: &StyledLine, span: &Span) -> String {
+        line.text
+            .chars()
+            .skip(span.start_col)
+            .take(span.end_col - span.start_col)
+            .collect()
     }
 
     fn assert_edit_matches_fresh(initial: &str, edit: TextEdit) -> Vec<StyledLine> {

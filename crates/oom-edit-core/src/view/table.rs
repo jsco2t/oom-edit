@@ -105,7 +105,7 @@ pub fn render_table(
         if !line.text.is_empty() {
             line.spans.push(Span {
                 start_col: 0,
-                end_col: line.text.chars().map(|c| c.len_utf8()).sum(),
+                end_col: line.text.chars().count(),
                 style: SemanticStyle::Text,
             });
         }
@@ -240,7 +240,7 @@ fn build_data_row(
     let mut spans = Vec::new();
     if !text.is_empty() {
         // Apply header style to the entire row content (between borders)
-        let text_len = text.chars().map(|c| c.len_utf8()).sum::<usize>();
+        let text_len = text.chars().count();
         if header_style == SemanticStyle::Strong {
             spans.push(Span {
                 start_col: 1,
@@ -320,6 +320,53 @@ mod tests {
     }
 
     #[test]
+    fn rendered_unicode_table_spans_cover_complete_rows_in_character_indices() {
+        let header = vec![make_inlines(&["café", "東京🙂"])];
+        let rows = vec![vec![make_inlines(&["résumé", "大阪🚀"])]];
+        let alignments = vec![TableAlignment::Left, TableAlignment::Left];
+
+        let lines = render_table(&alignments, &header, &rows, 0..100);
+
+        for line in &lines {
+            let char_count = line.text.chars().count();
+            assert_eq!(
+                line.spans.len(),
+                1,
+                "rendered table row should have exactly one full-row span: {:?}",
+                line.text
+            );
+            for span in &line.spans {
+                assert_eq!(span.style, SemanticStyle::Text);
+                assert!(span.start_col <= span.end_col);
+                assert!(
+                    span.end_col <= char_count,
+                    "span [{}, {}) exceeds {char_count} chars in {:?}",
+                    span.start_col,
+                    span.end_col,
+                    line.text
+                );
+                assert_eq!(span_text(line, span), line.text);
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_header_style_excludes_only_character_borders() {
+        let cells = compute_cells(&[make_inlines(&["café東京🙂"])], 1);
+        let line = build_data_row(
+            &cells,
+            &[TableAlignment::Left],
+            &[cells[0].display_width],
+            SemanticStyle::Strong,
+        );
+        let span = line.spans.first().expect("header row should be styled");
+
+        assert_eq!(span.start_col, 1);
+        assert_eq!(span.end_col, line.text.chars().count() - 1);
+        assert_eq!(span_text(&line, span), " café東京🙂 ");
+    }
+
+    #[test]
     fn render_empty_header_no_panic() {
         let header: Vec<Vec<Inline>> = vec![];
         let rows: Vec<Vec<Vec<Inline>>> = vec![];
@@ -349,5 +396,13 @@ mod tests {
         assert!(lines[1].text.ends_with("│"));
         assert!(lines[3].text.starts_with("│"));
         assert!(lines[3].text.ends_with("│"));
+    }
+
+    fn span_text(line: &StyledLine, span: &Span) -> String {
+        line.text
+            .chars()
+            .skip(span.start_col)
+            .take(span.end_col - span.start_col)
+            .collect()
     }
 }

@@ -86,7 +86,7 @@ pub fn wrap_lines(input: &StyledLine, width: u16, hanging_indent: u16) -> Vec<St
             let style_spans = style.map(|s| {
                 vec![Span {
                     start_col: hi,
-                    end_col: hi + ch.len_utf8(),
+                    end_col: hi + 1,
                     style: s,
                 }]
             });
@@ -326,6 +326,37 @@ mod tests {
                 text_width(&line.text)
             );
         }
+    }
+
+    #[test]
+    fn unicode_hard_break_span_uses_character_indices() {
+        let input = StyledLine {
+            text: "é🙂".to_string(),
+            spans: vec![Span {
+                start_col: 0,
+                end_col: 2,
+                style: SemanticStyle::Emphasis,
+            }],
+        };
+
+        let result = wrap_lines(&input, 1, 1);
+        let continuation = &result[1];
+        let span = continuation
+            .spans
+            .first()
+            .expect("hard-broken Unicode character should retain its style");
+
+        assert_eq!(continuation.text, " 🙂");
+        assert_eq!((span.start_col, span.end_col), (1, 2));
+        assert_eq!(
+            continuation
+                .text
+                .chars()
+                .skip(span.start_col)
+                .take(span.end_col - span.start_col)
+                .collect::<String>(),
+            "🙂"
+        );
     }
 
     #[test]

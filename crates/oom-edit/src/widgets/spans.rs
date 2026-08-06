@@ -85,3 +85,32 @@ pub fn resolve_style(style: SemanticStyle) -> ratatui::style::Style {
         sub_modifier: base.sub_modifier,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unicode_character_indexed_span_styles_complete_text() {
+        let line = oom_edit_core::StyledLine {
+            text: "café".to_string(),
+            spans: vec![oom_edit_core::Span {
+                start_col: 0,
+                end_col: 4,
+                style: SemanticStyle::Emphasis,
+            }],
+        };
+
+        let rendered = build_spans(&line.text, &line.spans);
+        let expected_style = resolve_style(SemanticStyle::Emphasis);
+        let rendered_text: String = rendered.iter().map(|span| span.content.as_ref()).collect();
+        let styled_text: String = rendered
+            .iter()
+            .filter(|span| span.style == expected_style)
+            .map(|span| span.content.as_ref())
+            .collect();
+
+        assert_eq!(rendered_text, "café");
+        assert_eq!(styled_text, "café");
+    }
+}

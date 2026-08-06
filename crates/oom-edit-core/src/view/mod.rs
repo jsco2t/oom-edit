@@ -762,10 +762,13 @@ impl<'a> ViewLayoutBuilder<'a> {
             for (key, val) in map {
                 let val_str = fm_value_to_compact(val);
                 let line_text = format!("│ {}: {} │", key, val_str);
+                let line_char_count = line_text.chars().count();
                 let colon_pos = line_text
-                    .rfind(':')
-                    .map(|p| p + 2)
-                    .unwrap_or(line_text.len());
+                    .chars()
+                    .enumerate()
+                    .filter_map(|(position, ch)| (ch == ':').then_some(position + 2))
+                    .last()
+                    .unwrap_or(line_char_count);
                 self.make_content_line(
                     StyledLine {
                         text: line_text.clone(),
@@ -777,7 +780,7 @@ impl<'a> ViewLayoutBuilder<'a> {
                             },
                             Span {
                                 start_col: colon_pos,
-                                end_col: line_text.len() - 2,
+                                end_col: line_char_count.saturating_sub(2),
                                 style: SemanticStyle::FmValue,
                             },
                         ],
@@ -861,3 +864,69 @@ fn fm_value_to_compact(value: &crate::frontmatter::Value) -> String {
 pub use blocks::*;
 pub use table::render_table;
 pub use wrap::{text_width, wrap_lines};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unicode_front_matter_panel_spans_select_key_and_value() {
+        let text = "---\ntítulo: café\n---\n";
+        let layout = front_matter_layout(text);
+        let row = layout
+            .lines
+            .iter()
+            .find(|line| line.styled.text.contains("título"))
+            .expect("front-matter row should be rendered");
+        let key_span = row
+            .styled
+            .spans
+            .iter()
+            .find(|span| span.style == SemanticStyle::FmKey)
+            .expect("front-matter key should be styled");
+        let value_span = row
+            .styled
+            .spans
+            .iter()
+            .find(|span| span.style == SemanticStyle::FmValue)
+            .expect("front-matter value should be styled");
+
+        assert_eq!(span_text(&row.styled, key_span), "título");
+        assert_eq!(span_text(&row.styled, value_span), "\"café\"");
+        assert!(value_span.end_col <= row.styled.text.chars().count());
+    }
+
+    #[test]
+    fn front_matter_border_does_not_shift_ascii_value_span() {
+        let text = "---\nkey: value\n---\n";
+        let layout = front_matter_layout(text);
+        let row = layout
+            .lines
+            .iter()
+            .find(|line| line.styled.text.contains("key"))
+            .expect("front-matter row should be rendered");
+        let value_span = row
+            .styled
+            .spans
+            .iter()
+            .find(|span| span.style == SemanticStyle::FmValue)
+            .expect("front-matter value should be styled");
+
+        assert!(row.styled.text.starts_with('│'));
+        assert_eq!(span_text(&row.styled, value_span), "\"value\"");
+    }
+
+    fn front_matter_layout(text: &str) -> ViewLayout {
+        let model = BlockModel::build(text, Some(0..text.len()));
+        let highlighter = syntax::Highlighter::new(text);
+        ViewLayout::build(&model, 80, &highlighter)
+    }
+
+    fn span_text(line: &StyledLine, span: &Span) -> String {
+        line.text
+            .chars()
+            .skip(span.start_col)
+            .take(span.end_col - span.start_col)
+            .collect()
+    }
+}
