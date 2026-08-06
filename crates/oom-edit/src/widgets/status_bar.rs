@@ -163,7 +163,7 @@ pub fn render(frame: &mut Frame<'_>, area: ratatui::layout::Rect, text: &StatusB
             // Place cursor at the end of the text.
             let col = area.x + cmdline.len().min(area.width as usize) as u16;
             frame.set_cursor_position(ratatui::layout::Position::new(
-                col.min(area.x + area.width - 1),
+                col.min(area.x + area.width.saturating_sub(1)),
                 area.y,
             ));
         }
@@ -571,6 +571,33 @@ mod tests {
         let text = sb.build(None);
         assert!(text.cmdline.is_none());
         assert!(!text.spans.is_empty());
+    }
+
+    #[test]
+    fn test_status_bar_zero_width_no_panic() {
+        use ratatui::{backend::TestBackend, layout::Rect, Terminal};
+
+        let text = StatusBarText {
+            spans: Vec::new(),
+            cmdline: Some(":w".to_string()),
+            cmdline_cursor: true,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(1, 1)).expect("create test terminal");
+
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 0,
+                        height: 1,
+                    },
+                    &text,
+                );
+            })
+            .expect("render zero-width status bar");
     }
 
     // ── Status bar build ────────────────────────────────────────────────
