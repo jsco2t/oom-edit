@@ -14,6 +14,126 @@ use crate::error::{OpenError, SaveError};
 use crate::frontmatter::FrontMatter;
 use crate::vim::UndoMark;
 
+trait AtomicSaveOperations {
+    type TempFile;
+    type ParentDirectory;
+
+    fn create_temp(&mut self, parent: &Path) -> io::Result<Self::TempFile>;
+    fn write_all(&mut self, temp_file: &mut Self::TempFile, contents: &[u8]) -> io::Result<()>;
+    fn set_permissions(
+        &mut self,
+        temp_file: &Self::TempFile,
+        permissions: fs::Permissions,
+    ) -> io::Result<()>;
+    fn sync_file(&mut self, temp_file: &Self::TempFile) -> io::Result<()>;
+    fn persist(&mut self, temp_file: Self::TempFile, target: &Path) -> io::Result<()>;
+    fn open_parent_read_only(&mut self, parent: &Path) -> io::Result<Self::ParentDirectory>;
+    fn sync_parent(&mut self, parent: &Self::ParentDirectory) -> io::Result<()>;
+}
+
+struct FileSystemAtomicSave;
+
+impl AtomicSaveOperations for FileSystemAtomicSave {
+    type TempFile = tempfile::NamedTempFile;
+    type ParentDirectory = fs::File;
+
+    fn create_temp(&mut self, parent: &Path) -> io::Result<Self::TempFile> {
+        tempfile::NamedTempFile::new_in(parent)
+    }
+
+    fn write_all(&mut self, temp_file: &mut Self::TempFile, contents: &[u8]) -> io::Result<()> {
+        temp_file.write_all(contents)
+    }
+
+    fn set_permissions(
+        &mut self,
+        temp_file: &Self::TempFile,
+        permissions: fs::Permissions,
+    ) -> io::Result<()> {
+        fs::set_permissions(temp_file.path(), permissions)
+    }
+
+    fn sync_file(&mut self, temp_file: &Self::TempFile) -> io::Result<()> {
+        temp_file.as_file().sync_all()
+    }
+
+    fn persist(&mut self, temp_file: Self::TempFile, target: &Path) -> io::Result<()> {
+        temp_file
+            .persist(target)
+            .map(|_| ())
+            .map_err(|e| io::Error::other(format!("failed to persist temp file: {e}")))
+    }
+
+    fn open_parent_read_only(&mut self, parent: &Path) -> io::Result<Self::ParentDirectory> {
+        fs::File::open(parent)
+    }
+
+    fn sync_parent(&mut self, parent: &Self::ParentDirectory) -> io::Result<()> {
+        parent.sync_all()
+    }
+}
+
+fn parent_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+struct AtomicSaveError {
+    error: io::Error,
+    committed: bool,
+}
+
+impl AtomicSaveError {
+    fn before_commit(error: io::Error) -> Self {
+        Self {
+            error,
+            committed: false,
+        }
+    }
+
+    fn after_commit(error: io::Error) -> Self {
+        Self {
+            error,
+            committed: true,
+        }
+    }
+}
+
+fn atomic_save<O: AtomicSaveOperations>(
+    operations: &mut O,
+    parent: &Path,
+    target: &Path,
+    contents: &[u8],
+    permissions: Option<fs::Permissions>,
+) -> Result<(), AtomicSaveError> {
+    let mut temp_file = operations
+        .create_temp(parent)
+        .map_err(AtomicSaveError::before_commit)?;
+    operations
+        .write_all(&mut temp_file, contents)
+        .map_err(AtomicSaveError::before_commit)?;
+    if let Some(permissions) = permissions {
+        operations
+            .set_permissions(&temp_file, permissions)
+            .map_err(AtomicSaveError::before_commit)?;
+    }
+    operations
+        .sync_file(&temp_file)
+        .map_err(AtomicSaveError::before_commit)?;
+    operations
+        .persist(temp_file, target)
+        .map_err(AtomicSaveError::before_commit)?;
+
+    // Make the rename durable. Failure means the save did not meet FR-5.3.
+    let parent_directory = operations
+        .open_parent_read_only(parent)
+        .map_err(AtomicSaveError::after_commit)?;
+    operations
+        .sync_parent(&parent_directory)
+        .map_err(AtomicSaveError::after_commit)
+}
+
 /// Line ending style.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineEnding {
@@ -159,6 +279,16 @@ impl Document {
         override_path: Option<&Path>,
         force: bool,
     ) -> Result<(), SaveError> {
+        self.save_with_text_using(text, override_path, force, &mut FileSystemAtomicSave)
+    }
+
+    fn save_with_text_using<O: AtomicSaveOperations>(
+        &mut self,
+        text: &str,
+        override_path: Option<&Path>,
+        force: bool,
+        operations: &mut O,
+    ) -> Result<(), SaveError> {
         let target_path = override_path
             .map(|p| p.to_path_buf())
             .or_else(|| self.path.clone())
@@ -240,47 +370,28 @@ impl Document {
         // Atomic write: create temp file with O_EXCL (prevents symlink attacks),
         // write, fsync, rename. The temp file is created in the same directory
         // as the target to ensure atomic rename on POSIX.
-        let parent = target_path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new(""));
+        let parent = parent_directory(&target_path);
+        let save_result = atomic_save(
+            operations,
+            parent,
+            &target_path,
+            serialized.as_bytes(),
+            Some(permissions),
+        );
 
-        let mut temp_file = tempfile::NamedTempFile::new_in(parent)?;
-        temp_file.write_all(serialized.as_bytes())?;
-
-        // Set permissions on the temp file (we own it exclusively due to O_EXCL)
-        fs::set_permissions(temp_file.path(), permissions)?;
-
-        // Sync the temp file to disk
-        fs::OpenOptions::new()
-            .write(true)
-            .open(temp_file.path())?
-            .sync_all()?;
-
-        // Best-effort fsync of parent directory
-        if let Ok(dir) = fs::OpenOptions::new().write(true).open(parent) {
-            let _ = dir.sync_all();
+        if let Err(error) = save_result {
+            if error.committed {
+                self.record_disk_state(&target_path, serialized.len(), override_path.is_some());
+            }
+            return Err(error.error.into());
         }
-
-        // Rename temp to target (atomic on POSIX)
-        temp_file
-            .persist(&target_path)
-            .map_err(|e| io::Error::other(format!("failed to persist temp file: {}", e)))?;
 
         // Update save point and recorded metadata
         self.save_point = self.save_point();
-        self.last_len = Some(serialized.len());
-        self.last_mtime = fs::metadata(&target_path)
-            .ok()
-            .and_then(|m| m.modified().ok());
+        self.record_disk_state(&target_path, serialized.len(), override_path.is_some());
 
         // Re-parse front matter after save (cheap — always re-parse)
         self.front_matter = crate::frontmatter::parse_front_matter(text);
-
-        // Update the path if an override was used (for :saveas)
-        if override_path.is_some() {
-            self.path = Some(target_path.to_path_buf());
-        }
 
         Ok(())
     }
@@ -291,32 +402,20 @@ impl Document {
     /// Uses atomic write (temp file + fsync + rename) to prevent corruption
     /// on crash or interrupt.
     pub fn save_copy(&self, path: &Path) -> Result<(), SaveError> {
+        self.save_copy_using(path, &mut FileSystemAtomicSave)
+    }
+
+    fn save_copy_using<O: AtomicSaveOperations>(
+        &self,
+        path: &Path,
+        operations: &mut O,
+    ) -> Result<(), SaveError> {
         let serialized = self.serialize();
 
         // Atomic write: create temp file, write, fsync, rename
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new(""));
-
-        let mut temp_file = tempfile::NamedTempFile::new_in(parent)?;
-        temp_file.write_all(serialized.as_bytes())?;
-
-        // Sync the temp file to disk
-        fs::OpenOptions::new()
-            .write(true)
-            .open(temp_file.path())?
-            .sync_all()?;
-
-        // Best-effort fsync of parent directory
-        if let Ok(dir) = fs::OpenOptions::new().write(true).open(parent) {
-            let _ = dir.sync_all();
-        }
-
-        // Rename temp to target (atomic on POSIX)
-        temp_file
-            .persist(path)
-            .map_err(|e| io::Error::other(format!("failed to persist temp file: {}", e)))?;
+        let parent = parent_directory(path);
+        atomic_save(operations, parent, path, serialized.as_bytes(), None)
+            .map_err(|error| error.error)?;
 
         // Update recorded metadata to match the copy
         // Note: we don't update self.last_len or self.last_mtime because
@@ -325,6 +424,14 @@ impl Document {
         let _ = fs::metadata(path);
 
         Ok(())
+    }
+
+    fn record_disk_state(&mut self, target: &Path, serialized_len: usize, retarget: bool) {
+        self.last_len = Some(serialized_len);
+        self.last_mtime = fs::metadata(target).ok().and_then(|m| m.modified().ok());
+        if retarget {
+            self.path = Some(target.to_path_buf());
+        }
     }
 
     /// Return the document's path, if any.
@@ -426,17 +533,17 @@ impl Document {
     fn serialize_text(&self, text: &str) -> String {
         let mut result = text.to_string();
 
-        // Restore line ending
-        if self.line_ending == LineEnding::CrLf {
-            result = result.replace('\n', "\r\n");
-        }
-
         // Restore final-newline
         if self.has_final_newline && !result.ends_with('\n') {
             result.push('\n');
         } else if !self.has_final_newline && result.ends_with('\n') {
             // Remove trailing newlines to match original
             result.truncate(result.trim_end_matches('\n').len());
+        }
+
+        // Restore line ending
+        if self.line_ending == LineEnding::CrLf {
+            result = result.replace('\n', "\r\n");
         }
 
         result
@@ -470,4 +577,259 @@ fn detect_line_ending(text: &str) -> (LineEnding, bool) {
 /// Normalize a string to LF line endings.
 fn normalize_lf(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::io;
+    use std::path::{Path, PathBuf};
+
+    use super::{parent_directory, AtomicSaveOperations, Document};
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum AtomicSaveEvent {
+        Write,
+        FileSync,
+        Rename,
+        OpenParentReadOnly(PathBuf),
+        DirectorySync,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Failure {
+        FileSync,
+        Persist,
+        ParentOpen,
+        ParentSync,
+    }
+
+    #[derive(Default)]
+    struct RecordingAtomicSave {
+        events: Vec<AtomicSaveEvent>,
+        failure: Option<Failure>,
+        commit_to_disk: bool,
+    }
+
+    impl RecordingAtomicSave {
+        fn failing_at(failure: Failure) -> Self {
+            Self {
+                events: Vec::new(),
+                failure: Some(failure),
+                commit_to_disk: false,
+            }
+        }
+
+        fn committing_and_failing_at(failure: Failure) -> Self {
+            Self {
+                events: Vec::new(),
+                failure: Some(failure),
+                commit_to_disk: true,
+            }
+        }
+
+        fn fail(&self, failure: Failure) -> io::Result<()> {
+            if self.failure == Some(failure) {
+                Err(io::Error::other("injected atomic-save failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl AtomicSaveOperations for RecordingAtomicSave {
+        type TempFile = Vec<u8>;
+        type ParentDirectory = ();
+
+        fn create_temp(&mut self, _parent: &Path) -> io::Result<Self::TempFile> {
+            Ok(Vec::new())
+        }
+
+        fn write_all(&mut self, temp_file: &mut Self::TempFile, contents: &[u8]) -> io::Result<()> {
+            self.events.push(AtomicSaveEvent::Write);
+            temp_file.extend_from_slice(contents);
+            Ok(())
+        }
+
+        fn set_permissions(
+            &mut self,
+            _temp_file: &Self::TempFile,
+            _permissions: fs::Permissions,
+        ) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn sync_file(&mut self, _temp_file: &Self::TempFile) -> io::Result<()> {
+            self.events.push(AtomicSaveEvent::FileSync);
+            self.fail(Failure::FileSync)
+        }
+
+        fn persist(&mut self, temp_file: Self::TempFile, target: &Path) -> io::Result<()> {
+            self.events.push(AtomicSaveEvent::Rename);
+            self.fail(Failure::Persist)?;
+            if self.commit_to_disk {
+                fs::write(target, temp_file)?;
+            }
+            Ok(())
+        }
+
+        fn open_parent_read_only(&mut self, parent: &Path) -> io::Result<Self::ParentDirectory> {
+            self.events
+                .push(AtomicSaveEvent::OpenParentReadOnly(parent.to_path_buf()));
+            self.fail(Failure::ParentOpen)
+        }
+
+        fn sync_parent(&mut self, _parent: &Self::ParentDirectory) -> io::Result<()> {
+            self.events.push(AtomicSaveEvent::DirectorySync);
+            self.fail(Failure::ParentSync)
+        }
+    }
+
+    fn expected_atomic_save_events(parent: &Path) -> Vec<AtomicSaveEvent> {
+        vec![
+            AtomicSaveEvent::Write,
+            AtomicSaveEvent::FileSync,
+            AtomicSaveEvent::Rename,
+            AtomicSaveEvent::OpenParentReadOnly(parent.to_path_buf()),
+            AtomicSaveEvent::DirectorySync,
+        ]
+    }
+
+    #[test]
+    fn both_document_save_paths_use_the_complete_atomic_sequence() {
+        let mut document = Document::from_text("original");
+        let mut save_operations = RecordingAtomicSave::default();
+        document
+            .save_with_text_using(
+                "updated",
+                Some(Path::new("document.md")),
+                true,
+                &mut save_operations,
+            )
+            .unwrap();
+        assert_eq!(
+            save_operations.events,
+            expected_atomic_save_events(Path::new("."))
+        );
+
+        let mut copy_operations = RecordingAtomicSave::default();
+        document
+            .save_copy_using(Path::new("copy.md"), &mut copy_operations)
+            .unwrap();
+        assert_eq!(
+            copy_operations.events,
+            expected_atomic_save_events(Path::new("."))
+        );
+    }
+
+    #[test]
+    fn document_save_paths_propagate_sync_and_parent_open_failures() {
+        for failure in [Failure::FileSync, Failure::ParentOpen, Failure::ParentSync] {
+            let mut document = Document::from_text("contents");
+            let mut save_operations = RecordingAtomicSave::failing_at(failure);
+            assert!(document
+                .save_with_text_using(
+                    "updated",
+                    Some(Path::new("document.md")),
+                    true,
+                    &mut save_operations,
+                )
+                .is_err());
+
+            let mut copy_operations = RecordingAtomicSave::failing_at(failure);
+            assert!(document
+                .save_copy_using(Path::new("copy.md"), &mut copy_operations)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn document_save_records_committed_disk_state_after_parent_durability_failure() {
+        for failure in [Failure::ParentOpen, Failure::ParentSync] {
+            let directory = tempfile::tempdir().unwrap();
+            let target = directory.path().join("document.md");
+            let mut document = Document::from_text("original");
+            let mut operations = RecordingAtomicSave::committing_and_failing_at(failure);
+
+            assert!(document
+                .save_with_text_using("updated", Some(&target), true, &mut operations)
+                .is_err());
+
+            assert_eq!(document.path(), Some(target.as_path()));
+            assert_eq!(document.last_len, Some("updated".len()));
+            assert!(document.last_mtime.is_some());
+        }
+    }
+
+    #[test]
+    fn document_save_does_not_record_disk_state_before_rename() {
+        for failure in [Failure::FileSync, Failure::Persist] {
+            let mut document = Document::from_text("original");
+            let mut operations = RecordingAtomicSave::failing_at(failure);
+
+            assert!(document
+                .save_with_text_using(
+                    "updated",
+                    Some(Path::new("document.md")),
+                    true,
+                    &mut operations,
+                )
+                .is_err());
+
+            assert_eq!(document.path(), None);
+            assert_eq!(document.last_len, None);
+            assert_eq!(document.last_mtime, None);
+        }
+    }
+
+    #[test]
+    fn relative_targets_resolve_parent_to_current_directory() {
+        assert_eq!(parent_directory(Path::new("document.md")), Path::new("."));
+    }
+
+    #[test]
+    fn real_document_saves_commit_contents_in_a_temp_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("document.md");
+        let copy = directory.path().join("copy.md");
+        let mut document = Document::from_text("durable contents");
+
+        document.save(Some(&target), true).unwrap();
+        document.save_copy(&copy).unwrap();
+
+        assert_eq!(fs::read_to_string(target).unwrap(), "durable contents");
+        assert_eq!(fs::read_to_string(copy).unwrap(), "durable contents");
+    }
+
+    #[test]
+    fn serialize_crlf_without_final_newline_removes_entire_line_ending() {
+        let mut document = Document::from_text("hello\r\nworld");
+        document.set_text("hello\nworld\n");
+
+        assert_eq!(document.serialize(), "hello\r\nworld");
+    }
+
+    #[test]
+    fn serialize_crlf_with_final_newline_adds_crlf_ending() {
+        let mut document = Document::from_text("hello\r\nworld\r\n");
+        document.set_text("hello\nworld");
+
+        assert_eq!(document.serialize(), "hello\r\nworld\r\n");
+    }
+
+    #[test]
+    fn serialize_round_trips_crlf_without_final_newline() {
+        let original = "hello\r\nworld";
+        let document = Document::from_text(original);
+
+        assert_eq!(document.serialize(), original);
+    }
+
+    #[test]
+    fn serialize_empty_crlf_document_without_final_newline_is_empty() {
+        let mut document = Document::from_text("hello\r\nworld");
+        document.set_text("");
+
+        assert_eq!(document.serialize(), "");
+    }
 }

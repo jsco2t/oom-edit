@@ -5,9 +5,125 @@
 //! Load-with-defaults on missing/partial config. Atomic write on change.
 //! Never fail startup on malformed config (warn to stderr, use defaults).
 
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+trait ConfigSaveOperations {
+    type ParentDirectory;
+
+    fn create_dir_all(&mut self, path: &Path) -> io::Result<()>;
+    fn write(&mut self, path: &Path, contents: &[u8]) -> io::Result<()>;
+    fn sync_file(&mut self, path: &Path) -> io::Result<()>;
+    fn rename(&mut self, source: &Path, target: &Path) -> io::Result<()>;
+    fn open_parent_read_only(&mut self, parent: &Path) -> io::Result<Self::ParentDirectory>;
+    fn sync_parent(&mut self, parent: &Self::ParentDirectory) -> io::Result<()>;
+}
+
+struct FileSystemConfigSave;
+
+impl ConfigSaveOperations for FileSystemConfigSave {
+    type ParentDirectory = std::fs::File;
+
+    fn create_dir_all(&mut self, path: &Path) -> io::Result<()> {
+        std::fs::create_dir_all(path)
+    }
+
+    fn write(&mut self, path: &Path, contents: &[u8]) -> io::Result<()> {
+        std::fs::write(path, contents)
+    }
+
+    fn sync_file(&mut self, path: &Path) -> io::Result<()> {
+        std::fs::File::open(path)?.sync_all()
+    }
+
+    fn rename(&mut self, source: &Path, target: &Path) -> io::Result<()> {
+        std::fs::rename(source, target)
+    }
+
+    fn open_parent_read_only(&mut self, parent: &Path) -> io::Result<Self::ParentDirectory> {
+        std::fs::File::open(parent)
+    }
+
+    fn sync_parent(&mut self, parent: &Self::ParentDirectory) -> io::Result<()> {
+        parent.sync_all()
+    }
+}
+
+fn parent_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+fn containing_directory(path: &Path) -> Option<&Path> {
+    path.parent().map(|parent| {
+        if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        }
+    })
+}
+
+fn ensure_parent_directory<O: ConfigSaveOperations>(
+    operations: &mut O,
+    parent: &Path,
+) -> Result<(), String> {
+    operations.create_dir_all(parent).map_err(|e| {
+        format!(
+            "failed to create config directory '{}': {e}",
+            parent.display()
+        )
+    })?;
+
+    // Re-establish directory-entry durability on every attempt so a retry
+    // also completes any ancestor sync that failed after an earlier mkdir.
+    let mut ancestor = containing_directory(parent).unwrap_or(parent).to_path_buf();
+    loop {
+        let directory = operations
+            .open_parent_read_only(&ancestor)
+            .map_err(|e| format!("failed to open config directory: {e}"))?;
+        operations
+            .sync_parent(&directory)
+            .map_err(|e| format!("failed to sync config directory: {e}"))?;
+
+        match containing_directory(&ancestor) {
+            Some(next) if next != ancestor.as_path() => {
+                ancestor = next.to_path_buf();
+            }
+            _ => break,
+        }
+    }
+
+    Ok(())
+}
+
+fn atomic_save_config<O: ConfigSaveOperations>(
+    operations: &mut O,
+    path: &Path,
+    contents: &[u8],
+) -> Result<(), String> {
+    let temp_path = path.with_extension("toml.tmp");
+    operations
+        .write(&temp_path, contents)
+        .map_err(|e| format!("failed to write config file: {e}"))?;
+    operations
+        .sync_file(&temp_path)
+        .map_err(|e| format!("failed to sync config file: {e}"))?;
+    operations
+        .rename(&temp_path, path)
+        .map_err(|e| format!("failed to rename config file: {e}"))?;
+
+    let parent = parent_directory(path);
+    let parent_directory = operations
+        .open_parent_read_only(parent)
+        .map_err(|e| format!("failed to open config directory: {e}"))?;
+    operations
+        .sync_parent(&parent_directory)
+        .map_err(|e| format!("failed to sync config directory: {e}"))
+}
 
 /// Config file path: `$XDG_CONFIG_HOME/oom-edit/config.toml`, falling back to
 /// `~/.config/oom-edit/config.toml`.
@@ -91,34 +207,35 @@ impl Config {
         }
     }
 
-    /// Save the configuration atomically (write temp + rename).
+    /// Save the configuration atomically (write temp + fsync + rename + dir fsync).
     ///
     /// Creates the parent directory if it doesn't exist.
     ///
     /// # Errors
     ///
     /// Returns an error if the directory cannot be created or the file
-    /// cannot be written.
+    /// cannot be written or synced.
     pub fn save(&self) -> Result<(), String> {
         let path = config_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                format!(
-                    "failed to create config directory '{}': {e}",
-                    parent.display()
-                )
-            })?;
-        }
+        self.save_to_path(&path)
+    }
+
+    fn save_to_path(&self, path: &Path) -> Result<(), String> {
+        self.save_to_path_using(path, &mut FileSystemConfigSave)
+    }
+
+    fn save_to_path_using<O: ConfigSaveOperations>(
+        &self,
+        path: &Path,
+        operations: &mut O,
+    ) -> Result<(), String> {
+        let parent = parent_directory(path);
+        ensure_parent_directory(operations, parent)?;
 
         let contents =
             toml::to_string_pretty(self).map_err(|e| format!("failed to serialize config: {e}"))?;
 
-        // Atomic write: write to temp file, then rename.
-        let temp_path = path.with_extension("toml.tmp");
-        std::fs::write(&temp_path, &contents)
-            .map_err(|e| format!("failed to write config file: {e}"))?;
-
-        std::fs::rename(&temp_path, &path).map_err(|e| format!("failed to rename config file: {e}"))
+        atomic_save_config(operations, path, contents.as_bytes())
     }
 }
 
@@ -126,7 +243,113 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::path::{Path, PathBuf};
+
     use super::*;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum ConfigSaveEvent {
+        CreateDirectories(PathBuf),
+        Write,
+        FileSync,
+        Rename,
+        OpenParentReadOnly(PathBuf),
+        DirectorySync,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Failure {
+        FileSync,
+        ParentOpen(usize),
+        ParentSync(usize),
+    }
+
+    #[derive(Default)]
+    struct RecordingConfigSave {
+        events: Vec<ConfigSaveEvent>,
+        failure: Option<Failure>,
+        parent_open_count: usize,
+        parent_sync_count: usize,
+    }
+
+    impl RecordingConfigSave {
+        fn failing_at(failure: Failure) -> Self {
+            Self {
+                events: Vec::new(),
+                failure: Some(failure),
+                parent_open_count: 0,
+                parent_sync_count: 0,
+            }
+        }
+
+        fn fail(&self, failure: Failure) -> io::Result<()> {
+            if self.failure == Some(failure) {
+                Err(io::Error::other("injected config-save failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl ConfigSaveOperations for RecordingConfigSave {
+        type ParentDirectory = ();
+
+        fn create_dir_all(&mut self, path: &Path) -> io::Result<()> {
+            self.events
+                .push(ConfigSaveEvent::CreateDirectories(path.to_path_buf()));
+            Ok(())
+        }
+
+        fn write(&mut self, _path: &Path, _contents: &[u8]) -> io::Result<()> {
+            self.events.push(ConfigSaveEvent::Write);
+            Ok(())
+        }
+
+        fn sync_file(&mut self, _path: &Path) -> io::Result<()> {
+            self.events.push(ConfigSaveEvent::FileSync);
+            self.fail(Failure::FileSync)
+        }
+
+        fn rename(&mut self, _source: &Path, _target: &Path) -> io::Result<()> {
+            self.events.push(ConfigSaveEvent::Rename);
+            Ok(())
+        }
+
+        fn open_parent_read_only(&mut self, parent: &Path) -> io::Result<Self::ParentDirectory> {
+            self.events
+                .push(ConfigSaveEvent::OpenParentReadOnly(parent.to_path_buf()));
+            self.parent_open_count += 1;
+            if self.failure == Some(Failure::ParentOpen(self.parent_open_count)) {
+                Err(io::Error::other("injected config-save failure"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn sync_parent(&mut self, _parent: &Self::ParentDirectory) -> io::Result<()> {
+            self.events.push(ConfigSaveEvent::DirectorySync);
+            self.parent_sync_count += 1;
+            if self.failure == Some(Failure::ParentSync(self.parent_sync_count)) {
+                Err(io::Error::other("injected config-save failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn expected_config_save_events(parent: &Path) -> Vec<ConfigSaveEvent> {
+        vec![
+            ConfigSaveEvent::CreateDirectories(parent.to_path_buf()),
+            ConfigSaveEvent::OpenParentReadOnly(parent_directory(parent).to_path_buf()),
+            ConfigSaveEvent::DirectorySync,
+            ConfigSaveEvent::Write,
+            ConfigSaveEvent::FileSync,
+            ConfigSaveEvent::Rename,
+            ConfigSaveEvent::OpenParentReadOnly(parent.to_path_buf()),
+            ConfigSaveEvent::DirectorySync,
+        ]
+    }
 
     /// Default config has sensible defaults.
     #[test]
@@ -153,9 +376,7 @@ mod tests {
         std::fs::create_dir_all(&config_dir).unwrap();
         let config_file = config_dir.join("config.toml");
 
-        // Override config_path for testing by writing to our temp dir.
-        let contents = toml::to_string_pretty(&config).unwrap();
-        std::fs::write(&config_file, &contents).unwrap();
+        config.save_to_path(&config_file).unwrap();
 
         // Read it back.
         let contents2 = std::fs::read_to_string(&config_file).unwrap();
@@ -211,13 +432,133 @@ mode = "light"
         let config_file = config_dir.join("config.toml");
 
         let config = Config::default();
-
-        // Override config_path by writing directly.
-        std::fs::create_dir_all(&config_dir).unwrap();
-        let contents = toml::to_string_pretty(&config).unwrap();
-        std::fs::write(&config_file, &contents).unwrap();
+        config.save_to_path(&config_file).unwrap();
 
         assert!(config_file.exists());
+    }
+
+    #[test]
+    fn config_save_uses_complete_atomic_sequence() {
+        let config = Config::default();
+        let mut operations = RecordingConfigSave::default();
+
+        config
+            .save_to_path_using(Path::new("config.toml"), &mut operations)
+            .unwrap();
+
+        assert_eq!(
+            operations.events,
+            expected_config_save_events(Path::new("."))
+        );
+    }
+
+    #[test]
+    fn config_save_propagates_sync_and_parent_open_failures() {
+        let config = Config::default();
+        for (failure, expected_message) in [
+            (Failure::FileSync, "failed to sync config file"),
+            (Failure::ParentOpen(2), "failed to open config directory"),
+            (Failure::ParentSync(2), "failed to sync config directory"),
+        ] {
+            let mut operations = RecordingConfigSave::failing_at(failure);
+            let error = config
+                .save_to_path_using(Path::new("config.toml"), &mut operations)
+                .unwrap_err();
+            assert!(
+                error.contains(expected_message),
+                "unexpected error for {failure:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_save_syncs_new_directory_entries_bottom_up() {
+        let config = Config::default();
+        let mut operations = RecordingConfigSave::default();
+
+        config
+            .save_to_path_using(Path::new("config/nested/config.toml"), &mut operations)
+            .unwrap();
+
+        assert_eq!(
+            operations.events,
+            vec![
+                ConfigSaveEvent::CreateDirectories(PathBuf::from("config/nested")),
+                ConfigSaveEvent::OpenParentReadOnly(PathBuf::from("config")),
+                ConfigSaveEvent::DirectorySync,
+                ConfigSaveEvent::OpenParentReadOnly(PathBuf::from(".")),
+                ConfigSaveEvent::DirectorySync,
+                ConfigSaveEvent::Write,
+                ConfigSaveEvent::FileSync,
+                ConfigSaveEvent::Rename,
+                ConfigSaveEvent::OpenParentReadOnly(PathBuf::from("config/nested")),
+                ConfigSaveEvent::DirectorySync,
+            ]
+        );
+    }
+
+    #[test]
+    fn absolute_config_path_stops_ancestor_sync_at_filesystem_root() {
+        let config = Config::default();
+        let mut operations = RecordingConfigSave::default();
+
+        config
+            .save_to_path_using(Path::new("/config/nested/config.toml"), &mut operations)
+            .unwrap();
+
+        assert_eq!(
+            &operations.events[..5],
+            &[
+                ConfigSaveEvent::CreateDirectories(PathBuf::from("/config/nested")),
+                ConfigSaveEvent::OpenParentReadOnly(PathBuf::from("/config")),
+                ConfigSaveEvent::DirectorySync,
+                ConfigSaveEvent::OpenParentReadOnly(PathBuf::from("/")),
+                ConfigSaveEvent::DirectorySync,
+            ]
+        );
+        assert!(!operations
+            .events
+            .contains(&ConfigSaveEvent::OpenParentReadOnly(PathBuf::from("."))));
+    }
+
+    #[test]
+    fn config_save_propagates_ancestor_sync_failures_before_writing() {
+        let config = Config::default();
+        for failure in [Failure::ParentOpen(1), Failure::ParentSync(1)] {
+            let mut operations = RecordingConfigSave::failing_at(failure);
+
+            assert!(config
+                .save_to_path_using(Path::new("config/nested/config.toml"), &mut operations,)
+                .is_err());
+            assert!(!operations.events.contains(&ConfigSaveEvent::Write));
+        }
+    }
+
+    #[test]
+    fn config_save_retry_repeats_ancestor_sync_chain() {
+        let config = Config::default();
+        let path = Path::new("config/nested/config.toml");
+        let mut first_attempt = RecordingConfigSave::failing_at(Failure::ParentSync(2));
+        assert!(config.save_to_path_using(path, &mut first_attempt).is_err());
+        assert!(!first_attempt.events.contains(&ConfigSaveEvent::Write));
+
+        let mut retry = RecordingConfigSave::default();
+        config.save_to_path_using(path, &mut retry).unwrap();
+        assert_eq!(
+            &retry.events[..5],
+            &[
+                ConfigSaveEvent::CreateDirectories(PathBuf::from("config/nested")),
+                ConfigSaveEvent::OpenParentReadOnly(PathBuf::from("config")),
+                ConfigSaveEvent::DirectorySync,
+                ConfigSaveEvent::OpenParentReadOnly(PathBuf::from(".")),
+                ConfigSaveEvent::DirectorySync,
+            ]
+        );
+    }
+
+    #[test]
+    fn relative_config_path_resolves_parent_to_current_directory() {
+        assert_eq!(parent_directory(Path::new("config.toml")), Path::new("."));
     }
 
     /// Config with all theme keys specified.

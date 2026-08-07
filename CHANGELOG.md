@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- CRLF files without a final newline no longer gain a stray carriage return when saved.
 - View-mode cursor-line highlighting now spans the full viewport width while preserving semantic syntax styles.
 - View mode now preserves the visible reading position when terminal resizing changes line wrapping.
 - Edit mode now renders a single status row and uses the reclaimed row for editor content.
