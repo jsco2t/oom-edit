@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- View-mode cursor-line highlighting now spans the full viewport width while preserving semantic syntax styles.
 - View mode now preserves the visible reading position when terminal resizing changes line wrapping.
 - Edit mode now renders a single status row and uses the reclaimed row for editor content.
 - Nested links, headings, and footnotes in lists and blockquotes now retain document-level View metadata, use sequential link markers, and finalize footer panels only once.
