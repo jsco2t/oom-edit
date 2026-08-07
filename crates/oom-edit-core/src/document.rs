@@ -66,7 +66,7 @@ impl Document {
                 let text = match String::from_utf8(bytes) {
                     Ok(t) => t,
                     Err(e) => {
-                        let offset = find_first_invalid_utf8(&e.into_bytes());
+                        let offset = e.utf8_error().valid_up_to();
                         return Err(OpenError::NotUtf8(offset));
                     }
                 };
@@ -470,17 +470,4 @@ fn detect_line_ending(text: &str) -> (LineEnding, bool) {
 /// Normalize a string to LF line endings.
 fn normalize_lf(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
-}
-
-/// Find the byte offset of the first invalid UTF-8 byte.
-///
-/// Scans for any byte with the high bit set — used to find a byte offset
-/// to report when `from_utf8` has already confirmed invalid UTF-8.
-fn find_first_invalid_utf8(bytes: &[u8]) -> usize {
-    for (i, &b) in bytes.iter().enumerate() {
-        if (b as i8) < 0 {
-            return i;
-        }
-    }
-    bytes.len()
 }

@@ -51,17 +51,66 @@ fn open_new_file_returns_empty_buffer() {
 }
 
 #[test]
-fn open_invalid_utf8_refuses() {
+fn open_invalid_utf8_after_ascii_reports_exact_byte_offset() {
     let dir = temp_dir();
     let path = dir.path().join("bad.md");
 
-    // Write a file with invalid UTF-8 (0xFF byte)
-    fs::write(&path, b"hello\xffworld").unwrap();
+    fs::write(&path, b"hello\xFF").unwrap();
 
-    let result = Document::open(&path);
-    assert!(result.is_err());
-    match result.unwrap_err() {
+    match Document::open(&path).unwrap_err() {
         OpenError::NotUtf8(offset) => assert_eq!(offset, 5),
+        other => panic!("expected NotUtf8, got {:?}", other),
+    }
+}
+
+#[test]
+fn open_invalid_utf8_after_multibyte_character_reports_exact_byte_offset() {
+    let dir = temp_dir();
+    let path = dir.path().join("bad.md");
+
+    fs::write(&path, b"caf\xC3\xA9\xFF").unwrap();
+
+    match Document::open(&path).unwrap_err() {
+        OpenError::NotUtf8(offset) => assert_eq!(offset, 5),
+        other => panic!("expected NotUtf8, got {:?}", other),
+    }
+}
+
+#[test]
+fn open_invalid_utf8_at_start_reports_zero_offset() {
+    let dir = temp_dir();
+    let path = dir.path().join("bad.md");
+
+    fs::write(&path, b"\xFF").unwrap();
+
+    match Document::open(&path).unwrap_err() {
+        OpenError::NotUtf8(offset) => assert_eq!(offset, 0),
+        other => panic!("expected NotUtf8, got {:?}", other),
+    }
+}
+
+#[test]
+fn open_invalid_utf8_after_multiple_multibyte_characters_reports_exact_byte_offset() {
+    let dir = temp_dir();
+    let path = dir.path().join("bad.md");
+
+    fs::write(&path, b"\xC3\xA9\xC3\xA9\xFF").unwrap();
+
+    match Document::open(&path).unwrap_err() {
+        OpenError::NotUtf8(offset) => assert_eq!(offset, 4),
+        other => panic!("expected NotUtf8, got {:?}", other),
+    }
+}
+
+#[test]
+fn open_invalid_utf8_after_three_byte_character_reports_exact_byte_offset() {
+    let dir = temp_dir();
+    let path = dir.path().join("bad.md");
+
+    fs::write(&path, b"abc\xE2\x82\xAC\xFF").unwrap();
+
+    match Document::open(&path).unwrap_err() {
+        OpenError::NotUtf8(offset) => assert_eq!(offset, 6),
         other => panic!("expected NotUtf8, got {:?}", other),
     }
 }
