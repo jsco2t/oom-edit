@@ -1,9 +1,5 @@
-# Vendored-sources replacement — activated in T02.
-#
-# When dependencies are vendored into vendor/, activate the following
-# blocks (uncomment) and remove the [source.crates-io] override below.
-#
-# Until then, builds use crates.io directly.
+# Vendored-sources replacement (activated in T02).
+# All dependencies are vendored into vendor/ and builds run offline.
 
 [source.crates-io]
 replace-with = "vendored-sources"

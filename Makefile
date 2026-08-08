@@ -168,7 +168,7 @@ vendor: ## Re-vendor dependencies (requires network)
 # Bench
 # ---------------------------------------------------------------------------
 .PHONY: bench
-bench: ## Run Criterion benchmarks
+bench: ## Run performance benchmarks
 	cargo bench --workspace --offline --locked
 
 .PHONY: bench-check
