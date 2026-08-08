@@ -387,31 +387,6 @@ pub fn handle_key(
             result.new_search = Some(new_search);
         }
 
-        // n: repeat search in same direction
-        crate::session::KeyCodeKind::Char('n')
-            if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
-        {
-            if let Some(current_search) = search {
-                result.search_changed = true;
-                result.new_search = Some(current_search.clone());
-            }
-        }
-
-        // N: repeat search in reverse direction
-        crate::session::KeyCodeKind::Char('N')
-            if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
-        {
-            if let Some(current_search) = search {
-                let mut new_search = current_search.clone();
-                new_search.set_direction(match new_search.direction() {
-                    SearchDirection::Forward => SearchDirection::Backward,
-                    SearchDirection::Backward => SearchDirection::Forward,
-                });
-                result.search_changed = true;
-                result.new_search = Some(new_search);
-            }
-        }
-
         // Tab: jump to next target
         crate::session::KeyCodeKind::Tab if !key.mods.ctrl && !key.mods.alt && !key.mods.shift => {
             if let Some(target) = next_jump_target(cursor, jump_targets, false) {
@@ -479,9 +454,9 @@ pub fn handle_key(
                         result.new_cursor = Some(ViewCursor::new(match_line));
                         // Check if we wrapped around the document
                         let wrapped = if current_search.direction() == SearchDirection::Forward {
-                            match_line < cursor.line
+                            match_line <= cursor.line
                         } else {
-                            match_line > cursor.line
+                            match_line >= cursor.line
                         };
                         if wrapped {
                             result
@@ -512,15 +487,20 @@ pub fn handle_key(
                     {
                         result.cursor_moved = true;
                         result.new_cursor = Some(ViewCursor::new(match_line));
+                        let wrapped = if reverse.direction() == SearchDirection::Forward {
+                            match_line <= cursor.line
+                        } else {
+                            match_line >= cursor.line
+                        };
+                        if wrapped {
+                            result.message = Some(" (wrapped)".to_string());
+                        }
                     }
                 }
                 result.search_changed = true;
-                let mut new_search = current_search.clone();
-                new_search.set_direction(match new_search.direction() {
-                    SearchDirection::Forward => SearchDirection::Backward,
-                    SearchDirection::Backward => SearchDirection::Forward,
-                });
-                result.new_search = Some(new_search);
+                // N reverses this invocation without changing the committed
+                // direction, so repeated N presses keep moving oppositely.
+                result.new_search = Some(current_search.clone());
             }
         }
 
@@ -695,39 +675,18 @@ pub fn find_next_match(
     search: &ViewSearch,
     cursor: &ViewCursor,
     layout: &ViewLayout,
-    text: &str,
+    _text: &str,
     direction: SearchDirection,
 ) -> Option<usize> {
-    let matches = search.find_matches(text);
-    if matches.is_empty() {
-        return None;
-    }
-
-    // Map byte offsets to view lines
-    // For each match, find which view line it falls on
-    let mut view_lines_with_matches: Vec<usize> = Vec::new();
-
-    for match_offset in &matches {
-        if *match_offset >= text.len() {
-            continue;
-        }
-
-        // Find the document line containing this match
-        let text_prefix = &text[..*match_offset];
-        let doc_line = text_prefix.chars().filter(|&c| c == '\n').count();
-
-        // Find the view line for this document line
-        let mut doc_line_idx = 0usize;
-        for (view_line, view_line_info) in layout.lines.iter().enumerate() {
-            if view_line_info.kind == LineKind::Content {
-                if doc_line_idx == doc_line {
-                    view_lines_with_matches.push(view_line);
-                    break;
-                }
-                doc_line_idx += 1;
-            }
-        }
-    }
+    let mut view_lines_with_matches = layout
+        .lines
+        .iter()
+        .enumerate()
+        .filter_map(|(view_line, line)| {
+            (line.kind == LineKind::Content && search.matches(&line.styled.text))
+                .then_some(view_line)
+        })
+        .collect::<Vec<_>>();
 
     if view_lines_with_matches.is_empty() {
         return None;
@@ -925,6 +884,55 @@ mod tests {
         assert_eq!(enter_view(1, 0, &layout, text), ViewCursor::new(1));
     }
 
+    #[test]
+    fn search_uses_rendered_text_across_synthetic_lines() {
+        let text = "**hello**\n\nfoo\n\nhello";
+        let layout = layout_with_lines(vec![
+            view_line_with_text("hello", LineKind::Content, 0..9),
+            view_line(LineKind::Synthetic, 0..9),
+            view_line_with_text("foo", LineKind::Content, 11..14),
+            view_line(LineKind::Synthetic, 11..14),
+            view_line_with_text("hello", LineKind::Content, 16..21),
+        ]);
+
+        let forward = ViewSearch::new("foo");
+        assert_eq!(
+            find_next_match(
+                &forward,
+                &ViewCursor::new(0),
+                &layout,
+                text,
+                SearchDirection::Forward,
+            ),
+            Some(2)
+        );
+
+        let mut backward = ViewSearch::new("hello");
+        backward.set_direction(SearchDirection::Backward);
+        assert_eq!(
+            find_next_match(
+                &backward,
+                &ViewCursor::new(0),
+                &layout,
+                text,
+                SearchDirection::Backward,
+            ),
+            Some(4)
+        );
+
+        let source_syntax = ViewSearch::new("**");
+        assert_eq!(
+            find_next_match(
+                &source_syntax,
+                &ViewCursor::new(0),
+                &layout,
+                text,
+                SearchDirection::Forward,
+            ),
+            None
+        );
+    }
+
     fn layout_with_lines(lines: Vec<ViewLine>) -> ViewLayout {
         ViewLayout {
             lines,
@@ -933,9 +941,13 @@ mod tests {
     }
 
     fn view_line(kind: LineKind, source: Range<usize>) -> ViewLine {
+        view_line_with_text("", kind, source)
+    }
+
+    fn view_line_with_text(text: &str, kind: LineKind, source: Range<usize>) -> ViewLine {
         ViewLine {
             styled: StyledLine {
-                text: String::new(),
+                text: text.to_string(),
                 spans: Vec::new(),
             },
             source,

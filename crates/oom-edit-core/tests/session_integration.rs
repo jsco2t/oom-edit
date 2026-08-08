@@ -653,7 +653,7 @@ fn saving_mid_insert_does_not_clean_later_text_in_the_same_undo_node() {
 }
 
 #[test]
-fn no_op_undo_does_not_clean_same_bytes_created_by_direct_edits() {
+fn substitute_undo_traverses_changes_that_recreate_saved_bytes() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("no-op-undo.md");
     let mut session = EditorSession::from_text("abc");
@@ -671,11 +671,12 @@ fn no_op_undo_does_not_clean_same_bytes_created_by_direct_edits() {
     assert!(session.is_dirty());
 
     session.handle_key(key('u'));
+    assert_eq!(session.document(), "xbc");
+    assert!(session.is_dirty());
+
+    session.handle_key(key('u'));
     assert_eq!(session.document(), "abc");
-    assert!(
-        session.is_dirty(),
-        "a consumed no-op undo must not clear direct edits that recreated saved bytes"
-    );
+    assert!(!session.is_dirty());
 }
 
 // ── Effect emission ─────────────────────────────────────────────────────────

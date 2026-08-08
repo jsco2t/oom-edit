@@ -258,6 +258,8 @@ struct ViewState {
     search: Option<ViewSearch>,
     /// Whether typed characters are currently extending the search pattern.
     search_input_active: bool,
+    /// Cursor position captured when the active search prompt was opened.
+    search_origin: Option<ViewCursor>,
     /// Whether the front-matter panel is collapsed.
     fm_collapsed: bool,
     /// Accumulated numeric count for navigation commands.
@@ -273,6 +275,7 @@ impl ViewState {
             cursor: ViewCursor::new(0),
             search: None,
             search_input_active: false,
+            search_origin: None,
             fm_collapsed: false,
             count: 0,
         }
@@ -286,6 +289,7 @@ impl ViewState {
             cursor: ViewCursor::new(0),
             search: None,
             search_input_active: false,
+            search_origin: None,
             fm_collapsed: false,
             count: 0,
         }
@@ -314,6 +318,7 @@ impl ViewState {
     fn clear_search(&mut self) {
         self.search = None;
         self.search_input_active = false;
+        self.search_origin = None;
     }
 }
 
@@ -664,6 +669,7 @@ impl EditorSession {
     /// assert!(!frame.lines[0].text.is_empty()); // first line has content
     /// ```
     pub fn render_source(&mut self, vp: Viewport) -> crate::style::SourceFrame {
+        self.vim.set_viewport(vp.top_line, vp.height);
         let text = self.vim.text();
         let line_count = self.line_count();
         let (cursor_line, cursor_col) = self.cursor();
@@ -675,7 +681,12 @@ impl EditorSession {
         // Highlight the visible lines (pad to viewport height)
         let start_line = first_visible.min(line_count);
         let end_line = last_visible.min(line_count);
-        let highlighted = self.highlighter.highlight_lines(start_line..end_line);
+        let mut highlighted = self.highlighter.highlight_lines(start_line..end_line);
+        for (offset, styled_line) in highlighted.iter_mut().enumerate() {
+            for search_match in self.vim.search_matches_for_line(start_line + offset) {
+                Self::overlay_search_match(styled_line, search_match);
+            }
+        }
 
         // Build the lines vector, padding if needed
         let mut lines = Vec::with_capacity(vp.height as usize);
@@ -849,6 +860,7 @@ impl EditorSession {
                 cursor,
                 search: None,
                 search_input_active: false,
+                search_origin: None,
                 fm_collapsed: false,
                 count: 0,
             });
@@ -978,6 +990,7 @@ impl EditorSession {
                         // Search mode activated but no pattern yet
                         vs.search = Some(new_search);
                         vs.search_input_active = true;
+                        vs.search_origin = Some(cursor);
                     } else {
                         // Pattern entered, perform search
                         vs.search = Some(new_search.clone());
@@ -1046,6 +1059,7 @@ impl EditorSession {
             KeyCodeKind::Enter => {
                 if let Some(vs) = self.view_state.as_mut() {
                     vs.search_input_active = false;
+                    vs.search_origin = None;
                 }
                 Vec::new()
             }
@@ -1057,7 +1071,7 @@ impl EditorSession {
             {
                 let mut effects = Vec::new();
                 if let Some(vs) = self.view_state.as_mut() {
-                    let cursor = vs.cursor;
+                    let cursor = vs.search_origin.unwrap_or(vs.cursor);
                     let text = self.vim.text();
                     let layout = vs.get_layout(&text, &self.highlighter, 80).clone();
                     let search_state = vs
@@ -1163,41 +1177,45 @@ impl EditorSession {
             }
             "s" | "substitute" => {
                 // :[range]s/pattern/replacement/[flags]
-                // Try to extract substitute args from the rest of the command
-                let sub_args = if let Some(rest) = args.0 {
-                    Self::parse_substitute(rest)
-                } else {
-                    None
+                let Some(substitute_args) = args.0 else {
+                    return vec![Effect::Message {
+                        text: "Invalid substitute command".to_string(),
+                        severity: Severity::Warning,
+                    }];
                 };
-                match sub_args {
-                    Some((pattern, replacement, flags)) => {
-                        let global = flags.contains('g');
-                        let text = self.vim.text();
-                        let new_text = if global {
-                            Self::substitute_global(&text, pattern, replacement)
-                        } else {
-                            Self::substitute_first(&text, pattern, replacement)
-                        };
-                        if new_text != text {
-                            self.vim.set_text(&new_text);
-                            vec![Effect::Edited]
-                        } else {
-                            vec![Effect::Message {
-                                text: "No replacement done".to_string(),
-                                severity: Severity::Info,
-                            }]
+                let Some((start_row, end_row)) =
+                    Self::parse_substitute_range(cmd, self.cursor().0, self.line_count())
+                else {
+                    return vec![Effect::Message {
+                        text: "Invalid substitute range".to_string(),
+                        severity: Severity::Warning,
+                    }];
+                };
+                match self.vim.substitute(substitute_args, start_row, end_row) {
+                    Ok(edits) if edits.is_empty() => vec![Effect::Message {
+                        text: "No replacement done".to_string(),
+                        severity: Severity::Info,
+                    }],
+                    Ok(edits) => {
+                        self.highlighter.apply_edit(&edits);
+                        if let Some(ref mut vs) = self.view_state {
+                            vs.invalidate();
                         }
+                        vec![Effect::Edited]
                     }
-                    None => vec![Effect::Message {
+                    Err(_) => vec![Effect::Message {
                         text: "Invalid substitute command".to_string(),
                         severity: Severity::Warning,
                     }],
                 }
             }
-            "noh" => vec![Effect::Message {
-                text: "Search highlighting cleared".to_string(),
-                severity: Severity::Info,
-            }],
+            "noh" => {
+                self.vim.clear_search_highlight();
+                vec![Effect::Message {
+                    text: "Search highlighting cleared".to_string(),
+                    severity: Severity::Info,
+                }]
+            }
             "view" => {
                 // Build the canonical ViewState rather than only changing mode.
                 // Ex commands execute while still in Command mode, so this takes
@@ -1292,36 +1310,79 @@ impl EditorSession {
         (base, (path, force))
     }
 
-    /// Parse substitute command arguments: "pattern/replacement/flags"
-    fn parse_substitute(args: &str) -> Option<(&str, &str, String)> {
-        if args.is_empty() {
-            return None;
-        }
-        let delim = args.chars().next()?;
-        let closing = args[1..].find(delim)?;
-        let pattern = &args[1..1 + closing];
-        let rest = &args[1 + closing + 1..];
-        let rep_end = rest.find(delim)?;
-        let replacement = &rest[..rep_end];
-        let flags = rest[rep_end + 1..].to_string();
-        Some((pattern, replacement, flags))
-    }
-
-    /// Substitute the first occurrence of pattern in text with replacement.
-    fn substitute_first(text: &str, pattern: &str, replacement: &str) -> String {
-        if let Some(pos) = text.find(pattern) {
-            let mut result = text[..pos].to_string();
-            result.push_str(replacement);
-            result.push_str(&text[pos + pattern.len()..]);
-            result
+    /// Resolve a substitute command's optional 1-based line range.
+    /// An omitted range targets the cursor line; `%` targets the whole buffer.
+    fn parse_substitute_range(
+        command: &str,
+        cursor_row: usize,
+        line_count: usize,
+    ) -> Option<(usize, usize)> {
+        let command = command.trim_start_matches(':');
+        let substitute_pos = if command.starts_with("substitute/") || command.starts_with("s/") {
+            0
         } else {
-            text.to_string()
+            command.find("substitute/").or_else(|| command.find("s/"))?
+        };
+        let prefix = command[..substitute_pos].trim();
+        let last_row = line_count.saturating_sub(1);
+
+        if prefix.is_empty() {
+            let row = cursor_row.min(last_row);
+            return Some((row, row));
         }
+        if prefix == "%" {
+            return Some((0, last_row));
+        }
+
+        let (start, end) = prefix.split_once(',').unwrap_or((prefix, prefix));
+        let start = start.parse::<usize>().ok()?.checked_sub(1)?;
+        let end = end.parse::<usize>().ok()?.checked_sub(1)?;
+        (start <= end && end <= last_row).then_some((start, end))
     }
 
-    /// Substitute all occurrences of pattern in text with replacement.
-    fn substitute_global(text: &str, pattern: &str, replacement: &str) -> String {
-        text.replace(pattern, replacement)
+    fn overlay_search_match(
+        line: &mut crate::style::StyledLine,
+        byte_range: std::ops::Range<usize>,
+    ) {
+        let byte_start = byte_range.start.min(line.text.len());
+        let byte_end = byte_range.end.min(line.text.len());
+        if byte_start >= byte_end
+            || !line.text.is_char_boundary(byte_start)
+            || !line.text.is_char_boundary(byte_end)
+        {
+            return;
+        }
+
+        let start_col = line.text[..byte_start].chars().count();
+        let end_col = line.text[..byte_end].chars().count();
+        let mut spans = Vec::with_capacity(line.spans.len() + 1);
+        for span in line.spans.drain(..) {
+            if span.end_col <= start_col || span.start_col >= end_col {
+                spans.push(span);
+                continue;
+            }
+            if span.start_col < start_col {
+                spans.push(crate::style::Span {
+                    start_col: span.start_col,
+                    end_col: start_col,
+                    style: span.style,
+                });
+            }
+            if span.end_col > end_col {
+                spans.push(crate::style::Span {
+                    start_col: end_col,
+                    end_col: span.end_col,
+                    style: span.style,
+                });
+            }
+        }
+        spans.push(crate::style::Span {
+            start_col,
+            end_col,
+            style: crate::style::SemanticStyle::Match,
+        });
+        spans.sort_by_key(|span| span.start_col);
+        line.spans = spans;
     }
 
     /// Translate our KeyInput → VimCore's internal KeyInput.

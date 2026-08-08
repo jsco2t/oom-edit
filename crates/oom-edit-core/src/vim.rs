@@ -292,7 +292,13 @@ impl VimCore {
     /// Create a new `VimCore` from initial text. Starts in Normal mode.
     pub(crate) fn new(text: &str) -> Self {
         let view = View::from_str(text);
-        let mut editor = Editor::new(view, ClipboardCapturingHost::new(), Options::default());
+        // oom-edit promises stock Vim `s`/`S` substitution semantics; hjkl's
+        // optional sneak motion is deliberately outside that conformance set.
+        let options = Options {
+            motion_sneak: false,
+            ..Options::default()
+        };
+        let mut editor = Editor::new(view, ClipboardCapturingHost::new(), options);
         install_vim_discipline(&mut editor);
         let save_point_dirty_gen = editor.buffer().dirty_gen();
         let save_point_undo_seq = editor.buffer().current_undo_seq();
@@ -323,12 +329,31 @@ impl VimCore {
             return self.handle_command_mode_key(hjkl_input, key);
         }
 
+        let cursor_before = self.cursor();
+        let repeat_search_wrapped = if self.mode == Mode::Normal
+            && key.mods == Modifiers::default()
+            && self.editor.last_search_pattern().is_some()
+        {
+            let direction = match key.code.kind {
+                KeyCodeKind::Char('n') => Some(self.editor.last_search_forward()),
+                KeyCodeKind::Char('N') => Some(!self.editor.last_search_forward()),
+                _ => None,
+            };
+            direction.map(|forward| {
+                let count = self.hjkl_state().count.max(1);
+                self.repeat_search_will_wrap(forward, count, cursor_before)
+            })
+        } else {
+            None
+        };
+
         let system_register_selected = self.system_clipboard_register_selected();
         let system_yank_pending = system_register_selected && self.yank_operator_pending();
         let system_yank_step =
             system_register_selected && (system_yank_pending || Self::is_yank_key(key));
 
         let history_traversal = self.is_history_traversal_key(key);
+        let history_text_before = history_traversal.then(|| self.text());
         let undo_seq_before = history_traversal.then(|| self.editor.buffer().current_undo_seq());
         let next_history_prefix = self.mode == Mode::Normal
             && !self.history_prefix_pending
@@ -355,7 +380,16 @@ impl VimCore {
         self.history_prefix_pending = next_history_prefix;
 
         // Drain any content edits
-        let edits = self.drain_content_edits();
+        let mut edits = self.drain_content_edits();
+        if self.editor.take_content_reset() {
+            let old_text = history_text_before.as_deref().unwrap_or("");
+            let new_text = self.text();
+            edits = vec![TextEdit {
+                range: 0..old_text.len(),
+                new_text_len: new_text.len(),
+                new_text,
+            }];
+        }
 
         let history_moved =
             undo_seq_before.is_some_and(|before| self.editor.buffer().current_undo_seq() != before);
@@ -390,6 +424,10 @@ impl VimCore {
         }
         effects.extend(self.clipboard_effects(writes, system_yank_step));
 
+        if repeat_search_wrapped == Some(true) {
+            effects.push(VimEffect::SearchWrapped);
+        }
+
         effects
     }
 
@@ -407,6 +445,41 @@ impl VimCore {
             .filter(|text| clipboard_text.as_ref() == Some(text))
             .map(VimEffect::ClipboardYank)
             .collect()
+    }
+
+    /// Determine whether a counted repeat search crosses a buffer boundary.
+    /// The engine processes the whole count in one step, so comparing only the
+    /// final cursor with the starting cursor loses wraps that happen midway.
+    fn repeat_search_will_wrap(
+        &mut self,
+        forward: bool,
+        count: usize,
+        cursor: (usize, usize),
+    ) -> bool {
+        let Some(pattern) = self.editor.last_search_pattern() else {
+            return false;
+        };
+        self.editor.push_search_pattern(&pattern);
+        if !self.editor.search_state().wrap_around {
+            return false;
+        }
+
+        let line_count = self.text().split('\n').count();
+        let mut total_matches = 0;
+        let mut matches_before_boundary = 0;
+        for row in 0..line_count {
+            let line = self.line(row).unwrap_or_default();
+            for range in self.search_matches_for_line(row) {
+                total_matches += 1;
+                let byte_start = range.start.min(line.len());
+                let position = (row, line[..byte_start].chars().count());
+                if (forward && position > cursor) || (!forward && position < cursor) {
+                    matches_before_boundary += 1;
+                }
+            }
+        }
+
+        total_matches > 0 && count > matches_before_boundary
     }
 
     fn hjkl_state(&self) -> &HjklVimState {
@@ -543,6 +616,33 @@ impl VimCore {
         }
     }
 
+    /// Return active search-highlight byte ranges for one buffer line.
+    pub(crate) fn search_matches_for_line(&mut self, row: usize) -> Vec<Range<usize>> {
+        self.editor
+            .highlights_for_line(row as u32)
+            .into_iter()
+            .filter_map(|highlight| {
+                matches!(
+                    highlight.kind,
+                    hjkl_engine::types::HighlightKind::SearchMatch
+                        | hjkl_engine::types::HighlightKind::IncSearch
+                )
+                .then_some(highlight.range.start.col as usize..highlight.range.end.col as usize)
+            })
+            .collect()
+    }
+
+    /// Clear the active search pattern used for match highlighting.
+    pub(crate) fn clear_search_highlight(&mut self) {
+        self.editor.set_search_pattern(None);
+    }
+
+    /// Publish the current source viewport for screen- and pagewise motions.
+    pub(crate) fn set_viewport(&mut self, top_row: usize, height: u16) {
+        self.editor.set_viewport_height(height);
+        self.editor.set_viewport_top(top_row);
+    }
+
     /// Command-line mode is not supported by the hjkl wrapper.
     /// Returns `None` always.
     pub(crate) fn command_line(&self) -> Option<String> {
@@ -563,12 +663,31 @@ impl VimCore {
         UndoMark(self.save_point_dirty_gen)
     }
 
-    /// Replace the entire buffer text in place. Returns the old text.
-    pub(crate) fn set_text(&mut self, text: &str) -> String {
-        let old = self.editor.buffer().as_string();
-        self.editor.buffer_mut().replace_all(text);
+    /// Apply one Ex substitution as a single undoable engine transaction.
+    pub(crate) fn substitute(
+        &mut self,
+        args: &str,
+        start_row: usize,
+        end_row: usize,
+    ) -> Result<Vec<TextEdit>, String> {
+        let command = hjkl_engine::substitute::parse_substitute(args)?;
+        let old_text = self.text();
+        let outcome = hjkl_engine::substitute::apply_substitute(
+            &mut self.editor,
+            &command,
+            start_row as u32..=end_row as u32,
+        )?;
+        if outcome.replacements == 0 {
+            return Ok(Vec::new());
+        }
+
         self.modified_since_save = true;
-        old
+        let new_text = self.text();
+        Ok(vec![TextEdit {
+            range: 0..old_text.len(),
+            new_text_len: new_text.len(),
+            new_text,
+        }])
     }
 
     /// Move the cursor to the given (row, col) position.

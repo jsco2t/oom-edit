@@ -409,7 +409,7 @@ pub static DEFAULT_DARK: Theme = Theme {
             (SemanticStyle::Variable, Color::White, Modifier::empty()),
             (SemanticStyle::Punct, Color::DarkGray, Modifier::empty()),
             (SemanticStyle::Selection, Color::Reset, Modifier::REVERSED),
-            (SemanticStyle::Match, Color::Yellow, Modifier::empty()),
+            (SemanticStyle::Match, Color::Yellow, Modifier::UNDERLINED),
             (SemanticStyle::CursorLine, Color::Reset, Modifier::empty()),
             (SemanticStyle::Muted, Color::DarkGray, Modifier::DIM),
         ],
@@ -481,7 +481,7 @@ pub static DEFAULT_DARK: Theme = Theme {
             (SemanticStyle::Variable, Color::White, Modifier::empty()),
             (SemanticStyle::Punct, Color::DarkGray, Modifier::empty()),
             (SemanticStyle::Selection, Color::Reset, Modifier::REVERSED),
-            (SemanticStyle::Match, Color::Yellow, Modifier::empty()),
+            (SemanticStyle::Match, Color::Yellow, Modifier::UNDERLINED),
             (SemanticStyle::CursorLine, Color::Reset, Modifier::empty()),
             (SemanticStyle::Muted, Color::DarkGray, Modifier::DIM),
         ],
@@ -549,7 +549,7 @@ pub static DEFAULT_DARK: Theme = Theme {
             (SemanticStyle::Variable, Modifier::empty()),
             (SemanticStyle::Punct, Modifier::DIM),
             (SemanticStyle::Selection, Modifier::REVERSED),
-            (SemanticStyle::Match, Modifier::empty()),
+            (SemanticStyle::Match, Modifier::UNDERLINED),
             (SemanticStyle::CursorLine, Modifier::REVERSED),
             (SemanticStyle::Muted, Modifier::DIM),
         ],
@@ -613,7 +613,7 @@ pub static DEFAULT_LIGHT: Theme = Theme {
             (SemanticStyle::Variable, Color::Black, Modifier::empty()),
             (SemanticStyle::Punct, Color::Gray, Modifier::empty()),
             (SemanticStyle::Selection, Color::Reset, Modifier::REVERSED),
-            (SemanticStyle::Match, Color::Red, Modifier::empty()),
+            (SemanticStyle::Match, Color::Red, Modifier::UNDERLINED),
             (SemanticStyle::CursorLine, Color::Reset, Modifier::empty()),
             (SemanticStyle::Muted, Color::Gray, Modifier::DIM),
         ],
@@ -681,7 +681,7 @@ pub static DEFAULT_LIGHT: Theme = Theme {
             (SemanticStyle::Variable, Color::Black, Modifier::empty()),
             (SemanticStyle::Punct, Color::Gray, Modifier::empty()),
             (SemanticStyle::Selection, Color::Reset, Modifier::REVERSED),
-            (SemanticStyle::Match, Color::Red, Modifier::empty()),
+            (SemanticStyle::Match, Color::Red, Modifier::UNDERLINED),
             (SemanticStyle::CursorLine, Color::Reset, Modifier::empty()),
             (SemanticStyle::Muted, Color::Gray, Modifier::DIM),
         ],
@@ -749,7 +749,7 @@ pub static DEFAULT_LIGHT: Theme = Theme {
             (SemanticStyle::Variable, Modifier::empty()),
             (SemanticStyle::Punct, Modifier::DIM),
             (SemanticStyle::Selection, Modifier::REVERSED),
-            (SemanticStyle::Match, Modifier::empty()),
+            (SemanticStyle::Match, Modifier::UNDERLINED),
             (SemanticStyle::CursorLine, Modifier::REVERSED),
             (SemanticStyle::Muted, Modifier::DIM),
         ],
@@ -813,7 +813,7 @@ pub static ACCESSIBLE: Theme = Theme {
             (SemanticStyle::Variable, Modifier::empty()),
             (SemanticStyle::Punct, Modifier::DIM),
             (SemanticStyle::Selection, Modifier::REVERSED),
-            (SemanticStyle::Match, Modifier::empty()),
+            (SemanticStyle::Match, Modifier::UNDERLINED),
             (SemanticStyle::CursorLine, Modifier::REVERSED),
             (SemanticStyle::Muted, Modifier::DIM),
         ],
@@ -871,7 +871,7 @@ pub static ACCESSIBLE: Theme = Theme {
             (SemanticStyle::Variable, Modifier::empty()),
             (SemanticStyle::Punct, Modifier::DIM),
             (SemanticStyle::Selection, Modifier::REVERSED),
-            (SemanticStyle::Match, Modifier::empty()),
+            (SemanticStyle::Match, Modifier::UNDERLINED),
             (SemanticStyle::CursorLine, Modifier::REVERSED),
             (SemanticStyle::Muted, Modifier::DIM),
         ],
@@ -929,7 +929,7 @@ pub static ACCESSIBLE: Theme = Theme {
             (SemanticStyle::Variable, Modifier::empty()),
             (SemanticStyle::Punct, Modifier::DIM),
             (SemanticStyle::Selection, Modifier::REVERSED),
-            (SemanticStyle::Match, Modifier::empty()),
+            (SemanticStyle::Match, Modifier::UNDERLINED),
             (SemanticStyle::CursorLine, Modifier::REVERSED),
             (SemanticStyle::Muted, Modifier::DIM),
         ],
@@ -1065,6 +1065,21 @@ mod tests {
                 assert!(
                     style.add_modifier.contains(Modifier::REVERSED),
                     "Selection must carry REVERSED on {tier:?} in {}",
+                    theme.name
+                );
+            }
+        }
+    }
+
+    /// Search matches must remain visible when foreground colors are absent.
+    #[test]
+    fn search_match_carries_underline() {
+        for theme in [&DEFAULT_DARK, &DEFAULT_LIGHT, &ACCESSIBLE] {
+            for tier in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
+                let style = theme.style(tier, SemanticStyle::Match);
+                assert!(
+                    style.add_modifier.contains(Modifier::UNDERLINED),
+                    "Search match must carry UNDERLINED on {tier:?} in {}",
                     theme.name
                 );
             }

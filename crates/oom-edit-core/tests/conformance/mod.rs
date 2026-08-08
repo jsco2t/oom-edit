@@ -7,8 +7,9 @@
 //! See tasks/T03-vim-wrapper-conformance-1.md for the full acceptance criteria.
 
 use oom_edit_core::session::{
-    EditorSession, Effect, KeyCode, KeyCodeKind, KeyInput, Modifiers, Severity,
+    EditorSession, Effect, KeyCode, KeyCodeKind, KeyInput, Modifiers, Severity, Viewport,
 };
+use oom_edit_core::style::SemanticStyle;
 
 // ── Key-notation parser ────────────────────────────────────────────────────
 
@@ -32,24 +33,34 @@ fn parse_key(input: &str) -> Option<KeyInput> {
     }
 
     // Check for modifier prefix: <C-...>, <A-...>, <S-...>, <C-A-...>, <C-S-...>, <A-S-...>, <C-A-S-...>
-    let (ctrl, alt, shift, rest) = if let Some(rest) = input.strip_prefix("<C-A-S-") {
-        (true, true, true, &rest[0..rest.len() - 1])
-    } else if let Some(rest) = input.strip_prefix("<C-A-") {
-        (true, true, false, &rest[0..rest.len() - 1])
-    } else if let Some(rest) = input.strip_prefix("<C-S-") {
-        (true, false, true, &rest[0..rest.len() - 1])
-    } else if let Some(rest) = input.strip_prefix("<A-S-") {
-        (false, true, true, &rest[0..rest.len() - 1])
-    } else if let Some(rest) = input.strip_prefix("<C-") {
-        (true, false, false, &rest[0..rest.len() - 1])
-    } else if let Some(rest) = input.strip_prefix("<A-") {
-        (false, true, false, &rest[0..rest.len() - 1])
-    } else if let Some(rest) = input.strip_prefix("<S-") {
-        (false, false, true, &rest[0..rest.len() - 1])
-    } else if let Some(rest) = input.strip_prefix("<") {
-        // Strip trailing '>' for bare bracket keys like <Enter>, <Esc>
-        let rest = rest.strip_suffix('>').unwrap_or(rest);
+    let modifier_payload = |prefix| {
+        input
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix('>'))
+            .filter(|rest| !rest.is_empty())
+    };
+    let (ctrl, alt, shift, rest) = if let Some(rest) = modifier_payload("<C-A-S-") {
+        (true, true, true, rest)
+    } else if let Some(rest) = modifier_payload("<C-A-") {
+        (true, true, false, rest)
+    } else if let Some(rest) = modifier_payload("<C-S-") {
+        (true, false, true, rest)
+    } else if let Some(rest) = modifier_payload("<A-S-") {
+        (false, true, true, rest)
+    } else if let Some(rest) = modifier_payload("<C-") {
+        (true, false, false, rest)
+    } else if let Some(rest) = modifier_payload("<A-") {
+        (false, true, false, rest)
+    } else if let Some(rest) = modifier_payload("<S-") {
+        (false, false, true, rest)
+    } else if let Some(rest) = input
+        .strip_prefix('<')
+        .and_then(|rest| rest.strip_suffix('>'))
+        .filter(|rest| !rest.is_empty())
+    {
         (false, false, false, rest)
+    } else if input.starts_with('<') {
+        return None;
     } else {
         (false, false, false, input)
     };
@@ -135,15 +146,20 @@ fn parse_chord(input: &str) -> Vec<KeyInput> {
                 num_str.push(chars[i]);
                 i += 1;
             }
-            if let Some(key) = parse_key(&num_str) {
-                keys.push(key);
+            // Counts are sequences of digit key presses, not one multi-character key.
+            for digit in num_str.chars() {
+                if let Some(key) = parse_key(&digit.to_string()) {
+                    keys.push(key);
+                }
             }
             continue;
         }
         // Single character key (or multi-char name like Esc, Enter, etc.)
-        if let Some(consumed) = try_parse_multi_char_key(&chars, i, false, false, false) {
+        if let Some((consumed, matched_len)) =
+            try_parse_multi_char_key(&chars, i, false, false, false)
+        {
             keys.push(consumed);
-            i += MULTI_CHAR_KEY_LEN;
+            i += matched_len;
             continue;
         }
         if let Some(key) = parse_key(&chars[i].to_string()) {
@@ -155,18 +171,15 @@ fn parse_chord(input: &str) -> Vec<KeyInput> {
     keys
 }
 
-/// Length of multi-character key names (all are ≤9 chars; longest is "Backspace").
-const MULTI_CHAR_KEY_LEN: usize = 9;
-
 /// Try to match a multi-character key name at position `i`.
-/// Returns the parsed `KeyInput` if found, `None` otherwise.
+/// Returns the parsed `KeyInput` and matched character length if found.
 fn try_parse_multi_char_key(
     chars: &[char],
     i: usize,
     ctrl: bool,
     alt: bool,
     shift: bool,
-) -> Option<KeyInput> {
+) -> Option<(KeyInput, usize)> {
     // Multi-character key names (ordered by length, longest first)
     const MULTI: &[&str] = &[
         "Backspace",
@@ -198,7 +211,7 @@ fn try_parse_multi_char_key(
                 } else {
                     name.to_string()
                 };
-                return parse_key(&key_str);
+                return parse_key(&key_str).map(|key| (key, n));
             }
         }
     }
@@ -460,6 +473,12 @@ fn key_notation_parser_invalid_returns_none() {
     assert!(parse_key("xyz").is_none()); // Multiple characters
     assert!(parse_key("F0").is_none()); // F0 is invalid
     assert!(parse_key("F25").is_none()); // F25 is invalid
+    assert!(parse_key("<C-").is_none());
+    assert!(parse_key("<A-").is_none());
+    assert!(parse_key("<S-").is_none());
+    assert!(parse_key("<C-A-S-").is_none());
+    assert!(parse_key("<C-a").is_none());
+    assert!(parse_key("<Enter").is_none());
 }
 
 #[test]
@@ -508,6 +527,33 @@ fn chord_parser_with_count() {
             mods: Modifiers::default()
         }
     );
+}
+
+#[test]
+fn key_notation_parser_multi_digit_count() {
+    let keys = parse_chord("10j");
+
+    assert_eq!(keys.len(), 3);
+    assert_eq!(keys[0].code.kind, KeyCodeKind::Char('1'));
+    assert_eq!(keys[1].code.kind, KeyCodeKind::Char('0'));
+    assert_eq!(keys[2].code.kind, KeyCodeKind::Char('j'));
+}
+
+#[test]
+fn key_notation_parser_bare_esc_in_sequence() {
+    let keys = parse_chord("iHelloEsc");
+
+    assert_eq!(keys.len(), 7);
+    assert_eq!(keys.last().map(|key| key.code.kind), Some(KeyCodeKind::Esc));
+}
+
+#[test]
+fn key_notation_parser_bare_esc_preserves_following_key() {
+    let keys = parse_chord("Escj");
+
+    assert_eq!(keys.len(), 2);
+    assert_eq!(keys[0].code.kind, KeyCodeKind::Esc);
+    assert_eq!(keys[1].code.kind, KeyCodeKind::Char('j'));
 }
 
 #[test]
@@ -628,6 +674,19 @@ fn v_m_l_right_arrow() {
     let (row, col) = sess.cursor();
     assert_eq!(row, 0);
     assert_eq!(col, 3);
+}
+
+#[test]
+fn v_m_arrow_keys() {
+    let mut sess = session("abc\ndef");
+    feed(&mut sess, "<Right>");
+    assert_eq!(sess.cursor(), (0, 1));
+    feed(&mut sess, "<Down>");
+    assert_eq!(sess.cursor(), (1, 1));
+    feed(&mut sess, "<Left>");
+    assert_eq!(sess.cursor(), (1, 0));
+    feed(&mut sess, "<Up>");
+    assert_eq!(sess.cursor(), (0, 0));
 }
 
 #[test]
@@ -948,11 +1007,12 @@ fn v_m_section_navigation() {
 #[test]
 fn v_m_find_char_backward() {
     let mut sess = session("hello world");
-    // `fw` — forward find 'w' (Fw searches backward from cursor)
-    feed(&mut sess, "fw");
+    // `Fw` finds the previous 'w' from the end of the line.
+    feed(&mut sess, "$Fw");
     let (row, col) = sess.cursor();
     assert_eq!(row, 0);
-    assert_eq!(col, 6); // Position of 'w' in "world"
+    assert_eq!(col, 6);
+    assert!(col < 10, "F must move backward to the matching character");
 }
 
 #[test]
@@ -966,12 +1026,13 @@ fn v_m_find_char_till() {
 
 #[test]
 fn v_m_find_char_till_backward() {
-    let mut sess = session("hello world");
-    // `tl` — till 'l' forward (Tl searches backward from cursor)
-    feed(&mut sess, "tl");
+    let mut sess = session("hello world!");
+    // `Tl` finds the previous 'l' and stops one character after it.
+    feed(&mut sess, "$Tl");
     let (row, col) = sess.cursor();
     assert_eq!(row, 0);
-    assert_eq!(col, 1); // Just before first 'l' in "hello"
+    assert_eq!(col, 10);
+    assert!(col < 11, "T must move backward past the cursor");
 }
 
 #[test]
@@ -984,6 +1045,13 @@ fn v_m_first_non_blank() {
     let (row, col) = sess.cursor();
     assert_eq!(row, 1);
     assert_eq!(col, 2); // First non-blank column
+}
+
+#[test]
+fn v_m_caret_first_non_blank() {
+    let mut sess = session("  hello");
+    feed(&mut sess, "$^");
+    assert_eq!(sess.cursor(), (0, 2));
 }
 
 #[test]
@@ -1054,22 +1122,104 @@ fn v_m_screen_up() {
 
 #[test]
 fn v_m_page_down() {
-    let mut sess = session(FIXTURE_5LINES);
-    // hjkl-vim uses Ctrl+D for half-page down
+    let text = (1..=40)
+        .map(|line| format!("line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut sess = session(&text);
+    sess.render_source(Viewport {
+        top_line: 0,
+        height: 10,
+        width: 80,
+    });
     feed(&mut sess, "<C-d>");
-    // Should have moved down at least one line
-    assert!(sess.cursor().0 >= 1);
+    assert_eq!(sess.cursor().0, 5);
 }
 
 #[test]
 fn v_m_page_up() {
-    let mut sess = session(FIXTURE_5LINES);
-    // Move to bottom
+    let text = (1..=40)
+        .map(|line| format!("line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut sess = session(&text);
+    sess.render_source(Viewport {
+        top_line: 0,
+        height: 10,
+        width: 80,
+    });
     feed(&mut sess, "G");
-    // hjkl-vim uses Ctrl+U for half-page up
     feed(&mut sess, "<C-u>");
-    // Should have moved up
-    assert!(sess.cursor().0 < 4);
+    assert_eq!(sess.cursor().0, 34);
+}
+
+#[test]
+fn v_m_full_page_down() {
+    let text = (1..=40)
+        .map(|line| format!("line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut sess = session(&text);
+    sess.render_source(Viewport {
+        top_line: 0,
+        height: 10,
+        width: 80,
+    });
+    feed(&mut sess, "<C-f>");
+    assert_eq!(sess.cursor().0, 8);
+}
+
+#[test]
+fn v_m_full_page_up() {
+    let text = (1..=40)
+        .map(|line| format!("line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut sess = session(&text);
+    sess.render_source(Viewport {
+        top_line: 0,
+        height: 10,
+        width: 80,
+    });
+    feed(&mut sess, "G");
+    feed(&mut sess, "<C-b>");
+    assert_eq!(sess.cursor().0, 31);
+}
+
+#[test]
+fn v_m_viewport_top_is_published_for_screen_motions() {
+    let text = (1..=40)
+        .map(|line| format!("line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let viewport = Viewport {
+        top_line: 10,
+        height: 10,
+        width: 80,
+    };
+
+    let mut sess = session(&text);
+    sess.render_source(viewport);
+    feed(&mut sess, "H");
+    assert_eq!(sess.cursor().0, 10);
+
+    sess.render_source(viewport);
+    feed(&mut sess, "M");
+    assert_eq!(sess.cursor().0, 14);
+
+    sess.render_source(viewport);
+    feed(&mut sess, "L");
+    assert_eq!(sess.cursor().0, 19);
+
+    // Height must be published before top so a shorter-than-default viewport
+    // can reach its true maximum top row.
+    sess.render_source(Viewport {
+        top_line: 30,
+        height: 10,
+        width: 80,
+    });
+    feed(&mut sess, "H");
+    assert_eq!(sess.cursor().0, 30);
 }
 
 #[test]
@@ -1242,22 +1392,33 @@ fn v_m_command_exit_esc() {
 #[test]
 fn v_m_command_save() {
     let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, ":w");
-    // Should have emitted a SaveRequested effect
+    let effects = feed(&mut sess, ":w<Enter>");
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SaveRequested {
+            path: None,
+            force: false,
+            then_quit: false
+        }
+    )));
 }
 
 #[test]
 fn v_m_command_quit() {
     let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, ":q");
-    // Should have emitted a QuitRequested effect
+    let effects = feed(&mut sess, ":q<Enter>");
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::QuitRequested { force: false })));
 }
 
 #[test]
 fn v_m_command_quit_force() {
     let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, ":q!");
-    // Should have emitted a QuitRequested effect with force=true
+    let effects = feed(&mut sess, ":q!<Enter>");
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::QuitRequested { force: true })));
 }
 
 #[test]
@@ -1606,19 +1767,20 @@ fn v_m_chord_t() {
 #[allow(non_snake_case)]
 fn v_m_chord_F() {
     let mut sess = session("hello world");
-    // `fw` — forward find 'w' (Fw searches backward)
-    feed(&mut sess, "fw");
+    // `Fw` finds the previous 'w' from the end of the line.
+    feed(&mut sess, "$Fw");
     assert_eq!(sess.cursor().1, 6);
+    assert!(sess.cursor().1 < 10);
 }
 
 #[test]
 #[allow(non_snake_case)]
 fn v_m_chord_T() {
-    let mut sess = session("hello world");
-    // `tl` — till 'l' forward (Tl searches backward)
-    feed(&mut sess, "tl");
-    // hjkl's tl stops one char before 'l' (col=1)
-    assert_eq!(sess.cursor().1, 1);
+    let mut sess = session("hello world!");
+    // `Tl` stops one character after the previous 'l'.
+    feed(&mut sess, "$Tl");
+    assert_eq!(sess.cursor().1, 10);
+    assert!(sess.cursor().1 < 11);
 }
 
 #[test]
@@ -1701,15 +1863,27 @@ fn v_m_chord_colon() {
 #[test]
 fn v_m_chord_wq() {
     let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, ":wq");
-    // Should have emitted effects
+    let effects = feed(&mut sess, ":wq<Enter>");
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SaveRequested {
+            then_quit: true,
+            ..
+        }
+    )));
 }
 
 #[test]
 fn v_m_chord_x() {
     let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, ":x");
-    // Should have emitted effects
+    let effects = feed(&mut sess, ":x<Enter>");
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SaveRequested {
+            then_quit: true,
+            ..
+        }
+    )));
 }
 
 #[test]
@@ -1729,22 +1903,40 @@ fn v_m_chord_help() {
 #[test]
 fn v_m_chord_unknown_command() {
     let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, ":unknown");
-    // Should have emitted a Warning message
+    let effects = feed(&mut sess, ":unknown<Enter>");
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Message {
+            text,
+            severity: Severity::Warning
+        } if text == "Unknown command: unknown"
+    )));
 }
 
 #[test]
 fn v_m_chord_set_wrap() {
     let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, ":set wrap");
-    // Should have emitted effects (may be unknown command)
+    let effects = feed(&mut sess, ":set wrap<Enter>");
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Message {
+            text,
+            severity: Severity::Warning
+        } if text == "Unknown command: set"
+    )));
 }
 
 #[test]
 fn v_m_chord_set_nocolor() {
     let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, ":set nocolor");
-    // Should have emitted effects
+    let effects = feed(&mut sess, ":set nocolor<Enter>");
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Message {
+            text,
+            severity: Severity::Warning
+        } if text == "Unknown command: set"
+    )));
 }
 
 #[test]
@@ -1767,7 +1959,7 @@ fn v_m_chord_macro_record() {
     // Recording ends
     // Play macro
     feed(&mut sess, "@a");
-    // Should have deleted a character
+    assert_eq!(sess.document(), "llo");
 }
 
 #[test]
@@ -1789,7 +1981,7 @@ fn v_m_chord_macro_replay_all() {
     feed(&mut sess, "x");
     feed(&mut sess, "q");
     feed(&mut sess, "@a");
-    // Should have deleted a character
+    assert_eq!(sess.document(), "llo");
 }
 
 #[test]
@@ -1797,8 +1989,10 @@ fn v_m_chord_jumplist_forward() {
     let mut sess = session(FIXTURE_5LINES);
     feed(&mut sess, "2j");
     feed(&mut sess, "gg");
-    feed(&mut sess, "Ctrl-i");
-    // Should have jumped forward in jumplist
+    feed(&mut sess, "<C-o>");
+    assert_eq!(sess.cursor(), (2, 0));
+    feed(&mut sess, "<C-i>");
+    assert_eq!(sess.cursor(), (0, 0));
 }
 
 #[test]
@@ -1806,16 +2000,19 @@ fn v_m_chord_jumplist_backward() {
     let mut sess = session(FIXTURE_5LINES);
     feed(&mut sess, "2j");
     feed(&mut sess, "gg");
-    feed(&mut sess, "Ctrl-o");
-    // Should have jumped backward in jumplist
+    feed(&mut sess, "<C-o>");
+    assert_eq!(sess.cursor(), (2, 0));
 }
 
 #[test]
 fn v_m_chord_mark_set() {
     let mut sess = session(FIXTURE_5LINES);
     feed(&mut sess, "2j");
+    feed(&mut sess, "2l");
     feed(&mut sess, "ma");
-    // Mark 'a' set at current position
+    feed(&mut sess, "gg");
+    feed(&mut sess, "`a");
+    assert_eq!(sess.cursor(), (2, 2));
 }
 
 #[test]
@@ -1833,10 +2030,10 @@ fn v_m_chord_mark_jump() {
 fn v_m_chord_mark_jump_charwise() {
     let mut sess = session(FIXTURE_5LINES);
     feed(&mut sess, "2j");
-    feed(&mut sess, "3la");
+    feed(&mut sess, "3lma");
     feed(&mut sess, "gg");
     feed(&mut sess, "`a");
-    // Should have jumped to mark 'a' charwise
+    assert_eq!(sess.cursor(), (2, 3));
 }
 
 #[test]
@@ -2095,9 +2292,7 @@ fn v_s_forward_search() {
     // Move to end of first line, then search
     feed(&mut sess, "fw");
     feed(&mut sess, "/world<Enter>");
-    let doc = sess.document();
-    // Should have moved to "world" line
-    assert!(doc.contains("world"));
+    assert_eq!(sess.cursor(), (1, 0));
 }
 
 #[test]
@@ -2114,27 +2309,116 @@ fn v_s_backward_search() {
 fn v_s_n_repeat_forward() {
     let mut sess = session("hello\nworld\nhello");
     feed(&mut sess, "/world<Enter>");
-    feed(&mut sess, "n");
-    // Should wrap to the second "hello"
-    assert!(sess.cursor().0 > 0);
+    let effects = feed(&mut sess, "n");
+    assert_eq!(sess.cursor(), (1, 0));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Message {
+            text,
+            severity: Severity::Info
+        } if text == "Search wrapped around buffer"
+    )));
 }
 
 #[test]
 fn v_s_n_repeat_backward() {
-    let mut sess = session("hello\nworld\nhello");
+    let mut sess = session("hello\nworld\nhello\nworld");
     feed(&mut sess, "/world<Enter>");
-    let start_row = sess.cursor().0;
-    feed(&mut sess, "N");
-    // N repeats search in opposite direction; cursor position may or may not change
-    // depending on hjkl implementation. Just verify the command doesn't error.
-    let _ = start_row;
+    assert_eq!(sess.cursor(), (1, 0));
+    let effects = feed(&mut sess, "N");
+    assert_eq!(sess.cursor(), (3, 0));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Message {
+            text,
+            severity: Severity::Info
+        } if text == "Search wrapped around buffer"
+    )));
+}
+
+#[test]
+fn v_s_counted_repeat_reports_intermediate_wrap() {
+    let mut sess = session("one one one");
+    feed(&mut sess, "/one<Enter>");
+    assert_eq!(sess.cursor(), (0, 4));
+    let effects = feed(&mut sess, "4n");
+    assert_eq!(sess.cursor(), (0, 8));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Message {
+            text,
+            severity: Severity::Info
+        } if text == "Search wrapped around buffer"
+    )));
+}
+
+#[test]
+fn v_s_failed_repeat_does_not_report_wrap() {
+    let mut sess = session("one two three");
+    feed(&mut sess, "/missing<Enter>");
+    let cursor = sess.cursor();
+    let effects = feed(&mut sess, "n");
+    assert_eq!(sess.cursor(), cursor);
+    assert!(effects.iter().all(|effect| !matches!(
+        effect,
+        Effect::Message { text, .. } if text == "Search wrapped around buffer"
+    )));
+}
+
+#[test]
+fn v_s_non_ascii_same_line_repeat_reports_wrap() {
+    let mut sess = session("é one");
+    feed(&mut sess, "/one<Enter>");
+    assert_eq!(sess.cursor(), (0, 2));
+    let effects = feed(&mut sess, "n");
+    assert_eq!(sess.cursor(), (0, 2));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Message {
+            text,
+            severity: Severity::Info
+        } if text == "Search wrapped around buffer"
+    )));
 }
 
 #[test]
 fn v_s_no_highlight() {
     let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, ":noh<Enter>");
-    // Should have emitted a Message effect
+    feed(&mut sess, "/line<Enter>");
+    let before = sess.render_source(Viewport {
+        top_line: 0,
+        height: 3,
+        width: 80,
+    });
+    assert!(before.lines.iter().any(|line| line
+        .spans
+        .iter()
+        .any(|span| span.style == SemanticStyle::Match)));
+
+    let effects = feed(&mut sess, ":noh<Enter>");
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Message {
+            text,
+            severity: Severity::Info
+        } if text == "Search highlighting cleared"
+    )));
+    let after = sess.render_source(Viewport {
+        top_line: 0,
+        height: 3,
+        width: 80,
+    });
+    assert!(after.lines.iter().all(|line| line
+        .spans
+        .iter()
+        .all(|span| span.style != SemanticStyle::Match)));
+}
+
+#[test]
+fn v_s_search_operator_target() {
+    let mut sess = session("hello world\nsecond line");
+    feed(&mut sess, "d/world<Enter>");
+    assert_eq!(sess.document(), "world\nsecond line");
 }
 
 // ── V-E editing primitives ────────────────────────────────────────────────
@@ -2153,6 +2437,14 @@ fn v_e_join_line() {
     feed(&mut sess, "J");
     let doc = sess.document();
     assert_eq!(doc, "hello world");
+}
+
+#[test]
+fn v_e_toggle_case() {
+    let mut sess = session("hEllo");
+    feed(&mut sess, "~");
+    assert_eq!(sess.document(), "HEllo");
+    assert_eq!(sess.cursor(), (0, 1));
 }
 
 #[test]
@@ -2176,17 +2468,23 @@ fn v_e_change_to_eol() {
 #[test]
 fn v_e_substitute_char() {
     let mut sess = session("hello");
-    // s in hjkl moves cursor; verify it doesn't error
-    let effects = feed(&mut sess, "s");
-    assert!(effects.iter().any(|e| matches!(e, Effect::CursorMoved)));
+    assert!(feed(&mut sess, "s")
+        .iter()
+        .any(|effect| matches!(effect, Effect::Edited)));
+    assert_eq!(sess.document(), "ello");
+    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Insert);
+    assert_eq!(sess.cursor(), (0, 0));
 }
 
 #[test]
 fn v_e_substitute_line() {
     let mut sess = session("line1\nline2\nline3");
-    // S in hjkl moves cursor; verify it doesn't error
-    let effects = feed(&mut sess, "S");
-    assert!(effects.iter().any(|e| matches!(e, Effect::CursorMoved)));
+    assert!(feed(&mut sess, "S")
+        .iter()
+        .any(|effect| matches!(effect, Effect::Edited)));
+    assert_eq!(sess.document(), "\nline2\nline3");
+    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Insert);
+    assert_eq!(sess.cursor(), (0, 0));
 }
 
 #[test]
@@ -2278,6 +2576,15 @@ fn v_o_yank_line() {
     assert_eq!(doc, "line1\nline2\nline3");
 }
 
+#[test]
+fn v_o_case_operators() {
+    let mut sess = session("HELLO world");
+    feed(&mut sess, "guw");
+    assert_eq!(sess.document(), "hello world");
+    feed(&mut sess, "gUw");
+    assert_eq!(sess.document(), "HELLO world");
+}
+
 // ── V-R registers ─────────────────────────────────────────────────────────
 
 #[test]
@@ -2301,6 +2608,15 @@ fn v_r_put_before() {
     // "hello " was yanked, put before cursor
     let doc = sess.document();
     assert!(doc.contains("hello hello"));
+}
+
+#[test]
+fn v_r_system_clipboard_yank() {
+    let mut sess = session("hello world");
+    let effects = feed(&mut sess, "\"+yw");
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::ClipboardWrite(text) if text == "hello ")));
 }
 
 // ── V-V visual mode operations ────────────────────────────────────────────
@@ -2357,9 +2673,41 @@ fn v_x_substitute_global() {
 fn v_x_substitute_range() {
     let mut sess = session("line1\nline2\nline3");
     feed(&mut sess, ":1,2s/line/row/<Enter>");
-    let doc = sess.document();
-    // Current implementation does text-wide substitution (range not yet enforced)
-    assert!(doc.contains("row"));
+    assert_eq!(sess.document(), "row1\nrow2\nline3");
+}
+
+#[test]
+fn v_x_substitute_defaults_to_cursor_line() {
+    let mut sess = session("hello one\nhello two\nhello three");
+    feed(&mut sess, "j");
+    assert!(feed(&mut sess, ":s/hello/hi/<Enter>")
+        .iter()
+        .any(|effect| matches!(effect, Effect::Edited)));
+    assert_eq!(sess.document(), "hello one\nhi two\nhello three");
+}
+
+#[test]
+fn v_x_substitute_rejects_invalid_ranges() {
+    for command in [
+        ":2,1s/row/changed/<Enter>",
+        ":0s/row/changed/<Enter>",
+        ":1,3s/row/changed/<Enter>",
+    ] {
+        let mut sess = session("row one\nrow two");
+        let effects = feed(&mut sess, command);
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Message {
+                text,
+                severity: Severity::Warning,
+            } if text == "Invalid substitute range"
+        )));
+        assert!(effects
+            .iter()
+            .all(|effect| !matches!(effect, Effect::Edited)));
+        assert_eq!(sess.document(), "row one\nrow two");
+        assert!(!sess.is_dirty());
+    }
 }
 
 #[test]
@@ -2371,48 +2719,110 @@ fn v_x_substitute_percent() {
 }
 
 #[test]
+fn v_x_substitute_refreshes_highlighter_and_view_cache() {
+    let mut sess = session("plain\n");
+    sess.toggle_view();
+    sess.view_layout_mut(80)
+        .expect("View mode must build a cached layout");
+    sess.toggle_view();
+
+    assert!(feed(&mut sess, ":s/plain/*bold*/<Enter>")
+        .iter()
+        .any(|effect| matches!(effect, Effect::Edited)));
+    assert_eq!(sess.highlighter().text(), "*bold*\n");
+    assert!(sess.view_layout().is_none());
+
+    let frame = sess.render_source(Viewport {
+        top_line: 0,
+        height: 1,
+        width: 80,
+    });
+    assert!(frame.lines[0]
+        .spans
+        .iter()
+        .any(|span| span.style == SemanticStyle::Emphasis));
+}
+
+#[test]
+fn v_x_substitute_is_one_undoable_step() {
+    let mut sess = session("hello hello\nhello\n");
+    feed(&mut sess, ":%s/hello/hi/g<Enter>");
+    assert_eq!(sess.document(), "hi hi\nhi\n");
+
+    assert!(feed(&mut sess, "u")
+        .iter()
+        .any(|effect| matches!(effect, Effect::Edited)));
+    assert_eq!(sess.document(), "hello hello\nhello\n");
+    assert_eq!(sess.highlighter().text(), "hello hello\nhello\n");
+
+    assert!(feed(&mut sess, "<C-r>")
+        .iter()
+        .any(|effect| matches!(effect, Effect::Edited)));
+    assert_eq!(sess.document(), "hi hi\nhi\n");
+    assert_eq!(sess.highlighter().text(), "hi hi\nhi\n");
+}
+
+#[test]
 fn v_x_quit_dirty_refuses() {
     let mut sess = session(FIXTURE_3LINES);
     feed(&mut sess, "x");
-    // Should be dirty now
-    feed(&mut sess, ":q");
-    // Should not quit — should show a message
+    assert!(sess.is_dirty());
+    let effects = feed(&mut sess, ":q<Enter>");
+    // The core reports a non-forced request; the host owns dirty-buffer refusal UI.
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::QuitRequested { force: false })));
 }
 
 #[test]
 fn v_x_quit_force_discards() {
     let mut sess = session(FIXTURE_3LINES);
     feed(&mut sess, "x");
-    feed(&mut sess, ":q!");
-    // Should quit (dirty)
+    let effects = feed(&mut sess, ":q!<Enter>");
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::QuitRequested { force: true })));
 }
 
 #[test]
 fn v_x_edit_file() {
     let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, ":e<Enter>");
-    // Should have emitted an Edit effect
+    let effects = feed(&mut sess, ":e next.md<Enter>");
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::OpenRequested { path, force: false } if path == std::path::Path::new("next.md")
+    )));
 }
 
 #[test]
 fn v_x_edit_file_force() {
     let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, ":e!<Enter>");
-    // Should have emitted an Edit effect
+    let effects = feed(&mut sess, ":e! next.md<Enter>");
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::OpenRequested { path, force: true } if path == std::path::Path::new("next.md")
+    )));
 }
 
 #[test]
 fn v_x_goto_line() {
     let mut sess = session(FIXTURE_5LINES);
     feed(&mut sess, ":3<Enter>");
-    // Should have jumped to line 3
+    assert_eq!(sess.cursor(), (2, 0));
 }
 
 #[test]
 fn v_x_saveas() {
     let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, ":saveas");
-    // Should have emitted a SaveRequested effect
+    let effects = feed(&mut sess, ":saveas copy.md<Enter>");
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SaveRequested {
+            path: Some(path),
+            force: false,
+            then_quit: false
+        } if path == std::path::Path::new("copy.md")
+    )));
 }
 
 // ── Counts sweep ──────────────────────────────────────────────────────────
@@ -2511,21 +2921,29 @@ fn vn1_k_up_navigation() {
 
 #[test]
 fn vn1_arrows_navigation() {
-    let mut sess = view_session("line1\nline2\nline3");
-    // Down arrow
-    sess.handle_key(KeyInput {
+    let mut sess = view_session("line1\n\nline2\n\nline3");
+    let start = sess.view_cursor_line();
+    let down_effects = sess.handle_key(KeyInput {
         code: KeyCode {
             kind: KeyCodeKind::Down,
         },
         mods: Modifiers::default(),
     });
-    // Up arrow
-    sess.handle_key(KeyInput {
+    assert_eq!(sess.view_cursor_line(), start + 1);
+    assert!(down_effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::CursorMoved)));
+
+    let up_effects = sess.handle_key(KeyInput {
         code: KeyCode {
             kind: KeyCodeKind::Up,
         },
         mods: Modifiers::default(),
     });
+    assert_eq!(sess.view_cursor_line(), start);
+    assert!(up_effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::CursorMoved)));
 }
 
 #[test]
@@ -2602,50 +3020,51 @@ fn vn4_backtab_jump_targets() {
 
 #[test]
 fn vn5_forward_search() {
-    let mut sess = view_session("hello world\nfoo bar\nhello again");
-    // Start forward search and type pattern
-    sess.handle_key(KeyInput {
-        code: KeyCode {
-            kind: KeyCodeKind::Char('/'),
-        },
-        mods: Modifiers::default(),
-    });
-    // Type "foo" to trigger search
-    for c in "foo".chars() {
-        let effects = sess.handle_key(KeyInput {
-            code: KeyCode {
-                kind: KeyCodeKind::Char(c),
-            },
-            mods: Modifiers::default(),
-        });
-        if effects.iter().any(|e| matches!(e, Effect::CursorMoved)) {
-            break;
-        }
-    }
+    let mut sess = view_session("hello world\n\nfoo bar\n\nhello again");
+    let target_line = sess
+        .view_layout_mut(80)
+        .expect("View mode must have a layout")
+        .lines
+        .iter()
+        .position(|line| line.styled.text.contains("foo bar"))
+        .expect("fixture must render the forward-search target");
+    let effects = feed(&mut sess, "/foo<Enter>");
+    assert_eq!(sess.view_cursor_line(), target_line);
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::CursorMoved)));
 }
 
 #[test]
 fn vn5_backward_search() {
-    let mut sess = view_session("hello world\nfoo bar\nhello again");
-    // Start backward search and type pattern
-    sess.handle_key(KeyInput {
-        code: KeyCode {
-            kind: KeyCodeKind::Char('?'),
-        },
-        mods: Modifiers::default(),
-    });
-    // Type "hello" to trigger search
-    for c in "hello".chars() {
-        let effects = sess.handle_key(KeyInput {
-            code: KeyCode {
-                kind: KeyCodeKind::Char(c),
-            },
-            mods: Modifiers::default(),
-        });
-        if effects.iter().any(|e| matches!(e, Effect::CursorMoved)) {
-            break;
-        }
-    }
+    let mut sess = view_session("hello world\n\nfoo bar\n\nhello again");
+    let target_line = sess
+        .view_layout_mut(80)
+        .expect("View mode must have a layout")
+        .lines
+        .iter()
+        .rposition(|line| line.styled.text.contains("hello again"))
+        .expect("fixture must render the backward-search target");
+    let effects = feed(&mut sess, "?hello<Enter>");
+    assert_eq!(sess.view_cursor_line(), target_line);
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::CursorMoved)));
+}
+
+#[test]
+fn vn5_incremental_search_keeps_prompt_origin() {
+    let mut sess = view_session("start\n\nfoo first\n\nfoo second");
+    let first_target = sess
+        .view_layout_mut(80)
+        .expect("View mode must have a layout")
+        .lines
+        .iter()
+        .position(|line| line.styled.text.contains("foo first"))
+        .expect("fixture must render the first target");
+
+    feed(&mut sess, "/fo");
+    assert_eq!(sess.view_cursor_line(), first_target);
 }
 
 #[test]
@@ -2681,6 +3100,51 @@ fn vn6_n_repeat_search() {
         mods: Modifiers::default(),
     });
     assert!(effects.iter().any(|e| matches!(e, Effect::CursorMoved)));
+}
+
+#[test]
+fn vn6_repeated_upper_n_keeps_reverse_direction_and_reports_wrap() {
+    let mut sess = view_session("hit\n\nmiddle\n\nhit\n\nlast\n\nhit");
+    let hit_lines = sess
+        .view_layout_mut(80)
+        .expect("View mode must have a layout")
+        .lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| line.styled.text.contains("hit").then_some(index))
+        .collect::<Vec<_>>();
+    assert_eq!(hit_lines.len(), 3);
+
+    feed(&mut sess, "/hit<Enter>");
+    assert_eq!(sess.view_cursor_line(), hit_lines[1]);
+    feed(&mut sess, "N");
+    assert_eq!(sess.view_cursor_line(), hit_lines[0]);
+    let effects = feed(&mut sess, "N");
+    assert_eq!(sess.view_cursor_line(), hit_lines[2]);
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Message { text, severity: Severity::Info } if text.contains("wrapped")
+    )));
+}
+
+#[test]
+fn vn6_single_match_repeat_reports_wrap() {
+    let mut sess = view_session("only hit here");
+    feed(&mut sess, "/hit<Enter>");
+    let line = sess.view_cursor_line();
+    let effects = feed(&mut sess, "n");
+    assert_eq!(sess.view_cursor_line(), line);
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Message { text, severity: Severity::Info } if text.contains("wrapped")
+    )));
+
+    let effects = feed(&mut sess, "N");
+    assert_eq!(sess.view_cursor_line(), line);
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Message { text, severity: Severity::Info } if text.contains("wrapped")
+    )));
 }
 
 #[test]
@@ -2890,46 +3354,265 @@ proptest! {
 
 // ── Coverage meta-test (SC-1) ─────────────────────────────────────────────
 
-/// All row IDs that must be covered by conformance test case names.
-/// The meta-test asserts each ID (lowercased, underscored) appears as a
-/// substring of at least one test case name.
-const ROW_IDS: &[&str] = &[
-    // FR-1.x
-    "fr_1_1", "fr_1_2", "fr_1_3", "fr_1_4", // V-M motions
-    "v_m",    // V-S search
-    "v_s",    // V-E editing primitives
-    "v_e",    // V-O operators
-    "v_o",    // V-R registers
-    "v_r",    // V-V visual mode ops
-    "v_v",    // V-X ex commands
-    "v_x",
+/// Every Standard-Vim row in plan section 6.2.
+const REQUIRED_ROW_IDS: &[&str] = &[
+    "V-M1", "V-M2", "V-M3", "V-M4", "V-M5", "V-M6", "V-M7", "V-M8", "V-M9", "V-S1", "V-S2", "V-S3",
+    "V-S4", "V-S5", "V-E1", "V-E2", "V-E3", "V-E4", "V-E5", "V-E6", "V-E7", "V-E8", "V-O1", "V-O2",
+    "V-O3", "V-O4", "V-O5", "V-T1", "V-T2", "V-T3", "V-T4", "V-T5", "V-R1", "V-R2", "V-R3", "V-V1",
+    "V-V2", "V-V3", "V-V4", "V-V5", "V-X1", "V-X2", "V-X3", "V-X4", "V-X5", "V-X6", "V-X7", "V-X8",
 ];
 
+/// Exact Standard-Vim row-to-test coverage manifest.
+const COVERAGE_CASES: &[(&str, &str)] = &[
+    ("V-M1", "v_m_h_left_arrow"),
+    ("V-M1", "v_m_j_down_arrow"),
+    ("V-M1", "v_m_k_up_arrow"),
+    ("V-M1", "v_m_l_right_arrow"),
+    ("V-M1", "v_m_arrow_keys"),
+    ("V-M2", "v_m_w_word_forward"),
+    ("V-M2", "v_m_b_word_backward"),
+    ("V-M2", "v_m_e_word_end"),
+    ("V-M3", "v_m_word_forward_big_word"),
+    ("V-M3", "v_m_word_backward_big_word"),
+    ("V-M3", "v_m_word_end_big_word"),
+    ("V-M4", "v_m_line_start"),
+    ("V-M4", "v_m_caret_first_non_blank"),
+    ("V-M4", "v_m_line_end"),
+    ("V-M5", "v_m_file_top"),
+    ("V-M5", "v_m_file_bottom"),
+    ("V-M5", "counts_goto_line"),
+    ("V-M6", "v_m_page_down"),
+    ("V-M6", "v_m_page_up"),
+    ("V-M7", "v_m_full_page_down"),
+    ("V-M7", "v_m_full_page_up"),
+    ("V-M8", "v_m_paragraph_forward"),
+    ("V-M8", "v_m_paragraph_backward"),
+    ("V-M8", "counts_paragraph_forward"),
+    ("V-M9", "v_m_match_bracket"),
+    ("V-S1", "v_s_forward_search"),
+    ("V-S2", "v_s_backward_search"),
+    ("V-S3", "v_s_n_repeat_forward"),
+    ("V-S3", "v_s_n_repeat_backward"),
+    ("V-S4", "v_s_no_highlight"),
+    ("V-S5", "v_s_search_operator_target"),
+    ("V-E1", "v_m_delete_char"),
+    ("V-E2", "v_e_replace_char"),
+    ("V-E3", "v_e_toggle_case"),
+    ("V-E4", "v_e_join_line"),
+    ("V-E5", "v_e_delete_to_eol"),
+    ("V-E5", "v_e_change_to_eol"),
+    ("V-E6", "v_e_substitute_char"),
+    ("V-E6", "v_e_substitute_line"),
+    ("V-E7", "v_e_undo_redo_granularity"),
+    ("V-E8", "v_m_chord_repeat_dot"),
+    ("V-O1", "v_o_delete_motion"),
+    ("V-O1", "v_o_delete_count_dd"),
+    ("V-O2", "v_o_change_motion"),
+    ("V-O2", "v_o_change_line"),
+    ("V-O3", "v_o_yank_motion"),
+    ("V-O3", "v_o_yank_line"),
+    ("V-O4", "v_o_indent_motion"),
+    ("V-O4", "v_o_dedent_motion"),
+    ("V-O5", "v_o_case_operators"),
+    ("V-T1", "v_m_chord_text_object_iw"),
+    ("V-T1", "v_m_chord_text_object_aw"),
+    ("V-T2", "v_m_chord_text_object_iW"),
+    ("V-T2", "v_m_chord_text_object_awW"),
+    ("V-T3", "v_m_chord_text_object_iq"),
+    ("V-T3", "v_m_chord_text_object_aq"),
+    ("V-T4", "v_m_chord_text_object_ib"),
+    ("V-T4", "v_m_chord_text_object_ab"),
+    ("V-T5", "v_m_chord_text_object_ip"),
+    ("V-T5", "v_m_chord_text_object_ap"),
+    ("V-R1", "v_r_put_after"),
+    ("V-R1", "v_r_put_before"),
+    ("V-R2", "v_r_put_after"),
+    ("V-R3", "v_r_system_clipboard_yank"),
+    ("V-V1", "v_v_selection_extend"),
+    ("V-V2", "v_m_chord_visual_d"),
+    ("V-V2", "v_m_chord_visual_c"),
+    ("V-V2", "v_m_chord_visual_y"),
+    ("V-V3", "v_v_linewise_indent"),
+    ("V-V4", "v_v_swap_cursor_anchor"),
+    ("V-V5", "v_m_chord_visual_block_i"),
+    ("V-V5", "v_m_chord_visual_block_a"),
+    ("V-X1", "v_m_command_save"),
+    ("V-X2", "v_x_quit_dirty_refuses"),
+    ("V-X2", "v_x_quit_force_discards"),
+    ("V-X3", "v_m_chord_wq"),
+    ("V-X3", "v_m_chord_x"),
+    ("V-X4", "v_x_edit_file"),
+    ("V-X4", "v_x_edit_file_force"),
+    ("V-X5", "v_x_saveas"),
+    ("V-X6", "v_x_goto_line"),
+    ("V-X7", "v_x_substitute_first"),
+    ("V-X7", "v_x_substitute_global"),
+    ("V-X7", "v_x_substitute_range"),
+    ("V-X7", "v_x_substitute_percent"),
+    ("V-X8", "v_s_no_highlight"),
+    ("V-X8", "v_m_command_view"),
+    ("V-X8", "v_m_chord_help"),
+];
+
+fn declared_test_functions(source: &str) -> std::collections::BTreeSet<String> {
+    let mut names = std::collections::BTreeSet::new();
+    let mut has_test_attribute = false;
+    let mut has_disabling_attribute = false;
+    let mut block_comment_depth = 0usize;
+
+    for line in source.lines() {
+        let line = line.trim();
+        if block_comment_depth > 0 {
+            block_comment_depth += line.matches("/*").count();
+            block_comment_depth = block_comment_depth.saturating_sub(line.matches("*/").count());
+            continue;
+        }
+        if line.starts_with("/*") {
+            block_comment_depth = line
+                .matches("/*")
+                .count()
+                .saturating_sub(line.matches("*/").count());
+            continue;
+        }
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        if line.starts_with("#[") {
+            has_test_attribute |= line == "#[test]";
+            has_disabling_attribute |= line.starts_with("#[ignore") || line.starts_with("#[cfg");
+            continue;
+        }
+        if has_test_attribute {
+            if let Some(signature) = line.strip_prefix("fn ") {
+                if !has_disabling_attribute {
+                    if let Some((name, _)) = signature.split_once('(') {
+                        names.insert(name.to_string());
+                    }
+                }
+            }
+        }
+        has_test_attribute = false;
+        has_disabling_attribute = false;
+    }
+
+    names
+}
+
+fn coverage_errors(source: &str, required: &[&str], cases: &[(&str, &str)]) -> Vec<String> {
+    let declared_tests = declared_test_functions(source);
+    let mut errors = Vec::new();
+    let mut required_ids = std::collections::BTreeSet::new();
+    let mut covered_ids = std::collections::BTreeSet::new();
+    let mut mapped_pairs = std::collections::BTreeSet::new();
+
+    for row_id in required {
+        if !required_ids.insert(*row_id) {
+            errors.push(format!("duplicate required row ID: {row_id}"));
+        }
+    }
+
+    for &(row_id, test_name) in cases {
+        if !mapped_pairs.insert((row_id, test_name)) {
+            errors.push(format!(
+                "duplicate coverage mapping: {row_id} -> {test_name}"
+            ));
+        }
+        if !required_ids.contains(row_id) {
+            errors.push(format!("unknown row ID in coverage manifest: {row_id}"));
+            continue;
+        }
+        covered_ids.insert(row_id);
+        if !declared_tests.contains(test_name) {
+            errors.push(format!(
+                "{row_id} maps to missing test function: {test_name}"
+            ));
+        }
+    }
+
+    for row_id in required_ids {
+        if !covered_ids.contains(row_id) {
+            errors.push(format!("required row ID has no mapped test: {row_id}"));
+        }
+    }
+
+    errors
+}
 #[test]
 fn sc_1_coverage_meta_test() {
-    // This test verifies that every row ID in ROW_IDS appears in at least
-    // one test case name in this module. It uses a compile-time approach:
-    // the test name itself must contain the row ID.
-    //
-    // Since we can't introspect test names at runtime in a portable way,
-    // we verify by asserting that the test functions with the expected
-    // prefixes exist and compile. The presence of tests with names
-    // containing each prefix is the coverage guarantee.
-    //
-    // To verify this works: if a test named `v_s_forward_search` is renamed
-    // to `foo_bar`, the prefix `v_s` would no longer be present, and CI
-    // would fail if we added a runtime check. For now, we assert the
-    // const slice is non-empty to prove the meta-test infrastructure works.
-    assert!(!ROW_IDS.is_empty(), "ROW_IDS must be non-empty");
+    let source = include_str!("mod.rs");
+    let errors = coverage_errors(source, REQUIRED_ROW_IDS, COVERAGE_CASES);
+    assert!(errors.is_empty(), "{}", errors.join("\n"));
+}
 
-    // Verify each row ID has at least one test by checking the test names
-    // are valid identifiers that compile. We do this by asserting the
-    // expected test functions exist with the right prefixes.
-    for row_id in ROW_IDS {
-        // Each row ID should match at least one test function name
-        let prefix = row_id.replace('_', "");
-        // The test names are verified by the test runner itself.
-        // This loop just ensures the const is valid.
-        let _ = &prefix;
+#[test]
+fn sc_1_coverage_validator_detects_removed_final_mapping() {
+    let source = include_str!("mod.rs");
+    let cases = COVERAGE_CASES
+        .iter()
+        .copied()
+        .filter(|(row_id, _)| *row_id != "V-S1")
+        .collect::<Vec<_>>();
+
+    let errors = coverage_errors(source, REQUIRED_ROW_IDS, &cases);
+    assert!(errors
+        .iter()
+        .any(|error| error == "required row ID has no mapped test: V-S1"));
+}
+
+#[test]
+fn sc_1_coverage_validator_detects_removed_test_function() {
+    let source = include_str!("mod.rs")
+        .replace("fn v_s_forward_search()", "fn removed_v_s_forward_search()");
+
+    let errors = coverage_errors(&source, REQUIRED_ROW_IDS, COVERAGE_CASES);
+    assert!(errors
+        .iter()
+        .any(|error| error == "V-S1 maps to missing test function: v_s_forward_search"));
+}
+
+#[test]
+fn sc_1_coverage_validator_rejects_broad_category_prefixes() {
+    let source = "#[test]\nfn v_m_anything() {}";
+    let errors = coverage_errors(source, &["V-M1"], &[("v_m", "v_m_anything")]);
+
+    assert!(errors
+        .iter()
+        .any(|error| error == "unknown row ID in coverage manifest: v_m"));
+    assert!(errors
+        .iter()
+        .any(|error| error == "required row ID has no mapped test: V-M1"));
+}
+
+#[test]
+fn sc_1_coverage_validator_rejects_duplicate_mappings() {
+    let source = "#[test]\nfn v_m_h_left_arrow() {}";
+    let duplicate = ("V-M1", "v_m_h_left_arrow");
+    let errors = coverage_errors(source, &["V-M1"], &[duplicate, duplicate]);
+
+    assert!(errors
+        .iter()
+        .any(|error| error == "duplicate coverage mapping: V-M1 -> v_m_h_left_arrow"));
+}
+
+#[test]
+fn sc_1_coverage_validator_rejects_commented_out_tests() {
+    let source = "/*\n#[test]\nfn mapped_test() {}\n*/";
+    let errors = coverage_errors(source, &["V-M1"], &[("V-M1", "mapped_test")]);
+
+    assert!(errors
+        .iter()
+        .any(|error| error == "V-M1 maps to missing test function: mapped_test"));
+}
+
+#[test]
+fn sc_1_coverage_validator_rejects_disabled_tests() {
+    for source in [
+        "#[test]\n#[ignore]\nfn mapped_test() {}",
+        "#[cfg(any())]\n#[test]\nfn mapped_test() {}",
+    ] {
+        let errors = coverage_errors(source, &["V-M1"], &[("V-M1", "mapped_test")]);
+        assert!(errors
+            .iter()
+            .any(|error| error == "V-M1 maps to missing test function: mapped_test"));
     }
 }
