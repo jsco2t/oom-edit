@@ -321,7 +321,11 @@ impl PaletteState {
                 return true;
             }
             KeyCodeKind::Down | KeyCodeKind::Tab => {
-                self.selected += 1;
+                let rows = self.build_rows(Contexts::ALL, &Keymap::default());
+                let visible_count = self.filter_rows(&rows).len();
+                if self.selected.saturating_add(1) < visible_count {
+                    self.selected += 1;
+                }
                 return true;
             }
             KeyCodeKind::Char(c) if !key.mods.ctrl && !key.mods.alt => {
@@ -482,6 +486,14 @@ fn centered_area(width: u16, height: u16, parent: ratatui::layout::Rect) -> rata
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oom_edit_core::session::{KeyCode, KeyCodeKind, KeyInput, Modifiers};
+
+    fn key(kind: KeyCodeKind) -> KeyInput {
+        KeyInput {
+            code: KeyCode { kind },
+            mods: Modifiers::default(),
+        }
+    }
 
     #[test]
     fn fuzzy_match_exact() {
@@ -515,6 +527,66 @@ mod tests {
     #[test]
     fn fuzzy_match_empty_pattern() {
         assert!(fuzzy_match("", "anything"));
+    }
+
+    #[test]
+    fn test_palette_down_clamps_at_last_row() {
+        let mut palette = PaletteState {
+            filter: "V-M2".to_string(),
+            ..PaletteState::default()
+        };
+        let rows = palette.build_rows(Contexts::ALL, &Keymap::default());
+        assert_eq!(palette.filter_rows(&rows).len(), 3);
+
+        let down = key(KeyCodeKind::Down);
+        for _ in 0..5 {
+            assert!(palette.handle_key(&down));
+        }
+        assert_eq!(palette.selected, 2);
+
+        assert!(palette.handle_key(&key(KeyCodeKind::Tab)));
+        assert_eq!(palette.selected, 2);
+    }
+
+    #[test]
+    fn test_palette_selected_command_at_boundary() {
+        let mut palette = PaletteState {
+            filter: "(no binding)".to_string(),
+            ..PaletteState::default()
+        };
+        let rows = palette.build_rows(Contexts::ALL, &Keymap::default());
+        let visible_rows = palette.filter_rows(&rows);
+        assert_eq!(
+            visible_rows.len(),
+            6,
+            "unexpected filtered rows: {:?}",
+            visible_rows
+                .iter()
+                .map(|&index| &rows[index])
+                .collect::<Vec<_>>()
+        );
+
+        for _ in 0..8 {
+            assert!(palette.handle_key(&key(KeyCodeKind::Down)));
+        }
+        assert_eq!(palette.selected, 5);
+        assert!(palette.handle_key(&key(KeyCodeKind::Tab)));
+        assert_eq!(palette.selected, 5);
+
+        assert_eq!(palette.selected_command(), Some(Command::QuitAll));
+    }
+
+    #[test]
+    fn test_palette_down_with_zero_visible() {
+        let mut palette = PaletteState {
+            filter: "zzzz-no-visible-row".to_string(),
+            ..PaletteState::default()
+        };
+        let rows = palette.build_rows(Contexts::ALL, &Keymap::default());
+        assert!(palette.filter_rows(&rows).is_empty());
+
+        assert!(palette.handle_key(&key(KeyCodeKind::Down)));
+        assert_eq!(palette.selected, 0);
     }
 
     #[test]
