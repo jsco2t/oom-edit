@@ -52,6 +52,8 @@ pub struct KeyCode {
 /// A key code — either a printable character or a special key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyCodeKind {
+    /// An input that is intentionally ignored.
+    Noop,
     /// A printable character.
     Char(char),
     /// Enter / Return key.
@@ -429,6 +431,13 @@ impl EditorSession {
     /// assert_eq!(session.mode(), oom_edit_core::session::Mode::Insert);
     /// ```
     pub fn handle_key(&mut self, key: KeyInput) -> Vec<Effect> {
+        // Unsupported terminal keys are consumed without reaching any mode
+        // handler or the Vim engine, where fallback mappings could otherwise
+        // cause edits, cursor movement, mode changes, or command effects.
+        if key.code.kind == KeyCodeKind::Noop {
+            return Vec::new();
+        }
+
         // View mode is read-only (FR-1.6) — most keys are no-ops
         if self.mode == Mode::View {
             return self.handle_view_mode_key(key);
@@ -1331,6 +1340,9 @@ impl EditorSession {
 
     fn key_code_kind_to_vim(&self, kind: KeyCodeKind) -> crate::vim::KeyCodeKind {
         match kind {
+            KeyCodeKind::Noop => {
+                unreachable!("Noop inputs are ignored before Vim key conversion")
+            }
             KeyCodeKind::Char(c) => crate::vim::KeyCodeKind::Char(c),
             KeyCodeKind::Enter => crate::vim::KeyCodeKind::Enter,
             KeyCodeKind::Esc => crate::vim::KeyCodeKind::Esc,

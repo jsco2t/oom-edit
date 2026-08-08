@@ -428,6 +428,13 @@ impl App {
             _ => return,
         };
 
+        // Unsupported terminal keys are global no-ops. Consume them before
+        // overlays and chord state so they cannot cancel an in-progress key
+        // sequence or otherwise mutate TUI state.
+        if key_input.code.kind == KeyCodeKind::Noop {
+            return;
+        }
+
         // 1. Overlay open → overlay's key handler.
         if self.overlay.is_some() {
             // Esc closes the overlay (handled by returning false).
@@ -1127,43 +1134,43 @@ fn crossterm_key_to_core(key: &KeyEvent) -> KeyInput {
             kind: KeyCodeKind::Delete,
         },
         CrosstermKeyCode::Insert => KeyCode {
-            kind: KeyCodeKind::Char(' '), // Insert: no direct mapping, treat as space
+            kind: KeyCodeKind::Noop,
         },
         CrosstermKeyCode::F(n) => KeyCode {
             kind: KeyCodeKind::F(n),
         },
         CrosstermKeyCode::Null => KeyCode {
-            kind: KeyCodeKind::Char('\0'),
+            kind: KeyCodeKind::Noop,
         },
         CrosstermKeyCode::Esc => KeyCode {
             kind: KeyCodeKind::Esc,
         },
         CrosstermKeyCode::CapsLock => KeyCode {
-            kind: KeyCodeKind::Esc, // No direct mapping; treat as Esc for safety
+            kind: KeyCodeKind::Noop,
         },
         CrosstermKeyCode::Menu => KeyCode {
-            kind: KeyCodeKind::Char(' '),
+            kind: KeyCodeKind::Noop,
         },
         CrosstermKeyCode::ScrollLock => KeyCode {
-            kind: KeyCodeKind::Esc,
+            kind: KeyCodeKind::Noop,
         },
         CrosstermKeyCode::Pause => KeyCode {
-            kind: KeyCodeKind::Esc,
+            kind: KeyCodeKind::Noop,
         },
         CrosstermKeyCode::NumLock => KeyCode {
-            kind: KeyCodeKind::Esc,
+            kind: KeyCodeKind::Noop,
         },
         CrosstermKeyCode::PrintScreen => KeyCode {
-            kind: KeyCodeKind::Esc,
+            kind: KeyCodeKind::Noop,
         },
         CrosstermKeyCode::KeypadBegin => KeyCode {
-            kind: KeyCodeKind::Esc,
+            kind: KeyCodeKind::Noop,
         },
         CrosstermKeyCode::Media(_) => KeyCode {
-            kind: KeyCodeKind::Esc,
+            kind: KeyCodeKind::Noop,
         },
         CrosstermKeyCode::Modifier(_) => KeyCode {
-            kind: KeyCodeKind::Esc,
+            kind: KeyCodeKind::Noop,
         },
     };
 
@@ -1218,6 +1225,7 @@ fn render_tab_bar(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{MediaKeyCode, ModifierKeyCode};
     use oom_edit_core::clipboard::RecordingClipboardSink;
 
     /// Create a test App with a recording clipboard sink.
@@ -1228,6 +1236,22 @@ mod tests {
             Tier::TrueColor,
             Box::new(RecordingClipboardSink::default()),
         )
+    }
+
+    fn unmapped_special_keys() -> [CrosstermKeyCode; 11] {
+        [
+            CrosstermKeyCode::Insert,
+            CrosstermKeyCode::Menu,
+            CrosstermKeyCode::Null,
+            CrosstermKeyCode::CapsLock,
+            CrosstermKeyCode::ScrollLock,
+            CrosstermKeyCode::Pause,
+            CrosstermKeyCode::NumLock,
+            CrosstermKeyCode::PrintScreen,
+            CrosstermKeyCode::KeypadBegin,
+            CrosstermKeyCode::Media(MediaKeyCode::Play),
+            CrosstermKeyCode::Modifier(ModifierKeyCode::LeftShift),
+        ]
     }
 
     /// Key translation: `i` → Char('i'), no mods.
@@ -1443,6 +1467,180 @@ mod tests {
                 crossterm_code, expected
             );
         }
+    }
+
+    #[test]
+    fn test_unmapped_keys_produce_noop() {
+        for crossterm_code in unmapped_special_keys() {
+            let key = KeyEvent::new(crossterm_code, KeyModifiers::NONE);
+            let core = crossterm_key_to_core(&key);
+            assert_eq!(
+                core.code.kind,
+                KeyCodeKind::Noop,
+                "crossterm {crossterm_code:?} should map to Noop"
+            );
+        }
+    }
+
+    #[test]
+    fn test_noop_not_space_or_esc() {
+        for crossterm_code in unmapped_special_keys() {
+            let key = KeyEvent::new(crossterm_code, KeyModifiers::NONE);
+            let kind = crossterm_key_to_core(&key).code.kind;
+            assert_ne!(kind, KeyCodeKind::Char(' '));
+            assert_ne!(kind, KeyCodeKind::Char('\0'));
+            assert_ne!(kind, KeyCodeKind::Esc);
+        }
+    }
+
+    #[test]
+    fn test_noop_has_no_behavioral_effect() {
+        let mut normal = EditorSession::from_text("hello");
+
+        let mut insert = EditorSession::from_text("hello");
+        insert.handle_key(KeyInput {
+            code: KeyCode {
+                kind: KeyCodeKind::Char('i'),
+            },
+            mods: Modifiers::default(),
+        });
+        assert_eq!(insert.mode(), oom_edit_core::session::Mode::Insert);
+
+        let mut command = EditorSession::from_text("hello");
+        command.handle_key(KeyInput {
+            code: KeyCode {
+                kind: KeyCodeKind::Char(':'),
+            },
+            mods: Modifiers::default(),
+        });
+        assert_eq!(command.mode(), oom_edit_core::session::Mode::Command);
+
+        for (mode_name, session) in [
+            ("Normal", &mut normal),
+            ("Insert", &mut insert),
+            ("Command", &mut command),
+        ] {
+            let document_before = session.document();
+            let cursor_before = session.cursor();
+            let mode_before = session.mode();
+
+            let effects = session.handle_key(KeyInput {
+                code: KeyCode {
+                    kind: KeyCodeKind::Noop,
+                },
+                mods: Modifiers::default(),
+            });
+
+            assert!(
+                effects.is_empty(),
+                "Noop emitted effects in {mode_name} mode"
+            );
+            assert_eq!(session.document(), document_before);
+            assert_eq!(session.cursor(), cursor_before);
+            assert_eq!(session.mode(), mode_before);
+        }
+    }
+
+    #[test]
+    fn test_unmapped_keys_have_no_app_behavioral_effect() {
+        let mut normal = test_app(EditorSession::from_text("hello"));
+
+        let mut insert = test_app(EditorSession::from_text("hello"));
+        insert.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('i'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            insert.session().unwrap().mode(),
+            oom_edit_core::session::Mode::Insert
+        );
+
+        let mut command = test_app(EditorSession::from_text("hello"));
+        command.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char(':'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            command.session().unwrap().mode(),
+            oom_edit_core::session::Mode::Command
+        );
+
+        for (mode_name, app) in [
+            ("Normal", &mut normal),
+            ("Insert", &mut insert),
+            ("Command", &mut command),
+        ] {
+            for crossterm_code in unmapped_special_keys() {
+                let document_before = app.session().unwrap().document();
+                let cursor_before = app.session().unwrap().cursor();
+                let mode_before = app.session().unwrap().mode();
+                let status_before = app.status_message.clone();
+
+                app.handle_event(&Event::Key(KeyEvent::new(
+                    crossterm_code,
+                    KeyModifiers::NONE,
+                )));
+
+                assert_eq!(app.session().unwrap().document(), document_before);
+                assert_eq!(app.session().unwrap().cursor(), cursor_before);
+                assert_eq!(app.session().unwrap().mode(), mode_before);
+                assert_eq!(app.status_message, status_before);
+                assert!(!app.should_quit, "{crossterm_code:?} quit in {mode_name}");
+                assert!(!app.overlay.is_some());
+                assert!(app.transient.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn test_unmapped_key_preserves_pending_space_chord() {
+        let mut app = test_app(EditorSession::from_text("hello"));
+
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char(' '),
+            KeyModifiers::NONE,
+        )));
+        assert!(app.pending_chord.since.is_some());
+
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Insert,
+            KeyModifiers::NONE,
+        )));
+        assert!(app.pending_chord.since.is_some());
+
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('v'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.session().unwrap().mode(),
+            oom_edit_core::session::Mode::View
+        );
+    }
+
+    #[test]
+    fn test_unmapped_key_preserves_pending_g_chord() {
+        let mut app = test_app(EditorSession::from_text("first"));
+        app.tabs
+            .push(TabEntry::new(EditorSession::from_text("second")));
+
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('g'),
+            KeyModifiers::NONE,
+        )));
+        assert!(app.pending_g);
+
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Insert,
+            KeyModifiers::NONE,
+        )));
+        assert!(app.pending_g);
+
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('t'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.active_tab, 1);
     }
 
     /// T12: F1 opens the command palette.

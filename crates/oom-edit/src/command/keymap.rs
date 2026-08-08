@@ -268,6 +268,7 @@ fn key_event_eq(a: &KeyInput, b: &KeyInput) -> bool {
 /// Render a key for display.
 fn render_key(key: &KeyInput) -> String {
     match key.code.kind {
+        KeyCodeKind::Noop => "Noop".to_string(),
         KeyCodeKind::Char(' ') => "Space".to_string(),
         KeyCodeKind::Char(c) => c.to_string(),
         KeyCodeKind::F(n) => format!("F{n}"),
