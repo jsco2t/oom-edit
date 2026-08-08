@@ -511,10 +511,10 @@ impl App {
                 use oom_edit_core::session::KeyCodeKind;
                 if let KeyCodeKind::Char(digit) = key_input.code.kind {
                     if !key_input.mods.ctrl && !key_input.mods.alt && !key_input.mods.shift {
-                        let tab_num = digit.to_digit(9).unwrap_or(0) as usize;
+                        let tab_num = digit.to_digit(10).unwrap_or(0) as usize;
                         if tab_num >= 1 && tab_num <= self.tab_count() {
                             self.pending_chord.reset();
-                            self.jump_to_tab(tab_num - 1);
+                            self.jump_to_tab(tab_num);
                             return;
                         }
                     }
@@ -1238,6 +1238,19 @@ mod tests {
         )
     }
 
+    fn test_app_with_tabs(tab_count: usize) -> App {
+        assert!(tab_count >= 1);
+
+        let mut app = test_app(EditorSession::from_text("tab 1"));
+        for tab_num in 2..=tab_count {
+            app.tabs
+                .push(TabEntry::new(EditorSession::from_text(&format!(
+                    "tab {tab_num}"
+                ))));
+        }
+        app
+    }
+
     fn unmapped_special_keys() -> [CrosstermKeyCode; 11] {
         [
             CrosstermKeyCode::Insert,
@@ -1702,6 +1715,71 @@ mod tests {
         app.handle_event(&Event::Key(q));
 
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn test_space_digit_jumps_to_correct_tab() {
+        let mut app = test_app_with_tabs(9);
+        assert_eq!(app.tab_count(), 9);
+
+        for tab_num in 1..=9 {
+            app.handle_event(&Event::Key(KeyEvent::new(
+                CrosstermKeyCode::Char(' '),
+                KeyModifiers::NONE,
+            )));
+            app.handle_event(&Event::Key(KeyEvent::new(
+                CrosstermKeyCode::Char(char::from_digit(tab_num as u32, 10).unwrap()),
+                KeyModifiers::NONE,
+            )));
+
+            assert_eq!(
+                app.active_tab,
+                tab_num - 1,
+                "Space+{tab_num} should activate tab {tab_num}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_space_digit_noop_when_tab_missing() {
+        let mut app = test_app_with_tabs(3);
+        app.active_tab = 1;
+
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char(' '),
+            KeyModifiers::NONE,
+        )));
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('5'),
+            KeyModifiers::NONE,
+        )));
+
+        assert_eq!(app.active_tab, 1);
+    }
+
+    #[test]
+    fn test_space_9_works() {
+        let mut app = test_app_with_tabs(9);
+
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char(' '),
+            KeyModifiers::NONE,
+        )));
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('9'),
+            KeyModifiers::NONE,
+        )));
+
+        assert_eq!(app.active_tab, 8);
+    }
+
+    #[test]
+    fn test_effect_tab_jump_uses_one_based_index() {
+        let mut app = test_app_with_tabs(3);
+
+        app.handle_effect(Effect::TabJump { index: 3 });
+
+        assert_eq!(app.active_tab, 2);
     }
 
     /// T12: Space in Insert mode self-inserts (routing order proof).
