@@ -125,6 +125,12 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
+    // NFR-5 verification: deliberate panic while the terminal is in raw mode.
+    // The panic hook should restore the terminal before the default handler.
+    if args.panic_test {
+        panic!("--panic-test: deliberate panic for NFR-5 verification");
+    }
+
     // Run the event loop.
     event::run_event_loop(app, terminal)
 }

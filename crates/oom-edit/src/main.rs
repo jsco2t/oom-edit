@@ -11,29 +11,13 @@ use oom_edit::ParseOutcome;
 
 fn main() -> ExitCode {
     match oom_edit::Args::parse(std::env::args()) {
-        Ok(ParseOutcome::Run(args)) => {
-            // Hidden debug flag: trigger a panic for NFR-5 verification.
-            // This flag is intentionally undocumented in --help.
-            if args.panic_test {
-                // Terminal guard hooks are installed during run(), so a panic
-                // here will trigger the panic hook and restore the terminal.
-                // We call run() first to ensure the hooks are armed, then panic.
-                let result = oom_edit::run(&args);
-                if result.is_err() {
-                    // If run() failed (e.g., terminal setup error), the hooks
-                    // may not be installed yet. Panic anyway to test the hook.
-                }
-                panic!("--panic-test: deliberate panic for NFR-5 verification");
+        Ok(ParseOutcome::Run(args)) => match oom_edit::run(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("oom-edit: {e}");
+                ExitCode::FAILURE
             }
-
-            match oom_edit::run(&args) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("oom-edit: {e}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
+        },
         // `--help` / `--version`: print to stdout and exit 0.
         Ok(ParseOutcome::Message(msg)) => {
             print!("{msg}");

@@ -112,13 +112,23 @@ pub fn restore_terminal(out: &mut impl Write) {
 /// installing the hook repeatedly would chain (and progressively slow) it.
 pub fn install_panic_hook() {
     static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
+    install_hook_once(&ONCE, || {
         let default = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            restore_terminal(&mut stdout());
-            default(info);
+            restore_then_default(|| restore_terminal(&mut stdout()), || default(info));
         }));
     });
+}
+
+/// Install a hook body exactly once through the same seam used in production.
+fn install_hook_once(once: &Once, install: impl FnOnce()) {
+    once.call_once(install);
+}
+
+/// Run terminal restoration before delegating to the previous panic hook.
+fn restore_then_default(restore: impl FnOnce(), default: impl FnOnce()) {
+    restore();
+    default();
 }
 
 /// Best-effort `SIGHUP`/`SIGTERM` handling.
@@ -211,8 +221,7 @@ mod tests {
     //! be constructed in CI. These are deterministic in-process tests of the
     //! restore wiring instead.
 
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::cell::{Cell, RefCell};
 
     use super::*;
 
@@ -241,51 +250,31 @@ mod tests {
         );
     }
 
-    /// The panic hook wiring runs the restore body *before* the previous hook.
-    /// Deterministic, in-process, no TTY.
+    /// The production panic-hook composition runs the restore body *before*
+    /// delegating to the previous hook. Deterministic, in-process, no TTY.
     #[test]
     fn panic_hook_wiring_runs_restore_before_default() {
-        let restored = Arc::new(AtomicBool::new(false));
-        let default_ran_after_restore = Arc::new(AtomicBool::new(false));
-        let sink = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let events = RefCell::new(Vec::new());
 
-        let prev = std::panic::take_hook();
-        {
-            let restored = Arc::clone(&restored);
-            let default_ran_after_restore = Arc::clone(&default_ran_after_restore);
-            let sink = Arc::clone(&sink);
-            std::panic::set_hook(Box::new(move |_info| {
-                restore_terminal(&mut *sink.lock().expect("sink poisoned"));
-                restored.store(true, Ordering::SeqCst);
-                default_ran_after_restore.store(restored.load(Ordering::SeqCst), Ordering::SeqCst);
-            }));
-        }
+        restore_then_default(
+            || events.borrow_mut().push("restore"),
+            || events.borrow_mut().push("default"),
+        );
 
-        let result = std::panic::catch_unwind(|| panic!("deliberate test panic"));
-        std::panic::set_hook(prev);
-
-        assert!(result.is_err(), "the closure should have panicked");
-        assert!(
-            restored.load(Ordering::SeqCst),
-            "the restore body must run on panic"
-        );
-        assert!(
-            default_ran_after_restore.load(Ordering::SeqCst),
-            "the default hook must run after the restore body"
-        );
-        let bytes = sink.lock().expect("sink poisoned");
-        assert!(
-            contains(&bytes, LEAVE_ALT_SCREEN),
-            "the restore body must emit the leave-alt-screen escape during a panic"
-        );
+        assert_eq!(*events.borrow(), ["restore", "default"]);
     }
 
-    /// `install_panic_hook` is `Once`-gated, so calling it repeatedly is safe.
+    /// The production installation seam invokes its installer exactly once.
     #[test]
     fn panic_hook_install_is_idempotent() {
-        install_panic_hook();
-        install_panic_hook();
-        install_panic_hook();
+        let once = Once::new();
+        let calls = Cell::new(0);
+
+        for _ in 0..3 {
+            install_hook_once(&once, || calls.set(calls.get() + 1));
+        }
+
+        assert_eq!(calls.get(), 1);
     }
 
     /// The signal handler's escape sequence disables mouse before leaving
