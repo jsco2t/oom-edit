@@ -2350,6 +2350,7 @@ fn v_x_substitute_global() {
     feed(&mut sess, ":s/hello/hi/g<Enter>");
     let doc = sess.document();
     assert_eq!(doc, "hi world hi");
+    assert!(sess.is_dirty());
 }
 
 #[test]

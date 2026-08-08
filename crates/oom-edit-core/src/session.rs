@@ -397,8 +397,12 @@ impl EditorSession {
         let text = self.vim.text();
         // Save using the document's I/O logic, passing the vim buffer text
         self.document.save_with_text(&text, path, force)?;
-        // Update the vim core's save point to match
-        self.save_point = self.document.save_point();
+        // The vim engine owns the authoritative dirty generation. Capture it
+        // once after the save succeeds, then keep the session and standalone
+        // document I/O state synchronized to that same mark.
+        let mark = self.vim.save_point();
+        self.save_point = mark;
+        self.document.set_save_point(mark);
         // Rebuild the highlighter with saved text
         self.highlighter = Highlighter::new(&text);
         // Invalidate view layout cache on save

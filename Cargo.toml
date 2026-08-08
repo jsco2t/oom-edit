@@ -19,3 +19,4 @@ doc_markdown = "allow"
 # OptionExt::contains method. We hand-roll that 3-line utility locally.
 [patch.crates-io]
 dirs-sys = { path = "crates/dirs-sys-patched" }
+hjkl-buffer = { path = "patches/hjkl-buffer" }

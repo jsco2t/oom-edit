@@ -70,6 +70,7 @@
 //    mode and track visual sub-kinds via the selection highlight checks.)
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use hjkl_buffer::{ContentEdit, View};
 use hjkl_engine::types::{DefaultHost, Options};
@@ -222,6 +223,14 @@ pub(crate) struct VimCore {
     mode: Mode,
     /// The last saved undo mark (for dirty tracking).
     save_point_dirty_gen: u64,
+    /// Stable sequence of the undo node active at the last save point.
+    save_point_undo_seq: u64,
+    /// Exact content at the last save point.
+    save_point_content: Arc<String>,
+    /// Whether the current undo state differs from the save point.
+    modified_since_save: bool,
+    /// Whether the preceding Normal-mode key was the `g` history prefix.
+    history_prefix_pending: bool,
 }
 
 impl VimCore {
@@ -231,10 +240,16 @@ impl VimCore {
         let mut editor = Editor::new(view, DefaultHost::new(), Options::default());
         install_vim_discipline(&mut editor);
         let save_point_dirty_gen = editor.buffer().dirty_gen();
+        let save_point_undo_seq = editor.buffer().current_undo_seq();
+        let save_point_content = editor.buffer().content_joined();
         Self {
             editor,
             mode: Mode::Normal,
             save_point_dirty_gen,
+            save_point_undo_seq,
+            save_point_content,
+            modified_since_save: false,
+            history_prefix_pending: false,
         }
     }
 
@@ -253,16 +268,33 @@ impl VimCore {
             return self.handle_command_mode_key(hjkl_input, key);
         }
 
+        let history_traversal = self.is_history_traversal_key(key);
+        let undo_seq_before = history_traversal.then(|| self.editor.buffer().current_undo_seq());
+        let next_history_prefix = self.mode == Mode::Normal
+            && !self.history_prefix_pending
+            && matches!(key.code.kind, KeyCodeKind::Char('g'))
+            && key.mods == Modifiers::default();
+
         // Feed the key through hjkl
         let consumed = feed_input(&mut self.editor, hjkl_input);
 
         if !consumed {
+            self.history_prefix_pending = false;
             // Key not consumed — could be a bell (unbound key in Normal)
             return vec![VimEffect::Bell];
         }
+        self.history_prefix_pending = next_history_prefix;
 
         // Drain any content edits
         let edits = self.drain_content_edits();
+
+        let history_moved =
+            undo_seq_before.is_some_and(|before| self.editor.buffer().current_undo_seq() != before);
+        if history_moved {
+            self.modified_since_save = !self.is_at_save_point();
+        } else if !edits.is_empty() {
+            self.modified_since_save = true;
+        }
 
         // Check for mode change
         let current_mode = self.compute_mode();
@@ -364,12 +396,15 @@ impl VimCore {
 
     /// Check if the buffer has been modified since the last save point.
     pub(crate) fn is_modified_since(&self, save_point: UndoMark) -> bool {
-        self.editor.buffer().dirty_gen() != save_point.0
+        self.editor.buffer().dirty_gen() != save_point.0 && self.modified_since_save
     }
 
     /// Take a new save point (current dirty generation).
     pub(crate) fn save_point(&mut self) -> UndoMark {
         self.save_point_dirty_gen = self.editor.buffer().dirty_gen();
+        self.save_point_undo_seq = self.editor.buffer().current_undo_seq();
+        self.save_point_content = self.editor.buffer().content_joined();
+        self.modified_since_save = false;
         UndoMark(self.save_point_dirty_gen)
     }
 
@@ -377,7 +412,7 @@ impl VimCore {
     pub(crate) fn set_text(&mut self, text: &str) -> String {
         let old = self.editor.buffer().as_string();
         self.editor.buffer_mut().replace_all(text);
-        self.save_point_dirty_gen = self.editor.buffer().dirty_gen();
+        self.modified_since_save = true;
         old
     }
 
@@ -402,6 +437,7 @@ impl VimCore {
     /// the hjkl input pipeline, so it counts as a single undo step.
     /// Returns the edits for the highlighter.
     pub(crate) fn insert_text(&mut self, text: &str) -> Vec<TextEdit> {
+        self.modified_since_save = true;
         let buffer = self.editor.buffer_mut();
         let cursor = buffer.cursor();
         let line = cursor.row;
@@ -510,6 +546,32 @@ impl VimCore {
     }
 
     // ── Internal helpers ─────────────────────────────────────────────
+
+    /// Return whether `key` traverses the undo tree in Normal mode.
+    fn is_history_traversal_key(&self, key: KeyInput) -> bool {
+        if self.mode != Mode::Normal {
+            return false;
+        }
+
+        match key.code.kind {
+            KeyCodeKind::Char('u') => {
+                !self.history_prefix_pending && key.mods == Modifiers::default()
+            }
+            KeyCodeKind::Char('r') => {
+                !self.history_prefix_pending && key.mods.ctrl && !key.mods.alt && !key.mods.shift
+            }
+            KeyCodeKind::Char('-' | '+') => {
+                self.history_prefix_pending && !key.mods.ctrl && !key.mods.alt
+            }
+            _ => false,
+        }
+    }
+
+    /// Check stable undo-node identity and exact within-node contents.
+    fn is_at_save_point(&self) -> bool {
+        self.editor.buffer().current_undo_seq() == self.save_point_undo_seq
+            && self.editor.buffer().content_joined().as_str() == self.save_point_content.as_str()
+    }
 
     /// Normalize <C-[> (Ctrl+LeftBracket) to Esc.
     ///
@@ -701,6 +763,60 @@ fn replacement_text_from_final_buffer<'a>(
                 final_text.len()
             )
         })
+}
+
+#[cfg(test)]
+mod dirty_tracking_tests {
+    use super::*;
+
+    fn key(ch: char) -> KeyInput {
+        KeyInput {
+            code: KeyCode {
+                kind: KeyCodeKind::Char(ch),
+            },
+            mods: Modifiers::default(),
+        }
+    }
+
+    fn ctrl_key(ch: char) -> KeyInput {
+        KeyInput {
+            code: KeyCode {
+                kind: KeyCodeKind::Char(ch),
+            },
+            mods: Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            },
+        }
+    }
+
+    #[test]
+    fn undo_sequence_identifies_the_save_point_across_history_pruning() {
+        let mut vim = VimCore::new("abcdef");
+        vim.editor.settings_mut().undo_levels = 2;
+
+        vim.handle_key(key('x'));
+        vim.handle_key(key('x'));
+        let mark = vim.save_point();
+        assert_eq!(vim.text(), "cdef");
+
+        vim.handle_key(key('x'));
+        assert!(vim.is_modified_since(mark));
+        vim.handle_key(key('u'));
+        assert_eq!(vim.text(), "cdef");
+        assert!(!vim.is_modified_since(mark));
+
+        vim.handle_key(ctrl_key('r'));
+        vim.handle_key(key('x'));
+        vim.handle_key(key('x'));
+        vim.handle_key(key('u'));
+        vim.handle_key(key('u'));
+        assert_ne!(vim.text(), "cdef");
+        assert!(
+            vim.is_modified_since(mark),
+            "a pruned save-point sequence must not be confused with a later node"
+        );
+    }
 }
 
 // ── UndoMark ───────────────────────────────────────────────────────────────

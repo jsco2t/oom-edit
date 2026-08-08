@@ -386,8 +386,8 @@ impl Document {
             return Err(error.error.into());
         }
 
-        // Update save point and recorded metadata
-        self.save_point = self.save_point();
+        // Update recorded metadata. EditorSession synchronizes this
+        // document's save point from the vim engine after a successful save.
         self.record_disk_state(&target_path, serialized.len(), override_path.is_some());
 
         // Re-parse front matter after save (cheap — always re-parse)

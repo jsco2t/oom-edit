@@ -645,8 +645,6 @@ dependencies = [
 [[package]]
 name = "hjkl-buffer"
 version = "0.39.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c9f9314b826a7e6c2bb4531442b0e73d279e785f9e74685f806ac4762c7f237"
 dependencies = [
  "regex",
  "ropey",

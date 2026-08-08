@@ -29,6 +29,15 @@ All direct dependencies of `oom-edit-core`, with license, rationale, and hand-ro
 | Crate | Version | License | Why patched | Patch |
 | --- | --- | --- | --- | --- |
 | `dirs-sys` | `0.5.0` (local fork) | MIT OR Apache-2.0 | Removed transitive dependency on `option-ext` (MPL-2.0, copyleft). Hand-rolled the 3-line `OptionExt::contains` utility locally. | `crates/dirs-sys-patched/` + `[patch.crates-io]` in root `Cargo.toml` |
+| `hjkl-buffer` | `0.39.0` (local fork) | MIT | Exposes the current undo node's stable sequence through one read-only accessor. Dirty tracking cannot derive this identity from undo depth, while serializing the full undo tree on each history key violates the editor latency budget. | `patches/hjkl-buffer/` + `[patch.crates-io]` in root `Cargo.toml` |
+
+The `hjkl-buffer` patch adds no dependency or runtime behavior and retains the
+upstream crate verbatim apart from the accessor. The pinned upstream release is
+actively integrated through the existing `hjkl` family and conformance suite;
+the local diff was reviewed as a single mutex-protected read-only accessor. Hand-rolling an
+undo-state mirror in oom-edit was rejected because it would duplicate branching
+and pruning semantics and could silently diverge from the engine. The license
+and transitive dependency tree are unchanged.
 
 ## Tree-sitter ABI note
 

@@ -26,6 +26,18 @@ fn key_special(kind: KeyCodeKind) -> KeyInput {
     }
 }
 
+fn key_ctrl(ch: char) -> KeyInput {
+    KeyInput {
+        code: KeyCode {
+            kind: KeyCodeKind::Char(ch),
+        },
+        mods: Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        },
+    }
+}
+
 fn move_view_cursor_to_text(session: &mut EditorSession, needle: &str) {
     session.toggle_view();
     let target_line = session
@@ -426,6 +438,246 @@ fn session_dirty_after_edit() {
     assert!(session.is_dirty(), "session should be dirty after insert");
 }
 
+#[test]
+fn session_is_clean_after_save_and_dirty_after_another_edit() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("dirty-cycle.md");
+    let mut session = EditorSession::from_text("hello");
+
+    assert!(!session.is_dirty(), "a new session should start clean");
+
+    session.handle_key(key('i'));
+    session.handle_key(key('x'));
+    session.handle_key(key_special(KeyCodeKind::Esc));
+    assert!(
+        session.is_dirty(),
+        "an insertion should make the session dirty"
+    );
+
+    session.save(Some(&path), false).unwrap();
+    assert!(
+        !session.is_dirty(),
+        "a successful save should clear dirty state"
+    );
+
+    session.handle_key(key('a'));
+    session.handle_key(key('y'));
+    session.handle_key(key_special(KeyCodeKind::Esc));
+    assert!(
+        session.is_dirty(),
+        "an insertion after saving should make the session dirty again"
+    );
+}
+
+#[test]
+fn failed_save_preserves_dirty_state() {
+    let mut session = EditorSession::from_text("hello");
+
+    session.handle_key(key('x'));
+    assert!(session.is_dirty(), "an edit should make the session dirty");
+
+    assert!(
+        session.save(None, false).is_err(),
+        "saving a pathless session without a target should fail"
+    );
+    assert!(
+        session.is_dirty(),
+        "a failed save must not advance the save point"
+    );
+}
+
+#[test]
+fn undoing_to_the_save_point_clears_dirty_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("undo-to-save-point.md");
+    let mut session = EditorSession::from_text("abc");
+
+    session.handle_key(key('x'));
+    assert!(
+        session.is_dirty(),
+        "the first deletion should make the session dirty"
+    );
+    session.save(Some(&path), false).unwrap();
+    assert!(!session.is_dirty(), "the saved state should be clean");
+
+    session.handle_key(key('x'));
+    assert!(
+        session.is_dirty(),
+        "the second deletion should make the session dirty"
+    );
+
+    session.handle_key(key('u'));
+    assert_eq!(session.document(), "bc");
+    assert!(
+        !session.is_dirty(),
+        "undoing the second deletion should restore the saved state"
+    );
+
+    session.handle_key(key_ctrl('r'));
+    assert_eq!(session.document(), "c");
+    assert!(
+        session.is_dirty(),
+        "redoing the second deletion should leave the save point"
+    );
+}
+
+#[test]
+fn editing_back_to_saved_contents_without_undo_remains_dirty() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("same-contents-new-state.md");
+    let mut session = EditorSession::from_text("abc");
+    session.save(Some(&path), false).unwrap();
+
+    session.handle_key(key('$'));
+    session.handle_key(key('x'));
+    assert_eq!(session.document(), "ab");
+
+    session.handle_key(key('a'));
+    session.handle_key(key('c'));
+    session.handle_key(key_special(KeyCodeKind::Esc));
+
+    assert_eq!(session.document(), "abc");
+    assert!(
+        session.is_dirty(),
+        "new edits that recreate saved bytes are still an unsaved undo state"
+    );
+
+    session.handle_key(key('$'));
+    session.handle_key(key('x'));
+    assert_eq!(session.document(), "ab");
+    session.handle_key(key('u'));
+    assert_eq!(session.document(), "abc");
+    assert!(
+        session.is_dirty(),
+        "undoing into a different node with saved-equivalent bytes must remain dirty"
+    );
+}
+
+#[test]
+fn branching_after_undo_discards_the_saved_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("discarded-save-point.md");
+    let mut session = EditorSession::from_text("abc");
+
+    session.handle_key(key('x'));
+    session.save(Some(&path), false).unwrap();
+    assert_eq!(session.document(), "bc");
+    assert!(!session.is_dirty());
+
+    session.handle_key(key('u'));
+    assert_eq!(session.document(), "abc");
+    assert!(session.is_dirty());
+
+    session.handle_key(key('i'));
+    session.handle_key(key('z'));
+    session.handle_key(key_special(KeyCodeKind::Esc));
+    assert_eq!(session.document(), "zabc");
+    assert!(
+        session.is_dirty(),
+        "a divergent Insert-mode branch must not reuse the discarded save point"
+    );
+
+    session.handle_key(key('u'));
+    session.handle_key(key_ctrl('r'));
+    assert_eq!(session.document(), "zabc");
+    assert!(session.is_dirty());
+}
+
+#[test]
+fn bracketed_paste_can_undo_to_the_save_point() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("paste-undo.md");
+    let mut session = EditorSession::from_text("abc");
+    session.save(Some(&path), false).unwrap();
+
+    session.handle_key(key('i'));
+    session.insert_paste("x");
+    session.handle_key(key_special(KeyCodeKind::Esc));
+    assert_eq!(session.document(), "xabc");
+    assert!(session.is_dirty());
+
+    session.handle_key(key('u'));
+    assert_eq!(session.document(), "abc");
+    assert!(!session.is_dirty());
+}
+
+#[test]
+fn history_traversal_with_g_updates_dirty_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("g-history.md");
+    let mut session = EditorSession::from_text("abc");
+
+    session.handle_key(key('x'));
+    session.save(Some(&path), false).unwrap();
+    session.handle_key(key('x'));
+    assert_eq!(session.document(), "c");
+    assert!(session.is_dirty());
+
+    session.handle_key(key('g'));
+    session.handle_key(key('-'));
+    assert_eq!(session.document(), "bc");
+    assert!(!session.is_dirty());
+
+    session.handle_key(key('g'));
+    session.handle_key(key('+'));
+    assert_eq!(session.document(), "c");
+    assert!(session.is_dirty());
+}
+
+#[test]
+fn saving_mid_insert_does_not_clean_later_text_in_the_same_undo_node() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("mid-insert-save.md");
+    let mut session = EditorSession::from_text("abc");
+
+    session.handle_key(key('i'));
+    session.handle_key(key('x'));
+    session.save(Some(&path), false).unwrap();
+    assert!(!session.is_dirty());
+
+    session.handle_key(key('y'));
+    session.handle_key(key_special(KeyCodeKind::Esc));
+    assert_eq!(session.document(), "xyabc");
+    assert!(session.is_dirty());
+
+    session.handle_key(key('u'));
+    assert_eq!(session.document(), "abc");
+    assert!(session.is_dirty());
+
+    session.handle_key(key_ctrl('r'));
+    assert_eq!(session.document(), "xyabc");
+    assert!(
+        session.is_dirty(),
+        "redoing the extended node must not match its earlier saved contents"
+    );
+}
+
+#[test]
+fn no_op_undo_does_not_clean_same_bytes_created_by_direct_edits() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("no-op-undo.md");
+    let mut session = EditorSession::from_text("abc");
+    session.save(Some(&path), false).unwrap();
+
+    for command in ["s/a/x/", "s/x/a/"] {
+        session.handle_key(key(':'));
+        for ch in command.chars() {
+            session.handle_key(key(ch));
+        }
+        session.handle_key(key_special(KeyCodeKind::Enter));
+    }
+
+    assert_eq!(session.document(), "abc");
+    assert!(session.is_dirty());
+
+    session.handle_key(key('u'));
+    assert_eq!(session.document(), "abc");
+    assert!(
+        session.is_dirty(),
+        "a consumed no-op undo must not clear direct edits that recreated saved bytes"
+    );
+}
+
 // ── Effect emission ─────────────────────────────────────────────────────────
 
 #[test]
@@ -504,10 +756,8 @@ fn highlighter_applied_on_edit() {
 
 #[test]
 fn highlighter_preserved_after_save() {
-    // Create a temp file
-    let temp_dir = std::env::temp_dir().join("oom-edit-test");
-    std::fs::create_dir_all(&temp_dir).ok();
-    let temp_path = temp_dir.join("highlighter_save_test.md");
+    let temp_dir = tempfile::tempdir().unwrap();
+    let temp_path = temp_dir.path().join("highlighter_save_test.md");
 
     // Write initial content with heading
     std::fs::write(&temp_path, "# Test\n\nContent\n").unwrap();
@@ -527,7 +777,7 @@ fn highlighter_preserved_after_save() {
     );
 
     // Save (rebuilds highlighter)
-    session.save(None, false).ok();
+    session.save(None, false).unwrap();
 
     // Re-open to verify the highlighter was rebuilt
     let mut session = EditorSession::open(&temp_path).expect("should re-open temp file");
@@ -539,8 +789,4 @@ fn highlighter_preserved_after_save() {
         !frame2.lines[0].spans.is_empty(),
         "reopened file should have highlighting"
     );
-
-    // Clean up
-    std::fs::remove_file(&temp_path).ok();
-    std::fs::remove_dir_all(&temp_dir).ok();
 }
