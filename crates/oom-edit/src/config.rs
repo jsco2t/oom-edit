@@ -189,7 +189,11 @@ impl Config {
     /// malformed TOML. Warns to stderr on errors.
     pub fn load() -> Self {
         let path = config_path();
-        match std::fs::read_to_string(&path) {
+        Self::load_from_path(&path)
+    }
+
+    pub(crate) fn load_from_path(path: &Path) -> Self {
+        match std::fs::read_to_string(path) {
             Ok(contents) => match toml::from_str(&contents) {
                 Ok(config) => config,
                 Err(e) => {
@@ -220,7 +224,7 @@ impl Config {
         self.save_to_path(&path)
     }
 
-    fn save_to_path(&self, path: &Path) -> Result<(), String> {
+    pub(crate) fn save_to_path(&self, path: &Path) -> Result<(), String> {
         self.save_to_path_using(path, &mut FileSystemConfigSave)
     }
 

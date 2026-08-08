@@ -115,6 +115,7 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let app = App::new(
         session,
         theme_name,
+        is_light,
         tier,
         Box::new(crate::clipboard::Osc52Clipboard::stdout()),
     );

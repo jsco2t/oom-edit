@@ -113,6 +113,7 @@ mod tests {
         App::new(
             EditorSession::from_text(RESIZE_DOCUMENT),
             "default-dark".to_string(),
+            false,
             Tier::TrueColor,
             Box::new(RecordingClipboardSink::default()),
         )

@@ -286,8 +286,9 @@ impl EnvParts {
 /// Resolve the active theme name through the selection ladder.
 ///
 /// Priority: `--theme` flag > config dark/light slot > "default-dark" fallback.
-/// Returns `(theme_name, is_light)`. If the name is unknown, warns and returns
-/// "default-dark".
+/// Returns `(theme_name, is_light)`, where `is_light` is the resolved display
+/// mode used to select the corresponding config slot. If the name is unknown,
+/// warns and returns "default-dark".
 pub fn resolve_theme(
     cli_theme: Option<&str>,
     config_mode: Option<&str>,
@@ -318,13 +319,6 @@ pub fn resolve_theme(
             .filter(|s| is_known(s))
             .unwrap_or("default-dark")
             .to_string(),
-    };
-
-    // accessible is always monochrome regardless of tier.
-    let is_light = if name == "accessible" {
-        false
-    } else {
-        is_light
     };
 
     (name, is_light)
@@ -1298,6 +1292,20 @@ mod tests {
             &env,
         );
         assert_eq!(name, "default-light");
+    }
+
+    #[test]
+    fn resolve_accessible_theme_preserves_light_display_mode() {
+        let env = EnvParts::default();
+        let (name, is_light) = resolve_theme(
+            None,
+            Some("light"),
+            Some("default-dark"),
+            Some("accessible"),
+            &env,
+        );
+        assert_eq!(name, "accessible");
+        assert!(is_light);
     }
 
     // ── Built-in themes ─────────────────────────────────────────────────

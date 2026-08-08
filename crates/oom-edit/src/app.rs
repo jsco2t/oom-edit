@@ -11,6 +11,7 @@
 //!    On match → `execute_command`. No match → fall through.
 //! 3. Everything else → active session's `handle_key(key)`, then drain `Effect`s.
 
+use std::path::PathBuf;
 use std::time::Instant;
 
 use crossterm::event::{Event, KeyCode as CrosstermKeyCode, KeyEvent, KeyModifiers};
@@ -92,6 +93,10 @@ pub struct App {
     pub theme_name: String,
     #[cfg(not(test))]
     theme_name: String,
+    /// Whether the active display mode was resolved as light at startup.
+    is_light: bool,
+    /// Config file used to persist explicit theme changes.
+    config_path: PathBuf,
     /// Active capability tier.
     tier: Tier,
     /// Clipboard sink for OSC 52 clipboard writes (T16).
@@ -103,6 +108,7 @@ impl App {
     pub fn new(
         session: EditorSession,
         theme_name: String,
+        is_light: bool,
         tier: Tier,
         clipboard_sink: Box<dyn ClipboardSink>,
     ) -> Self {
@@ -119,6 +125,8 @@ impl App {
             now: Instant::now(),
             transient: None,
             theme_name,
+            is_light,
+            config_path: crate::config::config_path(),
             tier,
             clipboard_sink,
         }
@@ -770,7 +778,13 @@ impl App {
                 let next = theme::cycle_theme(&self.theme_name);
                 self.theme_name = next.to_string();
                 // Persist to config.
-                if let Err(e) = crate::config::Config::load().save() {
+                let mut config = crate::config::Config::load_from_path(&self.config_path);
+                if self.is_light {
+                    config.theme.light = next.to_string();
+                } else {
+                    config.theme.dark = next.to_string();
+                }
+                if let Err(e) = config.save_to_path(&self.config_path) {
                     eprintln!("oom-edit: failed to save config: {e}");
                 }
                 self.set_transient(
@@ -1242,6 +1256,7 @@ mod tests {
         App::new(
             session,
             "default-dark".to_string(),
+            false,
             Tier::TrueColor,
             Box::new(RecordingClipboardSink::default()),
         )
@@ -1340,6 +1355,7 @@ mod tests {
         let mut app = App::new(
             EditorSession::from_text("hello\n"),
             "default-dark".to_string(),
+            false,
             Tier::TrueColor,
             Box::new(FailingClipboardSink),
         );
@@ -2060,6 +2076,8 @@ mod tests {
     fn app_cycle_theme_is_functional_noop() {
         let session = EditorSession::from_text("hello");
         let mut app = test_app(session);
+        let temp_dir = tempfile::tempdir().unwrap();
+        app.config_path = temp_dir.path().join("oom-edit/config.toml");
 
         // Space-t should trigger CycleTheme.
         let space = KeyEvent::new(CrosstermKeyCode::Char(' '), KeyModifiers::NONE);
@@ -2079,6 +2097,99 @@ mod tests {
         );
         // Should show a transient message about cycling.
         assert!(app.transient.is_some());
+    }
+
+    #[test]
+    fn app_cycle_theme_persists_current_display_mode_slot() {
+        struct Case {
+            name: &'static str,
+            current_theme: &'static str,
+            is_light: bool,
+            expected_theme: &'static str,
+        }
+
+        for case in [
+            Case {
+                name: "dark mode",
+                current_theme: "default-dark",
+                is_light: false,
+                expected_theme: "default-light",
+            },
+            Case {
+                name: "light mode",
+                current_theme: "default-dark",
+                is_light: true,
+                expected_theme: "default-light",
+            },
+            Case {
+                name: "light mode cycling to accessible",
+                current_theme: "default-light",
+                is_light: true,
+                expected_theme: "accessible",
+            },
+        ] {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let config_path = temp_dir.path().join("oom-edit/config.toml");
+            let mut initial_config = crate::config::Config::default();
+            initial_config.theme.dark = "saved-dark".to_string();
+            initial_config.theme.light = "saved-light".to_string();
+            initial_config.save_to_path(&config_path).unwrap();
+
+            let mut app = App::new(
+                EditorSession::from_text(""),
+                case.current_theme.to_string(),
+                case.is_light,
+                Tier::TrueColor,
+                Box::new(RecordingClipboardSink::default()),
+            );
+            app.config_path = config_path.clone();
+
+            app.execute_command(Command::CycleTheme);
+
+            let persisted = crate::config::Config::load_from_path(&config_path);
+            let (expected_dark, expected_light) = if case.is_light {
+                ("saved-dark", case.expected_theme)
+            } else {
+                (case.expected_theme, "saved-light")
+            };
+            assert_eq!(app.theme_name, case.expected_theme, "{}", case.name);
+            assert_eq!(persisted.theme.dark, expected_dark, "{}", case.name);
+            assert_eq!(persisted.theme.light, expected_light, "{}", case.name);
+        }
+    }
+
+    #[test]
+    fn app_cycle_theme_keeps_light_slot_after_accessible_restart() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("oom-edit/config.toml");
+        let mut initial_config = crate::config::Config::default();
+        initial_config.theme.mode = Some("light".to_string());
+        initial_config.theme.dark = "saved-dark".to_string();
+        initial_config.theme.light = "accessible".to_string();
+        initial_config.save_to_path(&config_path).unwrap();
+
+        let (theme_name, is_light) = theme::resolve_theme(
+            None,
+            initial_config.theme.mode.as_deref(),
+            Some(&initial_config.theme.dark),
+            Some(&initial_config.theme.light),
+            &theme::EnvParts::default(),
+        );
+        let mut app = App::new(
+            EditorSession::from_text(""),
+            theme_name,
+            is_light,
+            Tier::TrueColor,
+            Box::new(RecordingClipboardSink::default()),
+        );
+        app.config_path = config_path.clone();
+
+        app.execute_command(Command::CycleTheme);
+
+        let persisted = crate::config::Config::load_from_path(&config_path);
+        assert_eq!(app.theme_name, "default-dark");
+        assert_eq!(persisted.theme.dark, "saved-dark");
+        assert_eq!(persisted.theme.light, "default-dark");
     }
 
     /// T14: Resize in View mode remaps cursor to same content line.
@@ -2179,6 +2290,7 @@ mod tests {
         let mut app = App::new(
             EditorSession::from_text("first\nplain"),
             "default-light".to_string(),
+            true,
             Tier::TrueColor,
             Box::new(RecordingClipboardSink::default()),
         );
@@ -2265,6 +2377,7 @@ mod tests {
         let mut app = App::new(
             EditorSession::from_text("text"),
             "default-dark".to_string(),
+            false,
             Tier::Monochrome,
             Box::new(RecordingClipboardSink::default()),
         );

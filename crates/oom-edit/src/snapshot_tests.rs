@@ -45,6 +45,7 @@ fn test_app(text: &str) -> App {
     App::new(
         EditorSession::from_text(text),
         "default-dark".to_string(),
+        false,
         Tier::TrueColor,
         Box::new(RecordingClipboardSink::default()),
     )
