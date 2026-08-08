@@ -1,51 +1,44 @@
 //! Performance-smoke assertions for NFR-1..NFR-4.
 //!
-//! Run with `OOM_PERF_ASSERT=1 cargo test --offline --locked -p oom-edit-core --test perf_smoke`.
-//! When `OOM_PERF_ASSERT` is not set, each test is a no-op.
+//! Run with `cargo test --offline --locked -p oom-edit-core --test perf_smoke`.
+//! These relaxed regression thresholds do not replace the exact NFR benchmarks.
 
 mod perf_assertions {
     use oom_edit_core::session::{EditorSession, Viewport};
 
     #[test]
     fn perf_smoke_nfr1_open_to_first_frame() {
-        if std::env::var("OOM_PERF_ASSERT").is_err() {
-            return;
-        }
         // Minimal document
         let doc = String::from("# Test\n\nSome content.\n");
         let start = std::time::Instant::now();
         let mut session = EditorSession::from_text(&doc);
-        println!("Session created in {:?}", start.elapsed());
-        let start = std::time::Instant::now();
+        let after_session = start.elapsed();
         let _frame = session.render_source(Viewport {
             top_line: 0,
             height: 40,
             width: 80,
         });
-        println!("Rendered in {:?}", start.elapsed());
         let total = start.elapsed().as_millis() as u64;
         println!(
-            "NFR-1 open_to_first_frame: {}ms ({} bytes)",
+            "open_to_first_frame smoke: {}ms (session={:?}, {} bytes)",
             total,
+            after_session,
             doc.len()
         );
         assert!(
             total < 500,
-            "NFR-1 FAIL: open_to_first_frame took {}ms",
+            "NFR-1 smoke regression: open_to_first_frame took {}ms",
             total
         );
     }
 
     #[test]
     fn perf_smoke_nfr2_keystroke_to_frame() {
-        if std::env::var("OOM_PERF_ASSERT").is_err() {
-            return;
-        }
         let doc = String::from("# Test\n\nSome content.\n");
         let mut session = EditorSession::from_text(&doc);
         let iterations = 5u64;
         let start = std::time::Instant::now();
-        for i in 0..iterations {
+        for _ in 0..iterations {
             session.handle_key(oom_edit_core::session::KeyInput {
                 code: oom_edit_core::session::KeyCode {
                     kind: oom_edit_core::session::KeyCodeKind::Char('x'),
@@ -57,30 +50,23 @@ mod perf_assertions {
                 height: 40,
                 width: 80,
             });
-            if i % 2 == 0 {
-                eprint!(".");
-            }
         }
-        eprintln!();
         let elapsed = start.elapsed().as_millis() as u64 / iterations;
         println!("NFR-2 keystroke_to_frame: {}ms avg", elapsed);
         assert!(
             elapsed < 100,
-            "NFR-2 FAIL: keystroke_to_frame avg {}ms",
+            "NFR-2 smoke regression: keystroke_to_frame avg {}ms",
             elapsed
         );
     }
 
     #[test]
     fn perf_smoke_nfr3_incremental_rehighlight() {
-        if std::env::var("OOM_PERF_ASSERT").is_err() {
-            return;
-        }
         let doc = String::from("# Test\n\nSome content.\n");
         let mut session = EditorSession::from_text(&doc);
         let iterations = 5u64;
         let start = std::time::Instant::now();
-        for i in 0..iterations {
+        for _ in 0..iterations {
             session.handle_key(oom_edit_core::session::KeyInput {
                 code: oom_edit_core::session::KeyCode {
                     kind: oom_edit_core::session::KeyCodeKind::Char('x'),
@@ -92,25 +78,18 @@ mod perf_assertions {
                 height: 40,
                 width: 80,
             });
-            if i % 2 == 0 {
-                eprint!(".");
-            }
         }
-        eprintln!();
         let elapsed = start.elapsed().as_millis() as u64 / iterations;
         println!("NFR-3 incremental_rehighlight: {}ms avg", elapsed);
         assert!(
             elapsed < 100,
-            "NFR-3 FAIL: incremental_rehighlight avg {}ms",
+            "NFR-3 smoke regression: incremental_rehighlight avg {}ms",
             elapsed
         );
     }
 
     #[test]
     fn perf_smoke_nfr4_view_build() {
-        if std::env::var("OOM_PERF_ASSERT").is_err() {
-            return;
-        }
         let mut out = String::new();
         for i in 0..500 {
             out.push_str(&format!(
@@ -129,6 +108,10 @@ mod perf_assertions {
             elapsed,
             out.matches('\n').count() + 1
         );
-        assert!(elapsed < 500, "NFR-4 FAIL: view_build took {}ms", elapsed);
+        assert!(
+            elapsed < 500,
+            "NFR-4 smoke regression: view_build took {}ms",
+            elapsed
+        );
     }
 }
