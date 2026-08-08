@@ -72,14 +72,14 @@ impl ConfirmQuit {
                 return true;
             }
             KeyCodeKind::Esc => {
-                // Cancel
+                // Cancel -- return false so app.rs close-overlay path runs.
                 self.selected = 2;
-                return true;
+                return false;
             }
             KeyCodeKind::Char('c') if key.mods.ctrl && !key.mods.alt => {
-                // Ctrl-C → Cancel
+                // Ctrl-C → Cancel -- return false so app.rs close-overlay path runs.
                 self.selected = 2;
-                return true;
+                return false;
             }
             KeyCodeKind::Up => {
                 self.selected = self.selected.saturating_sub(1);
@@ -182,14 +182,14 @@ impl ConfirmOverwrite {
                 return true;
             }
             KeyCodeKind::Esc => {
-                // Cancel
+                // Cancel -- return false so app.rs close-overlay path runs.
                 self.selected = 2;
-                return true;
+                return false;
             }
             KeyCodeKind::Char('c') if key.mods.ctrl && !key.mods.alt => {
-                // Ctrl-C → Cancel
+                // Ctrl-C → Cancel -- return false so app.rs close-overlay path runs.
                 self.selected = 2;
-                return true;
+                return false;
             }
             KeyCodeKind::Up => {
                 self.selected = self.selected.saturating_sub(1);
@@ -334,118 +334,141 @@ mod tests {
         }
     }
 
+    fn enter_key() -> KeyInput {
+        KeyInput {
+            code: oom_edit_core::session::KeyCode {
+                kind: oom_edit_core::session::KeyCodeKind::Enter,
+            },
+            mods: oom_edit_core::session::Modifiers::default(),
+        }
+    }
+
     // ── ConfirmQuit ─────────────────────────────────────────────────────
 
     #[test]
-    fn confirm_quit_save_and_quit() {
+    fn confirm_quit_esc_returns_false() {
         let mut overlay = ConfirmQuit::new();
-        overlay.handle_key(&char_key('y'));
+        assert!(!overlay.handle_key(&esc_key()));
+        assert_eq!(overlay.result(), ConfirmResult::Cancel);
+    }
+
+    #[test]
+    fn confirm_quit_ctrlc_returns_false() {
+        let mut overlay = ConfirmQuit::new();
+        assert!(!overlay.handle_key(&ctrl_c_key()));
+        assert_eq!(overlay.result(), ConfirmResult::Cancel);
+    }
+
+    #[test]
+    fn confirm_quit_y_returns_true() {
+        let mut overlay = ConfirmQuit::new();
+        assert!(overlay.handle_key(&char_key('y')));
         assert_eq!(overlay.result(), ConfirmResult::Confirm);
     }
 
     #[test]
-    fn confirm_quit_save_and_quit_w() {
+    fn confirm_quit_w_returns_true() {
         let mut overlay = ConfirmQuit::new();
-        overlay.handle_key(&char_key('w'));
+        assert!(overlay.handle_key(&char_key('w')));
         assert_eq!(overlay.result(), ConfirmResult::Confirm);
     }
 
     #[test]
-    fn confirm_quit_without_saving() {
+    fn confirm_quit_n_returns_true() {
         let mut overlay = ConfirmQuit::new();
-        overlay.handle_key(&char_key('n'));
+        assert!(overlay.handle_key(&char_key('n')));
         assert_eq!(overlay.result(), ConfirmResult::Quit);
     }
 
     #[test]
-    fn confirm_quit_cancel_esc() {
+    fn confirm_quit_up_navigates() {
         let mut overlay = ConfirmQuit::new();
-        overlay.handle_key(&esc_key());
-        assert_eq!(overlay.result(), ConfirmResult::Cancel);
+        assert!(overlay.handle_key(&char_key('n')));
+
+        assert!(overlay.handle_key(&up_key()));
+        assert_eq!(overlay.result(), ConfirmResult::Confirm);
     }
 
     #[test]
-    fn confirm_quit_cancel_ctrl_c() {
+    fn confirm_quit_down_navigates() {
         let mut overlay = ConfirmQuit::new();
-        overlay.handle_key(&ctrl_c_key());
-        assert_eq!(overlay.result(), ConfirmResult::Cancel);
+
+        assert!(overlay.handle_key(&down_key()));
+        assert_eq!(overlay.result(), ConfirmResult::Quit);
     }
 
     #[test]
-    fn confirm_quit_navigate() {
+    fn confirm_quit_enter_returns_false() {
         let mut overlay = ConfirmQuit::new();
-        assert_eq!(overlay.result(), ConfirmResult::Confirm); // starts on save+quit
-
-        overlay.handle_key(&down_key());
-        assert_eq!(overlay.result(), ConfirmResult::Quit); // quit without save
-
-        overlay.handle_key(&down_key());
-        assert_eq!(overlay.result(), ConfirmResult::Cancel); // cancel
-
-        overlay.handle_key(&up_key());
-        assert_eq!(overlay.result(), ConfirmResult::Quit); // quit without save
-
-        overlay.handle_key(&up_key());
-        assert_eq!(overlay.result(), ConfirmResult::Confirm); // back to save+quit
+        assert!(!overlay.handle_key(&enter_key()));
+        assert_eq!(overlay.result(), ConfirmResult::Confirm);
     }
 
     #[test]
-    fn confirm_quit_unconsumed_key() {
+    fn confirm_quit_unknown_returns_false() {
         let mut overlay = ConfirmQuit::new();
-        // 'x' is not a recognized key — ignored, selection stays on first option
-        assert!(!overlay.handle_key(&char_key('x')));
+        assert!(!overlay.handle_key(&char_key('z')));
         assert_eq!(overlay.result(), ConfirmResult::Confirm);
     }
 
     // ── ConfirmOverwrite ────────────────────────────────────────────────
 
     #[test]
-    fn confirm_overwrite_overwrite() {
+    fn confirm_overwrite_esc_returns_false() {
         let mut overlay = ConfirmOverwrite::new();
-        overlay.handle_key(&char_key('o'));
+        assert!(!overlay.handle_key(&esc_key()));
+        assert_eq!(overlay.result(), ConfirmResult::Cancel);
+    }
+
+    #[test]
+    fn confirm_overwrite_ctrlc_returns_false() {
+        let mut overlay = ConfirmOverwrite::new();
+        assert!(!overlay.handle_key(&ctrl_c_key()));
+        assert_eq!(overlay.result(), ConfirmResult::Cancel);
+    }
+
+    #[test]
+    fn confirm_overwrite_o_returns_true() {
+        let mut overlay = ConfirmOverwrite::new();
+        assert!(overlay.handle_key(&char_key('o')));
         assert_eq!(overlay.result(), ConfirmResult::Confirm);
     }
 
     #[test]
-    fn confirm_overwrite_reload() {
+    fn confirm_overwrite_r_returns_true() {
         let mut overlay = ConfirmOverwrite::new();
-        overlay.handle_key(&char_key('r'));
+        assert!(overlay.handle_key(&char_key('r')));
         assert_eq!(overlay.result(), ConfirmResult::Reload);
     }
 
     #[test]
-    fn confirm_overwrite_cancel_esc() {
+    fn confirm_overwrite_up_navigates() {
         let mut overlay = ConfirmOverwrite::new();
-        overlay.handle_key(&esc_key());
-        assert_eq!(overlay.result(), ConfirmResult::Cancel);
+        assert!(!overlay.handle_key(&esc_key()));
+
+        assert!(overlay.handle_key(&up_key()));
+        assert_eq!(overlay.result(), ConfirmResult::Reload);
     }
 
     #[test]
-    fn confirm_overwrite_cancel_ctrl_c() {
+    fn confirm_overwrite_down_navigates() {
         let mut overlay = ConfirmOverwrite::new();
-        overlay.handle_key(&ctrl_c_key());
-        assert_eq!(overlay.result(), ConfirmResult::Cancel);
+
+        assert!(overlay.handle_key(&down_key()));
+        assert_eq!(overlay.result(), ConfirmResult::Reload);
     }
 
     #[test]
-    fn confirm_overwrite_navigate() {
+    fn confirm_overwrite_enter_returns_false() {
         let mut overlay = ConfirmOverwrite::new();
-        assert_eq!(overlay.result(), ConfirmResult::Confirm); // starts on overwrite
-
-        overlay.handle_key(&down_key());
-        assert_eq!(overlay.result(), ConfirmResult::Reload); // reload
-
-        overlay.handle_key(&down_key());
-        assert_eq!(overlay.result(), ConfirmResult::Cancel); // cancel
-
-        overlay.handle_key(&up_key());
-        assert_eq!(overlay.result(), ConfirmResult::Reload); // reload
+        assert!(!overlay.handle_key(&enter_key()));
+        assert_eq!(overlay.result(), ConfirmResult::Confirm);
     }
 
     #[test]
-    fn confirm_overwrite_unconsumed_key() {
+    fn confirm_overwrite_unknown_returns_false() {
         let mut overlay = ConfirmOverwrite::new();
-        assert!(!overlay.handle_key(&char_key('x')));
+        assert!(!overlay.handle_key(&char_key('z')));
         assert_eq!(overlay.result(), ConfirmResult::Confirm);
     }
 
