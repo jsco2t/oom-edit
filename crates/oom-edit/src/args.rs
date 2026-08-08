@@ -42,8 +42,20 @@ impl Args {
         let mut args = Args::default();
         let mut it = iter.into_iter().skip(1);
         let mut positional_count: u8 = 0;
+        let mut positionals_only = false;
 
         while let Some(arg) = it.next() {
+            if positionals_only {
+                positional_count += 1;
+                if positional_count > 1 {
+                    return Err(usage(
+                        "unexpected argument (only one positional path allowed)",
+                    ));
+                }
+                args.path = Some(PathBuf::from(arg));
+                continue;
+            }
+
             // Split `--flag=value` into (`--flag`, Some("value")).
             let (flag, inline) = match arg.split_once('=') {
                 Some((f, v)) => (f.to_string(), Some(v.to_string())),
@@ -60,6 +72,10 @@ impl Args {
                 "--panic-test" => {
                     reject_inline(&flag, inline.as_deref())?;
                     args.panic_test = true;
+                }
+                "--" => {
+                    reject_inline(&flag, inline.as_deref())?;
+                    positionals_only = true;
                 }
                 other if other.starts_with('-') => {
                     return Err(usage(&format!("unknown flag '{other}'")));
@@ -116,7 +132,7 @@ fn help_text() -> String {
 oom-edit — a console/TUI markdown editor with Vim-style modal editing
 
 USAGE:
-    oom-edit [OPTIONS] [path]
+    oom-edit [OPTIONS] [--] [path]
 
 OPTIONS:
     --theme NAME        Theme name (built-in: default-dark)
@@ -223,10 +239,59 @@ mod tests {
     }
 
     #[test]
+    fn double_dash_then_dash_file() {
+        let a = run_args(&["--", "-notes.md"]);
+        assert_eq!(a.path, Some(PathBuf::from("-notes.md")));
+    }
+
+    #[test]
+    fn double_dash_then_normal_file() {
+        let a = run_args(&["--", "file.md"]);
+        assert_eq!(a.path, Some(PathBuf::from("file.md")));
+    }
+
+    #[test]
+    fn double_dash_no_args_after() {
+        let a = run_args(&["--"]);
+        assert!(a.path.is_none());
+    }
+
+    #[test]
+    fn double_dash_takes_no_inline_value() {
+        let err = parse(&["--=notes.md"]).expect_err("separator takes no value");
+        assert!(err.contains("takes no value"));
+    }
+
+    #[test]
+    fn double_dash_multiple_positional_rejected() {
+        let err = parse(&["--", "a.md", "b.md"]).expect_err("multiple positional");
+        assert!(err.contains("unexpected argument"));
+    }
+
+    #[test]
+    fn double_dash_preserves_positional_count() {
+        let err = parse(&["a.md", "--", "-b.md"]).expect_err("multiple positional");
+        assert!(err.contains("unexpected argument"));
+    }
+
+    #[test]
+    fn dash_file_without_double_dash_rejected() {
+        let err = parse(&["-notes.md"]).expect_err("dash file");
+        assert!(err.contains("unknown flag"));
+    }
+
+    #[test]
+    fn double_dash_then_help_is_a_filename() {
+        let a = run_args(&["--", "--help"]);
+        assert_eq!(a.path, Some(PathBuf::from("--help")));
+    }
+
+    #[test]
     fn help_text_contains_usage() {
         match parse(&["--help"]).unwrap() {
             ParseOutcome::Message(m) => {
                 assert!(m.contains("USAGE:"));
+                assert!(m.contains("oom-edit [OPTIONS] [--] [path]"));
                 assert!(m.contains("oom-edit"));
             }
             other => panic!("expected help message, got {other:?}"),
