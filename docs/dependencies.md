@@ -32,13 +32,16 @@ All direct dependencies of `oom-edit-core`, with license, rationale, and hand-ro
 | `hjkl-buffer` | `0.39.0` (local fork) | MIT | Exposes the current undo node's stable sequence through one read-only accessor. Dirty tracking cannot derive this identity from undo depth, while serializing the full undo tree on each history key violates the editor latency budget. | `patches/hjkl-buffer/` + `[patch.crates-io]` in root `Cargo.toml` |
 | `tree-sitter-md` | `0.5.3` (local fork) | MIT | Replaces two unsafe `isdigit` calls in the Markdown external scanner with explicit ASCII digit checks. `TSLexer::lookahead` is a full Unicode code point, while C character-classification functions only accept `EOF` or values representable as `unsigned char`; glibc can segfault on valid high Unicode input. | `patches/tree-sitter-md/` + `[patch.crates-io]` in root `Cargo.toml` |
 
-The `hjkl-buffer` patch adds no dependency or runtime behavior and retains the
-upstream crate verbatim apart from the accessor. The pinned upstream release is
-actively integrated through the existing `hjkl` family and conformance suite;
-the local diff was reviewed as a single mutex-protected read-only accessor. Hand-rolling an
-undo-state mirror in oom-edit was rejected because it would duplicate branching
-and pruning semantics and could silently diverge from the engine. The license
-and transitive dependency tree are unchanged.
+The `hjkl-buffer` patch does not change the dependency graph or existing engine
+behavior, but it does add one public read-only API. oom-edit calls that API when
+it records or re-evaluates a save point, paying one mutex-protected O(1) read of
+the current undo node's sequence number. The pinned upstream release is actively
+integrated through the existing `hjkl` family and conformance suite, and the
+local diff was reviewed as that single accessor. Hand-rolling an undo-state
+mirror in oom-edit was rejected because it would duplicate branching and
+pruning semantics and could silently diverge from the engine. Version 0.41.2,
+the latest release checked on 2026-08-07, still does not expose an equivalent
+public O(1) accessor. The license and transitive dependency tree are unchanged.
 
 The `tree-sitter-md` patch changes only the ordered-list scanner's two digit
 checks. An explicit `'0'..='9'` comparison preserves CommonMark's ASCII marker
@@ -47,6 +50,17 @@ editor input or the property-test generator was rejected because the scanner
 bug is reachable with valid Markdown in production. The pinned release and
 current upstream source both contain the unsafe calls, so no released upgrade
 is available. The license and transitive dependency tree are unchanged.
+
+Both forks replace crates.io packages through `[patch.crates-io]`; they are
+maintained source inputs, not generated `vendor/` entries. Consequently,
+`make vendor` intentionally omits `vendor/hjkl-buffer` and
+`vendor/tree-sitter-md`. Their exact upstream provenance, reviewed deltas,
+removal criteria, and update procedure are recorded in the
+[patch maintenance record](../patches/README.md). These patches do not add new
+third-party packages, so their popularity baseline is the one already accepted
+for the pinned dependencies; the patch review instead covers upstream activity,
+license continuity, the complete local diff, and whether the change can be
+implemented safely within oom-edit.
 
 ## Tree-sitter ABI note
 
