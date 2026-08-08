@@ -2610,6 +2610,12 @@ mod tests {
     }
 
     #[test]
+    fn no_panic_ordered_list_marker_followed_by_high_unicode() {
+        let h = Highlighter::new("# é\n1\u{80000}\n");
+        let _ = h.highlight_lines(0..2);
+    }
+
+    #[test]
     fn no_panic_mixed_frontmatter_and_fences() {
         let h = Highlighter::new(
             "---\ntitle: Test\n---\n\n\
