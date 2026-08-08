@@ -73,11 +73,66 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use hjkl_buffer::{ContentEdit, View};
-use hjkl_engine::types::{DefaultHost, Options};
+use hjkl_engine::types::{CursorShape, DefaultHost, Host, Options, Viewport};
 use hjkl_engine::{Editor, PlannedInput, SpecialKey, VimMode as HjklVimMode};
+use hjkl_vim::vim::{Operator as HjklOperator, Pending as HjklPending, VimState as HjklVimState};
 use hjkl_vim::{feed_input, install_vim_discipline, VimEditorExt};
 
 // ── vim.rs internal types ──────────────────────────────────────────────────
+
+/// Host adapter that exposes engine clipboard writes as drainable events.
+struct ClipboardCapturingHost {
+    inner: DefaultHost,
+    pending_writes: Vec<String>,
+}
+
+impl ClipboardCapturingHost {
+    fn new() -> Self {
+        Self {
+            inner: DefaultHost::new(),
+            pending_writes: Vec::new(),
+        }
+    }
+
+    fn take_clipboard_writes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_writes)
+    }
+}
+
+impl Host for ClipboardCapturingHost {
+    type Intent = ();
+
+    fn write_clipboard(&mut self, text: String) {
+        self.inner.write_clipboard(text.clone());
+        self.pending_writes.push(text);
+    }
+
+    fn read_clipboard(&mut self) -> Option<String> {
+        self.inner.read_clipboard()
+    }
+
+    fn now(&self) -> core::time::Duration {
+        self.inner.now()
+    }
+
+    fn prompt_search(&mut self) -> Option<String> {
+        self.inner.prompt_search()
+    }
+
+    fn emit_cursor_shape(&mut self, shape: CursorShape) {
+        self.inner.emit_cursor_shape(shape);
+    }
+
+    fn viewport(&self) -> &Viewport {
+        self.inner.viewport()
+    }
+
+    fn viewport_mut(&mut self) -> &mut Viewport {
+        self.inner.viewport_mut()
+    }
+
+    fn emit_intent(&mut self, _intent: Self::Intent) {}
+}
 
 /// Effects emitted by `VimCore::handle_key`. Translated from hjkl state
 /// changes into a form the session layer can act on.
@@ -218,7 +273,7 @@ pub struct KeyInput {
 /// types.
 pub(crate) struct VimCore {
     /// The hjkl editor instance.
-    editor: Editor<hjkl_buffer::View, DefaultHost>,
+    editor: Editor<hjkl_buffer::View, ClipboardCapturingHost>,
     /// The current oom-edit mode, derived from hjkl state.
     mode: Mode,
     /// The last saved undo mark (for dirty tracking).
@@ -237,7 +292,7 @@ impl VimCore {
     /// Create a new `VimCore` from initial text. Starts in Normal mode.
     pub(crate) fn new(text: &str) -> Self {
         let view = View::from_str(text);
-        let mut editor = Editor::new(view, DefaultHost::new(), Options::default());
+        let mut editor = Editor::new(view, ClipboardCapturingHost::new(), Options::default());
         install_vim_discipline(&mut editor);
         let save_point_dirty_gen = editor.buffer().dirty_gen();
         let save_point_undo_seq = editor.buffer().current_undo_seq();
@@ -268,6 +323,11 @@ impl VimCore {
             return self.handle_command_mode_key(hjkl_input, key);
         }
 
+        let system_register_selected = self.system_clipboard_register_selected();
+        let system_yank_pending = system_register_selected && self.yank_operator_pending();
+        let system_yank_step =
+            system_register_selected && (system_yank_pending || Self::is_yank_key(key));
+
         let history_traversal = self.is_history_traversal_key(key);
         let undo_seq_before = history_traversal.then(|| self.editor.buffer().current_undo_seq());
         let next_history_prefix = self.mode == Mode::Normal
@@ -276,10 +336,19 @@ impl VimCore {
             && key.mods == Modifiers::default();
 
         // Feed the key through hjkl
-        let consumed = feed_input(&mut self.editor, hjkl_input);
+        let consumed = if self.is_visual_register_prefix(key) {
+            // hjkl handles a pending register selector in every visual mode,
+            // but only opens the `"{register}` chord from Normal mode. Seed
+            // that same pending state here so Visual yanks can target `+`/`*`.
+            self.hjkl_state_mut().pending = HjklPending::SelectRegister;
+            true
+        } else {
+            feed_input(&mut self.editor, hjkl_input)
+        };
 
         if !consumed {
             self.history_prefix_pending = false;
+            self.editor.host_mut().take_clipboard_writes();
             // Key not consumed — could be a bell (unbound key in Normal)
             return vec![VimEffect::Bell];
         }
@@ -311,7 +380,93 @@ impl VimCore {
             effects.push(VimEffect::CursorMoved);
         }
 
+        let writes = self.editor.host_mut().take_clipboard_writes();
+        if system_yank_pending
+            && writes.is_empty()
+            && !self.yank_operator_pending()
+            && self.editor.search_prompt_state().is_none()
+        {
+            self.hjkl_state_mut().pending_register = None;
+        }
+        effects.extend(self.clipboard_effects(writes, system_yank_step));
+
         effects
+    }
+
+    fn clipboard_effects(&self, writes: Vec<String>, system_yank_step: bool) -> Vec<VimEffect> {
+        if !system_yank_step || writes.is_empty() {
+            return Vec::new();
+        }
+
+        let clipboard_text = self
+            .editor
+            .with_registers(|registers| registers.read('+').map(|slot| slot.text.clone()));
+
+        writes
+            .into_iter()
+            .filter(|text| clipboard_text.as_ref() == Some(text))
+            .map(VimEffect::ClipboardYank)
+            .collect()
+    }
+
+    fn hjkl_state(&self) -> &HjklVimState {
+        self.editor
+            .discipline()
+            .as_any()
+            .downcast_ref::<HjklVimState>()
+            .expect("vim discipline must remain installed")
+    }
+
+    fn hjkl_state_mut(&mut self) -> &mut HjklVimState {
+        self.editor
+            .discipline_mut()
+            .as_any_mut()
+            .downcast_mut::<HjklVimState>()
+            .expect("vim discipline must remain installed")
+    }
+
+    fn system_clipboard_register_selected(&self) -> bool {
+        matches!(self.hjkl_state().pending_register, Some('+') | Some('*'))
+    }
+
+    fn is_yank_key(key: KeyInput) -> bool {
+        match key.code.kind {
+            KeyCodeKind::Char('y') => key.mods == Modifiers::default(),
+            KeyCodeKind::Char('Y') => !key.mods.ctrl && !key.mods.alt,
+            _ => false,
+        }
+    }
+
+    fn is_visual_register_prefix(&self, key: KeyInput) -> bool {
+        matches!(
+            self.mode,
+            Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+        ) && self.hjkl_state().pending == HjklPending::None
+            && matches!(key.code.kind, KeyCodeKind::Char('"'))
+            && key.mods == Modifiers::default()
+    }
+
+    fn yank_operator_pending(&self) -> bool {
+        if self
+            .editor
+            .search_prompt_state()
+            .and_then(|prompt| prompt.operator.as_ref())
+            .is_some_and(|(op, _, _)| *op == HjklOperator::Yank)
+        {
+            return true;
+        }
+
+        match &self.hjkl_state().pending {
+            HjklPending::Op { op, .. }
+            | HjklPending::OpTextObj { op, .. }
+            | HjklPending::OpG { op, .. }
+            | HjklPending::OpFind { op, .. }
+            | HjklPending::OpSquareBracketOpen { op, .. }
+            | HjklPending::OpSquareBracketClose { op, .. }
+            | HjklPending::OpSneakFirst { op, .. }
+            | HjklPending::OpSneakSecond { op, .. } => *op == HjklOperator::Yank,
+            _ => false,
+        }
     }
 
     /// Return the current mode.
@@ -788,6 +943,131 @@ mod dirty_tracking_tests {
                 ..Modifiers::default()
             },
         }
+    }
+
+    fn shift_key(ch: char) -> KeyInput {
+        KeyInput {
+            code: KeyCode {
+                kind: KeyCodeKind::Char(ch),
+            },
+            mods: Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            },
+        }
+    }
+
+    fn special_key(kind: KeyCodeKind) -> KeyInput {
+        KeyInput {
+            code: KeyCode { kind },
+            mods: Modifiers::default(),
+        }
+    }
+
+    fn feed(vim: &mut VimCore, keys: &str) -> Vec<VimEffect> {
+        keys.chars()
+            .flat_map(|ch| vim.handle_key(key(ch)))
+            .collect()
+    }
+
+    fn clipboard_writes(effects: Vec<VimEffect>) -> Vec<String> {
+        effects
+            .into_iter()
+            .filter_map(|effect| match effect {
+                VimEffect::ClipboardYank(text) => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn system_clipboard_yank_emits_exact_payload_once_and_drains() {
+        let mut vim = VimCore::new("hello\nworld");
+
+        assert_eq!(clipboard_writes(feed(&mut vim, "\"+yy")), ["hello\n"]);
+
+        let next_effects = vim.handle_key(key('l'));
+        assert!(!next_effects
+            .iter()
+            .any(|effect| matches!(effect, VimEffect::ClipboardYank(_))));
+
+        assert_eq!(clipboard_writes(feed(&mut vim, "\"+yy")), ["hello\n"]);
+    }
+
+    #[test]
+    fn counted_and_uppercase_system_yanks_emit_exact_payloads() {
+        let mut counted = VimCore::new("hello\nworld\nthird");
+        assert_eq!(
+            clipboard_writes(feed(&mut counted, "\"+2yy")),
+            ["hello\nworld\n"]
+        );
+
+        let mut uppercase = VimCore::new("hello\nworld\nthird");
+        assert!(clipboard_writes(feed(&mut uppercase, "\"+")).is_empty());
+
+        assert_eq!(
+            clipboard_writes(uppercase.handle_key(shift_key('Y'))),
+            ["hello"]
+        );
+    }
+
+    #[test]
+    fn operator_motion_and_visual_system_yanks_emit_exact_payloads() {
+        let mut operator_motion = VimCore::new("hello world");
+        assert_eq!(
+            clipboard_writes(feed(&mut operator_motion, "\"+yw")),
+            ["hello "]
+        );
+
+        let mut visual = VimCore::new("hello world");
+        assert!(clipboard_writes(feed(&mut visual, "v6l\"+")).is_empty());
+        assert_eq!(clipboard_writes(visual.handle_key(key('y'))), ["hello w"]);
+    }
+
+    #[test]
+    fn non_system_yanks_deletes_and_changes_do_not_emit_clipboard_effects() {
+        for keys in ["yy", "dd", "x", "cw", "\"_yy"] {
+            let mut vim = VimCore::new("hello world\nsecond line");
+
+            let effects = feed(&mut vim, keys);
+
+            assert!(
+                !effects
+                    .iter()
+                    .any(|effect| matches!(effect, VimEffect::ClipboardYank(_))),
+                "{keys:?} unexpectedly emitted a system clipboard write"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_system_yank_does_not_arm_a_later_ordinary_yank() {
+        let mut vim = VimCore::new("hello\nworld");
+        assert_eq!(clipboard_writes(feed(&mut vim, "\"+yy")), ["hello\n"]);
+
+        assert!(clipboard_writes(feed(&mut vim, "\"+yz")).is_empty());
+        assert!(clipboard_writes(feed(&mut vim, "yy")).is_empty());
+    }
+
+    #[test]
+    fn system_clipboard_search_yank_emits_exact_payload() {
+        let mut vim = VimCore::new("hello world\nsecond world");
+        assert!(clipboard_writes(feed(&mut vim, "\"+y/world")).is_empty());
+
+        let effects = vim.handle_key(special_key(KeyCodeKind::Enter));
+
+        assert_eq!(clipboard_writes(effects), ["hello "]);
+    }
+
+    #[test]
+    fn canceled_system_clipboard_search_does_not_arm_ordinary_yank() {
+        let mut vim = VimCore::new("hello world\nsecond world");
+        assert!(clipboard_writes(feed(&mut vim, "\"+y/world")).is_empty());
+
+        let cancel_effects = vim.handle_key(special_key(KeyCodeKind::Esc));
+
+        assert!(clipboard_writes(cancel_effects).is_empty());
+        assert!(clipboard_writes(feed(&mut vim, "yy")).is_empty());
     }
 
     #[test]

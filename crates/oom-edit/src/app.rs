@@ -933,11 +933,12 @@ impl App {
                         format!("Clipboard error: {e}"),
                         oom_edit_core::session::Severity::Warning,
                     );
+                } else {
+                    self.set_transient(
+                        "yanked to register".to_string(),
+                        oom_edit_core::session::Severity::Info,
+                    );
                 }
-                self.set_transient(
-                    "yanked to register".to_string(),
-                    oom_edit_core::session::Severity::Info,
-                );
             }
             Effect::ModeChanged(_) => {
                 // No action needed; render reads live state.
@@ -1226,7 +1227,15 @@ fn render_tab_bar(
 mod tests {
     use super::*;
     use crossterm::event::{MediaKeyCode, ModifierKeyCode};
-    use oom_edit_core::clipboard::RecordingClipboardSink;
+    use oom_edit_core::clipboard::{ClipboardError, ClipboardSink, RecordingClipboardSink};
+
+    struct FailingClipboardSink;
+
+    impl ClipboardSink for FailingClipboardSink {
+        fn copy(&mut self, _text: &str) -> Result<(), ClipboardError> {
+            Err(ClipboardError::NotSupported)
+        }
+    }
 
     /// Create a test App with a recording clipboard sink.
     fn test_app(session: EditorSession) -> App {
@@ -1236,6 +1245,13 @@ mod tests {
             Tier::TrueColor,
             Box::new(RecordingClipboardSink::default()),
         )
+    }
+
+    fn yank_current_line_to_system_clipboard(app: &mut App) {
+        for ch in ['"', '+', 'y', 'y'] {
+            let key = KeyEvent::new(CrosstermKeyCode::Char(ch), KeyModifiers::NONE);
+            app.handle_event(&Event::Key(key));
+        }
     }
 
     fn test_app_with_tabs(tab_count: usize) -> App {
@@ -1317,6 +1333,41 @@ mod tests {
         let key = KeyEvent::new(CrosstermKeyCode::F(5), KeyModifiers::NONE);
         let core = crossterm_key_to_core(&key);
         assert_eq!(core.code.kind, KeyCodeKind::F(5));
+    }
+
+    #[test]
+    fn clipboard_error_preserves_error_transient() {
+        let mut app = App::new(
+            EditorSession::from_text("hello\n"),
+            "default-dark".to_string(),
+            Tier::TrueColor,
+            Box::new(FailingClipboardSink),
+        );
+
+        yank_current_line_to_system_clipboard(&mut app);
+
+        let transient = app.transient.as_ref().expect("transient should be set");
+        assert!(
+            transient.text.contains("Clipboard error"),
+            "expected clipboard error message, got: {}",
+            transient.text
+        );
+        assert!(!transient.text.contains("yanked to register"));
+        assert_eq!(
+            transient.severity,
+            oom_edit_core::session::Severity::Warning
+        );
+    }
+
+    #[test]
+    fn clipboard_success_sets_success_transient() {
+        let mut app = test_app(EditorSession::from_text("hello\n"));
+
+        yank_current_line_to_system_clipboard(&mut app);
+
+        let transient = app.transient.as_ref().expect("transient should be set");
+        assert_eq!(transient.text, "yanked to register");
+        assert_eq!(transient.severity, oom_edit_core::session::Severity::Info);
     }
 
     /// App: typing 'i' enters Insert mode.
