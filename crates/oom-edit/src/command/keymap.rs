@@ -199,7 +199,7 @@ impl Keymap {
             // Does `ev` complete a Space-chord?
             for ([space, second], cmd, cctx) in &self.chords {
                 // First element must be Space; check context overlap.
-                if cctx.contains(ctx) && key_event_eq(second, ev) && render_key(space) == "Space" {
+                if cctx.contains(ctx) && key_event_eq(second, ev) && is_space_key(space) {
                     pending.reset();
                     return Resolution::Command(*cmd);
                 }
@@ -217,7 +217,7 @@ impl Keymap {
         }
 
         // Check if this key starts a chord (Space in NORMAL/VIEW).
-        let is_space = render_key(ev) == "Space";
+        let is_space = is_space_key(ev);
         let in_chord_context = ctx.contains(Contexts::NORMAL) || ctx.contains(Contexts::VIEW);
 
         if is_space && in_chord_context {
@@ -228,7 +228,7 @@ impl Keymap {
             let conts: Vec<(KeyInput, &CommandSpec)> = self
                 .chords
                 .iter()
-                .filter(|([k1, _], _, cctx)| render_key(k1) == "Space" && cctx.contains(ctx))
+                .filter(|([k1, _], _, cctx)| is_space_key(k1) && cctx.contains(ctx))
                 .map(|([_, k2], cmd, _)| {
                     (
                         *k2,
@@ -249,7 +249,7 @@ impl Keymap {
     pub fn continuations_for(&self, ctx: Contexts) -> Vec<(KeyInput, &'static CommandSpec)> {
         self.chords
             .iter()
-            .filter(|([k1, _], _, cctx)| render_key(k1) == "Space" && cctx.contains(ctx))
+            .filter(|([k1, _], _, cctx)| is_space_key(k1) && cctx.contains(ctx))
             .map(|([_, k2], cmd, _)| {
                 (
                     *k2,
@@ -263,6 +263,14 @@ impl Keymap {
 /// Compare two key events for dispatch.
 fn key_event_eq(a: &KeyInput, b: &KeyInput) -> bool {
     a.code.kind == b.code.kind && a.mods == b.mods
+}
+
+/// Check whether a key input is an unmodified Space press.
+fn is_space_key(key: &KeyInput) -> bool {
+    matches!(key.code.kind, KeyCodeKind::Char(' '))
+        && !key.mods.ctrl
+        && !key.mods.alt
+        && !key.mods.shift
 }
 
 /// Render a key for display.
@@ -294,6 +302,46 @@ fn render_key(key: &KeyInput) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oom_edit_core::session::Modifiers;
+
+    #[test]
+    fn test_is_space_key_positive() {
+        assert!(is_space_key(&ch(' ')));
+    }
+
+    #[test]
+    fn test_is_space_key_negative() {
+        for kind in [KeyCodeKind::Char('a'), KeyCodeKind::Esc, KeyCodeKind::Enter] {
+            let key = KeyInput {
+                code: KeyCode { kind },
+                mods: Modifiers::default(),
+            };
+            assert!(!is_space_key(&key));
+        }
+
+        for mods in [
+            Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            },
+            Modifiers {
+                alt: true,
+                ..Modifiers::default()
+            },
+            Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            },
+        ] {
+            let key = KeyInput {
+                code: KeyCode {
+                    kind: KeyCodeKind::Char(' '),
+                },
+                mods,
+            };
+            assert!(!is_space_key(&key));
+        }
+    }
 
     #[test]
     fn f1_resolves_help() {
@@ -367,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn space_t_resolves_cycle_theme() {
+    fn test_space_chord_resolves_with_new_helper() {
         let km = Keymap::default();
         let mut pending = PendingChord::default();
         let space = ch(' ');
@@ -377,6 +425,56 @@ mod tests {
         match km.resolve(Contexts::NORMAL, &t, &mut pending) {
             Resolution::Command(Command::CycleTheme) => {}
             other => panic!("Space+t should resolve CycleTheme, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn modified_space_does_not_start_or_satisfy_space_chord() {
+        for mods in [
+            Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            },
+            Modifiers {
+                alt: true,
+                ..Modifiers::default()
+            },
+            Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            },
+        ] {
+            let modified_space = KeyInput {
+                code: KeyCode {
+                    kind: KeyCodeKind::Char(' '),
+                },
+                mods,
+            };
+
+            let km = Keymap::default();
+            let mut pending = PendingChord::default();
+            assert!(matches!(
+                km.resolve(Contexts::NORMAL, &modified_space, &mut pending),
+                Resolution::None
+            ));
+            assert!(pending.since.is_none());
+
+            let km = Keymap {
+                single: Vec::new(),
+                chords: vec![(
+                    [modified_space, ch('t')],
+                    Command::CycleTheme,
+                    Contexts::NORMAL,
+                )],
+            };
+            let mut pending = PendingChord {
+                since: Some(Instant::now()),
+            };
+            assert!(matches!(
+                km.resolve(Contexts::NORMAL, &ch('t'), &mut pending),
+                Resolution::None
+            ));
+            assert!(pending.since.is_none());
         }
     }
 
