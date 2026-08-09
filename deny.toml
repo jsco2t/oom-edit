@@ -4,7 +4,7 @@
 # rules — non-negotiable"): permissive licenses only, no copyleft, no banned
 # crates, no unmaintained crates, no advisories.
 #
-# Run with: cargo deny check
+# Run with: make deny
 
 [graph]
 all-features = false
@@ -27,6 +27,7 @@ feature-depth = 1
 [licenses]
 version = 2
 confidence-threshold = 0.93
+unused-allowed-license = "deny"
 allow = [
     "MIT",
     "Apache-2.0",
@@ -35,20 +36,16 @@ allow = [
     "BSD-3-Clause",
     "ISC",
     "Zlib",
-    "Unicode-DFS-2016",
     "Unicode-3.0",
     "Unlicense",
-    "CC0-1.0",
 ]
 
 # ---------------------------------------------------------------------------
 # Bans — specific crates forbidden by policy.
 # ---------------------------------------------------------------------------
 [bans]
-multiple-versions = "warn"
-# Workspace members are path dependencies (no version constraint);
-# cargo-deny treats them as wildcards — use warn instead of deny.
-wildcards = "warn"
+multiple-versions = "deny"
+wildcards = "deny"
 highlight = "all"
 workspace-default-features = "allow"
 external-default-features = "allow"
@@ -58,7 +55,15 @@ deny = [
     { name = "git2",        reason = "GPL-2.0 with linking exception; not on the permissive-only allowlist" },
     { name = "libgit2-sys", reason = "GPL-2.0 with linking exception; not on the permissive-only allowlist" },
 ]
-skip = []
+skip = [
+    { crate = "foldhash@0.1.5", reason = "gray_matter -> yaml-rust2 -> hashlink -> hashbrown 0.15 requires foldhash 0.1; remove when that YAML stack adopts hashbrown 0.16+" },
+    { crate = "hashbrown@0.15.5", reason = "gray_matter -> yaml-rust2 -> hashlink requires hashbrown 0.15; remove when hashlink adopts a newer hashbrown line" },
+    { crate = "hashbrown@0.16.1", reason = "ratatui -> ratatui-core -> kasuari requires hashbrown 0.16; remove when kasuari adopts hashbrown 0.17+" },
+    { crate = "syn@2.0.119", reason = "Ratatui and current thiserror/tracing derive stacks require syn 2 while serde_derive requires syn 3; remove when those proc-macro owners converge on syn 3" },
+    { crate = "toml@0.9.12+spec-1.1.0", reason = "gray_matter requires toml 0.9 while oom-edit and hjkl require toml 1.1; remove when gray_matter adopts toml 1.x" },
+    { crate = "toml_datetime@0.7.5+spec-1.1.0", reason = "gray_matter -> toml 0.9 requires toml_datetime 0.7; remove when gray_matter adopts toml 1.x" },
+    { crate = "winnow@0.7.15", reason = "gray_matter -> toml 0.9 requires winnow 0.7 while toml 1.1 requires winnow 1.0; remove when gray_matter adopts toml 1.x" },
+]
 skip-tree = []
 
 # ---------------------------------------------------------------------------

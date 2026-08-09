@@ -1,6 +1,7 @@
 # Dependencies
 
-All direct dependencies of `oom-edit-core`, with license, rationale, and hand-roll assessment.
+This document records direct `oom-edit-core` dependencies, reviewed workspace dependency
+changes, and transitive exceptions, including license, rationale, and hand-roll assessment.
 
 ## Runtime dependencies
 
@@ -66,7 +67,59 @@ implemented safely within oom-edit.
 
 `tree-sitter-toml` (v0.20.0) depended on `tree-sitter = "0.20"`, which is ABI-incompatible with the `tree-sitter = "0.26"` used by all other grammar crates. This caused a dual-version conflict where `tree_sitter::Language` types from different versions were incompatible. The fix was to replace `tree-sitter-toml` with `tree-sitter-toml-ng` (v0.7.0), which uses `tree-sitter-language` (version-independent) like the other grammar crates.
 
+## Crossterm 0.29 dependency review
+
+The TUI's direct Crossterm pin was aligned from `=0.28.1` to `=0.29.0`, the version already
+selected by Ratatui 0.30.2's Crossterm backend. This adds no package to the resolved graph.
+
+- **License:** MIT in both releases; the vendored license text is unchanged and remains on
+  the cargo-deny allowlist.
+- **Maintenance signal:** as checked on 2026-08-09, the upstream
+  [crossterm-rs/crossterm](https://github.com/crossterm-rs/crossterm) repository is not
+  archived and was last pushed on 2026-08-08.
+- **Popularity baseline:** as checked on 2026-08-09, the upstream repository has 4,176 stars
+  and 402 forks. Crossterm 0.29 is also Ratatui 0.30.2's selected backend, so this change
+  consolidates on the version already exercised by the workspace's renderer.
+- **Vendored diff review:** 0.29 retains the Rust 1.63 minimum, MIT license, event, Windows,
+  and bracketed-paste features used by oom-edit. Its relevant changes add event helpers and
+  move the Unix backend from Rustix 0.38 to Rustix 1; the only listed breaking change affects
+  `KeyModifiers` display formatting, while oom-edit matches typed key modifiers rather than
+  parsing that display text. Both Crossterm releases were already vendored before this
+  consolidation, so `make vendor` changes no retained third-party source: it only deletes
+  packages that became unreachable and normalizes unambiguous lockfile references.
+- **Hand-roll assessment:** rejected. Reimplementing cross-platform raw mode, alternate-screen
+  control, key/mouse/resize decoding, bracketed paste, and terminal restoration would replace
+  a mature library with a large OS- and terminal-specific safety surface. It would also
+  duplicate the backend Ratatui already selects.
+
+The three primary obsolete vendored lineages removed are `crossterm 0.28.1`, `rustix
+0.38.44`, and `linux-raw-sys 0.4.15`. Removing Rustix 0.38 also makes its off-target Windows
+support branch unreachable: `windows-sys 0.59.0`, `windows-targets 0.52.6`, and the eight
+0.52.6 architecture packages. No retained vendored file changes, and no new package or local
+fork is introduced.
+
 ## Transitive dependency risks
 
 - **`hjkl` ecosystem**: `hjkl-engine` → `hjkl-bonsai` → `hjkl-xdg` → `dirs` → `dirs-sys` (patched). The `hjkl` crates are pinned pre-1.0 and fast-moving.
-- **Duplicate transitive versions**: `crossterm`, `hashbrown`, `rustix`, `syn`, `toml`, `toml_datetime`, `winnow` each have 2-3 versions in the dependency graph due to feature flags in transitive dependencies. This is expected and harmless but increases binary size.
+
+### Duplicate lineages eliminated
+
+- Direct `crossterm 0.28.1` was aligned with Ratatui's `crossterm 0.29.0` backend.
+- The old Crossterm branch's `rustix 0.38.44` and `linux-raw-sys 0.4.15` dependencies were
+  removed with it. Their exclusive Windows support packages were pruned as described above.
+
+### Temporarily accepted duplicate lineages
+
+`deny.toml` contains exact exceptions for the older side of each incompatible upstream
+requirement. `make deny` uses `-D warnings`, so an exception that becomes stale fails the gate
+and must be removed rather than silently accumulating.
+
+| Exact exception | Upstream owner and reason Cargo cannot unify it | Removal condition |
+| --- | --- | --- |
+| `foldhash 0.1.5` | `gray_matter -> yaml-rust2 -> hashlink -> hashbrown 0.15` requires foldhash 0.1, while current hashbrown lines use foldhash 0.2. | Remove when the `gray_matter` YAML stack adopts hashbrown 0.16 or newer. |
+| `hashbrown 0.15.5` | `gray_matter -> yaml-rust2 -> hashlink` requires the incompatible 0.15 line. | Remove when `hashlink` upgrades that requirement. |
+| `hashbrown 0.16.1` | `ratatui -> ratatui-core -> kasuari` requires 0.16, while the rest of the current graph can use 0.17. | Remove when `kasuari` adopts hashbrown 0.17 or newer. |
+| `syn 2.0.119` | Ratatui's `instability`/Darling macros, Crossterm's `derive_more`, and the current thiserror/tracing derive stacks require syn 2, while `serde_derive` requires syn 3. | Remove when those proc-macro owners converge on syn 3. |
+| `toml 0.9.12+spec-1.1.0` | `gray_matter` requires TOML 0.9, while oom-edit and hjkl require TOML 1.1. | Remove when `gray_matter` adopts TOML 1.x. |
+| `toml_datetime 0.7.5+spec-1.1.0` | `gray_matter -> toml 0.9` requires `toml_datetime` 0.7, incompatible with TOML 1.1's line. | Remove when `gray_matter` adopts TOML 1.x. |
+| `winnow 0.7.15` | `gray_matter -> toml 0.9` requires winnow 0.7, while TOML 1.1 requires winnow 1.0. | Remove when `gray_matter` adopts TOML 1.x. |

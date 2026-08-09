@@ -4,6 +4,7 @@
 # --offline --locked except vendor and toolchain.
 
 SHELL := /bin/bash
+DENY_FLAGS := check -D warnings
 
 .PHONY: help
 help: ## Show this help (default)
@@ -107,7 +108,7 @@ check: ## Run fmt-check + lint + build + test + deny + audit (with summary)
 	fi; \
 	echo ""; \
 	echo "deny"; \
-	if cargo deny check 2>&1; then \
+	if cargo deny $(DENY_FLAGS) 2>&1; then \
 		echo "[PASS] deny"; PASS=$$((PASS + 1)); \
 	else \
 		echo "[FAIL] deny"; FAIL=$$((FAIL + 1)); deny_ok=false; \
@@ -144,7 +145,7 @@ check: ## Run fmt-check + lint + build + test + deny + audit (with summary)
 # ---------------------------------------------------------------------------
 .PHONY: deny
 deny: ## License/ban/advisory checks (CI gate)
-	cargo deny check
+	cargo deny $(DENY_FLAGS)
 
 .PHONY: audit
 audit: ## RustSec advisory checks (CI gate)
