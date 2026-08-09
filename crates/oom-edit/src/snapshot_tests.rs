@@ -603,8 +603,8 @@ fn golden_palette_filtered() {
 fn golden_palette_vim_reference() {
     let mut app = test_app(kitchen_sink());
     open_palette_with_space_h(&mut app);
-    // Navigate down past app commands to Vim reference section.
-    for _ in 0..10 {
+    // Navigate into the Vim reference section and beyond the list viewport.
+    for _ in 0..17 {
         app.handle_event(&crossterm::event::Event::Key(
             crossterm::event::KeyEvent::new(
                 crossterm::event::KeyCode::Down,
@@ -616,6 +616,17 @@ fn golden_palette_vim_reference() {
         app.render(frame);
     });
     assert_snapshot(&lines, "palette_vim_reference");
+}
+
+/// Palette — exact 40×12 floor remains usable.
+#[test]
+fn golden_palette_floor_40x12() {
+    let mut app = test_app(kitchen_sink());
+    open_palette_with_space_h(&mut app);
+    let lines = render_app_lines(40, 12, |frame| {
+        app.render(frame);
+    });
+    assert_snapshot(&lines, "palette_floor_40x12");
 }
 
 // ── Which-key golden ────────────────────────────────────────────────────────

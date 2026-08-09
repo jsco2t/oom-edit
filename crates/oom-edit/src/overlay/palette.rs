@@ -7,9 +7,10 @@
 //! Floor geometry: 40×12. Close with Esc; execute with Enter.
 
 use ratatui::{
+    layout::{Constraint, Layout, Rect},
     style::Style,
     text::Line,
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
 
@@ -186,6 +187,9 @@ pub static VIM_REFERENCE: &[(&str, &str, &str)] = &[
 
 // ── Palette state ───────────────────────────────────────────────────────────
 
+const FLOOR_W: u16 = 40;
+const FLOOR_H: u16 = 12;
+
 /// The command palette state machine.
 #[derive(Debug, Default)]
 pub struct PaletteState {
@@ -347,12 +351,27 @@ impl PaletteState {
 
     /// Render the palette.
     pub fn render(&self, frame: &mut Frame<'_>, theme: &Theme, tier: Tier) {
-        let area = centered_area(40, 12, frame.area());
+        let area = palette_area(frame.area());
+        frame.render_widget(Clear, area);
+
         let block = Block::default()
             .borders(Borders::ALL)
             .title(" Command Palette ");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
 
-        frame.render_widget(block.clone(), area);
+        if inner.width == 0 || inner.height < 3 {
+            return;
+        }
+
+        let [filter_area, _spacer_area, list_area] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .areas(inner);
+
+        frame.render_widget(Paragraph::new(format!("> {}", self.filter)), filter_area);
 
         // Build rows.
         let km = Keymap::default();
@@ -361,11 +380,6 @@ impl PaletteState {
 
         // Build display lines.
         let mut lines: Vec<Line<'_>> = Vec::new();
-
-        // Filter input line.
-        let filter_text = format!("> {}", self.filter);
-        lines.push(Line::raw(filter_text));
-        lines.push(Line::raw("")); // separator
 
         for (idx, &row_idx) in visible_indices.iter().enumerate() {
             let row = &all_rows[row_idx];
@@ -399,24 +413,16 @@ impl PaletteState {
                 }
             };
             lines.push(line);
-
-            // Stop at max visible rows (floor 12 minus filter/header).
-            if lines.len() >= 12 {
-                break;
-            }
         }
 
-        let paragraph =
-            Paragraph::new(lines).block(Block::default().borders(Borders::NONE).title(""));
-
-        let inner = block.inner(area);
-        frame.render_widget(paragraph, inner);
+        let scroll = viewport_offset(self.selected, list_area.height);
+        frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), list_area);
     }
 
     /// Preferred centered geometry (width, height).
     #[allow(dead_code)]
     pub fn geometry(&self) -> (u16, u16) {
-        (40, 12)
+        (FLOOR_W, FLOOR_H)
     }
 
     /// Hint string.
@@ -469,16 +475,39 @@ fn fuzzy_match(pattern: &str, text: &str) -> bool {
 
 // ── Layout helpers ──────────────────────────────────────────────────────────
 
+/// Compute the responsive palette rectangle within the parent area.
+fn palette_area(parent: Rect) -> Rect {
+    let width = ((u32::from(parent.width) * 4 / 5) as u16)
+        .max(FLOOR_W)
+        .min(parent.width);
+    let height = ((u32::from(parent.height) * 4 / 5) as u16)
+        .max(FLOOR_H)
+        .min(parent.height);
+
+    centered_area(width, height, parent)
+}
+
 /// Compute a centered rectangle of the given size within the parent area.
-fn centered_area(width: u16, height: u16, parent: ratatui::layout::Rect) -> ratatui::layout::Rect {
-    let x = parent.width.saturating_sub(width).saturating_sub(1) / 2;
-    let y = parent.height.saturating_sub(height).saturating_sub(1) / 2;
-    ratatui::layout::Rect::new(
-        x,
-        y,
-        width.min(parent.width.saturating_sub(x)),
-        height.min(parent.height.saturating_sub(y)),
+fn centered_area(width: u16, height: u16, parent: Rect) -> Rect {
+    let width = width.min(parent.width);
+    let height = height.min(parent.height);
+    Rect::new(
+        parent
+            .x
+            .saturating_add(parent.width.saturating_sub(width) / 2),
+        parent
+            .y
+            .saturating_add(parent.height.saturating_sub(height) / 2),
+        width,
+        height,
     )
+}
+
+/// Compute the minimal vertical scroll needed to keep the selected row visible.
+fn viewport_offset(selected: usize, list_height: u16) -> u16 {
+    let capacity = usize::from(list_height);
+    let offset = selected.saturating_sub(capacity.saturating_sub(1));
+    u16::try_from(offset).unwrap_or(u16::MAX)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -487,6 +516,9 @@ fn centered_area(width: u16, height: u16, parent: ratatui::layout::Rect) -> rata
 mod tests {
     use super::*;
     use oom_edit_core::session::{KeyCode, KeyCodeKind, KeyInput, Modifiers};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    use crate::theme::{UiSlot, DEFAULT_DARK};
 
     fn key(kind: KeyCodeKind) -> KeyInput {
         KeyInput {
@@ -527,6 +559,97 @@ mod tests {
     #[test]
     fn fuzzy_match_empty_pattern() {
         assert!(fuzzy_match("", "anything"));
+    }
+
+    #[test]
+    fn palette_area_uses_floor_and_grows_to_eighty_percent() {
+        let cases = [
+            (Rect::new(0, 0, 40, 12), Rect::new(0, 0, 40, 12)),
+            (Rect::new(0, 0, 80, 24), Rect::new(8, 2, 64, 19)),
+            (Rect::new(0, 0, 200, 60), Rect::new(20, 6, 160, 48)),
+            (Rect::new(0, 0, 39, 11), Rect::new(0, 0, 39, 11)),
+            (Rect::new(0, 0, 30, 24), Rect::new(0, 2, 30, 19)),
+            (Rect::new(7, 11, 100, 50), Rect::new(17, 16, 80, 40)),
+        ];
+
+        for (parent, expected) in cases {
+            let actual = palette_area(parent);
+            assert_eq!(actual, expected, "unexpected palette area for {parent:?}");
+            assert!(actual.x >= parent.x);
+            assert!(actual.y >= parent.y);
+            assert!(actual.right() <= parent.right());
+            assert!(actual.bottom() <= parent.bottom());
+        }
+    }
+
+    #[test]
+    fn palette_viewport_offset_keeps_selection_visible() {
+        let cases = [
+            (0, 0, 0),
+            (0, 1, 0),
+            (1, 1, 1),
+            (0, 3, 0),
+            (2, 3, 0),
+            (3, 3, 1),
+            (7, 3, 5),
+            (usize::from(u16::MAX), 3, u16::MAX - 2),
+        ];
+
+        for (selected, height, expected) in cases {
+            let offset = viewport_offset(selected, height);
+            assert_eq!(offset, expected, "selected={selected}, height={height}");
+
+            if height > 0 {
+                let offset = usize::from(offset);
+                let height = usize::from(height);
+                assert!(offset <= selected);
+                assert!(selected < offset + height);
+                assert_eq!(offset, selected.saturating_sub(height - 1));
+            }
+        }
+
+        assert_eq!(
+            viewport_offset(usize::from(u16::MAX) + 42, 1),
+            u16::MAX,
+            "scroll saturates when the selected index cannot fit in u16"
+        );
+    }
+
+    #[test]
+    fn palette_render_clears_underlying_styles() {
+        let width = 80;
+        let height = 24;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let seed_style = DEFAULT_DARK.ui_style(Tier::TrueColor, UiSlot::BadgeInsert);
+        let seed_fg = seed_style.fg.expect("seed foreground");
+        let seed_bg = seed_style.bg.expect("seed background");
+        let seed_modifier = seed_style.add_modifier;
+        let palette = PaletteState::default();
+
+        terminal
+            .draw(|frame| {
+                let seed_lines = (0..height)
+                    .map(|_| Line::raw("X".repeat(usize::from(width))))
+                    .collect::<Vec<_>>();
+                frame.render_widget(Paragraph::new(seed_lines).style(seed_style), frame.area());
+                palette.render(frame, &DEFAULT_DARK, Tier::TrueColor);
+            })
+            .unwrap();
+
+        let modal = palette_area(Rect::new(0, 0, width, height));
+        let buffer = terminal.backend().buffer();
+        for y in modal.y..modal.bottom() {
+            for x in modal.x..modal.right() {
+                let cell = buffer.cell((x, y)).unwrap();
+                assert_ne!(cell.symbol(), "X", "seed glyph survived at ({x}, {y})");
+                assert_ne!(cell.fg, seed_fg, "seed foreground survived at ({x}, {y})");
+                assert_ne!(cell.bg, seed_bg, "seed background survived at ({x}, {y})");
+                assert!(
+                    !cell.modifier.contains(seed_modifier),
+                    "seed modifier survived at ({x}, {y})"
+                );
+            }
+        }
     }
 
     #[test]

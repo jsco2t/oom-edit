@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The command palette now clears its full surface, grows responsively from a 40×12 floor, keeps the filter fixed, and scrolls to keep the selected command or Vim reference visible.
 - The bottom application row now keeps a fixed, mode-colored badge at the left edge, uses a distinct full-row background, shows unique registry-derived hints, and opens Help through `Space h` without an F1 binding.
 - Source-editor line numbers now leave a two-cell gap before content and are absolute by default; the top-level `relative_line_numbers = true` setting restores hybrid-relative numbering in Normal, Visual, and Command modes.
 - CRLF files without a final newline no longer gain a stray carriage return when saved.

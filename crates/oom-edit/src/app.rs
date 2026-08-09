@@ -2823,8 +2823,8 @@ mod tests {
         let muted =
             theme::DEFAULT_DARK.style(Tier::Monochrome, oom_edit_core::SemanticStyle::Muted);
         let buffer = terminal.backend().buffer();
-        let muted_cell = (8..16)
-            .flat_map(|y| (20..58).map(move |x| (x, y)))
+        let muted_cell = (3..21)
+            .flat_map(|y| (8..72).map(move |x| (x, y)))
             .filter_map(|position| buffer.cell(position))
             .find(|cell| {
                 cell.symbol() != " "

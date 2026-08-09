@@ -1,24 +1,24 @@
    1  ---
    2  title: Kitchen Sink
-   3  author: Test
-   4  ---
-   5
-   6  # Heading One┌ Command Palette ─────────────────────┐
-   7               │                                      │
-   8  Some **bold**│> savitalic* text with `inline code` a│d a
-      [link](https:│/example.com).                        │
-   9               │▸ toggle-view          toggle view    │
-  10  > A blockquot│  save                 save           │
-  11               │  w                    Word forward (V│
-  12  ```rust      │  W                    WORD forward (w│
-  13  fn main() {  │  ^                    First non-blank│
-  14      println!(│  $                    End-of-line (la│
-  15  }            │  /pattern⏎            Forward search │
-  16  ```          └──────────────────────────────────────┘
-  17
-  18  ---
-  19
-  20  Another heading.
+   3  au┌ Command Palette ─────────────────────────────────────────────┐
+   4  --│> sav                                                         │
+   5    │                                                              │
+   6  # │▸ toggle-view          toggle view                    Space v │
+   7    │  save                 save                           Space w │
+   8  So│  w                    Word forward (Vim word rules: punctuati│
+      [l│  W                    WORD forward (whitespace-delimited). V-│
+   9    │  ^                    First non-blank character of line.  V-M│
+  10  > │  $                    End-of-line (last character).       V-M│
+  11    │  /pattern⏎            Forward search (regex); moves to next m│
+  12  ``│  ?pattern⏎            Backward search.                    V-S│
+  13  fn│  n                    Repeat last search in same direction, w│
+  14    │  N                    Repeat last search in opposite directio│
+  15  } │  :noh                 Clear search-match highlighting.    V-S│
+  16  ``│  x                    Delete char under cursor (into unnamed │
+  17    │  ~                    Toggle case of char under cursor, advan│
+  18  --│  J                    Join line below with one space.     V-E│
+  19    │  s                    Substitute char (delete + Insert).  V-E│
+  20  An└──────────────────────────────────────────────────────────────┘
   21
   22  More text here.
  NORMAL  ↑↓ navigate · type to filter · Enter execute · Esc close
