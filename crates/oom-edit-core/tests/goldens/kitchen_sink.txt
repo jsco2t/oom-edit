@@ -114,16 +114,16 @@ Blockquote with list:
 ▌ VW-9: Tables
 
 ┌───────────┬────────┬───────┐
-│ Left       Center  Right │
-├───────────┤────────┼───────┤
-│ a            b         c │
-│ long text    x         z │
+│ Left      │ Center │ Right │
+├───────────┼────────┼───────┤
+│ a         │   b    │     c │
+│ long text │   x    │     z │
 └───────────┴────────┴───────┘
 
 ┌────────┬───────┐
-│ Simple  Table │
-├────────┤───────┤
-│ cell    cell  │
+│ Simple │ Table │
+├────────┼───────┤
+│ cell   │ cell  │
 └────────┴───────┘
 
 ▌ VW-10: Thematic Break
