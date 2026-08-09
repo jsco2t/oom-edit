@@ -21,4 +21,4 @@
   20  Another heading.
   21
   22  More text here.
-F1Space: v=toggle view  h=help / command palette  w=save  q=quit  t=cycle theme
+ NORMAL  Space: v=toggle view  h=help / command palette  w=save  q=quit  t=cycle

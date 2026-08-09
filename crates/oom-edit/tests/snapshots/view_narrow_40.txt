@@ -7,4 +7,4 @@ blockquotes.
 
 
 
-F1 help  F1 help   VIEW (new) 1:1  16% T
+ VIEW    (new)              1:1  16% Top

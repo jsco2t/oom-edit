@@ -21,4 +21,4 @@
   20  Another heading.
   21
   22  More text here.
-F1 help  F1 help                                           VISUAL (new) 1:1  4%
+ VISUAL  (new)                                                       1:1  4% Top

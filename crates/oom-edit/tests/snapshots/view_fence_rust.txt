@@ -21,4 +21,4 @@ Another heading.
 More text here.
 
 ─ links ─
-F1 help  F1 help                                           VIEW (new) 1:1  4% To
+ VIEW    Space v=toggle view  Space q=quit                           1:1  4% Top

@@ -7,7 +7,7 @@
 //! ## Key routing order (arch §7.1)
 //!
 //! 1. Overlay open → overlay's key handler (take-and-return-bool).
-//! 2. Mode ∈ {Normal, View}: try app keymap — `F1`, `Space`-leader chords, `g`-chords.
+//! 2. Mode ∈ {Normal, View}: try app keymap — `Space`-leader and `g`-chords.
 //!    On match → `execute_command`. No match → fall through.
 //! 3. Everything else → active session's `handle_key(key)`, then drain `Effect`s.
 
@@ -329,7 +329,7 @@ impl App {
         }
 
         // Render which-key hint bar if conditions are met.
-        self.render_which_key(frame, area);
+        self.render_which_key(frame, status_area);
 
         // Render overlay on top if open.
         if self.overlay.is_some() {
@@ -370,7 +370,7 @@ impl App {
     /// Pure gate + pure build + thin render: the which-key popup appears
     /// only after 150ms of pending Space prefix, in Normal/View mode,
     /// and only when there are ≥2 continuations.
-    fn render_which_key(&self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
+    fn render_which_key(&self, frame: &mut Frame<'_>, status_area: ratatui::layout::Rect) {
         if !self.in_chord_context() {
             return;
         }
@@ -386,7 +386,14 @@ impl App {
 
         let ctx = self.mode_context();
         if let Some(text) = which_key::build_hint(&self.keymap, ctx) {
-            which_key::render(frame, area, &text);
+            let badge_width = crate::widgets::status_bar::MODE_BADGE_COLS.min(status_area.width);
+            let flexible_area = ratatui::layout::Rect::new(
+                status_area.x.saturating_add(badge_width),
+                status_area.y,
+                status_area.width.saturating_sub(badge_width),
+                status_area.height,
+            );
+            which_key::render(frame, flexible_area, &text);
         }
     }
 
@@ -1463,6 +1470,15 @@ mod tests {
         }
     }
 
+    fn open_palette_with_space_h(app: &mut App) {
+        for ch in [' ', 'h'] {
+            app.handle_event(&Event::Key(KeyEvent::new(
+                CrosstermKeyCode::Char(ch),
+                KeyModifiers::NONE,
+            )));
+        }
+    }
+
     fn test_app_with_tabs(tab_count: usize) -> App {
         assert!(tab_count >= 1);
 
@@ -2119,13 +2135,22 @@ mod tests {
         assert_eq!(app.active_tab, 1);
     }
 
-    /// T12: F1 opens the command palette.
     #[test]
-    fn app_f1_opens_palette() {
+    fn app_f1_does_not_open_palette() {
         let session = EditorSession::from_text("hello");
         let mut app = test_app(session);
         let key = KeyEvent::new(CrosstermKeyCode::F(1), KeyModifiers::NONE);
         app.handle_event(&Event::Key(key));
+
+        assert!(!app.overlay.is_some());
+    }
+
+    #[test]
+    fn app_space_h_opens_palette() {
+        let session = EditorSession::from_text("hello");
+        let mut app = test_app(session);
+        open_palette_with_space_h(&mut app);
+
         assert!(app.overlay.is_palette());
     }
 
@@ -2287,9 +2312,7 @@ mod tests {
         let session = EditorSession::from_text("hello");
         let mut app = test_app(session);
 
-        // Open palette via F1.
-        let f1 = KeyEvent::new(CrosstermKeyCode::F(1), KeyModifiers::NONE);
-        app.handle_event(&Event::Key(f1));
+        open_palette_with_space_h(&mut app);
         assert!(app.overlay.is_palette());
 
         // Esc closes the palette.
@@ -2304,9 +2327,7 @@ mod tests {
         let session = EditorSession::from_text("hello");
         let mut app = test_app(session);
 
-        // Open palette via F1.
-        let f1 = KeyEvent::new(CrosstermKeyCode::F(1), KeyModifiers::NONE);
-        app.handle_event(&Event::Key(f1));
+        open_palette_with_space_h(&mut app);
         assert!(app.overlay.is_palette());
 
         // Type 's' to filter for save-related commands.
@@ -2327,9 +2348,7 @@ mod tests {
         let session = EditorSession::from_text("hello");
         let mut app = test_app(session);
 
-        // Open palette via F1.
-        let f1 = KeyEvent::new(CrosstermKeyCode::F(1), KeyModifiers::NONE);
-        app.handle_event(&Event::Key(f1));
+        open_palette_with_space_h(&mut app);
         assert!(app.overlay.is_palette());
 
         // Enter executes the selected command (first row = ToggleView).
@@ -2350,9 +2369,7 @@ mod tests {
         let session = EditorSession::from_text("hello");
         let mut app = test_app(session);
 
-        // Open palette via F1.
-        let f1 = KeyEvent::new(CrosstermKeyCode::F(1), KeyModifiers::NONE);
-        app.handle_event(&Event::Key(f1));
+        open_palette_with_space_h(&mut app);
         assert!(app.overlay.is_palette(), "palette should be open");
 
         // Navigate down past the app commands to a Vim reference entry.
@@ -2412,9 +2429,7 @@ mod tests {
         let session = EditorSession::from_text("hello");
         let mut app = test_app(session);
 
-        // Open palette.
-        let f1 = KeyEvent::new(CrosstermKeyCode::F(1), KeyModifiers::NONE);
-        app.handle_event(&Event::Key(f1));
+        open_palette_with_space_h(&mut app);
         assert!(app.overlay.is_palette());
 
         // Press Space while palette is open — it should be consumed by
@@ -2438,9 +2453,8 @@ mod tests {
         let session = EditorSession::from_text("hello");
         let mut app = test_app(session);
 
-        // F1 should open the palette (keymap dispatch), NOT go to session.
-        let f1 = KeyEvent::new(CrosstermKeyCode::F(1), KeyModifiers::NONE);
-        app.handle_event(&Event::Key(f1));
+        // Space h should open the palette through keymap dispatch.
+        open_palette_with_space_h(&mut app);
 
         assert!(app.overlay.is_palette());
         // Mode should still be Normal (keymap consumed the key).

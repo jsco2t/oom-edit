@@ -70,6 +70,48 @@ fn session_line_count_matches_text() {
 }
 
 #[test]
+fn command_line_exposes_active_command_prompt() {
+    let mut session = EditorSession::from_text("hello");
+    assert_eq!(session.command_line(), None);
+
+    session.handle_key(key(':'));
+    assert_eq!(session.command_line().as_deref(), Some(""));
+
+    for ch in "help".chars() {
+        session.handle_key(key(ch));
+    }
+    assert_eq!(session.command_line().as_deref(), Some("help"));
+
+    session.handle_key(key_special(KeyCodeKind::Esc));
+    assert_eq!(session.command_line(), None);
+}
+
+#[test]
+fn command_line_exposes_only_active_view_search_prompt() {
+    let mut session = EditorSession::from_text("alpha beta alpha");
+    session.toggle_view();
+
+    session.handle_key(key('/'));
+    assert_eq!(session.command_line(), None);
+    assert_eq!(session.view_search_prompt().as_deref(), Some("/"));
+    for ch in "alpha".chars() {
+        session.handle_key(key(ch));
+    }
+    assert_eq!(session.command_line(), None);
+    assert_eq!(session.view_search_prompt().as_deref(), Some("/alpha"));
+
+    session.handle_key(key_special(KeyCodeKind::Enter));
+    assert_eq!(session.view_search_prompt(), None);
+    assert_eq!(
+        session.view_search().map(|search| search.pattern.as_str()),
+        Some("alpha")
+    );
+
+    session.handle_key(key('?'));
+    assert_eq!(session.view_search_prompt().as_deref(), Some("?"));
+}
+
+#[test]
 fn insert_mode_emits_mode_changed() {
     let mut session = EditorSession::from_text("hello");
 

@@ -21,4 +21,4 @@ More text here.
 ─ links ─
 [0] https://example.com
 
- VIEW (new) read-only view — Esc to edit 1:1  4% Top────────────────────────────
+ VIEW    (new) read-only view — Esc to edit                          1:1  4% Top

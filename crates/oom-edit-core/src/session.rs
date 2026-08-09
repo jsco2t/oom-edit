@@ -148,7 +148,7 @@ pub enum Effect {
         /// New option value.
         value: bool,
     },
-    /// Help was requested (from `:help` or `F1`).
+    /// Help was requested through the core command line (`:help`).
     ///
     /// The TUI opens its command palette with the Vim reference section.
     /// Headless hosts may ignore this effect.
@@ -568,9 +568,26 @@ impl EditorSession {
         self.vim.selections()
     }
 
-    /// Return the command-line text, or `None` when not in Command mode.
+    /// Return the unprefixed command-line text, or `None` outside Command mode.
     pub fn command_line(&self) -> Option<String> {
-        self.vim.command_line()
+        (self.mode == Mode::Command).then(|| self.command_buffer.clone())
+    }
+
+    /// Return the active View-search prompt, including `/` or `?` prefix.
+    ///
+    /// Submitted or cancelled prompts return `None` even though the last
+    /// search remains available for `n`/`N`.
+    pub fn view_search_prompt(&self) -> Option<String> {
+        let view_state = self
+            .view_state
+            .as_ref()
+            .filter(|state| state.search_input_active)?;
+        let search = view_state.search.as_ref()?;
+        let prefix = match search.last_direction {
+            SearchDirection::Forward => '/',
+            SearchDirection::Backward => '?',
+        };
+        Some(format!("{prefix}{}", search.pattern))
     }
 
     /// Return the view cursor position, or `None` when not in View mode.

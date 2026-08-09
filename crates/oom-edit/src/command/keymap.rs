@@ -70,7 +70,6 @@ impl PendingChord {
 /// The keymap: trigger → command pairs, built from a static table.
 ///
 /// Triggers:
-/// - `F1` → Help (single-key)
 /// - `Space v` → ToggleView
 /// - `Space h` → Help
 /// - `Space w` → Save
@@ -93,22 +92,12 @@ fn ch(c: char) -> KeyInput {
     }
 }
 
-/// Convenience: a plain F-key.
-fn f(n: u8) -> KeyInput {
-    KeyInput {
-        code: KeyCode {
-            kind: KeyCodeKind::F(n),
-        },
-        mods: oom_edit_core::session::Modifiers::default(),
-    }
-}
-
 impl Keymap {
     /// Build the default keymap.
     pub fn default() -> Self {
         let space = ch(' ');
 
-        let single: Vec<(KeyInput, Command, Contexts)> = vec![(f(1), Command::Help, Contexts::ALL)];
+        let single: Vec<(KeyInput, Command, Contexts)> = Vec::new();
 
         let chords: Vec<([KeyInput; 2], Command, Contexts)> = vec![
             (
@@ -344,13 +333,21 @@ mod tests {
     }
 
     #[test]
-    fn f1_resolves_help() {
+    fn default_keymap_has_no_function_key_bindings() {
         let km = Keymap::default();
-        let mut pending = PendingChord::default();
-        let key = f(1);
-        match km.resolve(Contexts::NORMAL, &key, &mut pending) {
-            Resolution::Command(Command::Help) => {}
-            other => panic!("F1 should resolve Help, got {other:?}"),
+
+        for (key, command, _) in &km.single {
+            assert!(
+                !matches!(key.code.kind, KeyCodeKind::F(_)),
+                "single-key trigger for {command:?} must not use a function key"
+            );
+        }
+        for ([first, second], command, _) in &km.chords {
+            assert!(
+                !matches!(first.code.kind, KeyCodeKind::F(_))
+                    && !matches!(second.code.kind, KeyCodeKind::F(_)),
+                "chord trigger for {command:?} must not use a function key"
+            );
         }
     }
 
@@ -529,12 +526,9 @@ mod tests {
     }
 
     #[test]
-    fn rendered_keys_f1() {
+    fn rendered_keys_help_uses_space_h_only() {
         let km = Keymap::default();
-        assert_eq!(
-            km.rendered_keys(Command::Help),
-            Some("F1 / Space h".to_string())
-        );
+        assert_eq!(km.rendered_keys(Command::Help), Some("Space h".to_string()));
     }
 
     #[test]

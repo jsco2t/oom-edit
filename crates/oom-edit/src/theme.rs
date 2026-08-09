@@ -22,6 +22,8 @@ use ratatui::style::{Color, Modifier, Style};
 /// These complement the [`SemanticStyle`] slots emitted by the core.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UiSlot {
+    /// Full bottom application-row surface.
+    StatusBar,
     /// Normal mode badge.
     BadgeNormal,
     /// Insert mode badge.
@@ -414,11 +416,42 @@ pub static DEFAULT_DARK: Theme = Theme {
             (SemanticStyle::Muted, Color::DarkGray, Modifier::DIM),
         ],
         ui: &[
-            (UiSlot::BadgeNormal, Color::White, None, Modifier::BOLD),
-            (UiSlot::BadgeInsert, Color::Green, None, Modifier::BOLD),
-            (UiSlot::BadgeVisual, Color::Yellow, None, Modifier::BOLD),
-            (UiSlot::BadgeView, Color::Cyan, None, Modifier::BOLD),
-            (UiSlot::BadgeCommand, Color::Magenta, None, Modifier::BOLD),
+            (
+                UiSlot::StatusBar,
+                Color::White,
+                Some(Color::Rgb(40, 44, 52)),
+                Modifier::DIM,
+            ),
+            (
+                UiSlot::BadgeNormal,
+                Color::Black,
+                Some(Color::White),
+                Modifier::BOLD,
+            ),
+            (
+                UiSlot::BadgeInsert,
+                Color::Black,
+                Some(Color::Green),
+                Modifier::BOLD,
+            ),
+            (
+                UiSlot::BadgeVisual,
+                Color::Black,
+                Some(Color::Yellow),
+                Modifier::BOLD,
+            ),
+            (
+                UiSlot::BadgeView,
+                Color::Black,
+                Some(Color::Cyan),
+                Modifier::BOLD,
+            ),
+            (
+                UiSlot::BadgeCommand,
+                Color::Black,
+                Some(Color::Magenta),
+                Modifier::BOLD,
+            ),
             (UiSlot::Border, Color::DarkGray, None, Modifier::empty()),
             (UiSlot::HintKey, Color::Yellow, None, Modifier::BOLD),
             (UiSlot::HintDesc, Color::White, None, Modifier::empty()),
@@ -486,11 +519,42 @@ pub static DEFAULT_DARK: Theme = Theme {
             (SemanticStyle::Muted, Color::DarkGray, Modifier::DIM),
         ],
         ui: &[
-            (UiSlot::BadgeNormal, Color::White, None, Modifier::BOLD),
-            (UiSlot::BadgeInsert, Color::Green, None, Modifier::BOLD),
-            (UiSlot::BadgeVisual, Color::Yellow, None, Modifier::BOLD),
-            (UiSlot::BadgeView, Color::Cyan, None, Modifier::BOLD),
-            (UiSlot::BadgeCommand, Color::Magenta, None, Modifier::BOLD),
+            (
+                UiSlot::StatusBar,
+                Color::White,
+                Some(Color::DarkGray),
+                Modifier::DIM,
+            ),
+            (
+                UiSlot::BadgeNormal,
+                Color::Black,
+                Some(Color::White),
+                Modifier::BOLD,
+            ),
+            (
+                UiSlot::BadgeInsert,
+                Color::Black,
+                Some(Color::Green),
+                Modifier::BOLD,
+            ),
+            (
+                UiSlot::BadgeVisual,
+                Color::Black,
+                Some(Color::Yellow),
+                Modifier::BOLD,
+            ),
+            (
+                UiSlot::BadgeView,
+                Color::Black,
+                Some(Color::Cyan),
+                Modifier::BOLD,
+            ),
+            (
+                UiSlot::BadgeCommand,
+                Color::Black,
+                Some(Color::Magenta),
+                Modifier::BOLD,
+            ),
             (UiSlot::Border, Color::DarkGray, None, Modifier::empty()),
             (UiSlot::HintKey, Color::Yellow, None, Modifier::BOLD),
             (UiSlot::HintDesc, Color::White, None, Modifier::empty()),
@@ -554,6 +618,7 @@ pub static DEFAULT_DARK: Theme = Theme {
             (SemanticStyle::Muted, Modifier::DIM),
         ],
         ui: &[
+            (UiSlot::StatusBar, Modifier::DIM),
             (UiSlot::BadgeNormal, Modifier::BOLD),
             (UiSlot::BadgeInsert, Modifier::BOLD),
             (UiSlot::BadgeVisual, Modifier::BOLD),
@@ -618,11 +683,42 @@ pub static DEFAULT_LIGHT: Theme = Theme {
             (SemanticStyle::Muted, Color::Gray, Modifier::DIM),
         ],
         ui: &[
-            (UiSlot::BadgeNormal, Color::Black, None, Modifier::BOLD),
-            (UiSlot::BadgeInsert, Color::Green, None, Modifier::BOLD),
-            (UiSlot::BadgeVisual, Color::Yellow, None, Modifier::BOLD),
-            (UiSlot::BadgeView, Color::Cyan, None, Modifier::BOLD),
-            (UiSlot::BadgeCommand, Color::Magenta, None, Modifier::BOLD),
+            (
+                UiSlot::StatusBar,
+                Color::Black,
+                Some(Color::Rgb(225, 228, 232)),
+                Modifier::DIM,
+            ),
+            (
+                UiSlot::BadgeNormal,
+                Color::Black,
+                Some(Color::White),
+                Modifier::BOLD,
+            ),
+            (
+                UiSlot::BadgeInsert,
+                Color::Black,
+                Some(Color::Green),
+                Modifier::BOLD,
+            ),
+            (
+                UiSlot::BadgeVisual,
+                Color::Black,
+                Some(Color::Yellow),
+                Modifier::BOLD,
+            ),
+            (
+                UiSlot::BadgeView,
+                Color::Black,
+                Some(Color::Cyan),
+                Modifier::BOLD,
+            ),
+            (
+                UiSlot::BadgeCommand,
+                Color::Black,
+                Some(Color::Magenta),
+                Modifier::BOLD,
+            ),
             (UiSlot::Border, Color::Gray, None, Modifier::empty()),
             (UiSlot::HintKey, Color::Yellow, None, Modifier::BOLD),
             (UiSlot::HintDesc, Color::Black, None, Modifier::empty()),
@@ -686,11 +782,42 @@ pub static DEFAULT_LIGHT: Theme = Theme {
             (SemanticStyle::Muted, Color::Gray, Modifier::DIM),
         ],
         ui: &[
-            (UiSlot::BadgeNormal, Color::Black, None, Modifier::BOLD),
-            (UiSlot::BadgeInsert, Color::Green, None, Modifier::BOLD),
-            (UiSlot::BadgeVisual, Color::Yellow, None, Modifier::BOLD),
-            (UiSlot::BadgeView, Color::Cyan, None, Modifier::BOLD),
-            (UiSlot::BadgeCommand, Color::Magenta, None, Modifier::BOLD),
+            (
+                UiSlot::StatusBar,
+                Color::Black,
+                Some(Color::Gray),
+                Modifier::DIM,
+            ),
+            (
+                UiSlot::BadgeNormal,
+                Color::Black,
+                Some(Color::White),
+                Modifier::BOLD,
+            ),
+            (
+                UiSlot::BadgeInsert,
+                Color::Black,
+                Some(Color::Green),
+                Modifier::BOLD,
+            ),
+            (
+                UiSlot::BadgeVisual,
+                Color::Black,
+                Some(Color::Yellow),
+                Modifier::BOLD,
+            ),
+            (
+                UiSlot::BadgeView,
+                Color::Black,
+                Some(Color::Cyan),
+                Modifier::BOLD,
+            ),
+            (
+                UiSlot::BadgeCommand,
+                Color::Black,
+                Some(Color::Magenta),
+                Modifier::BOLD,
+            ),
             (UiSlot::Border, Color::Gray, None, Modifier::empty()),
             (UiSlot::HintKey, Color::Yellow, None, Modifier::BOLD),
             (UiSlot::HintDesc, Color::Black, None, Modifier::empty()),
@@ -754,6 +881,7 @@ pub static DEFAULT_LIGHT: Theme = Theme {
             (SemanticStyle::Muted, Modifier::DIM),
         ],
         ui: &[
+            (UiSlot::StatusBar, Modifier::DIM),
             (UiSlot::BadgeNormal, Modifier::BOLD),
             (UiSlot::BadgeInsert, Modifier::BOLD),
             (UiSlot::BadgeVisual, Modifier::BOLD),
@@ -818,6 +946,7 @@ pub static ACCESSIBLE: Theme = Theme {
             (SemanticStyle::Muted, Modifier::DIM),
         ],
         ui: &[
+            (UiSlot::StatusBar, Modifier::DIM),
             (UiSlot::BadgeNormal, Modifier::BOLD),
             (UiSlot::BadgeInsert, Modifier::BOLD),
             (UiSlot::BadgeVisual, Modifier::BOLD),
@@ -876,6 +1005,7 @@ pub static ACCESSIBLE: Theme = Theme {
             (SemanticStyle::Muted, Modifier::DIM),
         ],
         ui: &[
+            (UiSlot::StatusBar, Modifier::DIM),
             (UiSlot::BadgeNormal, Modifier::BOLD),
             (UiSlot::BadgeInsert, Modifier::BOLD),
             (UiSlot::BadgeVisual, Modifier::BOLD),
@@ -934,6 +1064,7 @@ pub static ACCESSIBLE: Theme = Theme {
             (SemanticStyle::Muted, Modifier::DIM),
         ],
         ui: &[
+            (UiSlot::StatusBar, Modifier::DIM),
             (UiSlot::BadgeNormal, Modifier::BOLD),
             (UiSlot::BadgeInsert, Modifier::BOLD),
             (UiSlot::BadgeVisual, Modifier::BOLD),
@@ -1099,6 +1230,7 @@ mod tests {
         ];
 
         let ui_slots = [
+            UiSlot::StatusBar,
             UiSlot::BadgeNormal,
             UiSlot::BadgeInsert,
             UiSlot::BadgeVisual,
@@ -1380,6 +1512,7 @@ mod tests {
         ];
 
         let slots = [
+            UiSlot::StatusBar,
             UiSlot::BadgeNormal,
             UiSlot::BadgeInsert,
             UiSlot::BadgeVisual,
@@ -1469,6 +1602,98 @@ mod tests {
             dark.ui_style(Tier::TrueColor, UiSlot::CursorLine).bg,
             light.ui_style(Tier::TrueColor, UiSlot::CursorLine).bg
         );
+    }
+
+    #[test]
+    fn color_badges_use_black_text_and_mode_backgrounds() {
+        let badge_slots = [
+            UiSlot::BadgeNormal,
+            UiSlot::BadgeInsert,
+            UiSlot::BadgeVisual,
+            UiSlot::BadgeView,
+            UiSlot::BadgeCommand,
+        ];
+
+        for theme in [&DEFAULT_DARK, &DEFAULT_LIGHT] {
+            for tier in [Tier::TrueColor, Tier::Color16] {
+                let status_background = theme
+                    .ui_style(tier, UiSlot::StatusBar)
+                    .bg
+                    .expect("color status row must have a background");
+                let mut backgrounds = std::collections::HashSet::new();
+                for slot in badge_slots {
+                    let style = theme.ui_style(tier, slot);
+                    assert_eq!(style.fg, Some(Color::Black));
+                    assert!(
+                        style.add_modifier.contains(Modifier::BOLD),
+                        "{slot:?} must retain its text carrier in {} at {tier:?}",
+                        theme.name
+                    );
+                    let badge_background = style.bg.expect("color badge must have a background");
+                    assert_ne!(
+                        badge_background, status_background,
+                        "{slot:?} must be visually distinct from the status row in {} at {tier:?}",
+                        theme.name
+                    );
+                    backgrounds.insert(badge_background);
+                }
+                assert_eq!(
+                    backgrounds.len(),
+                    badge_slots.len(),
+                    "mode badge backgrounds must be distinct in {} at {tier:?}",
+                    theme.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn monochrome_status_row_keeps_non_color_carriers() {
+        let slots = [
+            UiSlot::StatusBar,
+            UiSlot::BadgeNormal,
+            UiSlot::BadgeInsert,
+            UiSlot::BadgeVisual,
+            UiSlot::BadgeView,
+            UiSlot::BadgeCommand,
+        ];
+
+        for theme in [&DEFAULT_DARK, &DEFAULT_LIGHT, &ACCESSIBLE] {
+            for slot in slots {
+                let style = theme.ui_style(Tier::Monochrome, slot);
+                assert_eq!(style.fg, Some(Color::Reset));
+                assert_eq!(style.bg, None);
+                assert!(
+                    !style.add_modifier.is_empty(),
+                    "{slot:?} needs a monochrome modifier carrier in {}",
+                    theme.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn accessible_status_row_is_color_free_at_every_tier() {
+        let slots = [
+            UiSlot::StatusBar,
+            UiSlot::BadgeNormal,
+            UiSlot::BadgeInsert,
+            UiSlot::BadgeVisual,
+            UiSlot::BadgeView,
+            UiSlot::BadgeCommand,
+        ];
+
+        for tier in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
+            for slot in slots {
+                let style = ACCESSIBLE.ui_style(tier, slot);
+                assert_eq!(style.fg, Some(Color::Reset));
+                assert_eq!(style.bg, None);
+                assert!(
+                    !style.add_modifier.is_empty(),
+                    "{slot:?} needs an accessible modifier carrier at {tier:?}"
+                );
+            }
+        }
     }
 
     #[test]

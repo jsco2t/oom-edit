@@ -57,6 +57,17 @@ fn test_app_with_relative_line_numbers(text: &str, relative_line_numbers: bool) 
     )
 }
 
+fn open_palette_with_space_h(app: &mut App) {
+    for ch in [' ', 'h'] {
+        app.handle_event(&crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(ch),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        ));
+    }
+}
+
 /// Render an `App` into a `TestBackend` and return the lines.
 ///
 /// The closure receives a mutable `&mut Frame<'_>` and can borrow `app`
@@ -560,13 +571,7 @@ fn golden_view_search_match() {
 #[test]
 fn golden_palette_top() {
     let mut app = test_app(kitchen_sink());
-    // Open palette via F1.
-    app.handle_event(&crossterm::event::Event::Key(
-        crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::F(1),
-            crossterm::event::KeyModifiers::NONE,
-        ),
-    ));
+    open_palette_with_space_h(&mut app);
     let lines = render_app_lines(80, 24, |frame| {
         app.render(frame);
     });
@@ -577,13 +582,7 @@ fn golden_palette_top() {
 #[test]
 fn golden_palette_filtered() {
     let mut app = test_app(kitchen_sink());
-    // Open palette.
-    app.handle_event(&crossterm::event::Event::Key(
-        crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::F(1),
-            crossterm::event::KeyModifiers::NONE,
-        ),
-    ));
+    open_palette_with_space_h(&mut app);
     // Type "sav" to filter.
     for c in "sav".chars() {
         app.handle_event(&crossterm::event::Event::Key(
@@ -603,13 +602,7 @@ fn golden_palette_filtered() {
 #[test]
 fn golden_palette_vim_reference() {
     let mut app = test_app(kitchen_sink());
-    // Open palette.
-    app.handle_event(&crossterm::event::Event::Key(
-        crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::F(1),
-            crossterm::event::KeyModifiers::NONE,
-        ),
-    ));
+    open_palette_with_space_h(&mut app);
     // Navigate down past app commands to Vim reference section.
     for _ in 0..10 {
         app.handle_event(&crossterm::event::Event::Key(
@@ -776,23 +769,33 @@ fn golden_view_narrow_40() {
 
 // ── Drift meta-tests ────────────────────────────────────────────────────────
 
-/// Every context has a non-empty hint-bar entry (F1 cells are always present).
+/// Every context's hint cells are an exact projection of eligible commands.
 #[test]
-fn drift_every_context_has_hint_bar() {
-    use crate::command::registry::Contexts;
+fn drift_hint_bar_matches_registry() {
+    use crate::command::registry::{commands_for, Contexts};
     use crate::command::Keymap;
 
     let km = Keymap::default();
     for ctx in Contexts::each_bit() {
         let cells = crate::widgets::hint_bar::build_hints(ctx, &km);
-        assert!(
-            !cells.is_empty(),
-            "context {:?} must have non-empty hint bar",
-            ctx
+        let commands = commands_for(ctx);
+        assert_eq!(
+            cells.len(),
+            commands.len(),
+            "context {ctx:?} must have one hint per eligible command"
         );
-        // F1 help is always first and last.
-        assert_eq!(cells[0].text, "F1 help");
-        assert_eq!(cells[cells.len() - 1].text, "F1 help");
+        for command in commands {
+            let suffix = format!("={}", command.desc);
+            assert_eq!(
+                cells
+                    .iter()
+                    .filter(|cell| cell.text.ends_with(&suffix))
+                    .count(),
+                1,
+                "context {ctx:?} command {:?} must appear exactly once",
+                command.id
+            );
+        }
     }
 }
 

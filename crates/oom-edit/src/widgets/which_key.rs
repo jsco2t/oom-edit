@@ -7,7 +7,7 @@
 
 use std::time::{Duration, Instant};
 
-use ratatui::{style::Style, widgets::Paragraph, Frame};
+use ratatui::{style::Style, text::Line, widgets::Paragraph, Frame};
 
 use crate::command::{keymap::Keymap, registry::Contexts};
 
@@ -54,7 +54,7 @@ pub fn build_hint(km: &Keymap, ctx: Contexts) -> Option<String> {
 /// Thin render: creates a Paragraph widget positioned in the bottom-right
 /// corner of the body area.
 pub fn render(frame: &mut Frame<'_>, area: ratatui::layout::Rect, text: &str) {
-    let hint_width = text.len().min(area.width as usize) as u16;
+    let hint_width = Line::from(text).width().min(area.width as usize) as u16;
     let hint_area = ratatui::layout::Rect::new(
         area.x + area.width.saturating_sub(hint_width + 1),
         area.y + area.height.saturating_sub(1),

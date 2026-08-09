@@ -246,7 +246,7 @@ fn render_selection(_frame: &mut Frame<'_>, _area: Rect, _sel: &std::ops::Range<
     // and render a highlighted overlay here.
 }
 
-/// Render the full status row: hint bar (left) + status bar (right).
+/// Render the full status row using one fixed-badge geometry.
 pub fn render_status_row(
     frame: &mut Frame<'_>,
     session: &EditorSession,
@@ -269,7 +269,10 @@ pub fn render_status_row(
     let cursor = session.cursor();
 
     // Check if command line is active.
-    let command_line = session.command_line();
+    let command_line = session
+        .command_line()
+        .map(|text| format!(":{text}"))
+        .or_else(|| session.view_search_prompt());
 
     let status = status_bar::StatusBar {
         mode,
@@ -283,44 +286,31 @@ pub fn render_status_row(
 
     let status_text = status.build(transient, theme, tier);
 
-    // Split area: hint bar on left (when no transient and no command line),
-    // status bar on right (or full width when transient/command line active).
     let has_transient = transient.is_some() && command_line.is_none();
     let cmdline_active = command_line.is_some();
-
-    if cmdline_active || has_transient {
-        // Status bar takes full width.
-        status_bar::render(frame, area, &status_text);
+    let middle = if cmdline_active || has_transient {
+        String::new()
+    } else if !overlay_hints.is_empty() {
+        overlay_hints.to_string()
     } else {
-        // Hint bar on left, status bar on right.
-        // Reserve RULER_COLS for the ruler on the right.
-        let ruler_width = status_bar::RULER_COLS;
-        let hint_width = area.width.saturating_sub(ruler_width);
+        let flexible_width = area
+            .width
+            .saturating_sub(status_bar::MODE_BADGE_COLS)
+            .saturating_sub(status_bar::RULER_COLS);
+        let km = Keymap::default();
+        let cells = hint_bar::build_hints(ctx, &km);
+        hint_bar::format_hints(&cells, flexible_width)
+    };
 
-        if hint_width > 0 {
-            // Build hint bar text.
-            let km = Keymap::default();
-            let cells = hint_bar::build_hints(ctx, &km);
-            let hint_text = hint_bar::format_hints(&cells, hint_width);
-
-            let hint_area = Rect {
-                x: area.x,
-                y: area.y,
-                width: hint_width,
-                height: 1,
-            };
-            hint_bar::render(frame, hint_area, &hint_text, overlay_hints);
-        }
-
-        // Status bar on right.
-        let status_area = Rect {
-            x: area.x + hint_width,
-            y: area.y,
-            width: area.width.saturating_sub(hint_width),
-            height: 1,
-        };
-        status_bar::render(frame, status_area, &status_text);
-    }
+    status_bar::render(
+        frame,
+        area,
+        &status_text,
+        &middle,
+        overlay_hints.is_empty(),
+        theme,
+        tier,
+    );
 }
 
 /// Convert editor mode to UI context.
@@ -362,6 +352,68 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    fn render_session_status(session: &EditorSession, width: u16) -> Terminal<TestBackend> {
+        let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_status_row(
+                    frame,
+                    session,
+                    None,
+                    "",
+                    frame.area(),
+                    &DEFAULT_DARK,
+                    Tier::TrueColor,
+                );
+            })
+            .unwrap();
+        terminal
+    }
+
+    #[test]
+    fn prompt_cursor_is_offset_after_badge() {
+        let mut command = EditorSession::from_text("hello");
+        feed(&mut command, ":w");
+        let command_terminal = render_session_status(&command, 80);
+        assert_eq!(
+            command_terminal.backend().cursor_position(),
+            ratatui::layout::Position::new(status_bar::MODE_BADGE_COLS + 2, 0)
+        );
+        assert!(buffer_row(&command_terminal, 0, 80).starts_with(" :CMD    :w"));
+
+        let mut view_search = EditorSession::from_text("# heading");
+        view_search.toggle_view();
+        feed(&mut view_search, "/head");
+        let view_terminal = render_session_status(&view_search, 80);
+        assert_eq!(
+            view_terminal.backend().cursor_position(),
+            ratatui::layout::Position::new(status_bar::MODE_BADGE_COLS + 5, 0)
+        );
+        assert!(buffer_row(&view_terminal, 0, 80).starts_with(" VIEW    /head"));
+    }
+
+    #[test]
+    fn entering_and_leaving_view_changes_fixed_badge_label_and_background() {
+        let mut session = EditorSession::from_text("# heading");
+        let normal = render_session_status(&session, 80);
+        let normal_cell = normal.backend().buffer().cell((1, 0)).unwrap();
+        assert!(buffer_row(&normal, 0, 80).starts_with(" NORMAL "));
+
+        session.toggle_view();
+        let view = render_session_status(&session, 80);
+        let view_cell = view.backend().buffer().cell((1, 0)).unwrap();
+        assert!(buffer_row(&view, 0, 80).starts_with(" VIEW "));
+        assert_ne!(normal_cell.bg, view_cell.bg);
+
+        session.toggle_view();
+        let normal_again = render_session_status(&session, 80);
+        assert!(buffer_row(&normal_again, 0, 80).starts_with(" NORMAL "));
+        assert_eq!(
+            normal_again.backend().buffer().cell((1, 0)).unwrap().bg,
+            normal_cell.bg
+        );
     }
 
     #[test]

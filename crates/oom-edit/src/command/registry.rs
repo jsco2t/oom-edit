@@ -126,7 +126,7 @@ pub struct CommandSpec {
 /// | Command id   | name         | keys          | contexts            | quick_bar |
 /// |--------------|--------------|---------------|---------------------|-----------|
 /// | `ToggleView` | `toggle-view`| `Space v`     | NORMAL, VIEW        | yes       |
-/// | `Help`       | `help`       | `F1`, `Space h`| all non-OVERLAY     | yes       |
+/// | `Help`       | `help`       | `Space h`      | all non-OVERLAY     | yes       |
 /// | `Save`       | `save`       | `Space w`     | NORMAL              | yes       |
 /// | `Quit`       | `quit`       | `Space q`     | NORMAL, VIEW        | yes       |
 /// | `CycleTheme` | `cycle-theme`| `Space t`     | NORMAL, VIEW        | no        |

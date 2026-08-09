@@ -3,17 +3,19 @@
 //! Pure build + thin render: `build_status()` returns a ready-to-render
 //! `StatusBarText`; `render()` maps it to ratatui widgets.
 //!
-//! Layout: `[left Min(1), badge Length(badge_w), ruler Length(RULER_COLS)]`
-//! When Command mode is active, the whole row becomes `:{text}`.
+//! Layout: `[badge Length(MODE_BADGE_COLS), middle Min(0), ruler Length(RULER_COLS)]`.
+//! Command and View-search prompts use the middle plus ruler region while the
+//! badge remains fixed at the left edge.
 //!
 //! FR-6.2, FR-6.4.
 
 use std::time::{Duration, Instant};
 
 use ratatui::{
+    layout::{Alignment, Position, Rect},
     style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Paragraph},
     Frame,
 };
 
@@ -26,6 +28,9 @@ pub const TRANSIENT_TTL: Duration = Duration::from_secs(4);
 
 /// Ruler column width: `line:col  n%` — max ~22 chars for large files.
 pub const RULER_COLS: u16 = 22;
+
+/// Fixed mode-badge width, sized for the longest label: ` V-BLOCK `.
+pub const MODE_BADGE_COLS: u16 = 9;
 
 /// Severity glyph prefix for status messages.
 fn severity_glyph(severity: Severity) -> &'static str {
@@ -78,40 +83,27 @@ pub struct StatusBar {
 /// The rendered output of the status bar — ready for thin render.
 #[derive(Debug, Default)]
 pub struct StatusBarText {
-    /// The full status line as spans (for rendering in the status area).
-    /// Empty when command_line takeover is active.
-    pub spans: Vec<Span<'static>>,
-    /// When command-line takeover is active, the text to display.
-    pub cmdline: Option<String>,
-    /// Whether the cursor should be visible at the end of the command line.
-    pub cmdline_cursor: bool,
+    /// Mode label and its theme-selected badge style.
+    pub badge: Span<'static>,
+    /// File/transient content for the flexible middle region.
+    pub content: Vec<Span<'static>>,
+    /// Ruler text for the fixed right region.
+    pub ruler: Span<'static>,
+    /// Active command or View-search prompt, including its prefix.
+    pub prompt: Option<String>,
+    /// Whether the cursor should be visible at the end of the prompt.
+    pub prompt_cursor: bool,
 }
 
 impl StatusBar {
     /// Build the status bar text. Pure function — no rendering.
     pub fn build(&self, transient: Option<&Transient>, theme: &Theme, tier: Tier) -> StatusBarText {
-        // Command-line takeover: when in Command mode or View-search,
-        // the entire row becomes the command line.
-        if let Some(ref cmdline) = self.command_line {
-            let mut text = String::from(':');
-            text.push_str(cmdline);
-            return StatusBarText {
-                spans: Vec::new(),
-                cmdline: Some(text),
-                cmdline_cursor: true,
-            };
-        }
-
-        let mut spans = Vec::new();
-
-        // Mode badge.
-        let badge = mode_badge(self.mode);
-        spans.push(Span::styled(
-            badge,
+        let badge = Span::styled(
+            mode_badge(self.mode),
             mode_badge_style(self.mode, theme, tier),
-        ));
+        );
 
-        // Left region: file + dirty + transient messages.
+        // Flexible content: file + dirty + transient messages.
         let mut left = String::new();
 
         // File path (just the file name, not the full path).
@@ -134,48 +126,99 @@ impl StatusBar {
             left.push_str(&t.text);
         }
 
-        if !left.is_empty() {
-            spans.push(Span::raw(left));
-        }
-
-        // Right region: ruler.
-        let ruler = ruler_text(self.cursor_line, self.line_count);
-        spans.push(Span::raw(" ".to_string()));
-        spans.push(Span::styled(
-            ruler,
+        let content = (!left.is_empty())
+            .then(|| Span::raw(left))
+            .into_iter()
+            .collect();
+        let ruler = Span::styled(
+            ruler_text(self.cursor_line, self.line_count),
             Style::default().add_modifier(ratatui::style::Modifier::DIM),
-        ));
+        );
 
         StatusBarText {
-            spans,
-            cmdline: None,
-            cmdline_cursor: false,
+            badge,
+            content,
+            ruler,
+            prompt: self.command_line.clone(),
+            prompt_cursor: self.command_line.is_some(),
         }
     }
 }
 
 /// Render the status bar text into the given area.
-pub fn render(frame: &mut Frame<'_>, area: ratatui::layout::Rect, text: &StatusBarText) {
-    let block = Block::default().borders(Borders::BOTTOM);
-    frame.render_widget(block, area);
+pub fn render(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    text: &StatusBarText,
+    middle: &str,
+    show_ruler: bool,
+    theme: &Theme,
+    tier: Tier,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
 
-    if let Some(ref cmdline) = text.cmdline {
-        // Command-line takeover: render the full text with a cursor at the end.
-        let paragraph = Paragraph::new(cmdline.as_str());
-        frame.render_widget(paragraph, area);
+    let row_style = theme.ui_style(tier, UiSlot::StatusBar);
+    frame.render_widget(Block::default().style(row_style), area);
 
-        if text.cmdline_cursor {
-            // Place cursor at the end of the text.
-            let col = area.x + cmdline.len().min(area.width as usize) as u16;
-            frame.set_cursor_position(ratatui::layout::Position::new(
-                col.min(area.x + area.width.saturating_sub(1)),
-                area.y,
-            ));
+    let badge_width = MODE_BADGE_COLS.min(area.width);
+    let badge_area = Rect::new(area.x, area.y, badge_width, 1.min(area.height));
+    frame.render_widget(Block::default().style(text.badge.style), badge_area);
+    frame.render_widget(Paragraph::new(Line::from(text.badge.clone())), badge_area);
+
+    let flexible_x = area.x.saturating_add(badge_width);
+    let flexible_width = area.width.saturating_sub(badge_width);
+    if flexible_width == 0 {
+        return;
+    }
+
+    if let Some(prompt) = &text.prompt {
+        let prompt_area = Rect::new(flexible_x, area.y, flexible_width, 1.min(area.height));
+        frame.render_widget(
+            Paragraph::new(prompt.as_str()).style(row_style),
+            prompt_area,
+        );
+
+        if text.prompt_cursor {
+            let prompt_width = Line::from(prompt.as_str()).width() as u16;
+            let col = flexible_x
+                .saturating_add(prompt_width)
+                .min(area.x.saturating_add(area.width).saturating_sub(1));
+            frame.set_cursor_position(Position::new(col, area.y));
         }
-    } else if !text.spans.is_empty() {
-        let line = Line::from(text.spans.clone());
-        let paragraph = Paragraph::new(line);
-        frame.render_widget(paragraph, area);
+        return;
+    }
+
+    let ruler_width = if show_ruler {
+        RULER_COLS.min(flexible_width)
+    } else {
+        0
+    };
+    let middle_width = flexible_width.saturating_sub(ruler_width);
+    let middle_area = Rect::new(flexible_x, area.y, middle_width, 1.min(area.height));
+    let ruler_area = Rect::new(
+        flexible_x.saturating_add(middle_width),
+        area.y,
+        ruler_width,
+        1.min(area.height),
+    );
+
+    if middle_width > 0 {
+        let middle_line = if middle.is_empty() {
+            Line::from(text.content.clone())
+        } else {
+            Line::from(middle).style(Style::default().add_modifier(ratatui::style::Modifier::DIM))
+        };
+        frame.render_widget(Paragraph::new(middle_line).style(row_style), middle_area);
+    }
+    if ruler_width > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::from(text.ruler.clone()))
+                .alignment(Alignment::Right)
+                .style(row_style),
+            ruler_area,
+        );
     }
 }
 
@@ -370,9 +413,151 @@ mod tests {
         }
 
         assert_ne!(
-            mode_badge_style(Mode::Normal, &DEFAULT_DARK, Tier::TrueColor),
-            mode_badge_style(Mode::Normal, &DEFAULT_LIGHT, Tier::TrueColor)
+            DEFAULT_DARK.ui_style(Tier::TrueColor, UiSlot::StatusBar),
+            DEFAULT_LIGHT.ui_style(Tier::TrueColor, UiSlot::StatusBar)
         );
+    }
+
+    fn render_status(
+        mode: Mode,
+        width: u16,
+        tier: Tier,
+    ) -> ratatui::Terminal<ratatui::backend::TestBackend> {
+        let status = StatusBar {
+            mode,
+            path: "test.md".to_string(),
+            dirty: false,
+            is_new: false,
+            cursor_line: 1,
+            line_count: 10,
+            command_line: None,
+        };
+        let text = status.build(None, &DEFAULT_DARK, tier);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 1))
+            .expect("create status test terminal");
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    frame.area(),
+                    &text,
+                    "Space h=help",
+                    true,
+                    &DEFAULT_DARK,
+                    tier,
+                );
+            })
+            .expect("render status row");
+        terminal
+    }
+
+    #[test]
+    fn status_row_badge_starts_at_column_zero_and_has_constant_width() {
+        let modes = [
+            Mode::Normal,
+            Mode::Insert,
+            Mode::Visual,
+            Mode::VisualLine,
+            Mode::VisualBlock,
+            Mode::Command,
+            Mode::View,
+        ];
+
+        for mode in modes {
+            let terminal = render_status(mode, 80, Tier::TrueColor);
+            let buffer = terminal.backend().buffer();
+            let badge_style = mode_badge_style(mode, &DEFAULT_DARK, Tier::TrueColor);
+            let label: String = (0..MODE_BADGE_COLS)
+                .map(|x| buffer.cell((x, 0)).expect("badge cell").symbol())
+                .collect();
+
+            assert!(label.starts_with(mode_badge(mode)));
+            for x in 0..MODE_BADGE_COLS {
+                let cell = buffer.cell((x, 0)).expect("badge cell");
+                assert_eq!(cell.fg, badge_style.fg.expect("badge foreground"));
+                assert_eq!(cell.bg, badge_style.bg.expect("badge background"));
+                assert!(cell.modifier.contains(ratatui::style::Modifier::BOLD));
+            }
+            assert_eq!(
+                buffer.cell((MODE_BADGE_COLS, 0)).expect("middle cell").bg,
+                DEFAULT_DARK
+                    .ui_style(Tier::TrueColor, UiSlot::StatusBar)
+                    .bg
+                    .expect("status-row background")
+            );
+        }
+    }
+
+    #[test]
+    fn status_row_background_covers_blank_cells() {
+        let terminal = render_status(Mode::Normal, 80, Tier::TrueColor);
+        let status_background = DEFAULT_DARK
+            .ui_style(Tier::TrueColor, UiSlot::StatusBar)
+            .bg
+            .expect("status-row background");
+        let buffer = terminal.backend().buffer();
+        assert_eq!(
+            buffer.cell((40, 0)).expect("blank status cell").symbol(),
+            " "
+        );
+        for x in MODE_BADGE_COLS..80 {
+            assert_eq!(
+                buffer.cell((x, 0)).expect("status-row cell").bg,
+                status_background,
+                "status-row background missing at column {x}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_row_geometry_saturates_at_supported_widths() {
+        let text = StatusBar {
+            mode: Mode::Normal,
+            path: "test.md".to_string(),
+            dirty: false,
+            is_new: false,
+            cursor_line: 1,
+            line_count: 10,
+            command_line: None,
+        }
+        .build(None, &DEFAULT_DARK, Tier::TrueColor);
+
+        for width in [0, 1, 5, 40, 80, 200] {
+            let backend_width = width.max(1);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(backend_width, 1))
+                    .expect("create geometry test terminal");
+            terminal
+                .draw(|frame| {
+                    render(
+                        frame,
+                        Rect::new(0, 0, width, 1),
+                        &text,
+                        "Space h=help",
+                        true,
+                        &DEFAULT_DARK,
+                        Tier::TrueColor,
+                    );
+                })
+                .unwrap_or_else(|error| panic!("width {width} must render: {error}"));
+
+            if width >= MODE_BADGE_COLS + RULER_COLS {
+                let row: String = (0..width)
+                    .map(|x| {
+                        terminal
+                            .backend()
+                            .buffer()
+                            .cell((x, 0))
+                            .expect("row cell")
+                            .symbol()
+                    })
+                    .collect();
+                assert!(
+                    row.ends_with("Top"),
+                    "ruler must be right-aligned at width {width}"
+                );
+            }
+        }
     }
 
     // ── Severity glyph ──────────────────────────────────────────────────
@@ -610,7 +795,7 @@ mod tests {
     // ── Command-line takeover ───────────────────────────────────────────
 
     #[test]
-    fn build_command_line_takes_over() {
+    fn build_preserves_badge_during_prompt() {
         let sb = StatusBar {
             mode: Mode::Command,
             path: "test.md".to_string(),
@@ -618,13 +803,12 @@ mod tests {
             is_new: false,
             cursor_line: 1,
             line_count: 10,
-            command_line: Some("w".to_string()),
+            command_line: Some(":w".to_string()),
         };
         let text = sb.build(None, &DEFAULT_DARK, Tier::TrueColor);
-        assert!(text.cmdline.is_some());
-        assert_eq!(text.cmdline.as_deref(), Some(":w"));
-        assert!(text.cmdline_cursor);
-        assert!(text.spans.is_empty());
+        assert_eq!(text.prompt.as_deref(), Some(":w"));
+        assert!(text.prompt_cursor);
+        assert_eq!(text.badge.content.as_ref(), " :CMD ");
     }
 
     #[test]
@@ -639,19 +823,24 @@ mod tests {
             command_line: None,
         };
         let text = sb.build(None, &DEFAULT_DARK, Tier::TrueColor);
-        assert!(text.cmdline.is_none());
-        assert!(!text.spans.is_empty());
+        assert!(text.prompt.is_none());
+        assert!(!text.content.is_empty());
     }
 
     #[test]
     fn test_status_bar_zero_width_no_panic() {
         use ratatui::{backend::TestBackend, layout::Rect, Terminal};
 
-        let text = StatusBarText {
-            spans: Vec::new(),
-            cmdline: Some(":w".to_string()),
-            cmdline_cursor: true,
-        };
+        let text = StatusBar {
+            mode: Mode::Command,
+            path: "test.md".to_string(),
+            dirty: false,
+            is_new: false,
+            cursor_line: 1,
+            line_count: 1,
+            command_line: Some(":w".to_string()),
+        }
+        .build(None, &DEFAULT_DARK, Tier::TrueColor);
         let mut terminal = Terminal::new(TestBackend::new(1, 1)).expect("create test terminal");
 
         terminal
@@ -665,6 +854,10 @@ mod tests {
                         height: 1,
                     },
                     &text,
+                    "",
+                    true,
+                    &DEFAULT_DARK,
+                    Tier::TrueColor,
                 );
             })
             .expect("render zero-width status bar");
@@ -684,7 +877,7 @@ mod tests {
             command_line: None,
         };
         let text = sb.build(None, &DEFAULT_DARK, Tier::TrueColor);
-        let full_text: String = text.spans.iter().map(|s| s.content.as_ref()).collect();
+        let full_text: String = text.content.iter().map(|s| s.content.as_ref()).collect();
         assert!(full_text.contains("[+]"));
     }
 
@@ -706,7 +899,7 @@ mod tests {
             command_line: None,
         };
         let text = sb.build(Some(&transient), &DEFAULT_DARK, Tier::TrueColor);
-        let full_text: String = text.spans.iter().map(|s| s.content.as_ref()).collect();
+        let full_text: String = text.content.iter().map(|s| s.content.as_ref()).collect();
         assert!(full_text.contains("read-only view"));
     }
 
@@ -728,7 +921,7 @@ mod tests {
             command_line: None,
         };
         let text = sb.build(Some(&transient), &DEFAULT_DARK, Tier::TrueColor);
-        let full_text: String = text.spans.iter().map(|s| s.content.as_ref()).collect();
+        let full_text: String = text.content.iter().map(|s| s.content.as_ref()).collect();
         // FR-6.2: error message renders with ✗ even on monochrome
         assert!(full_text.contains("\u{2717}"));
     }
@@ -751,7 +944,7 @@ mod tests {
             command_line: None,
         };
         let text = sb.build(Some(&transient), &DEFAULT_DARK, Tier::TrueColor);
-        let full_text: String = text.spans.iter().map(|s| s.content.as_ref()).collect();
+        let full_text: String = text.content.iter().map(|s| s.content.as_ref()).collect();
         assert!(full_text.contains("\u{26a0}"));
     }
 

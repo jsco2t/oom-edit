@@ -643,12 +643,6 @@ impl VimCore {
         self.editor.set_viewport_top(top_row);
     }
 
-    /// Command-line mode is not supported by the hjkl wrapper.
-    /// Returns `None` always.
-    pub(crate) fn command_line(&self) -> Option<String> {
-        None
-    }
-
     /// Check if the buffer has been modified since the last save point.
     pub(crate) fn is_modified_since(&self, save_point: UndoMark) -> bool {
         self.editor.buffer().dirty_gen() != save_point.0 && self.modified_since_save

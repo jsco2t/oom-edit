@@ -21,4 +21,4 @@
   20  Another heading.
   21
   22  More text here.
-↑↓ navigate · type to filter · Enter execute · Esc close   NORMAL (new) 1:1  4%
+ NORMAL  ↑↓ navigate · type to filter · Enter execute · Esc close

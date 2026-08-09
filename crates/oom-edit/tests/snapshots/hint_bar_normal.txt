@@ -21,4 +21,4 @@
   20  Another heading.
   21
   22  More text here.
-F1 help  F1 help                                           NORMAL (new) 1:1  4%
+ NORMAL  Space v=toggle view  Space w=save  Space q=quit             1:1  4% Top
