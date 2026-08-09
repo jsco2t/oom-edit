@@ -211,6 +211,16 @@ impl<'a> ViewLayoutBuilder<'a> {
     // ── VW-1: Headings ───────────────────────────────────────────────
 
     fn render_heading(&mut self, level: u8, inlines: &[Inline], source: &Range<usize>) {
+        let heading_style = match level {
+            1 => SemanticStyle::Heading1,
+            2 => SemanticStyle::Heading2,
+            3 => SemanticStyle::Heading3,
+            4 => SemanticStyle::Heading4,
+            5 => SemanticStyle::Heading5,
+            6 => SemanticStyle::Heading6,
+            _ => SemanticStyle::Heading1,
+        };
+
         // Build heading prefix glyph
         let prefix: String = match level {
             1 => "█ ".to_string(),
@@ -223,7 +233,7 @@ impl<'a> ViewLayoutBuilder<'a> {
         };
 
         // Render inline content
-        let styled = self.render_inlines(inlines, SemanticStyle::Heading1);
+        let styled = self.render_inlines(inlines, heading_style);
 
         // Combine prefix + content
         let mut combined_text = prefix.to_string();
@@ -238,16 +248,6 @@ impl<'a> ViewLayoutBuilder<'a> {
         }
 
         // Apply heading style to prefix
-        let heading_style = match level {
-            1 => SemanticStyle::Heading1,
-            2 => SemanticStyle::Heading2,
-            3 => SemanticStyle::Heading3,
-            4 => SemanticStyle::Heading4,
-            5 => SemanticStyle::Heading5,
-            6 => SemanticStyle::Heading6,
-            _ => SemanticStyle::Heading1,
-        };
-
         combined_spans.push(Span {
             start_col: 0,
             end_col: prefix_char_len,
@@ -293,6 +293,11 @@ impl<'a> ViewLayoutBuilder<'a> {
 
         for inline in inlines {
             let (inline_text, style) = self.inline_to_text_and_style(inline);
+            let style = if style == SemanticStyle::Text {
+                default_style
+            } else {
+                style
+            };
             let char_len = inline_text.chars().count();
 
             text.push_str(&inline_text);
@@ -861,6 +866,64 @@ pub use wrap::{text_width, wrap_lines};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heading_text_inherits_its_level_style() {
+        let text = "# one\n\n## two\n\n### three\n\n#### four\n\n##### five\n\n###### six\n";
+        let model = BlockModel::build(text, None);
+        let highlighter = syntax::Highlighter::new(text);
+        let layout = ViewLayout::build(&model, 80, &highlighter);
+
+        for (label, expected_style) in [
+            ("one", SemanticStyle::Heading1),
+            ("two", SemanticStyle::Heading2),
+            ("three", SemanticStyle::Heading3),
+            ("four", SemanticStyle::Heading4),
+            ("five", SemanticStyle::Heading5),
+            ("six", SemanticStyle::Heading6),
+        ] {
+            let line = layout
+                .lines
+                .iter()
+                .find(|line| line.styled.text.contains(label))
+                .unwrap_or_else(|| panic!("missing rendered heading {label:?}"));
+            assert!(
+                line.styled.spans.iter().any(|span| {
+                    span.style == expected_style && span_text(&line.styled, span).contains(label)
+                }),
+                "heading text {label:?} must use {expected_style:?}: {:?}",
+                line.styled.spans
+            );
+        }
+    }
+
+    #[test]
+    fn heading_inline_styles_override_the_heading_level() {
+        let text = "## plain *emphasis* `code`\n";
+        let model = BlockModel::build(text, None);
+        let highlighter = syntax::Highlighter::new(text);
+        let layout = ViewLayout::build(&model, 80, &highlighter);
+        let heading = layout
+            .lines
+            .iter()
+            .find(|line| line.styled.text.contains("plain"))
+            .expect("rendered heading");
+
+        for (content, expected_style) in [
+            ("plain ", SemanticStyle::Heading2),
+            ("emphasis", SemanticStyle::Emphasis),
+            ("code", SemanticStyle::CodeSpan),
+        ] {
+            assert!(
+                heading.styled.spans.iter().any(|span| {
+                    span.style == expected_style
+                        && span_text(&heading.styled, span).contains(content)
+                }),
+                "heading content {content:?} must use {expected_style:?}: {:?}",
+                heading.styled.spans
+            );
+        }
+    }
 
     #[test]
     fn unicode_front_matter_panel_spans_select_key_and_value() {

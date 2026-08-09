@@ -15,6 +15,13 @@
 use oom_edit_core::SemanticStyle;
 use ratatui::style::{Color, Modifier, Style};
 
+#[cfg(test)]
+pub(crate) const ZED_UI_TEXT: Color = Color::Rgb(200, 204, 212);
+#[cfg(test)]
+pub(crate) const ZED_CYAN: Color = Color::Rgb(110, 180, 191);
+#[cfg(test)]
+pub(crate) const ZED_ORANGE: Color = Color::Rgb(191, 149, 106);
+
 // ── UI Slots ────────────────────────────────────────────────────────────────
 
 /// UI-specific display slots used by the status bar, hint bar, gutter, etc.
@@ -287,7 +294,8 @@ impl EnvParts {
 
 /// Resolve the active theme name through the selection ladder.
 ///
-/// Priority: `--theme` flag > config dark/light slot > "default-dark" fallback.
+/// Priority: `--theme` flag > compatible config dark/light slot > the display
+/// mode's built-in default.
 /// Returns `(theme_name, is_light)`, where `is_light` is the resolved display
 /// mode used to select the corresponding config slot. If the name is unknown,
 /// warns and returns "default-dark".
@@ -301,25 +309,22 @@ pub fn resolve_theme(
     let _tier = env.effective_tier();
     let is_light = env.is_light(config_mode);
 
-    // Known theme names for validation.
-    fn is_known(name: &str) -> bool {
-        name == "default-dark" || name == "default-light" || name == "accessible"
-    }
-
     // Determine theme name: CLI flag > config slot > default.
+    let fallback = if is_light {
+        "default-light"
+    } else {
+        "default-dark"
+    };
+    let configured = if is_light { config_light } else { config_dark };
     let name: String = match cli_theme {
         Some(cli) if is_known(cli) => cli.to_string(),
         Some(cli) => {
             eprintln!("oom-edit: unknown theme '{cli}', using default-dark");
             "default-dark".to_string()
         }
-        None if is_light => config_light
-            .filter(|s| is_known(s))
-            .unwrap_or("default-light")
-            .to_string(),
-        None => config_dark
-            .filter(|s| is_known(s))
-            .unwrap_or("default-dark")
+        None => configured
+            .filter(|name| is_known(name) && supports_mode(name, is_light))
+            .unwrap_or(fallback)
             .to_string(),
     };
 
@@ -341,11 +346,35 @@ pub fn built_in_themes() -> &'static [&'static str] {
     &["default-dark", "default-light", "accessible"]
 }
 
-/// Cycle to the next built-in theme. Returns the new theme name.
-pub fn cycle_theme(current: &str) -> &'static str {
-    let themes = built_in_themes();
-    let idx = themes.iter().position(|&t| t == current).unwrap_or(0);
-    themes[(idx + 1) % themes.len()]
+fn is_known(name: &str) -> bool {
+    built_in_themes().contains(&name)
+}
+
+fn supports_mode(name: &str, is_light: bool) -> bool {
+    match name {
+        "default-dark" => !is_light,
+        "default-light" => is_light,
+        "accessible" => true,
+        _ => false,
+    }
+}
+
+fn themes_for_mode(is_light: bool) -> &'static [&'static str] {
+    if is_light {
+        &["default-light", "accessible"]
+    } else {
+        &["default-dark", "accessible"]
+    }
+}
+
+/// Cycle to the next built-in theme compatible with the display mode.
+/// Returns the mode's default when `current` is unknown or incompatible.
+pub fn cycle_theme(current: &str, is_light: bool) -> &'static str {
+    let themes = themes_for_mode(is_light);
+    themes
+        .iter()
+        .position(|&name| name == current)
+        .map_or(themes[0], |idx| themes[(idx + 1) % themes.len()])
 }
 
 // ── Built-in: default-dark ──────────────────────────────────────────────────
@@ -376,105 +405,275 @@ pub static DEFAULT_DARK: Theme = Theme {
     name: "default-dark",
     truecolor: Palette::TrueColor {
         semantic: &[
-            (SemanticStyle::Text, Color::White, Modifier::empty()),
-            (SemanticStyle::Heading1, Color::Yellow, Modifier::BOLD),
-            (SemanticStyle::Heading2, Color::Yellow, Modifier::BOLD),
-            (SemanticStyle::Heading3, Color::Cyan, Modifier::BOLD),
-            (SemanticStyle::Heading4, Color::Cyan, Modifier::BOLD),
-            (SemanticStyle::Heading5, Color::Magenta, Modifier::BOLD),
-            (SemanticStyle::Heading6, Color::Magenta, Modifier::BOLD),
-            (SemanticStyle::Emphasis, Color::White, Modifier::ITALIC),
-            (SemanticStyle::Strong, Color::White, Modifier::BOLD),
-            (SemanticStyle::Strikethrough, Color::Gray, Modifier::empty()),
-            (SemanticStyle::CodeSpan, Color::Green, Modifier::empty()),
-            (SemanticStyle::CodeBlock, Color::Green, Modifier::empty()),
-            (SemanticStyle::Quote, Color::Yellow, Modifier::empty()),
-            (SemanticStyle::ListMarker, Color::Cyan, Modifier::empty()),
-            (SemanticStyle::Link, Color::Cyan, Modifier::UNDERLINED),
-            (SemanticStyle::LinkUrl, Color::DarkGray, Modifier::empty()),
-            (SemanticStyle::Rule, Color::DarkGray, Modifier::empty()),
-            (SemanticStyle::HtmlRaw, Color::DarkGray, Modifier::empty()),
             (
-                SemanticStyle::FmDelimiter,
-                Color::DarkGray,
+                SemanticStyle::Text,
+                Color::Rgb(200, 204, 212),
                 Modifier::empty(),
             ),
-            (SemanticStyle::FmKey, Color::Yellow, Modifier::BOLD),
-            (SemanticStyle::FmValue, Color::Green, Modifier::empty()),
-            (SemanticStyle::Keyword, Color::Red, Modifier::BOLD),
-            (SemanticStyle::Function, Color::Cyan, Modifier::empty()),
-            (SemanticStyle::TypeName, Color::Yellow, Modifier::empty()),
-            (SemanticStyle::StringLit, Color::Green, Modifier::empty()),
-            (SemanticStyle::NumberLit, Color::Magenta, Modifier::empty()),
-            (SemanticStyle::Comment, Color::DarkGray, Modifier::ITALIC),
-            (SemanticStyle::Operator, Color::White, Modifier::empty()),
-            (SemanticStyle::Variable, Color::White, Modifier::empty()),
-            (SemanticStyle::Punct, Color::DarkGray, Modifier::empty()),
+            (
+                SemanticStyle::Heading1,
+                Color::Rgb(110, 180, 191),
+                Modifier::BOLD,
+            ),
+            (
+                SemanticStyle::Heading2,
+                Color::Rgb(191, 149, 106),
+                Modifier::BOLD,
+            ),
+            (
+                SemanticStyle::Heading3,
+                Color::Rgb(223, 193, 132),
+                Modifier::BOLD,
+            ),
+            (
+                SemanticStyle::Heading4,
+                Color::Rgb(161, 193, 129),
+                Modifier::BOLD,
+            ),
+            (
+                SemanticStyle::Heading5,
+                Color::Rgb(110, 180, 191),
+                Modifier::BOLD,
+            ),
+            (
+                SemanticStyle::Heading6,
+                Color::Rgb(180, 119, 207),
+                Modifier::BOLD,
+            ),
+            (
+                SemanticStyle::Emphasis,
+                Color::Rgb(180, 119, 207),
+                Modifier::ITALIC,
+            ),
+            (
+                SemanticStyle::Strong,
+                Color::Rgb(223, 193, 132),
+                Modifier::BOLD,
+            ),
+            (
+                SemanticStyle::Strikethrough,
+                Color::Rgb(200, 204, 212),
+                Modifier::empty(),
+            ),
+            (
+                SemanticStyle::CodeSpan,
+                Color::Rgb(161, 193, 129),
+                Modifier::empty(),
+            ),
+            (
+                SemanticStyle::CodeBlock,
+                Color::Rgb(161, 193, 129),
+                Modifier::empty(),
+            ),
+            (
+                SemanticStyle::Quote,
+                Color::Rgb(223, 193, 132),
+                Modifier::empty(),
+            ),
+            (
+                SemanticStyle::ListMarker,
+                Color::Rgb(208, 114, 119),
+                Modifier::empty(),
+            ),
+            (
+                SemanticStyle::Link,
+                Color::Rgb(180, 119, 207),
+                Modifier::UNDERLINED,
+            ),
+            (
+                SemanticStyle::LinkUrl,
+                Color::Rgb(110, 180, 191),
+                Modifier::UNDERLINED,
+            ),
+            (
+                SemanticStyle::Rule,
+                Color::Rgb(59, 64, 72),
+                Modifier::empty(),
+            ),
+            (
+                SemanticStyle::HtmlRaw,
+                Color::Rgb(93, 99, 111),
+                Modifier::empty(),
+            ),
+            (
+                SemanticStyle::FmDelimiter,
+                Color::Rgb(59, 64, 72),
+                Modifier::empty(),
+            ),
+            (
+                SemanticStyle::FmKey,
+                Color::Rgb(223, 193, 132),
+                Modifier::BOLD,
+            ),
+            (
+                SemanticStyle::FmValue,
+                Color::Rgb(161, 193, 129),
+                Modifier::empty(),
+            ),
+            (
+                SemanticStyle::Keyword,
+                Color::Rgb(180, 119, 207),
+                Modifier::BOLD,
+            ),
+            (
+                SemanticStyle::Function,
+                Color::Rgb(115, 173, 233),
+                Modifier::empty(),
+            ),
+            (
+                SemanticStyle::TypeName,
+                Color::Rgb(110, 180, 191),
+                Modifier::empty(),
+            ),
+            (
+                SemanticStyle::StringLit,
+                Color::Rgb(161, 193, 129),
+                Modifier::empty(),
+            ),
+            (
+                SemanticStyle::NumberLit,
+                Color::Rgb(191, 149, 106),
+                Modifier::empty(),
+            ),
+            (
+                SemanticStyle::Comment,
+                Color::Rgb(93, 99, 111),
+                Modifier::ITALIC,
+            ),
+            (
+                SemanticStyle::Operator,
+                Color::Rgb(200, 204, 212),
+                Modifier::empty(),
+            ),
+            (
+                SemanticStyle::Variable,
+                Color::Rgb(200, 204, 212),
+                Modifier::empty(),
+            ),
+            (
+                SemanticStyle::Punct,
+                Color::Rgb(200, 204, 212),
+                Modifier::empty(),
+            ),
             (SemanticStyle::Selection, Color::Reset, Modifier::REVERSED),
-            (SemanticStyle::Match, Color::Yellow, Modifier::UNDERLINED),
+            (
+                SemanticStyle::Match,
+                Color::Rgb(115, 173, 233),
+                Modifier::UNDERLINED,
+            ),
             (SemanticStyle::CursorLine, Color::Reset, Modifier::empty()),
-            (SemanticStyle::Muted, Color::DarkGray, Modifier::DIM),
+            (SemanticStyle::Muted, Color::Rgb(59, 64, 72), Modifier::DIM),
         ],
         ui: &[
             (
                 UiSlot::StatusBar,
-                Color::White,
-                Some(Color::Rgb(40, 44, 52)),
+                Color::Rgb(200, 204, 212),
+                Some(Color::Rgb(47, 52, 62)),
                 Modifier::DIM,
             ),
             (
                 UiSlot::BadgeNormal,
-                Color::Black,
-                Some(Color::White),
+                Color::Rgb(40, 44, 51),
+                Some(Color::Rgb(115, 173, 233)),
                 Modifier::BOLD,
             ),
             (
                 UiSlot::BadgeInsert,
-                Color::Black,
-                Some(Color::Green),
+                Color::Rgb(40, 44, 51),
+                Some(Color::Rgb(161, 193, 129)),
                 Modifier::BOLD,
             ),
             (
                 UiSlot::BadgeVisual,
-                Color::Black,
-                Some(Color::Yellow),
+                Color::Rgb(40, 44, 51),
+                Some(Color::Rgb(180, 119, 207)),
                 Modifier::BOLD,
             ),
             (
                 UiSlot::BadgeView,
-                Color::Black,
-                Some(Color::Cyan),
+                Color::Rgb(40, 44, 51),
+                Some(Color::Rgb(110, 180, 191)),
                 Modifier::BOLD,
             ),
             (
                 UiSlot::BadgeCommand,
-                Color::Black,
-                Some(Color::Magenta),
+                Color::Rgb(40, 44, 51),
+                Some(Color::Rgb(223, 193, 132)),
                 Modifier::BOLD,
             ),
-            (UiSlot::Border, Color::DarkGray, None, Modifier::empty()),
-            (UiSlot::HintKey, Color::Yellow, None, Modifier::BOLD),
-            (UiSlot::HintDesc, Color::White, None, Modifier::empty()),
-            (UiSlot::StatusSuccess, Color::Green, None, Modifier::empty()),
-            (UiSlot::StatusInfo, Color::White, None, Modifier::empty()),
             (
-                UiSlot::StatusWarning,
-                Color::Yellow,
+                UiSlot::Border,
+                Color::Rgb(47, 52, 62),
                 None,
                 Modifier::empty(),
             ),
-            (UiSlot::StatusError, Color::Red, None, Modifier::empty()),
-            (UiSlot::Gutter, Color::DarkGray, None, Modifier::DIM),
-            (UiSlot::GutterCurrent, Color::Yellow, None, Modifier::BOLD),
+            (
+                UiSlot::HintKey,
+                Color::Rgb(223, 193, 132),
+                None,
+                Modifier::BOLD,
+            ),
+            (
+                UiSlot::HintDesc,
+                Color::Rgb(200, 204, 212),
+                None,
+                Modifier::empty(),
+            ),
+            (
+                UiSlot::StatusSuccess,
+                Color::Rgb(161, 193, 129),
+                None,
+                Modifier::empty(),
+            ),
+            (
+                UiSlot::StatusInfo,
+                Color::Rgb(115, 173, 233),
+                None,
+                Modifier::empty(),
+            ),
+            (
+                UiSlot::StatusWarning,
+                Color::Rgb(223, 193, 132),
+                None,
+                Modifier::empty(),
+            ),
+            (
+                UiSlot::StatusError,
+                Color::Rgb(208, 114, 119),
+                None,
+                Modifier::empty(),
+            ),
+            (UiSlot::Gutter, Color::Rgb(93, 99, 111), None, Modifier::DIM),
+            (
+                UiSlot::GutterCurrent,
+                Color::Rgb(200, 204, 212),
+                None,
+                Modifier::BOLD,
+            ),
             (
                 UiSlot::CursorLine,
                 Color::Reset,
-                Some(Color::DarkGray),
+                Some(Color::Rgb(47, 52, 62)),
                 Modifier::DIM,
             ),
-            (UiSlot::TabActive, Color::White, None, Modifier::BOLD),
-            (UiSlot::TabInactive, Color::Gray, None, Modifier::DIM),
-            (UiSlot::TabSeparator, Color::DarkGray, None, Modifier::DIM),
+            (
+                UiSlot::TabActive,
+                Color::Rgb(200, 204, 212),
+                None,
+                Modifier::BOLD,
+            ),
+            (
+                UiSlot::TabInactive,
+                Color::Rgb(93, 99, 111),
+                None,
+                Modifier::DIM,
+            ),
+            (
+                UiSlot::TabSeparator,
+                Color::Rgb(47, 52, 62),
+                None,
+                Modifier::DIM,
+            ),
         ],
     },
     color16: Palette::Color16 {
@@ -1455,6 +1654,60 @@ mod tests {
         assert!(is_light);
     }
 
+    #[test]
+    fn resolve_config_slots_reject_opposite_mode_theme() {
+        let env = EnvParts::default();
+
+        let (dark_name, dark_is_light) = resolve_theme(
+            None,
+            Some("dark"),
+            Some("default-light"),
+            Some("default-light"),
+            &env,
+        );
+        assert_eq!(dark_name, "default-dark");
+        assert!(!dark_is_light);
+
+        let (light_name, light_is_light) = resolve_theme(
+            None,
+            Some("light"),
+            Some("default-dark"),
+            Some("default-dark"),
+            &env,
+        );
+        assert_eq!(light_name, "default-light");
+        assert!(light_is_light);
+
+        for mode in ["dark", "light"] {
+            let (name, _) = resolve_theme(
+                None,
+                Some(mode),
+                Some("accessible"),
+                Some("accessible"),
+                &env,
+            );
+            assert_eq!(name, "accessible", "accessible must support {mode} mode");
+        }
+
+        let (dark_cli_override, _) = resolve_theme(
+            Some("default-light"),
+            Some("dark"),
+            Some("default-dark"),
+            Some("default-light"),
+            &env,
+        );
+        assert_eq!(dark_cli_override, "default-light");
+
+        let (light_cli_override, _) = resolve_theme(
+            Some("default-dark"),
+            Some("light"),
+            Some("default-dark"),
+            Some("default-light"),
+            &env,
+        );
+        assert_eq!(light_cli_override, "default-dark");
+    }
+
     // ── Built-in themes ─────────────────────────────────────────────────
 
     #[test]
@@ -1467,21 +1720,120 @@ mod tests {
     }
 
     #[test]
-    fn cycle_theme_cycles_all_three() {
-        let t1 = cycle_theme("default-dark");
-        let t2 = cycle_theme(t1);
-        let t3 = cycle_theme(t2);
-        let t4 = cycle_theme(t3);
-        assert_eq!(t1, "default-light");
-        assert_eq!(t2, "accessible");
-        assert_eq!(t3, "default-dark");
-        assert_eq!(t4, "default-light");
+    fn cycle_theme_stays_within_display_mode() {
+        assert_eq!(cycle_theme("default-dark", false), "accessible");
+        assert_eq!(cycle_theme("accessible", false), "default-dark");
+        assert_eq!(cycle_theme("default-light", true), "accessible");
+        assert_eq!(cycle_theme("accessible", true), "default-light");
+
+        assert_eq!(cycle_theme("default-light", false), "default-dark");
+        assert_eq!(cycle_theme("default-dark", true), "default-light");
+        assert_eq!(cycle_theme("nonexistent", false), "default-dark");
+        assert_eq!(cycle_theme("nonexistent", true), "default-light");
     }
 
     #[test]
-    fn cycle_theme_unknown_cycles_to_second() {
-        let t = cycle_theme("nonexistent");
-        assert_eq!(t, "default-light"); // index 0 = default-dark, so next = default-light
+    fn default_dark_truecolor_matches_zed_onedark_md() {
+        let expected_semantic = [
+            (SemanticStyle::Text, Color::Rgb(200, 204, 212)),
+            (SemanticStyle::Heading1, Color::Rgb(110, 180, 191)),
+            (SemanticStyle::Heading2, Color::Rgb(191, 149, 106)),
+            (SemanticStyle::Heading3, Color::Rgb(223, 193, 132)),
+            (SemanticStyle::Heading4, Color::Rgb(161, 193, 129)),
+            (SemanticStyle::Heading5, Color::Rgb(110, 180, 191)),
+            (SemanticStyle::Heading6, Color::Rgb(180, 119, 207)),
+            (SemanticStyle::Emphasis, Color::Rgb(180, 119, 207)),
+            (SemanticStyle::Strong, Color::Rgb(223, 193, 132)),
+            (SemanticStyle::CodeSpan, Color::Rgb(161, 193, 129)),
+            (SemanticStyle::CodeBlock, Color::Rgb(161, 193, 129)),
+            (SemanticStyle::ListMarker, Color::Rgb(208, 114, 119)),
+            (SemanticStyle::Quote, Color::Rgb(223, 193, 132)),
+            (SemanticStyle::Link, Color::Rgb(180, 119, 207)),
+            (SemanticStyle::LinkUrl, Color::Rgb(110, 180, 191)),
+            (SemanticStyle::Keyword, Color::Rgb(180, 119, 207)),
+            (SemanticStyle::Function, Color::Rgb(115, 173, 233)),
+            (SemanticStyle::TypeName, Color::Rgb(110, 180, 191)),
+            (SemanticStyle::StringLit, Color::Rgb(161, 193, 129)),
+            (SemanticStyle::NumberLit, Color::Rgb(191, 149, 106)),
+            (SemanticStyle::Comment, Color::Rgb(93, 99, 111)),
+            (SemanticStyle::Operator, Color::Rgb(200, 204, 212)),
+            (SemanticStyle::Variable, Color::Rgb(200, 204, 212)),
+        ];
+
+        for (slot, expected) in expected_semantic {
+            assert_eq!(
+                DEFAULT_DARK.style(Tier::TrueColor, slot).fg,
+                Some(expected),
+                "unexpected Zed foreground for {slot:?}"
+            );
+        }
+
+        let expected_ui = [
+            (UiSlot::StatusBar, Color::Rgb(200, 204, 212)),
+            (UiSlot::BadgeNormal, Color::Rgb(40, 44, 51)),
+            (UiSlot::Border, Color::Rgb(47, 52, 62)),
+            (UiSlot::HintKey, Color::Rgb(223, 193, 132)),
+            (UiSlot::StatusError, Color::Rgb(208, 114, 119)),
+            (UiSlot::Gutter, Color::Rgb(93, 99, 111)),
+            (UiSlot::TabActive, Color::Rgb(200, 204, 212)),
+        ];
+        for (slot, expected) in expected_ui {
+            assert_eq!(
+                DEFAULT_DARK.ui_style(Tier::TrueColor, slot).fg,
+                Some(expected),
+                "unexpected Zed foreground for {slot:?}"
+            );
+        }
+        assert_eq!(
+            DEFAULT_DARK.ui_style(Tier::TrueColor, UiSlot::StatusBar).bg,
+            Some(Color::Rgb(47, 52, 62))
+        );
+        assert_eq!(
+            DEFAULT_DARK
+                .ui_style(Tier::TrueColor, UiSlot::CursorLine)
+                .bg,
+            Some(Color::Rgb(47, 52, 62))
+        );
+    }
+
+    #[test]
+    fn default_dark_truecolor_colored_entries_are_rgb() {
+        fn assert_rgb(color: Color, description: &str) {
+            assert!(
+                matches!(color, Color::Rgb(_, _, _)),
+                "{description} must use an exact RGB color, got {color:?}"
+            );
+        }
+
+        let Palette::TrueColor { semantic, ui } = &DEFAULT_DARK.truecolor else {
+            panic!("default-dark TrueColor palette changed tiers");
+        };
+
+        for (slot, foreground, _) in *semantic {
+            if matches!(slot, SemanticStyle::Selection | SemanticStyle::CursorLine) {
+                assert_eq!(
+                    *foreground,
+                    Color::Reset,
+                    "semantic slot {slot:?} is an intentional composition sentinel"
+                );
+            } else {
+                assert_rgb(*foreground, &format!("semantic slot {slot:?}"));
+            }
+        }
+        for (slot, foreground, background, _) in *ui {
+            if *slot == UiSlot::CursorLine {
+                assert_eq!(
+                    *foreground,
+                    Color::Reset,
+                    "UI cursor-line foreground is an intentional composition sentinel"
+                );
+            } else {
+                assert_rgb(*foreground, &format!("UI slot {slot:?} foreground"));
+            }
+            if let Some(background) = background {
+                assert_rgb(*background, &format!("UI slot {slot:?} background"));
+            }
+        }
     }
 
     // ── get_theme ───────────────────────────────────────────────────────
@@ -1561,28 +1913,26 @@ mod tests {
     }
 
     #[test]
-    fn default_dark_chrome_preserves_previous_colors() {
+    fn default_dark_color16_chrome_preserves_previous_colors() {
         let theme = &DEFAULT_DARK;
 
-        for tier in [Tier::TrueColor, Tier::Color16] {
-            assert_eq!(
-                theme.ui_style(tier, UiSlot::CursorLine).bg,
-                Some(Color::DarkGray)
-            );
-            assert_eq!(theme.ui_style(tier, UiSlot::CursorLine).fg, None);
-            assert_eq!(
-                theme.ui_style(tier, UiSlot::TabActive).fg,
-                Some(Color::White)
-            );
-            assert_eq!(
-                theme.ui_style(tier, UiSlot::TabInactive).fg,
-                Some(Color::Gray)
-            );
-            assert_eq!(
-                theme.ui_style(tier, UiSlot::TabSeparator).fg,
-                Some(Color::DarkGray)
-            );
-        }
+        assert_eq!(
+            theme.ui_style(Tier::Color16, UiSlot::CursorLine).bg,
+            Some(Color::DarkGray)
+        );
+        assert_eq!(theme.ui_style(Tier::Color16, UiSlot::CursorLine).fg, None);
+        assert_eq!(
+            theme.ui_style(Tier::Color16, UiSlot::TabActive).fg,
+            Some(Color::White)
+        );
+        assert_eq!(
+            theme.ui_style(Tier::Color16, UiSlot::TabInactive).fg,
+            Some(Color::Gray)
+        );
+        assert_eq!(
+            theme.ui_style(Tier::Color16, UiSlot::TabSeparator).fg,
+            Some(Color::DarkGray)
+        );
     }
 
     #[test]
@@ -1623,7 +1973,13 @@ mod tests {
                 let mut backgrounds = std::collections::HashSet::new();
                 for slot in badge_slots {
                     let style = theme.ui_style(tier, slot);
-                    assert_eq!(style.fg, Some(Color::Black));
+                    let expected_black = if theme.name == "default-dark" && tier == Tier::TrueColor
+                    {
+                        Color::Rgb(40, 44, 51)
+                    } else {
+                        Color::Black
+                    };
+                    assert_eq!(style.fg, Some(expected_black));
                     assert!(
                         style.add_modifier.contains(Modifier::BOLD),
                         "{slot:?} must retain its text carrier in {} at {tier:?}",

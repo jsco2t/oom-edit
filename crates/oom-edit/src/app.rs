@@ -845,7 +845,7 @@ impl App {
                 }
             }
             Command::CycleTheme => {
-                let next = theme::cycle_theme(&self.theme_name);
+                let next = theme::cycle_theme(&self.theme_name, self.is_light);
                 self.theme_name = next.to_string();
                 // Persist to config.
                 let mut config = crate::config::Config::load_from_path(&self.config_path);
@@ -2510,44 +2510,48 @@ mod tests {
     }
 
     #[test]
-    fn app_cycle_theme_persists_current_display_mode_slot() {
+    fn app_cycle_theme_never_persists_opposite_mode_theme() {
         struct Case {
             name: &'static str,
             current_theme: &'static str,
             is_light: bool,
             expected_theme: &'static str,
-            relative_line_numbers: bool,
         }
 
         for case in [
             Case {
-                name: "dark mode",
+                name: "dark mode cycles to accessible",
                 current_theme: "default-dark",
                 is_light: false,
-                expected_theme: "default-light",
-                relative_line_numbers: false,
+                expected_theme: "accessible",
             },
             Case {
-                name: "light mode",
-                current_theme: "default-dark",
-                is_light: true,
-                expected_theme: "default-light",
-                relative_line_numbers: true,
+                name: "dark mode recovers an incompatible current theme",
+                current_theme: "default-light",
+                is_light: false,
+                expected_theme: "default-dark",
             },
             Case {
-                name: "light mode cycling to accessible",
+                name: "light mode cycles to accessible",
                 current_theme: "default-light",
                 is_light: true,
                 expected_theme: "accessible",
-                relative_line_numbers: true,
+            },
+            Case {
+                name: "light mode recovers an incompatible current theme",
+                current_theme: "default-dark",
+                is_light: true,
+                expected_theme: "default-light",
             },
         ] {
             let temp_dir = tempfile::tempdir().unwrap();
             let config_path = temp_dir.path().join("oom-edit/config.toml");
             let mut initial_config = crate::config::Config::default();
+            initial_config.theme.mode = Some(if case.is_light { "light" } else { "dark" }.into());
             initial_config.theme.dark = "saved-dark".to_string();
             initial_config.theme.light = "saved-light".to_string();
-            initial_config.relative_line_numbers = case.relative_line_numbers;
+            initial_config.relative_line_numbers = true;
+            initial_config.editor.wrap = false;
             initial_config.save_to_path(&config_path).unwrap();
 
             let mut app = App::new(
@@ -2555,8 +2559,8 @@ mod tests {
                 case.current_theme.to_string(),
                 case.is_light,
                 Tier::TrueColor,
-                true,
-                case.relative_line_numbers,
+                initial_config.editor.wrap,
+                initial_config.relative_line_numbers,
                 Box::new(RecordingClipboardSink::default()),
             );
             app.config_path = config_path.clone();
@@ -2564,56 +2568,66 @@ mod tests {
             app.execute_command(Command::CycleTheme);
 
             let persisted = crate::config::Config::load_from_path(&config_path);
-            let (expected_dark, expected_light) = if case.is_light {
-                ("saved-dark", case.expected_theme)
+            let mut expected_config = initial_config.clone();
+            if case.is_light {
+                expected_config.theme.light = case.expected_theme.to_string();
             } else {
-                (case.expected_theme, "saved-light")
-            };
+                expected_config.theme.dark = case.expected_theme.to_string();
+            }
             assert_eq!(app.theme_name, case.expected_theme, "{}", case.name);
-            assert_eq!(persisted.theme.dark, expected_dark, "{}", case.name);
-            assert_eq!(persisted.theme.light, expected_light, "{}", case.name);
-            assert_eq!(
-                persisted.relative_line_numbers, case.relative_line_numbers,
-                "{}",
-                case.name
-            );
+            assert_eq!(persisted, expected_config, "{}", case.name);
         }
     }
 
     #[test]
-    fn app_cycle_theme_keeps_light_slot_after_accessible_restart() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let config_path = temp_dir.path().join("oom-edit/config.toml");
-        let mut initial_config = crate::config::Config::default();
-        initial_config.theme.mode = Some("light".to_string());
-        initial_config.theme.dark = "saved-dark".to_string();
-        initial_config.theme.light = "accessible".to_string();
-        initial_config.save_to_path(&config_path).unwrap();
+    fn app_cycle_theme_keeps_mode_appropriate_slot_after_accessible_restart() {
+        for (mode, expected_theme) in [("dark", "default-dark"), ("light", "default-light")] {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let config_path = temp_dir.path().join("oom-edit/config.toml");
+            let mut initial_config = crate::config::Config::default();
+            initial_config.theme.mode = Some(mode.to_string());
+            initial_config.theme.dark = if mode == "dark" {
+                "accessible".to_string()
+            } else {
+                "saved-dark".to_string()
+            };
+            initial_config.theme.light = if mode == "light" {
+                "accessible".to_string()
+            } else {
+                "saved-light".to_string()
+            };
+            initial_config.save_to_path(&config_path).unwrap();
 
-        let (theme_name, is_light) = theme::resolve_theme(
-            None,
-            initial_config.theme.mode.as_deref(),
-            Some(&initial_config.theme.dark),
-            Some(&initial_config.theme.light),
-            &theme::EnvParts::default(),
-        );
-        let mut app = App::new(
-            EditorSession::from_text(""),
-            theme_name,
-            is_light,
-            Tier::TrueColor,
-            true,
-            false,
-            Box::new(RecordingClipboardSink::default()),
-        );
-        app.config_path = config_path.clone();
+            let (theme_name, is_light) = theme::resolve_theme(
+                None,
+                initial_config.theme.mode.as_deref(),
+                Some(&initial_config.theme.dark),
+                Some(&initial_config.theme.light),
+                &theme::EnvParts::default(),
+            );
+            let mut app = App::new(
+                EditorSession::from_text(""),
+                theme_name,
+                is_light,
+                Tier::TrueColor,
+                true,
+                false,
+                Box::new(RecordingClipboardSink::default()),
+            );
+            app.config_path = config_path.clone();
 
-        app.execute_command(Command::CycleTheme);
+            app.execute_command(Command::CycleTheme);
 
-        let persisted = crate::config::Config::load_from_path(&config_path);
-        assert_eq!(app.theme_name, "default-dark");
-        assert_eq!(persisted.theme.dark, "saved-dark");
-        assert_eq!(persisted.theme.light, "default-dark");
+            let persisted = crate::config::Config::load_from_path(&config_path);
+            let mut expected_config = initial_config.clone();
+            if is_light {
+                expected_config.theme.light = expected_theme.to_string();
+            } else {
+                expected_config.theme.dark = expected_theme.to_string();
+            }
+            assert_eq!(app.theme_name, expected_theme, "{mode} mode");
+            assert_eq!(persisted, expected_config, "{mode} mode");
+        }
     }
 
     /// T14: Resize in View mode remaps cursor to same content line.

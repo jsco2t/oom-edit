@@ -18,7 +18,7 @@ use oom_edit_core::clipboard::RecordingClipboardSink;
 use oom_edit_core::session::EditorSession;
 
 use crate::app::App;
-use crate::theme::Tier;
+use crate::theme::{Tier, ZED_CYAN, ZED_ORANGE, ZED_UI_TEXT};
 
 // ── Snapshot directory ───────────────────────────────────────────────────────
 
@@ -776,6 +776,50 @@ fn golden_view_narrow_40() {
         app.render(frame);
     });
     assert_snapshot(&lines, "view_narrow_40");
+}
+
+#[test]
+fn default_dark_render_uses_zed_colors_for_plain_text_and_headings() {
+    const WIDTH: u16 = 80;
+    const HEIGHT: u16 = 10;
+
+    let mut app = test_app("plain text\n\n# Cyan heading\n\n## Orange heading\n");
+    for ch in [' ', 'v'] {
+        app.handle_event(&crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(ch),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        ));
+    }
+    let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    let buffer = terminal.backend().buffer();
+
+    for (token, expected) in [
+        ("plain text", ZED_UI_TEXT),
+        ("Cyan heading", ZED_CYAN),
+        ("Orange heading", ZED_ORANGE),
+    ] {
+        let (start_x, y) = (0..HEIGHT)
+            .find_map(|y| {
+                let row: String = (0..WIDTH)
+                    .filter_map(|x| buffer.cell((x, y)))
+                    .map(|cell| cell.symbol())
+                    .collect();
+                row.find(token)
+                    .map(|byte_index| (row[..byte_index].chars().count() as u16, y))
+            })
+            .unwrap_or_else(|| panic!("rendered fixture is missing {token:?}"));
+
+        for x in start_x..start_x + token.chars().count() as u16 {
+            assert_eq!(
+                buffer.cell((x, y)).expect("rendered token cell").fg,
+                expected,
+                "unexpected foreground for {token:?} at ({x}, {y})"
+            );
+        }
+    }
 }
 
 // ── Drift meta-tests ────────────────────────────────────────────────────────

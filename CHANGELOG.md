@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Theme cycling now keeps light and dark config slots mode-compatible, the default dark TrueColor palette uses exact Zed OneDark Markdown RGB values, and View headings apply their per-level colors to heading text as well as markers.
 - The command palette now clears its full surface, grows responsively from a 40×12 floor, keeps the filter fixed, and scrolls to keep the selected command or Vim reference visible.
 - The bottom application row now keeps a fixed, mode-colored badge at the left edge, uses a distinct full-row background, shows unique registry-derived hints, and opens Help through `Space h` without an F1 binding.
 - Source-editor line numbers now leave a two-cell gap before content and are absolute by default; the top-level `relative_line_numbers = true` setting restores hybrid-relative numbering in Normal, Visual, and Command modes.
