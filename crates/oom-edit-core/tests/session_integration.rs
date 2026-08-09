@@ -346,6 +346,62 @@ fn render_view_invalidation_on_width_change() {
     );
 }
 
+#[test]
+fn view_navigation_keeps_non_default_layout() {
+    let text = format!(
+        "# Width-sensitive view\n\n{}\n\n# Search target\n\nThe target text remains searchable.\n",
+        "wrapping words ".repeat(40)
+    );
+    let mut session = EditorSession::from_text(&text);
+    session.toggle_view();
+
+    let layout_at_80: Vec<String> = session
+        .view_layout()
+        .expect("View entry should build the 80-column fallback layout")
+        .lines
+        .iter()
+        .map(|line| line.styled.text.clone())
+        .collect();
+    let layout_at_120: Vec<String> = session
+        .render_view(120)
+        .lines
+        .iter()
+        .map(|line| line.styled.text.clone())
+        .collect();
+    assert_ne!(
+        layout_at_80, layout_at_120,
+        "fixture must wrap differently at the historical fallback and renderer-selected widths"
+    );
+
+    for input in [
+        key('j'),
+        key('k'),
+        key_special(KeyCodeKind::Down),
+        key_special(KeyCodeKind::Up),
+        key('/'),
+        key('t'),
+        key_special(KeyCodeKind::Enter),
+    ] {
+        session.handle_key(input);
+        let current_layout: Vec<&str> = session
+            .view_layout()
+            .expect("navigation and search should keep the layout cached")
+            .lines
+            .iter()
+            .map(|line| line.styled.text.as_str())
+            .collect();
+        assert_eq!(current_layout, layout_at_120);
+    }
+
+    let layout_at_60: Vec<String> = session
+        .render_view(60)
+        .lines
+        .iter()
+        .map(|line| line.styled.text.clone())
+        .collect();
+    assert_ne!(layout_at_60, layout_at_120);
+}
+
 // ── toggle_view ─────────────────────────────────────────────────────────────
 
 #[test]

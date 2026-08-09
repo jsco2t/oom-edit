@@ -266,6 +266,9 @@ struct ViewState {
     layout_cache: Option<ViewLayout>,
     /// The width used when the layout was last built.
     last_width: u16,
+    /// Number of layouts built for deterministic cache-invariant tests.
+    #[cfg(test)]
+    layout_build_count: usize,
     /// Current cursor position in view coordinates.
     cursor: ViewCursor,
     /// Active search state (if in search mode).
@@ -286,6 +289,8 @@ impl ViewState {
         Self {
             layout_cache: None,
             last_width: 0,
+            #[cfg(test)]
+            layout_build_count: 0,
             cursor: ViewCursor::new(0),
             search: None,
             search_input_active: false,
@@ -296,10 +301,12 @@ impl ViewState {
     }
 
     /// Create a new ViewState with a pre-built layout.
-    fn with_layout(layout: ViewLayout) -> Self {
+    fn with_layout(layout: ViewLayout, width: u16) -> Self {
         Self {
             layout_cache: Some(layout),
-            last_width: 0, // Will be set on first render_view call
+            last_width: width,
+            #[cfg(test)]
+            layout_build_count: 1,
             cursor: ViewCursor::new(0),
             search: None,
             search_input_active: false,
@@ -314,13 +321,21 @@ impl ViewState {
     /// Rebuilds when the layout is missing or when `width` differs from
     /// the width used for the last build (`last_width`).
     fn get_layout(&mut self, text: &str, highlighter: &Highlighter, width: u16) -> &ViewLayout {
-        if self.layout_cache.is_none() || self.last_width != width {
+        if self.needs_layout(width) {
             let model = BlockModel::build(text, None);
             let layout = ViewLayout::build(&model, width, highlighter);
             self.layout_cache = Some(layout);
             self.last_width = width;
+            #[cfg(test)]
+            {
+                self.layout_build_count += 1;
+            }
         }
         self.layout_cache.as_ref().unwrap()
+    }
+
+    fn needs_layout(&self, width: u16) -> bool {
+        self.layout_cache.is_none() || self.last_width != width
     }
 
     /// Invalidate the layout cache.
@@ -608,12 +623,7 @@ impl EditorSession {
     /// width changes. Pass the current terminal width on each call.
     pub fn view_layout_mut(&mut self, width: u16) -> Option<&ViewLayout> {
         if self.mode == Mode::View {
-            if let Some(ref mut vs) = self.view_state {
-                let text = self.vim.text();
-                Some(vs.get_layout(&text, &self.highlighter, width))
-            } else {
-                None
-            }
+            Some(self.render_view(width))
         } else {
             None
         }
@@ -1047,30 +1057,21 @@ impl EditorSession {
     /// assert!(!layout.lines.is_empty());
     /// ```
     pub fn render_view(&mut self, width: u16) -> &crate::style::ViewLayout {
-        // Ensure view_state exists
-        if self.view_state.is_none() {
-            let text = self.vim.text();
-            let model = BlockModel::build(&text, None);
-            let layout = ViewLayout::build(&model, width, &self.highlighter);
-            self.view_state = Some(ViewState::with_layout(layout));
-        }
+        let needs_layout = self
+            .view_state
+            .as_ref()
+            .is_none_or(|view_state| view_state.needs_layout(width));
 
-        // Check if layout needs rebuilding
-        if let Some(ref mut vs) = self.view_state {
-            if vs.layout_cache.is_none() || vs.last_width != width {
-                let text = self.vim.text();
-                let model = BlockModel::build(&text, None);
-                let layout = ViewLayout::build(&model, width, &self.highlighter);
-                vs.layout_cache = Some(layout);
-                vs.last_width = width;
-            }
-            vs.layout_cache.as_ref().unwrap()
+        if needs_layout {
+            let text = self.vim.text();
+            self.view_state
+                .get_or_insert_with(ViewState::new)
+                .get_layout(&text, &self.highlighter, width)
         } else {
-            // SAFETY: The block above always sets view_state to Some when it
-            // was None, so this branch is unreachable. Kept for borrow-checker
-            // compatibility; if the compiler ever allowed both paths, there
-            // would be conflicting borrows on self.
-            unreachable!("view_state was just set above")
+            self.view_state
+                .as_ref()
+                .and_then(|view_state| view_state.layout_cache.as_ref())
+                .expect("a valid View cache must contain a layout")
         }
     }
 
@@ -1107,7 +1108,8 @@ impl EditorSession {
             let (edit_line, _edit_col) = if let Some(ref mut vs) = self.view_state {
                 let text = self.vim.text();
                 let cursor_line = vs.cursor.line;
-                let layout = vs.get_layout(&text, &self.highlighter, 80);
+                let width = vs.last_width;
+                let layout = vs.get_layout(&text, &self.highlighter, width);
                 let cursor = ViewCursor::new(cursor_line);
                 nav::leave_view(&cursor, layout, &text)
             } else {
@@ -1132,17 +1134,9 @@ impl EditorSession {
             let model = BlockModel::build(&text, None);
             let layout = ViewLayout::build(&model, 80, &self.highlighter);
             let cursor = nav::enter_view(edit_line, edit_col, &layout, &text);
-
-            self.view_state = Some(ViewState {
-                layout_cache: Some(layout),
-                last_width: 0,
-                cursor,
-                search: None,
-                search_input_active: false,
-                search_origin: None,
-                fm_collapsed: false,
-                count: 0,
-            });
+            let mut view_state = ViewState::with_layout(layout, 80);
+            view_state.cursor = cursor;
+            self.view_state = Some(view_state);
             self.mode = Mode::View;
             vec![Effect::ModeChanged(Mode::View)]
         }
@@ -1239,28 +1233,40 @@ impl EditorSession {
             vs.count = 0;
 
             let text = self.vim.text();
-            // Clone the layout to avoid holding a borrow on vs
-            let layout = vs.get_layout(&text, &self.highlighter, 80).clone();
-            let jump_targets = layout.jump_targets.clone();
-            let max_view_lines = layout.lines.len();
-
             let cursor = ViewCursor::new(cursor_line);
             let search = search_pattern.as_ref().map(|p| {
                 let mut s = ViewSearch::new(p);
                 s.set_direction(search_direction.unwrap_or(SearchDirection::Forward));
                 s
             });
-
-            let result = nav::handle_key(
-                key,
-                &cursor,
-                search.as_ref(),
-                max_view_lines,
-                &jump_targets,
-                &layout,
-                prev_count,
-                &text,
-            );
+            let width = vs.last_width;
+            let (result, search_match) = {
+                let layout = vs.get_layout(&text, &self.highlighter, width);
+                let result = nav::handle_key(
+                    key,
+                    &cursor,
+                    search.as_ref(),
+                    layout.lines.len(),
+                    &layout.jump_targets,
+                    layout,
+                    prev_count,
+                    &text,
+                );
+                let search_match = result
+                    .new_search
+                    .as_ref()
+                    .filter(|new_search| result.search_changed && !new_search.pattern.is_empty())
+                    .and_then(|new_search| {
+                        nav::find_next_match(
+                            new_search,
+                            &cursor,
+                            layout,
+                            &text,
+                            new_search.direction(),
+                        )
+                    });
+                (result, search_match)
+            };
 
             // Apply search state changes
             if result.search_changed {
@@ -1272,14 +1278,8 @@ impl EditorSession {
                         vs.search_origin = Some(cursor);
                     } else {
                         // Pattern entered, perform search
-                        vs.search = Some(new_search.clone());
-                        if let Some(match_line) = nav::find_next_match(
-                            &new_search,
-                            &cursor,
-                            &layout,
-                            &text,
-                            new_search.direction(),
-                        ) {
+                        vs.search = Some(new_search);
+                        if let Some(match_line) = search_match {
                             vs.cursor.line = match_line;
                             effects.push(Effect::CursorMoved);
                         }
@@ -1352,19 +1352,25 @@ impl EditorSession {
                 if let Some(vs) = self.view_state.as_mut() {
                     let cursor = vs.search_origin.unwrap_or(vs.cursor);
                     let text = self.vim.text();
-                    let layout = vs.get_layout(&text, &self.highlighter, 80).clone();
-                    let search_state = vs
+                    let mut search_state = vs
                         .search
-                        .as_mut()
-                        .expect("active View search input must have search state");
+                        .as_ref()
+                        .expect("active View search input must have search state")
+                        .clone();
                     search_state.pattern.push(c);
-                    if let Some(match_line) = nav::find_next_match(
-                        search_state,
-                        &cursor,
-                        &layout,
-                        &text,
-                        search_state.direction(),
-                    ) {
+                    let width = vs.last_width;
+                    let match_line = {
+                        let layout = vs.get_layout(&text, &self.highlighter, width);
+                        nav::find_next_match(
+                            &search_state,
+                            &cursor,
+                            layout,
+                            &text,
+                            search_state.direction(),
+                        )
+                    };
+                    vs.search = Some(search_state);
+                    if let Some(match_line) = match_line {
                         vs.cursor.line = match_line;
                         effects.push(Effect::CursorMoved);
                     }
@@ -1380,7 +1386,8 @@ impl EditorSession {
         let (edit_line, _edit_col) = if let Some(ref mut vs) = self.view_state {
             let text = self.vim.text();
             let cursor_line = vs.cursor.line;
-            let layout = vs.get_layout(&text, &self.highlighter, 80);
+            let width = vs.last_width;
+            let layout = vs.get_layout(&text, &self.highlighter, width);
             let cursor = ViewCursor::new(cursor_line);
             nav::leave_view(&cursor, layout, &text)
         } else {
@@ -1747,5 +1754,155 @@ impl From<Mode> for crate::vim::Mode {
             Mode::Command => crate::vim::Mode::Command,
             Mode::View => crate::vim::Mode::Normal, // View is session-owned; fall back to Normal for hjkl
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WRAPPING_VIEW_TEXT: &str = "---\ntitle: Cache width test\n---\n\n# First heading\n\nThis paragraph deliberately contains enough repeated words to wrap differently at eighty and one hundred twenty columns while keeping searchable text in the rendered View layout.\n\n# Second heading\n\nMore searchable text follows so navigation has several rendered lines to move through.\n";
+
+    fn key(kind: KeyCodeKind) -> KeyInput {
+        KeyInput {
+            code: KeyCode { kind },
+            mods: Modifiers::default(),
+        }
+    }
+
+    fn rendered_view_session() -> EditorSession {
+        let mut session = EditorSession::from_text(WRAPPING_VIEW_TEXT);
+        session.toggle_view();
+        assert_view_layout_cached(&session, 80);
+        session.render_view(120);
+        assert_view_layout_cached(&session, 120);
+        session
+    }
+
+    fn assert_view_width(session: &EditorSession, expected: u16) {
+        let view_state = session
+            .view_state
+            .as_ref()
+            .expect("View state should exist");
+        assert_eq!(view_state.last_width, expected);
+    }
+
+    fn assert_view_layout_cached(session: &EditorSession, expected_width: u16) {
+        assert_view_width(session, expected_width);
+        let view_state = session.view_state.as_ref().unwrap();
+        assert!(view_state.layout_cache.is_some());
+    }
+
+    fn layout_build_count(session: &EditorSession) -> usize {
+        session.view_state.as_ref().unwrap().layout_build_count
+    }
+
+    fn view_session_at_second_heading() -> EditorSession {
+        let mut session = EditorSession::from_text(WRAPPING_VIEW_TEXT);
+        session.toggle_view();
+        let line_at_80 = session
+            .view_layout()
+            .unwrap()
+            .lines
+            .iter()
+            .position(|line| line.styled.text.contains("Second heading"))
+            .unwrap();
+        let line_at_120 = session
+            .render_view(120)
+            .lines
+            .iter()
+            .position(|line| line.styled.text.contains("Second heading"))
+            .unwrap();
+        assert_ne!(line_at_80, line_at_120);
+        session.view_state.as_mut().unwrap().cursor = ViewCursor::new(line_at_120);
+        session
+    }
+
+    #[test]
+    fn view_commands_preserve_rendered_layout_width() {
+        let mut session = rendered_view_session();
+        let initial_build_count = layout_build_count(&session);
+
+        session.render_view(120);
+        assert_eq!(layout_build_count(&session), initial_build_count);
+
+        for kind in [
+            KeyCodeKind::Char('j'),
+            KeyCodeKind::Char('k'),
+            KeyCodeKind::Down,
+            KeyCodeKind::Up,
+        ] {
+            session.handle_key(key(kind));
+            assert_view_layout_cached(&session, 120);
+            assert_eq!(layout_build_count(&session), initial_build_count);
+        }
+
+        session.handle_key(key(KeyCodeKind::Char('/')));
+        assert_view_layout_cached(&session, 120);
+        session.handle_key(key(KeyCodeKind::Char('s')));
+        assert_view_layout_cached(&session, 120);
+        session.handle_key(key(KeyCodeKind::Enter));
+        assert_view_layout_cached(&session, 120);
+        assert_eq!(layout_build_count(&session), initial_build_count);
+
+        session.handle_key(key(KeyCodeKind::Char('z')));
+        let view_state = session.view_state.as_ref().unwrap();
+        assert_eq!(view_state.last_width, 120);
+        assert!(view_state.layout_cache.is_none());
+        assert_eq!(layout_build_count(&session), initial_build_count);
+
+        session.handle_key(key(KeyCodeKind::Char('j')));
+        assert_view_layout_cached(&session, 120);
+        assert_eq!(layout_build_count(&session), initial_build_count + 1);
+
+        session.render_view(100);
+        assert_view_layout_cached(&session, 100);
+        assert_eq!(layout_build_count(&session), initial_build_count + 2);
+        session.render_view(100);
+        assert_eq!(layout_build_count(&session), initial_build_count + 2);
+        session.render_view(120);
+        assert_view_layout_cached(&session, 120);
+        assert_eq!(layout_build_count(&session), initial_build_count + 3);
+
+        session.handle_key(key(KeyCodeKind::Esc));
+        assert_eq!(session.mode(), Mode::Normal);
+        assert_view_layout_cached(&session, 120);
+
+        let mut session = rendered_view_session();
+        session.toggle_view();
+        assert_eq!(session.mode(), Mode::Normal);
+        assert_view_layout_cached(&session, 120);
+
+        for action in ['i', 'a', 'o'] {
+            let mut session = rendered_view_session();
+            session.handle_key(key(KeyCodeKind::Char(action)));
+            assert_ne!(session.mode(), Mode::View);
+            assert_view_width(&session, 120);
+        }
+    }
+
+    #[test]
+    fn view_exit_paths_use_rendered_layout_width() {
+        let mut session = view_session_at_second_heading();
+        session.handle_key(key(KeyCodeKind::Esc));
+        assert_eq!(session.mode(), Mode::Normal);
+        assert_eq!(session.cursor().0, 8);
+
+        let mut session = view_session_at_second_heading();
+        session.toggle_view();
+        assert_eq!(session.mode(), Mode::Normal);
+        assert_eq!(session.cursor().0, 8);
+
+        for action in ['i', 'a'] {
+            let mut session = view_session_at_second_heading();
+            session.handle_key(key(KeyCodeKind::Char(action)));
+            assert_eq!(session.mode(), Mode::Insert);
+            assert_eq!(session.cursor().0, 8);
+        }
+
+        let mut session = view_session_at_second_heading();
+        session.handle_key(key(KeyCodeKind::Char('o')));
+        assert_eq!(session.mode(), Mode::Insert);
+        assert_eq!(session.cursor().0, 9);
     }
 }
