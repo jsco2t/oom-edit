@@ -190,7 +190,16 @@ fn find_wrap_point(chars: &[char], start: usize, max_cols: usize) -> usize {
             if last_space > start {
                 return last_space;
             }
-            // No space found — hard break here
+            // No space found — hard break here. An over-wide character at
+            // the start still has to be consumed so the wrapper makes
+            // progress, together with any zero-width suffix it owns.
+            if i == start {
+                let mut end = i + 1;
+                while end < chars.len() && chars[end].width().unwrap_or(0) == 0 {
+                    end += 1;
+                }
+                return end;
+            }
             return i;
         }
 
@@ -357,6 +366,20 @@ mod tests {
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].text, "*\u{fe0f}");
+        assert_eq!(result[1].text, "x");
+    }
+
+    #[test]
+    fn wrap_overwide_glyph_at_width_one_makes_progress() {
+        let input = StyledLine {
+            text: "甲x".to_string(),
+            spans: Vec::new(),
+        };
+
+        let result = wrap_lines(&input, 1, 0);
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].text, "甲");
         assert_eq!(result[1].text, "x");
     }
 

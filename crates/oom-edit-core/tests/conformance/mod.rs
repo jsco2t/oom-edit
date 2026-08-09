@@ -1131,6 +1131,9 @@ fn v_m_page_down() {
         top_line: 0,
         height: 10,
         width: 80,
+        wrap: true,
+        left_col: 0,
+        skip_rows: 0,
     });
     feed(&mut sess, "<C-d>");
     assert_eq!(sess.cursor().0, 5);
@@ -1147,6 +1150,9 @@ fn v_m_page_up() {
         top_line: 0,
         height: 10,
         width: 80,
+        wrap: true,
+        left_col: 0,
+        skip_rows: 0,
     });
     feed(&mut sess, "G");
     feed(&mut sess, "<C-u>");
@@ -1164,6 +1170,9 @@ fn v_m_full_page_down() {
         top_line: 0,
         height: 10,
         width: 80,
+        wrap: true,
+        left_col: 0,
+        skip_rows: 0,
     });
     feed(&mut sess, "<C-f>");
     assert_eq!(sess.cursor().0, 8);
@@ -1180,6 +1189,9 @@ fn v_m_full_page_up() {
         top_line: 0,
         height: 10,
         width: 80,
+        wrap: true,
+        left_col: 0,
+        skip_rows: 0,
     });
     feed(&mut sess, "G");
     feed(&mut sess, "<C-b>");
@@ -1196,6 +1208,9 @@ fn v_m_viewport_top_is_published_for_screen_motions() {
         top_line: 10,
         height: 10,
         width: 80,
+        wrap: true,
+        left_col: 0,
+        skip_rows: 0,
     };
 
     let mut sess = session(&text);
@@ -1217,6 +1232,9 @@ fn v_m_viewport_top_is_published_for_screen_motions() {
         top_line: 30,
         height: 10,
         width: 80,
+        wrap: true,
+        left_col: 0,
+        skip_rows: 0,
     });
     feed(&mut sess, "H");
     assert_eq!(sess.cursor().0, 30);
@@ -1919,10 +1937,7 @@ fn v_m_chord_set_wrap() {
     let effects = feed(&mut sess, ":set wrap<Enter>");
     assert!(effects.iter().any(|effect| matches!(
         effect,
-        Effect::Message {
-            text,
-            severity: Severity::Warning
-        } if text == "Unknown command: set"
+        Effect::SetOption { key, value } if key == "wrap" && *value
     )));
 }
 
@@ -1935,7 +1950,7 @@ fn v_m_chord_set_nocolor() {
         Effect::Message {
             text,
             severity: Severity::Warning
-        } if text == "Unknown command: set"
+        } if text == "Unknown option: nocolor"
     )));
 }
 
@@ -2389,6 +2404,9 @@ fn v_s_no_highlight() {
         top_line: 0,
         height: 3,
         width: 80,
+        wrap: true,
+        left_col: 0,
+        skip_rows: 0,
     });
     assert!(before.lines.iter().any(|line| line
         .spans
@@ -2407,6 +2425,9 @@ fn v_s_no_highlight() {
         top_line: 0,
         height: 3,
         width: 80,
+        wrap: true,
+        left_col: 0,
+        skip_rows: 0,
     });
     assert!(after.lines.iter().all(|line| line
         .spans
@@ -2736,6 +2757,9 @@ fn v_x_substitute_refreshes_highlighter_and_view_cache() {
         top_line: 0,
         height: 1,
         width: 80,
+        wrap: true,
+        left_col: 0,
+        skip_rows: 0,
     });
     assert!(frame.lines[0]
         .spans

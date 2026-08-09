@@ -111,10 +111,15 @@ pub struct SourceFrame {
     /// Exactly `viewport.height` lines (padded with empty StyledLines if the
     /// buffer has fewer lines).
     pub lines: Vec<StyledLine>,
-    /// 1-based line number of the first line in `lines`.
+    /// The document line number displayed for each visual row. The first
+    /// visual row of a document line is `Some(1-based line number)`; wrapped
+    /// continuation rows and padding rows are `None`.
+    pub line_numbers: Vec<Option<usize>>,
+    /// 1-based document line number selected by `viewport.top_line`.
     pub first_line_number: usize,
-    /// Cursor position in viewport-relative coordinates: `(row, col)` where
-    /// `row` is 0-based within `lines` and `col` is the character column.
+    /// Cursor position in viewport-relative screen coordinates: `(row, col)`
+    /// where `row` is 0-based within `lines` and `col` is the character column
+    /// within that visual row.
     pub cursor: (u16, u16),
     /// Visual-mode selection ranges, viewport-relative, expressed as byte
     /// ranges into the full document text.

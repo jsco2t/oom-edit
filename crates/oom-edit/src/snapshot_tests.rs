@@ -47,6 +47,7 @@ fn test_app(text: &str) -> App {
         "default-dark".to_string(),
         false,
         Tier::TrueColor,
+        true,
         Box::new(RecordingClipboardSink::default()),
     )
 }

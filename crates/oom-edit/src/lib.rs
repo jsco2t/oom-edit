@@ -37,7 +37,7 @@ pub(crate) mod theme;
 pub(crate) mod widgets;
 
 pub use args::{Args, ParseOutcome};
-pub use config::Config;
+pub use config::{Config, EditorConfig, ThemeConfig};
 pub use theme::{EnvParts, Tier};
 
 use std::io::stdout;
@@ -117,6 +117,7 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         theme_name,
         is_light,
         tier,
+        config.editor.wrap,
         Box::new(crate::clipboard::Osc52Clipboard::stdout()),
     );
 

@@ -17,6 +17,9 @@ mod perf_assertions {
             top_line: 0,
             height: 40,
             width: 80,
+            wrap: true,
+            left_col: 0,
+            skip_rows: 0,
         });
         let total = start.elapsed().as_millis() as u64;
         println!(
@@ -49,6 +52,9 @@ mod perf_assertions {
                 top_line: 0,
                 height: 40,
                 width: 80,
+                wrap: true,
+                left_col: 0,
+                skip_rows: 0,
             });
         }
         let elapsed = start.elapsed().as_millis() as u64 / iterations;
@@ -77,6 +83,9 @@ mod perf_assertions {
                 top_line: 0,
                 height: 40,
                 width: 80,
+                wrap: true,
+                left_col: 0,
+                skip_rows: 0,
             });
         }
         let elapsed = start.elapsed().as_millis() as u64 / iterations;

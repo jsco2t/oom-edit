@@ -1,7 +1,7 @@
 //! Configuration — `$XDG_CONFIG_HOME/oom-edit/config.toml` (fallback
 //! `~/.config/oom-edit/config.toml`).
 //!
-//! `[theme]` section with `mode`, `dark`, and `light` keys.
+//! `[theme]` and `[editor]` sections.
 //! Load-with-defaults on missing/partial config. Atomic write on change.
 //! Never fail startup on malformed config (warn to stderr, use defaults).
 
@@ -149,6 +149,28 @@ fn dirs_home() -> Option<PathBuf> {
 pub struct Config {
     #[serde(default)]
     pub theme: ThemeConfig,
+    #[serde(default)]
+    pub editor: EditorConfig,
+}
+
+/// The `[editor]` section of the config.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditorConfig {
+    /// Whether long source lines wrap. Defaults to `true`.
+    #[serde(default = "default_wrap")]
+    pub wrap: bool,
+}
+
+impl Default for EditorConfig {
+    fn default() -> Self {
+        Self {
+            wrap: default_wrap(),
+        }
+    }
+}
+
+fn default_wrap() -> bool {
+    true
 }
 
 /// The `[theme]` section of the config.
@@ -362,6 +384,29 @@ mod tests {
         assert_eq!(config.theme.mode, None);
         assert_eq!(config.theme.dark, "default-dark");
         assert_eq!(config.theme.light, "default-light");
+        assert!(config.editor.wrap);
+    }
+
+    #[test]
+    fn config_editor_wrap_defaults_true() {
+        assert!(Config::default().editor.wrap);
+    }
+
+    #[test]
+    fn config_editor_wrap_roundtrip() {
+        let config = Config {
+            editor: EditorConfig { wrap: false },
+            ..Config::default()
+        };
+        let serialized = toml::to_string(&config).unwrap();
+        let parsed: Config = toml::from_str(&serialized).unwrap();
+        assert!(!parsed.editor.wrap);
+    }
+
+    #[test]
+    fn config_missing_editor_section_defaults_wrap_true() {
+        let config: Config = toml::from_str("[theme]\nmode = \"dark\"\n").unwrap();
+        assert!(config.editor.wrap);
     }
 
     /// Config round-trip: save and reload produces the same config.
@@ -373,6 +418,7 @@ mod tests {
                 dark: "my-dark".to_string(),
                 light: "my-light".to_string(),
             },
+            editor: EditorConfig { wrap: false },
         };
 
         let temp_dir = tempfile::tempdir().unwrap();

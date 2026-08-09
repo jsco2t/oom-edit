@@ -5,7 +5,8 @@
   -1
    6# Heading One
   +1
-  +2Some **bold** and *italic* text with `inline code` and a [link](https://exam
+  +2Some **bold** and *italic* text with `inline code` and a
+    [link](https://example.com).
   +3
   +4> A blockquote with **emphasis** inside.
   +5
@@ -20,5 +21,4 @@
  +14Another heading.
  +15
  +16More text here.
- +17
 F1 help  F1 help                                           NORMAL (new) 6:1  26%

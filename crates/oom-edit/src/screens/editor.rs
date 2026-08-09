@@ -20,35 +20,53 @@ use crate::widgets::status_bar;
 /// Render the editor screen into the given frame area.
 ///
 /// The `area` is the editor body rect; the application owns surrounding UI.
+#[derive(Debug, Clone, Copy)]
+pub struct EditorViewport {
+    pub top_line: usize,
+    pub wrap: bool,
+    pub left_col: usize,
+    pub skip_rows: usize,
+}
+
+impl EditorViewport {
+    pub const fn new(top_line: usize, wrap: bool, left_col: usize, skip_rows: usize) -> Self {
+        Self {
+            top_line,
+            wrap,
+            left_col,
+            skip_rows,
+        }
+    }
+}
+
 pub fn render_editor(
     frame: &mut Frame<'_>,
     session: &mut EditorSession,
-    top_line: usize,
+    viewport: EditorViewport,
     area: Rect,
     theme: &Theme,
     tier: Tier,
 ) {
-    render_body(frame, session, top_line, area, theme, tier);
+    render_body(frame, session, viewport, area, theme, tier);
+}
+
+/// Return the source text width after reserving the line-number gutter.
+pub(crate) fn source_text_width(area_width: u16, line_count: usize) -> u16 {
+    let gutter_w = (status_bar::gutter_width(line_count) as u16).max(4);
+    area_width.saturating_sub(gutter_w.min(area_width))
 }
 
 /// Render the editor body (gutter + source lines + cursor + selections).
 fn render_body(
     frame: &mut Frame<'_>,
     session: &mut EditorSession,
-    top_line: usize,
+    viewport: EditorViewport,
     area: Rect,
     theme: &Theme,
     tier: Tier,
 ) {
     let height = area.height.max(1) as usize;
 
-    let vp = oom_edit_core::session::Viewport {
-        top_line,
-        height: area.height,
-        width: area.width,
-    };
-
-    let frame_data = session.render_source(vp);
     let mode = session.mode();
     let cursor = session.cursor();
     let line_count = session.line_count();
@@ -58,6 +76,17 @@ fn render_body(
     let gutter_w = gutter_w.max(4);
     let gutter_area_width = gutter_w.min(area.width);
 
+    let vp = oom_edit_core::session::Viewport {
+        top_line: viewport.top_line,
+        height: area.height,
+        width: area.width.saturating_sub(gutter_area_width),
+        wrap: viewport.wrap,
+        left_col: viewport.left_col,
+        skip_rows: viewport.skip_rows,
+    };
+
+    let frame_data = session.render_source(vp);
+
     // Render gutter.
     if gutter_area_width > 0 && gutter_area_width < area.width {
         let gutter_area = Rect {
@@ -66,15 +95,7 @@ fn render_body(
             width: gutter_area_width,
             height: area.height,
         };
-        render_gutter(
-            frame,
-            mode,
-            top_line,
-            cursor.0,
-            height,
-            line_count,
-            gutter_area,
-        );
+        render_gutter(frame, mode, cursor.0, &frame_data.line_numbers, gutter_area);
     }
 
     // Text area starts after gutter.
@@ -116,7 +137,15 @@ fn render_body(
     // Draw cursor.
     let (cursor_row, cursor_col) = frame_data.cursor;
     let row = (text_area.y + cursor_row).min(text_area.y + text_area.height.saturating_sub(1));
-    let col = text_area.x + cursor_col.min(text_area.width.saturating_sub(1));
+    let display_col = frame_data
+        .lines
+        .get(cursor_row as usize)
+        .map(|line| {
+            let prefix: String = line.text.chars().take(cursor_col as usize).collect();
+            Line::from(prefix).width() as u16
+        })
+        .unwrap_or(0);
+    let col = text_area.x + display_col;
     frame.set_cursor_position(ratatui::layout::Position::new(col, row));
 
     // Render visual selections.
@@ -129,20 +158,25 @@ fn render_body(
 fn render_gutter(
     frame: &mut Frame<'_>,
     mode: oom_edit_core::session::Mode,
-    top_line: usize,
     cursor_line: usize,
-    height: usize,
-    line_count: usize,
+    line_numbers: &[Option<usize>],
     area: Rect,
 ) {
-    let gutter_lines = status_bar::build_gutter(
-        mode,
-        top_line,
-        cursor_line,
-        height,
-        line_count,
-        area.width as usize,
-    );
+    let gutter_lines: Vec<String> = line_numbers
+        .iter()
+        .map(|line_number| match line_number {
+            Some(line_number) => status_bar::build_gutter(
+                mode,
+                line_number - 1,
+                cursor_line,
+                1,
+                *line_number,
+                area.width as usize,
+            )
+            .remove(0),
+            None => " ".repeat(area.width as usize),
+        })
+        .collect();
 
     let mut text_lines = Vec::new();
     for gutter_line in &gutter_lines {
@@ -289,8 +323,27 @@ fn mode_to_context(mode: oom_edit_core::session::Mode) -> Contexts {
 mod tests {
     use super::*;
     use crate::theme::DEFAULT_DARK;
+    use oom_edit_core::session::{KeyCode, KeyCodeKind, KeyInput, Modifiers};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+    fn feed(session: &mut EditorSession, input: &str) {
+        for ch in input.chars() {
+            session.handle_key(KeyInput {
+                code: KeyCode {
+                    kind: KeyCodeKind::Char(ch),
+                },
+                mods: Modifiers::default(),
+            });
+        }
+    }
+
+    fn buffer_row(terminal: &Terminal<TestBackend>, row: usize, width: usize) -> String {
+        terminal.backend().buffer().content()[row * width..(row + 1) * width]
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
 
     #[test]
     fn render_editor_uses_full_area_height() {
@@ -305,7 +358,14 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render_editor(frame, &mut session, 0, area, &DEFAULT_DARK, Tier::TrueColor);
+                render_editor(
+                    frame,
+                    &mut session,
+                    EditorViewport::new(0, true, 0, 0),
+                    area,
+                    &DEFAULT_DARK,
+                    Tier::TrueColor,
+                );
             })
             .unwrap();
 
@@ -344,6 +404,246 @@ mod tests {
         assert_eq!(cell.fg, semantic_style.fg.expect("semantic foreground"));
         assert_eq!(cell.bg, cursor_style.bg.expect("cursor-line background"));
         assert!(cell.modifier.contains(cursor_style.add_modifier));
+    }
+
+    #[test]
+    fn gutter_blank_for_continuation_rows() {
+        let mut session = EditorSession::from_text(&"x".repeat(25));
+        let mut terminal = Terminal::new(TestBackend::new(14, 3)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_editor(
+                    frame,
+                    &mut session,
+                    EditorViewport::new(0, true, 0, 0),
+                    area,
+                    &DEFAULT_DARK,
+                    Tier::TrueColor,
+                );
+            })
+            .unwrap();
+        assert_eq!(&buffer_row(&terminal, 1, 14)[..4], "    ");
+        assert_eq!(&buffer_row(&terminal, 2, 14)[..4], "    ");
+    }
+
+    #[test]
+    fn gutter_normal_for_content_rows_under_wrap() {
+        let text = format!("{}\nlast", "x".repeat(25));
+        let mut session = EditorSession::from_text(&text);
+        let mut terminal = Terminal::new(TestBackend::new(14, 4)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_editor(
+                    frame,
+                    &mut session,
+                    EditorViewport::new(0, true, 0, 0),
+                    area,
+                    &DEFAULT_DARK,
+                    Tier::TrueColor,
+                );
+            })
+            .unwrap();
+        assert!(buffer_row(&terminal, 0, 14)[..4].contains('1'));
+        assert!(buffer_row(&terminal, 3, 14)[..4].contains("+1"));
+    }
+
+    #[test]
+    fn gutter_all_numbers_under_nowrap() {
+        let mut session = EditorSession::from_text("first\nsecond");
+        let mut terminal = Terminal::new(TestBackend::new(14, 2)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_editor(
+                    frame,
+                    &mut session,
+                    EditorViewport::new(0, false, 0, 0),
+                    area,
+                    &DEFAULT_DARK,
+                    Tier::TrueColor,
+                );
+            })
+            .unwrap();
+        assert!(!buffer_row(&terminal, 0, 14)[..4].trim().is_empty());
+        assert!(!buffer_row(&terminal, 1, 14)[..4].trim().is_empty());
+    }
+
+    #[test]
+    fn editor_cursor_not_clamped_with_wrap() {
+        let mut session = EditorSession::from_text(&"x".repeat(25));
+        feed(&mut session, "15l");
+        let mut terminal = Terminal::new(TestBackend::new(14, 3)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_editor(
+                    frame,
+                    &mut session,
+                    EditorViewport::new(0, true, 0, 0),
+                    area,
+                    &DEFAULT_DARK,
+                    Tier::TrueColor,
+                );
+            })
+            .unwrap();
+        assert_eq!(
+            terminal.backend().cursor_position(),
+            ratatui::layout::Position::new(9, 1)
+        );
+    }
+
+    #[test]
+    fn editor_cursor_not_clamped_with_hscroll() {
+        let mut session = EditorSession::from_text(&"x".repeat(25));
+        feed(&mut session, "15l");
+        let mut terminal = Terminal::new(TestBackend::new(14, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_editor(
+                    frame,
+                    &mut session,
+                    EditorViewport::new(0, false, 10, 0),
+                    area,
+                    &DEFAULT_DARK,
+                    Tier::TrueColor,
+                );
+            })
+            .unwrap();
+        assert_eq!(
+            terminal.backend().cursor_position(),
+            ratatui::layout::Position::new(9, 0)
+        );
+    }
+
+    #[test]
+    fn editor_cursor_wraps_to_blank_row_at_insert_boundary() {
+        let mut session = EditorSession::from_text(&"x".repeat(40));
+        feed(&mut session, "A");
+        let mut terminal = Terminal::new(TestBackend::new(44, 2)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_editor(
+                    frame,
+                    &mut session,
+                    EditorViewport::new(0, true, 0, 0),
+                    area,
+                    &DEFAULT_DARK,
+                    Tier::TrueColor,
+                );
+            })
+            .unwrap();
+        assert_eq!(
+            terminal.backend().cursor_position(),
+            ratatui::layout::Position::new(4, 1)
+        );
+    }
+
+    #[test]
+    fn editor_cursor_display_column_handles_cjk_wrap() {
+        let mut session = EditorSession::from_text("甲乙丙丁");
+        feed(&mut session, "2l");
+        let mut terminal = Terminal::new(TestBackend::new(8, 2)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_editor(
+                    frame,
+                    &mut session,
+                    EditorViewport::new(0, true, 0, 0),
+                    area,
+                    &DEFAULT_DARK,
+                    Tier::TrueColor,
+                );
+            })
+            .unwrap();
+        assert_eq!(
+            terminal.backend().cursor_position(),
+            ratatui::layout::Position::new(4, 1)
+        );
+    }
+
+    #[test]
+    fn editor_cursor_display_column_handles_combining_mark() {
+        let mut session = EditorSession::from_text("a\u{301}bcdef");
+        feed(&mut session, "2l");
+        let mut terminal = Terminal::new(TestBackend::new(10, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_editor(
+                    frame,
+                    &mut session,
+                    EditorViewport::new(0, false, 0, 0),
+                    area,
+                    &DEFAULT_DARK,
+                    Tier::TrueColor,
+                );
+            })
+            .unwrap();
+        assert_eq!(
+            terminal.backend().cursor_position(),
+            ratatui::layout::Position::new(5, 0)
+        );
+    }
+
+    #[test]
+    fn editor_cursor_display_column_handles_cjk_hscroll() {
+        let mut session = EditorSession::from_text("甲乙丙丁戊己庚辛");
+        feed(&mut session, "6l");
+        let mut terminal = Terminal::new(TestBackend::new(10, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_editor(
+                    frame,
+                    &mut session,
+                    EditorViewport::new(0, false, 4, 0),
+                    area,
+                    &DEFAULT_DARK,
+                    Tier::TrueColor,
+                );
+            })
+            .unwrap();
+        assert_eq!(
+            terminal.backend().cursor_position(),
+            ratatui::layout::Position::new(7, 0)
+        );
+    }
+
+    #[test]
+    fn editor_cursor_line_highlight_on_visual_row() {
+        let mut session = EditorSession::from_text(&"x".repeat(25));
+        feed(&mut session, "15l");
+        let mut terminal = Terminal::new(TestBackend::new(14, 3)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_editor(
+                    frame,
+                    &mut session,
+                    EditorViewport::new(0, true, 0, 0),
+                    area,
+                    &DEFAULT_DARK,
+                    Tier::TrueColor,
+                );
+            })
+            .unwrap();
+        let cursor_bg = DEFAULT_DARK
+            .ui_style(Tier::TrueColor, UiSlot::CursorLine)
+            .bg
+            .expect("cursor-line background");
+        assert_ne!(
+            terminal.backend().buffer().cell((5, 0)).unwrap().bg,
+            cursor_bg
+        );
+        assert_eq!(
+            terminal.backend().buffer().cell((5, 1)).unwrap().bg,
+            cursor_bg
+        );
     }
 
     #[test]

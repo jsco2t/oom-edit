@@ -24,7 +24,7 @@ use crossterm::event::MouseEventKind;
 
 use crate::command::{keymap::PendingChord, Command, Keymap};
 use crate::overlay::Overlay;
-use crate::screens::editor::{render_editor, render_status_row};
+use crate::screens::editor::{render_editor, render_status_row, source_text_width, EditorViewport};
 use crate::screens::view::render_view;
 use crate::theme::{self, Theme, Tier};
 use crate::widgets::status_bar;
@@ -32,6 +32,8 @@ use crate::widgets::which_key;
 
 /// Scrolloff: keep this many lines of context around the cursor.
 const SCROLLOFF: usize = 3;
+/// Horizontal scrolloff in no-wrap mode.
+const HSCROLLOFF: usize = 5;
 
 fn body_height(total_height: u16, has_multiple_tabs: bool) -> u16 {
     let tab_bar_height = u16::from(has_multiple_tabs);
@@ -44,6 +46,10 @@ pub(crate) struct TabEntry {
     session: EditorSession,
     /// The first visible line (owned by the TUI for scroll-follow).
     top_line: usize,
+    /// First visible character column when wrapping is disabled.
+    left_col: usize,
+    /// Visual rows skipped within `top_line` when wrapping is enabled.
+    skip_rows: usize,
     /// The first visible view line (owned by the TUI for scroll-follow in View mode).
     view_top: usize,
 }
@@ -53,6 +59,8 @@ impl TabEntry {
         Self {
             session,
             top_line: 0,
+            left_col: 0,
+            skip_rows: 0,
             view_top: 0,
         }
     }
@@ -84,6 +92,10 @@ pub struct App {
     keymap: Keymap,
     /// Viewport height (set after render for scroll-follow).
     viewport_height: usize,
+    /// Source text viewport width, excluding the line-number gutter.
+    viewport_width: usize,
+    /// Runtime source-wrap option, initialized from config.
+    wrap_enabled: bool,
     /// Current time (injected by tick for testability of which-key delay gate).
     now: Instant,
     /// Active transient message with TTL expiry.
@@ -110,6 +122,7 @@ impl App {
         theme_name: String,
         is_light: bool,
         tier: Tier,
+        wrap_enabled: bool,
         clipboard_sink: Box<dyn ClipboardSink>,
     ) -> Self {
         Self {
@@ -122,6 +135,8 @@ impl App {
             pending_g: false,
             keymap: Keymap::default(),
             viewport_height: 22,
+            viewport_width: 76,
+            wrap_enabled,
             now: Instant::now(),
             transient: None,
             theme_name,
@@ -225,6 +240,10 @@ impl App {
         let body_height = body_height(area.height, self.has_multiple_tabs());
 
         self.viewport_height = body_height as usize;
+        self.viewport_width = self
+            .active()
+            .map(|entry| source_text_width(area.width, entry.session.line_count()) as usize)
+            .unwrap_or(area.width as usize);
 
         let mut draw_y = area.y;
 
@@ -278,7 +297,12 @@ impl App {
                 render_editor(
                     frame,
                     &mut entry.session,
-                    entry.top_line,
+                    EditorViewport::new(
+                        entry.top_line,
+                        self.wrap_enabled,
+                        entry.left_col,
+                        entry.skip_rows,
+                    ),
                     body_area,
                     active_theme,
                     self.tier,
@@ -362,14 +386,44 @@ impl App {
     }
 
     /// Get the active tab's top_line.
-    fn top_line(&self) -> usize {
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub fn top_line(&self) -> usize {
         self.active().map(|t| t.top_line).unwrap_or(0)
     }
 
     /// Set the active tab's top_line.
     fn set_top_line(&mut self, val: usize) {
         if let Some(entry) = self.tabs.get_mut(self.active_tab) {
+            if entry.top_line != val {
+                entry.skip_rows = 0;
+            }
             entry.top_line = val;
+        }
+    }
+
+    /// Get the active tab's horizontal offset.
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub fn left_col(&self) -> usize {
+        self.active().map(|t| t.left_col).unwrap_or(0)
+    }
+
+    /// Set the active tab's horizontal offset.
+    fn set_left_col(&mut self, val: usize) {
+        if let Some(entry) = self.tabs.get_mut(self.active_tab) {
+            entry.left_col = val;
+        }
+    }
+
+    /// Get the active tab's wrapped-row offset.
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub fn skip_rows(&self) -> usize {
+        self.active().map(|t| t.skip_rows).unwrap_or(0)
+    }
+
+    /// Set the active tab's wrapped-row offset.
+    fn set_skip_rows(&mut self, val: usize) {
+        if let Some(entry) = self.tabs.get_mut(self.active_tab) {
+            entry.skip_rows = val;
         }
     }
 
@@ -392,6 +446,10 @@ impl App {
         if let Event::Resize(_width, height) = event {
             // Clamp viewport height using the same chrome rows as render().
             self.viewport_height = body_height(*height, self.has_multiple_tabs()) as usize;
+            self.viewport_width = self
+                .active()
+                .map(|entry| source_text_width(*_width, entry.session.line_count()) as usize)
+                .unwrap_or(*_width as usize);
             // View mode: remap cursor from edit coordinates so it stays on
             // the same content line after re-wrap (FR-3.1).
             if self.session().map(|s| s.mode()) == Some(oom_edit_core::session::Mode::View) {
@@ -410,8 +468,8 @@ impl App {
                         .session
                         .remap_view_cursor_from_edit(edit_line, edit_col);
                 }
-                self.scroll_follow();
             }
+            self.scroll_follow();
             return;
         }
 
@@ -904,6 +962,8 @@ impl App {
                             if let Some(ref mut entry) = self.tabs.get_mut(self.active_tab) {
                                 entry.session = new_session;
                                 entry.top_line = 0;
+                                entry.left_col = 0;
+                                entry.skip_rows = 0;
                             }
                             self.set_transient(
                                 format!("Opened: {}", path.display()),
@@ -925,6 +985,8 @@ impl App {
                             if let Some(ref mut entry) = self.tabs.get_mut(self.active_tab) {
                                 entry.session = new_session;
                                 entry.top_line = 0;
+                                entry.left_col = 0;
+                                entry.skip_rows = 0;
                             }
                             self.set_transient(
                                 format!("Opened: {}", path.display()),
@@ -965,6 +1027,24 @@ impl App {
             }
             Effect::Edited => {
                 // No action needed; render reads live state.
+            }
+            Effect::SetOption { key, value } => {
+                if key == "wrap" {
+                    self.wrap_enabled = value;
+                    if value {
+                        self.set_left_col(0);
+                    }
+                    self.set_transient(
+                        if value { "wrap" } else { "nowrap" }.to_string(),
+                        oom_edit_core::session::Severity::Info,
+                    );
+                } else {
+                    self.set_transient(
+                        format!("Unknown option: {key}"),
+                        oom_edit_core::session::Severity::Warning,
+                    );
+                }
+                self.scroll_follow();
             }
             Effect::HelpRequested => {
                 // Open command palette.
@@ -1042,29 +1122,136 @@ impl App {
                 self.set_view_top(new_top);
             }
         } else {
-            // Source editor scroll-follow.
             if let Some(entry) = self.active() {
-                let cursor_line = entry.session.cursor().0;
-                let line_count = entry.session.line_count();
-                let top_line = entry.top_line;
-
-                if cursor_line < top_line + SCROLLOFF {
-                    self.set_top_line(cursor_line.saturating_sub(SCROLLOFF));
-                } else if cursor_line >= top_line + self.viewport_height.saturating_sub(SCROLLOFF) {
-                    self.set_top_line(
-                        cursor_line
-                            .saturating_sub(self.viewport_height.saturating_sub(SCROLLOFF + 1)),
-                    );
-                }
-
-                // Clamp to document bounds.
-                let new_top = self.top_line();
-                if new_top + self.viewport_height > line_count {
-                    self.set_top_line(line_count.saturating_sub(self.viewport_height));
-                }
-                self.set_top_line(self.top_line().min(line_count.saturating_sub(1)));
+                let (top_line, skip_rows, left_col) = Self::source_scroll_position(
+                    entry,
+                    self.wrap_enabled,
+                    self.viewport_height,
+                    self.viewport_width,
+                );
+                self.set_top_line(top_line);
+                self.set_skip_rows(skip_rows);
+                self.set_left_col(left_col);
             }
         }
+    }
+
+    fn source_scroll_position(
+        entry: &TabEntry,
+        wrap: bool,
+        viewport_height: usize,
+        viewport_width: usize,
+    ) -> (usize, usize, usize) {
+        let (cursor_line, cursor_col) = entry.session.cursor();
+        let line_count = entry.session.line_count();
+        if viewport_height == 0 || line_count == 0 {
+            return (entry.top_line, 0, if wrap { 0 } else { entry.left_col });
+        }
+
+        if !wrap {
+            let mut top_line = entry.top_line.min(line_count.saturating_sub(1));
+            if cursor_line < top_line.saturating_add(SCROLLOFF) {
+                top_line = cursor_line.saturating_sub(SCROLLOFF);
+            } else if cursor_line
+                >= top_line.saturating_add(viewport_height.saturating_sub(SCROLLOFF))
+            {
+                top_line =
+                    cursor_line.saturating_sub(viewport_height.saturating_sub(SCROLLOFF + 1));
+            }
+            if top_line.saturating_add(viewport_height) > line_count {
+                top_line = line_count.saturating_sub(viewport_height);
+            }
+            top_line = top_line.min(line_count.saturating_sub(1));
+
+            let mut left_col = entry.left_col;
+            if viewport_width == 0 {
+                left_col = 0;
+            } else {
+                let margin = HSCROLLOFF.min(viewport_width.saturating_sub(1) / 2);
+                if cursor_col < left_col.saturating_add(margin) {
+                    left_col = cursor_col.saturating_sub(margin);
+                } else {
+                    let right_margin = viewport_width.saturating_sub(margin + 1);
+                    if cursor_col > left_col.saturating_add(right_margin) {
+                        left_col = cursor_col.saturating_sub(right_margin);
+                    }
+                }
+            }
+            return (top_line, 0, left_col);
+        }
+
+        if viewport_width == 0 {
+            return (cursor_line, 0, 0);
+        }
+
+        let width = viewport_width.min(u16::MAX as usize) as u16;
+        let scrolloff = SCROLLOFF.min(viewport_height.saturating_sub(1) / 2);
+        let bottom_target = viewport_height.saturating_sub(scrolloff + 1);
+        let mut top_line = entry.top_line.min(line_count.saturating_sub(1));
+        let mut skip_rows = if cursor_line == top_line {
+            entry.skip_rows
+        } else {
+            0
+        };
+
+        if cursor_line < top_line {
+            top_line = cursor_line;
+            skip_rows = 0;
+        }
+
+        let (cursor_visual_row, cursor_line_height) =
+            entry
+                .session
+                .visual_row_info(cursor_line, cursor_col, width, true);
+        let mut cursor_screen_row = cursor_visual_row;
+        for line in top_line..cursor_line {
+            let (_, rows) = entry.session.visual_row_info(line, 0, width, true);
+            cursor_screen_row = cursor_screen_row.saturating_add(rows);
+        }
+        cursor_screen_row = cursor_screen_row.saturating_sub(skip_rows);
+
+        if cursor_screen_row < scrolloff {
+            let mut candidate_top = cursor_line;
+            let mut candidate_cursor_row = cursor_visual_row;
+            while candidate_top > 0 && candidate_cursor_row < scrolloff {
+                let previous = candidate_top - 1;
+                let (_, previous_rows) = entry.session.visual_row_info(previous, 0, width, true);
+                if candidate_cursor_row.saturating_add(previous_rows) > bottom_target {
+                    break;
+                }
+                candidate_top = previous;
+                candidate_cursor_row = candidate_cursor_row.saturating_add(previous_rows);
+            }
+            top_line = candidate_top;
+            skip_rows = 0;
+        } else if cursor_screen_row > bottom_target {
+            let mut candidate_top = cursor_line;
+            let mut candidate_cursor_row = cursor_visual_row;
+            while candidate_top > 0 {
+                let previous = candidate_top - 1;
+                let (_, previous_rows) = entry.session.visual_row_info(previous, 0, width, true);
+                if candidate_cursor_row.saturating_add(previous_rows) > bottom_target {
+                    break;
+                }
+                candidate_top = previous;
+                candidate_cursor_row = candidate_cursor_row.saturating_add(previous_rows);
+            }
+            top_line = candidate_top;
+            skip_rows = 0;
+        }
+
+        if top_line == cursor_line && cursor_line_height > viewport_height {
+            if cursor_visual_row < skip_rows.saturating_add(scrolloff) {
+                skip_rows = cursor_visual_row.saturating_sub(scrolloff);
+            } else if cursor_visual_row > skip_rows.saturating_add(bottom_target) {
+                skip_rows = cursor_visual_row.saturating_sub(bottom_target);
+            }
+            skip_rows = skip_rows.min(cursor_line_height.saturating_sub(1));
+        } else {
+            skip_rows = 0;
+        }
+
+        (top_line, skip_rows, 0)
     }
 
     /// Scroll up by `lines` rows — Vim Ctrl-e / Ctrl-y style (viewport moves,
@@ -1258,6 +1445,7 @@ mod tests {
             "default-dark".to_string(),
             false,
             Tier::TrueColor,
+            true,
             Box::new(RecordingClipboardSink::default()),
         )
     }
@@ -1357,6 +1545,7 @@ mod tests {
             "default-dark".to_string(),
             false,
             Tier::TrueColor,
+            true,
             Box::new(FailingClipboardSink),
         );
 
@@ -1516,6 +1705,206 @@ mod tests {
 
         // Scroll follow should have adjusted top_line
         assert!(app.top_line() > 0, "top_line should have scrolled down");
+    }
+
+    #[test]
+    fn scroll_follow_horizontal_adjusts_left_col() {
+        let mut app = test_app(EditorSession::from_text(&"x".repeat(100)));
+        app.wrap_enabled = false;
+        app.viewport_width = 20;
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('$'),
+            KeyModifiers::NONE,
+        )));
+        assert!(app.left_col() > 0);
+    }
+
+    #[test]
+    fn scroll_follow_horizontal_scrolloff_margin() {
+        let mut app = test_app(EditorSession::from_text(&"x".repeat(100)));
+        app.wrap_enabled = false;
+        app.viewport_width = 20;
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('$'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.left_col(), 85);
+    }
+
+    #[test]
+    fn scroll_follow_horizontal_left_clamp() {
+        let mut app = test_app(EditorSession::from_text(&"x".repeat(100)));
+        app.wrap_enabled = false;
+        app.viewport_width = 20;
+        for ch in ['$', '0'] {
+            app.handle_event(&Event::Key(KeyEvent::new(
+                CrosstermKeyCode::Char(ch),
+                KeyModifiers::NONE,
+            )));
+        }
+        assert_eq!(app.left_col(), 0);
+    }
+
+    #[test]
+    fn scroll_follow_wrap_visual_row_awareness() {
+        let text = format!("{}\nsecond", "x".repeat(45));
+        let mut app = test_app(EditorSession::from_text(&text));
+        app.viewport_width = 10;
+        app.viewport_height = 4;
+
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('j'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.top_line(), 1, "the wrapped first line no longer fits");
+    }
+
+    #[test]
+    fn scroll_follow_wrap_upward_crossing_uses_top_margin() {
+        let text = (0..30)
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut app = test_app(EditorSession::from_text(&text));
+        app.viewport_width = 20;
+        app.viewport_height = 10;
+        for ch in [':', '1', '0'] {
+            app.handle_event(&Event::Key(KeyEvent::new(
+                CrosstermKeyCode::Char(ch),
+                KeyModifiers::NONE,
+            )));
+        }
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        app.tabs[0].top_line = 10;
+
+        app.scroll_follow();
+
+        assert_eq!(app.top_line(), 6);
+    }
+
+    #[test]
+    fn scroll_follow_wrap_advances_past_very_long_line() {
+        let text = format!("{}\nsecond", "x".repeat(100));
+        let mut app = test_app(EditorSession::from_text(&text));
+        app.viewport_width = 10;
+        app.viewport_height = 6;
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('j'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.top_line(), 1);
+    }
+
+    #[test]
+    fn scroll_follow_wrap_skip_rows_for_tall_line() {
+        let mut app = test_app(EditorSession::from_text(&"x".repeat(100)));
+        app.viewport_width = 10;
+        app.viewport_height = 5;
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('$'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.skip_rows(), 7);
+    }
+
+    #[test]
+    fn scroll_follow_skip_rows_resets_on_line_change() {
+        let text = format!("{}\nsecond", "x".repeat(100));
+        let mut app = test_app(EditorSession::from_text(&text));
+        app.viewport_width = 10;
+        app.viewport_height = 5;
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('$'),
+            KeyModifiers::NONE,
+        )));
+        assert!(app.skip_rows() > 0);
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('j'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.top_line(), 1);
+        assert_eq!(app.skip_rows(), 0);
+    }
+
+    #[test]
+    fn scroll_follow_skip_rows_scrolloff() {
+        let mut app = test_app(EditorSession::from_text(&"x".repeat(100)));
+        app.viewport_width = 10;
+        app.viewport_height = 5;
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('$'),
+            KeyModifiers::NONE,
+        )));
+        let (cursor_line, cursor_col) = app.session().unwrap().cursor();
+        let (visual_row, _) =
+            app.session()
+                .unwrap()
+                .visual_row_info(cursor_line, cursor_col, 10, true);
+        assert_eq!(visual_row - app.skip_rows(), 2);
+    }
+
+    #[test]
+    fn app_set_wrap_toggles_runtime_state() {
+        let mut app = test_app(EditorSession::from_text("text"));
+        app.wrap_enabled = false;
+        app.handle_effect(Effect::SetOption {
+            key: "wrap".to_string(),
+            value: true,
+        });
+        assert!(app.wrap_enabled);
+        assert_eq!(app.transient.as_ref().unwrap().text, "wrap");
+    }
+
+    #[test]
+    fn app_set_nowrap_triggers_horizontal_follow() {
+        let mut app = test_app(EditorSession::from_text(&"x".repeat(100)));
+        app.viewport_width = 20;
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('$'),
+            KeyModifiers::NONE,
+        )));
+        app.handle_effect(Effect::SetOption {
+            key: "wrap".to_string(),
+            value: false,
+        });
+        assert!(!app.wrap_enabled);
+        assert!(app.left_col() > 0);
+        assert_eq!(app.transient.as_ref().unwrap().text, "nowrap");
+    }
+
+    #[test]
+    fn app_set_wrap_resets_left_col() {
+        let mut app = test_app(EditorSession::from_text("text"));
+        app.wrap_enabled = false;
+        app.set_left_col(20);
+        app.handle_effect(Effect::SetOption {
+            key: "wrap".to_string(),
+            value: true,
+        });
+        assert_eq!(app.left_col(), 0);
+    }
+
+    #[test]
+    fn app_set_wrap_not_persisted() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+        crate::config::Config::default()
+            .save_to_path(&config_path)
+            .unwrap();
+        let mut app = test_app(EditorSession::from_text("text"));
+        app.config_path = config_path.clone();
+        app.handle_effect(Effect::SetOption {
+            key: "wrap".to_string(),
+            value: false,
+        });
+        assert!(
+            crate::config::Config::load_from_path(&config_path)
+                .editor
+                .wrap
+        );
     }
 
     /// App: key-translation table covers all special keys.
@@ -2140,6 +2529,7 @@ mod tests {
                 case.current_theme.to_string(),
                 case.is_light,
                 Tier::TrueColor,
+                true,
                 Box::new(RecordingClipboardSink::default()),
             );
             app.config_path = config_path.clone();
@@ -2180,6 +2570,7 @@ mod tests {
             theme_name,
             is_light,
             Tier::TrueColor,
+            true,
             Box::new(RecordingClipboardSink::default()),
         );
         app.config_path = config_path.clone();
@@ -2292,6 +2683,7 @@ mod tests {
             "default-light".to_string(),
             true,
             Tier::TrueColor,
+            true,
             Box::new(RecordingClipboardSink::default()),
         );
         app.tabs
@@ -2379,6 +2771,7 @@ mod tests {
             "default-dark".to_string(),
             false,
             Tier::Monochrome,
+            true,
             Box::new(RecordingClipboardSink::default()),
         );
         app.overlay = Overlay::open_palette();

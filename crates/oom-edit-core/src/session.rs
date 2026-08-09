@@ -141,6 +141,13 @@ pub enum Effect {
     CursorMoved,
     /// Buffer was edited (dirty may have changed).
     Edited,
+    /// A host-owned boolean option was changed by an ex command.
+    SetOption {
+        /// Stable option key understood by the host.
+        key: String,
+        /// New option value.
+        value: bool,
+    },
     /// Help was requested (from `:help` or `F1`).
     ///
     /// The TUI opens its command palette with the Vim reference section.
@@ -200,6 +207,13 @@ pub struct Viewport {
     pub height: u16,
     /// The width of the viewport in columns.
     pub width: u16,
+    /// Whether long source lines wrap into visual rows.
+    pub wrap: bool,
+    /// Source-window character offset when wrapping is disabled. When this is
+    /// nonzero, the left edge indicator replaces the first window character.
+    pub left_col: usize,
+    /// Visual rows skipped within `top_line` when wrapping is enabled.
+    pub skip_rows: usize,
 }
 
 // ── VimCore re-export (internal) ──────────────────────────────────────────
@@ -645,6 +659,43 @@ impl EditorSession {
         self.vim.line(idx)
     }
 
+    /// Return the cursor's visual row within a document line and that line's
+    /// total wrapped height at `width`.
+    ///
+    /// When wrapping is disabled, the result is always `(0, 1)`.
+    /// For the active cursor at an exact full-width end-of-line in Insert
+    /// mode, the result includes the synthetic blank continuation row used to
+    /// display the insertion point.
+    pub fn visual_row_info(
+        &self,
+        doc_line: usize,
+        doc_col: usize,
+        width: u16,
+        wrap: bool,
+    ) -> (usize, usize) {
+        if !wrap {
+            return (0, 1);
+        }
+
+        let line = self.line(doc_line).unwrap_or_default();
+        let styled = crate::style::StyledLine {
+            text: line.clone(),
+            spans: Vec::new(),
+        };
+        let mut wrapped = crate::view::wrap_lines(&styled, width, 0);
+        if (doc_line, doc_col) == self.cursor()
+            && self.mode() == Mode::Insert
+            && Self::cursor_needs_blank_continuation(&line, &wrapped, doc_col, width)
+        {
+            wrapped.push(crate::style::StyledLine {
+                text: String::new(),
+                spans: Vec::new(),
+            });
+        }
+        let (row, _) = Self::wrapped_cursor_position(&line, &wrapped, doc_col);
+        (row, wrapped.len().max(1))
+    }
+
     /// Render the source editor frame for the given viewport.
     ///
     /// Produces a [`crate::style::SourceFrame`] containing:
@@ -663,7 +714,14 @@ impl EditorSession {
     /// use oom_edit_core::session::{EditorSession, Viewport};
     ///
     /// let mut session = EditorSession::from_text("# Hello\n\nWorld\n");
-    /// let vp = Viewport { top_line: 0, height: 10, width: 80 };
+    /// let vp = Viewport {
+    ///     top_line: 0,
+    ///     height: 10,
+    ///     width: 80,
+    ///     wrap: true,
+    ///     left_col: 0,
+    ///     skip_rows: 0,
+    /// };
     /// let frame = session.render_source(vp);
     /// assert_eq!(frame.lines.len(), 10); // padded to viewport height
     /// assert!(!frame.lines[0].text.is_empty()); // first line has content
@@ -688,26 +746,78 @@ impl EditorSession {
             }
         }
 
-        // Build the lines vector, padding if needed
+        // Build visual rows and their gutter metadata.
         let mut lines = Vec::with_capacity(vp.height as usize);
+        let mut line_numbers = Vec::with_capacity(vp.height as usize);
+        let mut screen_cursor = (0usize, 0usize);
 
-        // Lines before the visible region are blank (for padding above)
-        let padding_before = if first_visible > line_count {
-            vp.height as usize
+        if vp.wrap {
+            for (offset, styled_line) in highlighted.iter().enumerate() {
+                let doc_line = start_line + offset;
+                let mut wrapped = crate::view::wrap_lines(styled_line, vp.width, 0);
+                if doc_line == cursor_line
+                    && self.mode() == Mode::Insert
+                    && Self::cursor_needs_blank_continuation(
+                        &styled_line.text,
+                        &wrapped,
+                        cursor_col,
+                        vp.width,
+                    )
+                {
+                    wrapped.push(crate::style::StyledLine {
+                        text: String::new(),
+                        spans: Vec::new(),
+                    });
+                }
+                let skip = if offset == 0 {
+                    vp.skip_rows.min(wrapped.len().saturating_sub(1))
+                } else {
+                    0
+                };
+                let first_screen_row = lines.len();
+
+                if doc_line == cursor_line {
+                    let (wrapped_row, wrapped_col) =
+                        Self::wrapped_cursor_position(&styled_line.text, &wrapped, cursor_col);
+                    screen_cursor = (
+                        first_screen_row + wrapped_row.saturating_sub(skip),
+                        wrapped_col,
+                    );
+                }
+
+                for (wrapped_row, row) in wrapped.into_iter().enumerate().skip(skip) {
+                    if lines.len() == vp.height as usize {
+                        break;
+                    }
+                    line_numbers.push(if wrapped_row == 0 {
+                        Some(doc_line + 1)
+                    } else {
+                        None
+                    });
+                    lines.push(row);
+                }
+
+                if lines.len() == vp.height as usize {
+                    break;
+                }
+            }
         } else {
-            0
-        };
-
-        for _ in 0..padding_before {
-            lines.push(crate::style::StyledLine {
-                text: String::new(),
-                spans: Vec::new(),
-            });
-        }
-
-        // Add highlighted lines
-        for styled_line in &highlighted {
-            lines.push(styled_line.clone());
+            for (offset, styled_line) in highlighted.iter().enumerate() {
+                if lines.len() == vp.height as usize {
+                    break;
+                }
+                let doc_line = start_line + offset;
+                if doc_line == cursor_line {
+                    screen_cursor = (
+                        lines.len(),
+                        cursor_col
+                            .saturating_sub(vp.left_col)
+                            .min(vp.width.saturating_sub(1) as usize),
+                    );
+                }
+                lines.push(Self::horizontal_window(styled_line, vp.left_col, vp.width));
+                line_numbers.push(Some(doc_line + 1));
+            }
         }
 
         // Pad with blank lines if we have fewer lines than viewport height
@@ -716,18 +826,12 @@ impl EditorSession {
                 text: String::new(),
                 spans: Vec::new(),
             });
+            line_numbers.push(None);
         }
 
         // Truncate to exactly viewport.height (in case we over-highlighted)
         lines.truncate(vp.height as usize);
-
-        // Compute viewport-relative cursor position
-        let cursor_row = if cursor_line >= first_visible {
-            (cursor_line - first_visible) as u16
-        } else {
-            0
-        };
-        let cursor_col_u16 = cursor_col as u16;
+        line_numbers.truncate(vp.height as usize);
 
         // Collect visual-mode selections, clipped to viewport
         let selections = self.vim.selections();
@@ -743,10 +847,168 @@ impl EditorSession {
 
         crate::style::SourceFrame {
             lines,
+            line_numbers,
             first_line_number: first_visible + 1,
-            cursor: (cursor_row.min(vp.height.saturating_sub(1)), cursor_col_u16),
+            cursor: (
+                screen_cursor.0.min(vp.height.saturating_sub(1) as usize) as u16,
+                screen_cursor.1.min(vp.width.saturating_sub(1) as usize) as u16,
+            ),
             selections: viewport_selections,
         }
+    }
+
+    fn wrapped_cursor_position(
+        source: &str,
+        wrapped: &[crate::style::StyledLine],
+        doc_col: usize,
+    ) -> (usize, usize) {
+        let chars: Vec<char> = source.chars().collect();
+        let doc_col = doc_col.min(chars.len());
+        let mut source_pos = 0usize;
+
+        for (row, styled) in wrapped.iter().enumerate() {
+            if row > 0 {
+                while source_pos < chars.len() && chars[source_pos].is_whitespace() {
+                    if doc_col == source_pos {
+                        let previous_col = wrapped[row - 1].text.chars().count();
+                        return (row - 1, previous_col);
+                    }
+                    source_pos += 1;
+                }
+            }
+
+            let row_start = source_pos;
+            let row_len = styled.text.chars().count();
+            let row_end = (row_start + row_len).min(chars.len());
+
+            if doc_col < row_end {
+                return (row, doc_col.saturating_sub(row_start));
+            }
+            if doc_col == row_end {
+                if row + 1 < wrapped.len() && row_end == chars.len() {
+                    return (row + 1, 0);
+                }
+                if row + 1 < wrapped.len() && row_end < chars.len() {
+                    if chars[row_end].is_whitespace() {
+                        return (row, row_len);
+                    }
+                    return (row + 1, 0);
+                }
+                return (row, row_len);
+            }
+
+            source_pos = row_end;
+        }
+
+        let last = wrapped.len().saturating_sub(1);
+        (
+            last,
+            wrapped
+                .get(last)
+                .map_or(0, |line| line.text.chars().count()),
+        )
+    }
+
+    fn cursor_needs_blank_continuation(
+        source: &str,
+        wrapped: &[crate::style::StyledLine],
+        doc_col: usize,
+        width: u16,
+    ) -> bool {
+        width > 0
+            && doc_col == source.chars().count()
+            && wrapped.last().is_some_and(|line| {
+                unicode_width::UnicodeWidthStr::width(line.text.as_str()) >= width as usize
+            })
+    }
+
+    fn horizontal_window(
+        styled_line: &crate::style::StyledLine,
+        left_col: usize,
+        width: u16,
+    ) -> crate::style::StyledLine {
+        let chars: Vec<char> = styled_line.text.chars().collect();
+        let width = width as usize;
+        if width == 0 || left_col >= chars.len() {
+            return crate::style::StyledLine {
+                text: String::new(),
+                spans: Vec::new(),
+            };
+        }
+
+        let end_col = left_col.saturating_add(width).min(chars.len());
+        let text: String = chars[left_col..end_col].iter().collect();
+        let spans = styled_line
+            .spans
+            .iter()
+            .filter_map(|span| {
+                let start = span.start_col.max(left_col);
+                let end = span.end_col.min(end_col);
+                (start < end).then_some(crate::style::Span {
+                    start_col: start - left_col,
+                    end_col: end - left_col,
+                    style: span.style,
+                })
+            })
+            .collect();
+        let mut window = crate::style::StyledLine { text, spans };
+
+        if left_col > 0 {
+            Self::replace_window_character(&mut window, 0, '«', crate::style::SemanticStyle::Muted);
+        }
+        if chars.len() > left_col.saturating_add(width) {
+            Self::replace_window_character(
+                &mut window,
+                width.saturating_sub(1),
+                '»',
+                crate::style::SemanticStyle::Muted,
+            );
+        }
+
+        window
+    }
+
+    fn replace_window_character(
+        line: &mut crate::style::StyledLine,
+        col: usize,
+        replacement: char,
+        style: crate::style::SemanticStyle,
+    ) {
+        let mut chars: Vec<char> = line.text.chars().collect();
+        if col >= chars.len() {
+            return;
+        }
+        chars[col] = replacement;
+        line.text = chars.into_iter().collect();
+
+        let mut spans = Vec::with_capacity(line.spans.len() + 1);
+        for span in &line.spans {
+            if span.end_col <= col || span.start_col > col {
+                spans.push(span.clone());
+                continue;
+            }
+            if span.start_col < col {
+                spans.push(crate::style::Span {
+                    start_col: span.start_col,
+                    end_col: col,
+                    style: span.style,
+                });
+            }
+            if span.end_col > col + 1 {
+                spans.push(crate::style::Span {
+                    start_col: col + 1,
+                    end_col: span.end_col,
+                    style: span.style,
+                });
+            }
+        }
+        spans.push(crate::style::Span {
+            start_col: col,
+            end_col: col + 1,
+            style,
+        });
+        spans.sort_by_key(|span| span.start_col);
+        line.spans = spans;
     }
 
     /// Render the View mode layout for the given width.
@@ -1125,7 +1387,7 @@ impl EditorSession {
     /// Process an ex command text and produce effects.
     ///
     /// Handles: :w, :w!, :w {path}, :wq, :x, :q, :q!, :e, :e!, :e {path},
-    /// :saveas, :{number}, :s, :noh, :view, :help, and unknown commands.
+    /// :saveas, :{number}, :s, :noh, :view, :help, :set, and unknown commands.
     fn process_ex_command(&mut self, command: &str) -> Vec<Effect> {
         let cmd = command.trim();
         let (base, args) = Self::parse_ex_command(cmd);
@@ -1224,6 +1486,24 @@ impl EditorSession {
                 self.toggle_view()
             }
             "help" => vec![Effect::HelpRequested],
+            "set" => match args.0 {
+                Some("wrap") => vec![Effect::SetOption {
+                    key: "wrap".to_string(),
+                    value: true,
+                }],
+                Some("nowrap") => vec![Effect::SetOption {
+                    key: "wrap".to_string(),
+                    value: false,
+                }],
+                Some(unknown) => vec![Effect::Message {
+                    text: format!("Unknown option: {unknown}"),
+                    severity: Severity::Warning,
+                }],
+                None => vec![Effect::Message {
+                    text: "Usage: :set <option>".to_string(),
+                    severity: Severity::Warning,
+                }],
+            },
             "qa" => vec![Effect::QuitAllRequested { force: args.1 }],
             "tabnew" => {
                 if let Some(path) = args.0 {

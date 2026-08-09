@@ -5,20 +5,20 @@
   +4
   +5# Heading One  ┌ Command Palette ─────────────────────┐
   +6               │                                      │
-  +7Some **bold** a│> *italic* text with `inline code` and│a [link](https://exam
-  +8               │                                      │
-  +9> A blockquote │  toggle-view          toggle view    │
- +10               │  help                 help / command │
- +11```rust        │  save                 save           │
- +12fn main() {    │  quit                 quit           │
- +13    println!("H│  cycle-theme          cycle theme    │
- +14}              │  next-tab             next tab       │
- +15```            │  prev-tab             previous tab   │
- +16               └──────────────────────────────────────┘
+  +7Some **bold** a│> *italic* text with `inline code` and│a
+    [link](https://│xample.com).                          │
+  +8               │  toggle-view          toggle view    │
+  +9> A blockquote │  help                 help / command │
+ +10               │  save                 save           │
+ +11```rust        │  quit                 quit           │
+ +12fn main() {    │  cycle-theme          cycle theme    │
+ +13    println!("H│  next-tab             next tab       │
+ +14}              │  prev-tab             previous tab   │
+ +15```            └──────────────────────────────────────┘
+ +16
  +17---
  +18
  +19Another heading.
  +20
  +21More text here.
- +22
 ↑↓ navigate · type to filter · Enter execute · Esc close   NORMAL (new) 1:1  4%

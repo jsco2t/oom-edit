@@ -99,6 +99,9 @@ fn render_source_returns_frame_with_lines() {
         top_line: 0,
         height: 10,
         width: 80,
+        wrap: true,
+        left_col: 0,
+        skip_rows: 0,
     };
     let frame = session.render_source(vp);
 
@@ -116,6 +119,9 @@ fn render_source_cursor_position() {
         top_line: 0,
         height: 10,
         width: 80,
+        wrap: true,
+        left_col: 0,
+        skip_rows: 0,
     };
     let frame = session.render_source(vp);
 
@@ -130,6 +136,9 @@ fn render_source_has_highlighting_spans() {
         top_line: 0,
         height: 10,
         width: 80,
+        wrap: true,
+        left_col: 0,
+        skip_rows: 0,
     };
     let frame = session.render_source(vp);
 
@@ -156,6 +165,9 @@ fn render_source_first_line_number() {
         top_line: 0,
         height: 10,
         width: 80,
+        wrap: true,
+        left_col: 0,
+        skip_rows: 0,
     };
     let frame = session.render_source(vp);
     assert_eq!(
@@ -168,6 +180,9 @@ fn render_source_first_line_number() {
         top_line: 5,
         height: 10,
         width: 80,
+        wrap: true,
+        left_col: 0,
+        skip_rows: 0,
     };
     let frame = session.render_source(vp);
     assert_eq!(
@@ -184,6 +199,9 @@ fn render_source_empty_document() {
         top_line: 0,
         height: 5,
         width: 80,
+        wrap: true,
+        left_col: 0,
+        skip_rows: 0,
     };
     let frame = session.render_source(vp);
 
@@ -212,6 +230,9 @@ fn render_source_top_line_past_end() {
         top_line: 10,
         height: 5,
         width: 80,
+        wrap: true,
+        left_col: 0,
+        skip_rows: 0,
     };
     let frame = session.render_source(vp);
 
@@ -734,6 +755,9 @@ fn highlighter_applied_on_edit() {
         top_line: 0,
         height: 10,
         width: 80,
+        wrap: true,
+        left_col: 0,
+        skip_rows: 0,
     };
     let frame1 = session.render_source(vp);
     assert!(
@@ -770,6 +794,9 @@ fn highlighter_preserved_after_save() {
         top_line: 0,
         height: 10,
         width: 80,
+        wrap: true,
+        left_col: 0,
+        skip_rows: 0,
     };
     let frame1 = session.render_source(vp);
     assert!(

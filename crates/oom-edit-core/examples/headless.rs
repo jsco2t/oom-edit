@@ -98,6 +98,9 @@ fn main() {
         top_line: 0,
         height: 10,
         width: 80,
+        wrap: true,
+        left_col: 0,
+        skip_rows: 0,
     };
     let frame = session.render_source(vp);
     println!("\n=== Source frame ({} lines) ===", frame.lines.len());

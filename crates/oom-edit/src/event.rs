@@ -115,6 +115,7 @@ mod tests {
             "default-dark".to_string(),
             false,
             Tier::TrueColor,
+            true,
             Box::new(RecordingClipboardSink::default()),
         )
     }

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Source mode now wraps long lines by default, with blank continuation gutters and visual-row-aware cursor following.
+- `[editor].wrap` configures the startup behavior, and `:set wrap` / `:set nowrap` switch it for the current session.
+- No-wrap mode now follows the cursor horizontally and marks hidden content with `«` and `»` edge indicators.
+
+### Changed
+
+- **Breaking (0.2.0):** `oom-edit-core::Viewport` now accepts `wrap`, `left_col`, and `skip_rows`; `SourceFrame` exposes per-row `line_numbers`; and `Effect::SetOption` delegates runtime option changes to hosts. `oom_edit::Config` now includes an `editor: EditorConfig` field. Embedders must initialize the new viewport/config fields and handle the new effect variant.
+
 ### Fixed
 
 - CRLF files without a final newline no longer gain a stray carriage return when saved.

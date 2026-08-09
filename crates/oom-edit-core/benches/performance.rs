@@ -81,6 +81,9 @@ fn bench_open_to_first_frame() {
             top_line: 0,
             height: 40,
             width: 80,
+            wrap: true,
+            left_col: 0,
+            skip_rows: 0,
         });
     });
     let avg = elapsed / iters as u32;
@@ -107,6 +110,9 @@ fn bench_keystroke_to_frame() {
             top_line: 0,
             height: 40,
             width: 80,
+            wrap: true,
+            left_col: 0,
+            skip_rows: 0,
         });
     });
     let avg = elapsed / iters as u32;
@@ -133,6 +139,9 @@ fn bench_incremental_rehighlight() {
             top_line: 0,
             height: 40,
             width: 80,
+            wrap: true,
+            left_col: 0,
+            skip_rows: 0,
         });
     });
     let avg = elapsed / iters as u32;
