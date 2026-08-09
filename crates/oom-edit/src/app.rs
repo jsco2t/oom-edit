@@ -96,6 +96,8 @@ pub struct App {
     viewport_width: usize,
     /// Runtime source-wrap option, initialized from config.
     wrap_enabled: bool,
+    /// Whether normal-like source modes use hybrid-relative line numbers.
+    relative_line_numbers: bool,
     /// Current time (injected by tick for testability of which-key delay gate).
     now: Instant,
     /// Active transient message with TTL expiry.
@@ -123,6 +125,7 @@ impl App {
         is_light: bool,
         tier: Tier,
         wrap_enabled: bool,
+        relative_line_numbers: bool,
         clipboard_sink: Box<dyn ClipboardSink>,
     ) -> Self {
         Self {
@@ -137,6 +140,7 @@ impl App {
             viewport_height: 22,
             viewport_width: 76,
             wrap_enabled,
+            relative_line_numbers,
             now: Instant::now(),
             transient: None,
             theme_name,
@@ -303,6 +307,7 @@ impl App {
                         entry.left_col,
                         entry.skip_rows,
                     ),
+                    self.relative_line_numbers,
                     body_area,
                     active_theme,
                     self.tier,
@@ -1446,6 +1451,7 @@ mod tests {
             false,
             Tier::TrueColor,
             true,
+            false,
             Box::new(RecordingClipboardSink::default()),
         )
     }
@@ -1546,6 +1552,7 @@ mod tests {
             false,
             Tier::TrueColor,
             true,
+            false,
             Box::new(FailingClipboardSink),
         );
 
@@ -2495,6 +2502,7 @@ mod tests {
             current_theme: &'static str,
             is_light: bool,
             expected_theme: &'static str,
+            relative_line_numbers: bool,
         }
 
         for case in [
@@ -2503,18 +2511,21 @@ mod tests {
                 current_theme: "default-dark",
                 is_light: false,
                 expected_theme: "default-light",
+                relative_line_numbers: false,
             },
             Case {
                 name: "light mode",
                 current_theme: "default-dark",
                 is_light: true,
                 expected_theme: "default-light",
+                relative_line_numbers: true,
             },
             Case {
                 name: "light mode cycling to accessible",
                 current_theme: "default-light",
                 is_light: true,
                 expected_theme: "accessible",
+                relative_line_numbers: true,
             },
         ] {
             let temp_dir = tempfile::tempdir().unwrap();
@@ -2522,6 +2533,7 @@ mod tests {
             let mut initial_config = crate::config::Config::default();
             initial_config.theme.dark = "saved-dark".to_string();
             initial_config.theme.light = "saved-light".to_string();
+            initial_config.relative_line_numbers = case.relative_line_numbers;
             initial_config.save_to_path(&config_path).unwrap();
 
             let mut app = App::new(
@@ -2530,6 +2542,7 @@ mod tests {
                 case.is_light,
                 Tier::TrueColor,
                 true,
+                case.relative_line_numbers,
                 Box::new(RecordingClipboardSink::default()),
             );
             app.config_path = config_path.clone();
@@ -2545,6 +2558,11 @@ mod tests {
             assert_eq!(app.theme_name, case.expected_theme, "{}", case.name);
             assert_eq!(persisted.theme.dark, expected_dark, "{}", case.name);
             assert_eq!(persisted.theme.light, expected_light, "{}", case.name);
+            assert_eq!(
+                persisted.relative_line_numbers, case.relative_line_numbers,
+                "{}",
+                case.name
+            );
         }
     }
 
@@ -2571,6 +2589,7 @@ mod tests {
             is_light,
             Tier::TrueColor,
             true,
+            false,
             Box::new(RecordingClipboardSink::default()),
         );
         app.config_path = config_path.clone();
@@ -2684,6 +2703,7 @@ mod tests {
             true,
             Tier::TrueColor,
             true,
+            false,
             Box::new(RecordingClipboardSink::default()),
         );
         app.tabs
@@ -2696,7 +2716,7 @@ mod tests {
         let theme = &theme::DEFAULT_LIGHT;
         let text_style = theme.style(Tier::TrueColor, oom_edit_core::SemanticStyle::Text);
         let cursor_style = theme.ui_style(Tier::TrueColor, theme::UiSlot::CursorLine);
-        let cursor_cell = buffer.cell((4, 1)).expect("cursor-line document cell");
+        let cursor_cell = buffer.cell((6, 1)).expect("cursor-line document cell");
         assert_eq!(
             cursor_cell.fg,
             text_style.fg.expect("light text foreground")
@@ -2706,7 +2726,7 @@ mod tests {
             cursor_style.bg.expect("light cursor-line background")
         );
         assert_eq!(
-            buffer.cell((4, 2)).expect("plain document cell").fg,
+            buffer.cell((6, 2)).expect("plain document cell").fg,
             text_style.fg.expect("light text foreground")
         );
 
@@ -2772,6 +2792,7 @@ mod tests {
             false,
             Tier::Monochrome,
             true,
+            false,
             Box::new(RecordingClipboardSink::default()),
         );
         app.overlay = Overlay::open_palette();

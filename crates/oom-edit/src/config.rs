@@ -147,6 +147,9 @@ fn dirs_home() -> Option<PathBuf> {
 /// Configuration loaded from disk (or defaults if missing/malformed).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Config {
+    /// Whether Normal, Visual, and Command modes use hybrid-relative line numbers.
+    #[serde(default)]
+    pub relative_line_numbers: bool,
     #[serde(default)]
     pub theme: ThemeConfig,
     #[serde(default)]
@@ -381,6 +384,7 @@ mod tests {
     #[test]
     fn config_defaults() {
         let config = Config::default();
+        assert!(!config.relative_line_numbers);
         assert_eq!(config.theme.mode, None);
         assert_eq!(config.theme.dark, "default-dark");
         assert_eq!(config.theme.light, "default-light");
@@ -413,6 +417,7 @@ mod tests {
     #[test]
     fn config_round_trip() {
         let config = Config {
+            relative_line_numbers: true,
             theme: ThemeConfig {
                 mode: Some("light".to_string()),
                 dark: "my-dark".to_string(),
@@ -433,6 +438,7 @@ mod tests {
         let config2: Config = toml::from_str(&contents2).unwrap();
 
         assert_eq!(config, config2);
+        assert!(config2.relative_line_numbers);
     }
 
     /// Malformed TOML falls back to defaults (warns to stderr).
@@ -460,6 +466,7 @@ mod tests {
 mode = "light"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(!config.relative_line_numbers);
         assert_eq!(config.theme.mode, Some("light".to_string()));
         assert_eq!(config.theme.dark, "default-dark");
         assert_eq!(config.theme.light, "default-light");
@@ -469,6 +476,7 @@ mode = "light"
     #[test]
     fn config_empty_uses_defaults() {
         let config: Config = toml::from_str("").unwrap();
+        assert!(!config.relative_line_numbers);
         assert_eq!(config.theme.mode, None);
         assert_eq!(config.theme.dark, "default-dark");
         assert_eq!(config.theme.light, "default-light");

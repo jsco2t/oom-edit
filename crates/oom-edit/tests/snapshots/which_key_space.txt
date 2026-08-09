@@ -1,24 +1,24 @@
-   1---
-  +1title: Kitchen Sink
-  +2author: Test
-  +3---
-  +4
-  +5# Heading One
-  +6
-  +7Some **bold** and *italic* text with `inline code` and a
-    [link](https://example.com).
-  +8
-  +9> A blockquote with **emphasis** inside.
- +10
- +11```rust
- +12fn main() {
- +13    println!("Hello!");
- +14}
- +15```
- +16
- +17---
- +18
- +19Another heading.
- +20
- +21More text here.
+   1  ---
+   2  title: Kitchen Sink
+   3  author: Test
+   4  ---
+   5
+   6  # Heading One
+   7
+   8  Some **bold** and *italic* text with `inline code` and a
+      [link](https://example.com).
+   9
+  10  > A blockquote with **emphasis** inside.
+  11
+  12  ```rust
+  13  fn main() {
+  14      println!("Hello!");
+  15  }
+  16  ```
+  17
+  18  ---
+  19
+  20  Another heading.
+  21
+  22  More text here.
 F1Space: v=toggle view  h=help / command palette  w=save  q=quit  t=cycle theme

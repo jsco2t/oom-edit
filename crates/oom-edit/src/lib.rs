@@ -118,6 +118,7 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         is_light,
         tier,
         config.editor.wrap,
+        config.relative_line_numbers,
         Box::new(crate::clipboard::Osc52Clipboard::stdout()),
     );
 

@@ -1,0 +1,24 @@
+   1  ---
+  +1  title: Kitchen Sink
+  +2  author: Test
+  +3  ---
+  +4
+  +5  # Heading One
+  +6
+  +7  Some **bold** and *italic* text with `inline code` and a
+      [link](https://example.com).
+  +8
+  +9  > A blockquote with **emphasis** inside.
+ +10
+ +11  ```rust
+ +12  fn main() {
+ +13      println!("Hello!");
+ +14  }
+ +15  ```
+ +16
+ +17  ---
+ +18
+ +19  Another heading.
+ +20
+ +21  More text here.
+F1 help  F1 help                                           NORMAL (new) 1:1  4%

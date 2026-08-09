@@ -240,9 +240,10 @@ pub fn ruler_text(cursor_line: usize, line_count: usize) -> String {
 
 /// Build the line-number gutter.
 ///
-/// In Insert/View modes: absolute line numbers for all lines.
-/// In Normal/Visual modes: hybrid — current line absolute + highlighted,
-/// others show distance from cursor (relative).
+/// With relative line numbers disabled, all modes use absolute line numbers.
+/// When enabled, Normal/Visual/Command modes use hybrid numbering — the
+/// current line is absolute and other lines show their signed distance from
+/// the cursor. Insert/View modes remain absolute.
 ///
 /// `top_line` is the 0-based index of the first visible line.
 /// `cursor_line` is the 0-based cursor line.
@@ -257,11 +258,12 @@ pub fn build_gutter(
     cursor_line: usize,
     height: usize,
     line_count: usize,
+    relative_line_numbers: bool,
     gutter_w: usize,
 ) -> Vec<String> {
     let mut lines = Vec::with_capacity(height);
 
-    let show_absolute = matches!(mode, Mode::Insert | Mode::View);
+    let show_absolute = !relative_line_numbers || matches!(mode, Mode::Insert | Mode::View);
 
     for i in 0..height {
         let line_num = top_line + i;
@@ -277,23 +279,23 @@ pub fn build_gutter(
         if show_absolute {
             // Absolute line numbers, right-aligned.
             let text = format!("{display_line}");
-            lines.push(right_pad(&text, gutter_w));
+            lines.push(format_gutter_cell(&text, gutter_w));
         } else {
             // Hybrid mode: current line absolute + highlighted, others relative.
             if line_num == cursor_line {
                 // Current line: absolute number, right-aligned with padding for highlighting.
                 let text = format!("{display_line}");
-                lines.push(right_pad(&text, gutter_w));
+                lines.push(format_gutter_cell(&text, gutter_w));
             } else if line_num < cursor_line {
                 // Above cursor: relative distance, right-aligned.
                 let dist = cursor_line - line_num;
                 let text = format!("-{dist}");
-                lines.push(right_pad(&text, gutter_w));
+                lines.push(format_gutter_cell(&text, gutter_w));
             } else {
                 // Below cursor: relative distance, right-aligned.
                 let dist = line_num - cursor_line;
                 let text = format!("+{dist}");
-                lines.push(right_pad(&text, gutter_w));
+                lines.push(format_gutter_cell(&text, gutter_w));
             }
         }
     }
@@ -301,20 +303,23 @@ pub fn build_gutter(
     lines
 }
 
-/// Right-align a string to the given width with left-padding.
-fn right_pad(text: &str, width: usize) -> String {
-    let pad = width.saturating_sub(text.len());
-    format!("{:pad$}{text}", "")
+/// Blank terminal cells reserved between the final gutter digit and source text.
+pub const GUTTER_CONTENT_GAP: usize = 2;
+
+/// Right-align a gutter label while reserving the trailing content gap.
+fn format_gutter_cell(text: &str, width: usize) -> String {
+    let number_width = width.saturating_sub(GUTTER_CONTENT_GAP);
+    format!("{text:>number_width$}{}", " ".repeat(GUTTER_CONTENT_GAP))
 }
 
-/// Compute the gutter width: `digits(line_count) + 1`, min 4.
+/// Compute the gutter width: number/sign width plus the trailing content gap.
 pub fn gutter_width(line_count: usize) -> usize {
     let digits = if line_count == 0 {
         1
     } else {
         line_count.to_string().len()
     };
-    digits.max(3) + 1 // +1 for the sign column in hybrid mode
+    digits.max(3) + 1 + GUTTER_CONTENT_GAP // +1 for the sign column in hybrid mode
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -447,19 +452,26 @@ mod tests {
             5,   // cursor_line
             10,  // height
             100, // line_count
-            5,   // gutter_w
+            true,
+            6, // gutter_w
         );
         assert_eq!(gutter.len(), 10);
-        assert_eq!(gutter[0], "    1"); // 1-based line numbers
-        assert_eq!(gutter[5], "    6");
-        assert_eq!(gutter[9], "   10");
+        assert_eq!(gutter[0], "   1  "); // 1-based line numbers
+        assert_eq!(gutter[5], "   6  ");
+        assert_eq!(gutter[9], "  10  ");
     }
 
     #[test]
     fn gutter_absolute_view_mode() {
-        let gutter = build_gutter(Mode::View, 0, 0, 5, 50, 5);
-        assert_eq!(gutter[0], "    1");
-        assert_eq!(gutter[4], "    5");
+        let gutter = build_gutter(Mode::View, 0, 0, 5, 50, false, 6);
+        assert_eq!(gutter[0], "   1  ");
+        assert_eq!(gutter[4], "   5  ");
+    }
+
+    #[test]
+    fn gutter_absolute_normal_when_relative_disabled() {
+        let gutter = build_gutter(Mode::Normal, 0, 2, 5, 20, false, 6);
+        assert_eq!(gutter, ["   1  ", "   2  ", "   3  ", "   4  ", "   5  "]);
     }
 
     #[test]
@@ -470,24 +482,42 @@ mod tests {
             5,   // cursor_line
             10,  // height
             100, // line_count
-            5,   // gutter_w
+            true,
+            6, // gutter_w
         );
-        assert_eq!(gutter[5], "    6"); // current line is absolute (0-based 5 = 1-based 6)
-                                        // Lines above cursor show negative distance
-        assert_eq!(gutter[4], "   -1");
-        assert_eq!(gutter[3], "   -2");
+        assert_eq!(gutter[5], "   6  "); // current line is absolute (0-based 5 = 1-based 6)
+                                         // Lines above cursor show negative distance
+        assert_eq!(gutter[4], "  -1  ");
+        assert_eq!(gutter[3], "  -2  ");
         // Lines below cursor show positive distance
-        assert_eq!(gutter[6], "   +1");
-        assert_eq!(gutter[9], "   +4");
+        assert_eq!(gutter[6], "  +1  ");
+        assert_eq!(gutter[9], "  +4  ");
     }
 
     #[test]
     fn gutter_hybrid_visual_mode() {
         // Visual mode uses same hybrid as Normal
-        let gutter = build_gutter(Mode::Visual, 0, 3, 5, 20, 5);
-        assert_eq!(gutter[3], "    4"); // current line absolute
-        assert_eq!(gutter[2], "   -1");
-        assert_eq!(gutter[4], "   +1");
+        let gutter = build_gutter(Mode::Visual, 0, 3, 5, 20, true, 6);
+        assert_eq!(gutter[3], "   4  "); // current line absolute
+        assert_eq!(gutter[2], "  -1  ");
+        assert_eq!(gutter[4], "  +1  ");
+    }
+
+    #[test]
+    fn gutter_opt_in_policy_covers_every_source_mode() {
+        for mode in [
+            Mode::Normal,
+            Mode::Visual,
+            Mode::VisualLine,
+            Mode::VisualBlock,
+            Mode::Command,
+        ] {
+            let gutter = build_gutter(mode, 0, 1, 3, 10, true, 6);
+            assert_eq!(gutter, ["  -1  ", "   2  ", "  +1  "], "{mode:?}");
+        }
+
+        let insert = build_gutter(Mode::Insert, 0, 1, 3, 10, true, 6);
+        assert_eq!(insert, ["   1  ", "   2  ", "   3  "]);
     }
 
     #[test]
@@ -498,22 +528,37 @@ mod tests {
             97,  // cursor_line
             10,  // height
             100, // line_count
-            5,   // gutter_w
+            false,
+            6, // gutter_w
         );
         // Lines 96-100 (0-based 95-99) are content, lines 101+ are padding
-        assert_eq!(gutter[4], "  100"); // last content line (top_line+4=99 < 100)
-        assert_eq!(gutter[5], "     "); // first padding line (top_line+5=100 >= 100)
-        assert_eq!(gutter[9], "     "); // padding beyond document
+        assert_eq!(gutter[4], " 100  "); // last content line (top_line+4=99 < 100)
+        assert_eq!(gutter[5], "      "); // first padding line (top_line+5=100 >= 100)
+        assert_eq!(gutter[9], "      "); // padding beyond document
+    }
+
+    #[test]
+    fn gutter_rows_end_with_two_column_gap() {
+        let absolute = build_gutter(Mode::Insert, 999, 999, 2, 1000, false, 7);
+        let relative = build_gutter(Mode::Normal, 0, 1, 2, 1000, true, 7);
+
+        for row in [&absolute[0], &relative[0], &relative[1]] {
+            assert_eq!(row.len(), 7);
+            assert!(row.ends_with("  "));
+            assert!(!row.ends_with("   "));
+        }
+        assert_eq!(absolute[0], " 1000  ");
+        assert_eq!(absolute[1], "       ");
     }
 
     #[test]
     fn gutter_width_calculation() {
-        assert_eq!(gutter_width(0), 4); // min 4
-        assert_eq!(gutter_width(9), 4); // 1 digit + 1 = 2, min 4
-        assert_eq!(gutter_width(99), 4); // 2 digits + 1 = 3, min 4
-        assert_eq!(gutter_width(100), 4); // 3 digits + 1 = 4
-        assert_eq!(gutter_width(999), 4); // 3 digits + 1 = 4
-        assert_eq!(gutter_width(1000), 5); // 4 digits + 1 = 5
+        assert_eq!(gutter_width(0), 6); // min number/sign width 4 + gap 2
+        assert_eq!(gutter_width(9), 6);
+        assert_eq!(gutter_width(99), 6);
+        assert_eq!(gutter_width(100), 6);
+        assert_eq!(gutter_width(999), 6);
+        assert_eq!(gutter_width(1000), 7);
     }
 
     // ── Transient TTL ───────────────────────────────────────────────────

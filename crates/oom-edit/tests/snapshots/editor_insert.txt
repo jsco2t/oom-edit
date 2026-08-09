@@ -1,24 +1,24 @@
-   1---
-   2title: Kitchen Sink
-   3author: Test
-   4---
+   1  ---
+   2  title: Kitchen Sink
+   3  author: Test
+   4  ---
    5
-   6# Heading One
+   6  # Heading One
    7
-   8Some **bold** and *italic* text with `inline code` and a
-    [link](https://example.com).
+   8  Some **bold** and *italic* text with `inline code` and a
+      [link](https://example.com).
    9
-  10> A blockquote with **emphasis** inside.
+  10  > A blockquote with **emphasis** inside.
   11
-  12```rust
-  13fn main() {
-  14    println!("Hello!");
-  15}
-  16```
+  12  ```rust
+  13  fn main() {
+  14      println!("Hello!");
+  15  }
+  16  ```
   17
-  18---
+  18  ---
   19
-  20Another heading.
+  20  Another heading.
   21
-  22More text here.
+  22  More text here.
 F1 help  F1 help                                           INSERT (new) 1:1  4%

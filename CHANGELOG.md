@@ -15,10 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Breaking (0.2.0):** `oom-edit-core::Viewport` now accepts `wrap`, `left_col`, and `skip_rows`; `SourceFrame` exposes per-row `line_numbers`; and `Effect::SetOption` delegates runtime option changes to hosts. `oom_edit::Config` now includes an `editor: EditorConfig` field. Embedders must initialize the new viewport/config fields and handle the new effect variant.
+- **Breaking (0.2.0):** `oom-edit-core::Viewport` now accepts `wrap`, `left_col`, and `skip_rows`; `SourceFrame` exposes per-row `line_numbers`; and `Effect::SetOption` delegates runtime option changes to hosts. `oom_edit::Config` now includes `editor: EditorConfig` and `relative_line_numbers: bool` fields. Embedders must initialize the new viewport/config fields and handle the new effect variant.
 
 ### Fixed
 
+- Source-editor line numbers now leave a two-cell gap before content and are absolute by default; the top-level `relative_line_numbers = true` setting restores hybrid-relative numbering in Normal, Visual, and Command modes.
 - CRLF files without a final newline no longer gain a stray carriage return when saved.
 - View-mode cursor-line highlighting now spans the full viewport width while preserving semantic syntax styles.
 - View mode now preserves the visible reading position when terminal resizing changes line wrapping.

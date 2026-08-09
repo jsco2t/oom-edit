@@ -42,12 +42,17 @@ fn trim_trailing_blank(s: &str) -> String {
 /// Build a minimal `App` with the given text, using the dark TrueColor theme
 /// and a recording clipboard sink (no OSC 52 side effects in tests).
 fn test_app(text: &str) -> App {
+    test_app_with_relative_line_numbers(text, false)
+}
+
+fn test_app_with_relative_line_numbers(text: &str, relative_line_numbers: bool) -> App {
     App::new(
         EditorSession::from_text(text),
         "default-dark".to_string(),
         false,
         Tier::TrueColor,
         true,
+        relative_line_numbers,
         Box::new(RecordingClipboardSink::default()),
     )
 }
@@ -262,7 +267,7 @@ fn guard_update_creates() {
 
 // ── Editor screen goldens ───────────────────────────────────────────────────
 
-/// Editor Normal mode — kitchen-sink document, 80×24, relative gutter, NORMAL badge.
+/// Editor Normal mode — kitchen-sink document, 80×24, absolute gutter, NORMAL badge.
 #[test]
 fn golden_editor_normal() {
     let mut app = test_app(kitchen_sink());
@@ -270,6 +275,16 @@ fn golden_editor_normal() {
         app.render(frame);
     });
     assert_snapshot(&lines, "editor_normal");
+}
+
+/// Editor Normal mode with hybrid-relative line numbers explicitly enabled.
+#[test]
+fn golden_editor_relative_line_numbers() {
+    let mut app = test_app_with_relative_line_numbers(kitchen_sink(), true);
+    let lines = render_app_lines(80, 24, |frame| {
+        app.render(frame);
+    });
+    assert_snapshot(&lines, "editor_relative_line_numbers");
 }
 
 /// Editor Insert mode — absolute gutter, INSERT badge.

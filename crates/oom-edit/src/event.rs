@@ -116,6 +116,7 @@ mod tests {
             false,
             Tier::TrueColor,
             true,
+            false,
             Box::new(RecordingClipboardSink::default()),
         )
     }

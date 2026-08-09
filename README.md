@@ -31,3 +31,11 @@ make run ARGS=file.md   # open a file
 
 **`make` is the build system of record.** Every developer-facing workflow has
 a make target; CI runs identical commands.
+
+## Configuration
+
+oom-edit loads `$XDG_CONFIG_HOME/oom-edit/config.toml` (falling back to
+`~/.config/oom-edit/config.toml`). Line numbers are absolute by default. Set
+the top-level TOML key `relative_line_numbers = true` to use hybrid-relative
+numbers in Normal, Visual, and Command source modes; the current line remains
+absolute, and Insert mode remains absolute. Rendered View mode has no gutter.
