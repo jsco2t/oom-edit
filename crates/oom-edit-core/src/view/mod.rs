@@ -161,7 +161,7 @@ impl<'a> ViewLayoutBuilder<'a> {
                 ordered,
                 tight: _tight,
                 items,
-            } => self.render_list(*ordered, items, &block.span),
+            } => self.render_list(*ordered, items),
             BlockKind::BlockQuote { children } => self.render_blockquote(children, &block.span),
             BlockKind::Table {
                 alignments,
@@ -471,14 +471,30 @@ impl<'a> ViewLayoutBuilder<'a> {
 
     // ── VW-6: Bulleted lists ─────────────────────────────────────────
 
-    fn render_list(
+    fn render_list(&mut self, ordered: Option<u64>, items: &[crate::view::blocks::ListItem]) {
+        self.render_list_at_depth(ordered, items, 0);
+    }
+
+    fn render_list_at_depth(
         &mut self,
         ordered: Option<u64>,
         items: &[crate::view::blocks::ListItem],
-        source: &Range<usize>,
+        depth: usize,
     ) {
-        for item in items {
-            self.render_list_item(item, 0, ordered, source);
+        for (index, item) in items.iter().enumerate() {
+            let marker = match item.task {
+                Some(true) => "☑".to_string(),
+                Some(false) => "☐".to_string(),
+                None => match ordered {
+                    Some(start) => format!("{}.", start + index as u64),
+                    None => match depth {
+                        0 => "•".to_string(),
+                        1 => "◦".to_string(),
+                        _ => "▪".to_string(),
+                    },
+                },
+            };
+            self.render_list_item(item, depth, &marker);
         }
     }
 
@@ -486,29 +502,77 @@ impl<'a> ViewLayoutBuilder<'a> {
         &mut self,
         item: &crate::view::blocks::ListItem,
         depth: usize,
-        _ordered: Option<u64>,
-        _source: &Range<usize>,
+        marker: &str,
     ) {
-        // Determine bullet glyph
-        let bullet = match item.task {
-            Some(true) => "☑",
-            Some(false) => "☐",
-            None => match depth {
-                0 => "•",
-                1 => "◦",
-                _ => "▪",
-            },
-        };
-
         let indent = "  ".repeat(depth);
-        let prefix = format!("{}{} ", indent, bullet);
-        let prefix_char_len = prefix.chars().count();
+        let first_prefix = format!("{indent}{marker} ");
+        let prefix_char_len = first_prefix.chars().count();
+        let continuation_prefix = " ".repeat(prefix_char_len);
 
         let available_width = self.width.saturating_sub(prefix_char_len as u16);
+        let mut marker_pending = true;
 
         // Render children into this builder so document-level metadata is shared.
         for child in &item.children {
-            self.render_block_into(child, &prefix, available_width, None);
+            if let BlockKind::List { ordered, items, .. } = &child.kind {
+                if marker_pending {
+                    let marker_start = indent.chars().count();
+                    self.make_content_line(
+                        StyledLine {
+                            text: format!("{indent}{marker}"),
+                            spans: vec![Span {
+                                start_col: marker_start,
+                                end_col: marker_start + marker.chars().count(),
+                                style: SemanticStyle::ListMarker,
+                            }],
+                        },
+                        item.span.clone(),
+                    );
+                    marker_pending = false;
+                }
+                self.render_list_at_depth(*ordered, items, depth + 1);
+                continue;
+            }
+
+            let parent_width = self.width;
+            let first_child_line = self.lines.len();
+            self.width = available_width;
+            self.render_block(child);
+            self.width = parent_width;
+
+            for view_line in &mut self.lines[first_child_line..] {
+                let uses_marker = marker_pending && view_line.kind == LineKind::Content;
+                let prefix = if uses_marker {
+                    marker_pending = false;
+                    &first_prefix
+                } else {
+                    &continuation_prefix
+                };
+
+                if item.task == Some(true) {
+                    for span in &mut view_line.styled.spans {
+                        if span.style == SemanticStyle::Text {
+                            span.style = SemanticStyle::Muted;
+                        }
+                    }
+                }
+
+                view_line.styled.text.insert_str(0, prefix);
+                for span in &mut view_line.styled.spans {
+                    span.start_col += prefix_char_len;
+                    span.end_col += prefix_char_len;
+                }
+
+                if uses_marker {
+                    let marker_start = indent.chars().count();
+                    view_line.styled.spans.push(Span {
+                        start_col: marker_start,
+                        end_col: marker_start + marker.chars().count(),
+                        style: SemanticStyle::ListMarker,
+                    });
+                    view_line.styled.spans.sort_by_key(|span| span.start_col);
+                }
+            }
         }
     }
 

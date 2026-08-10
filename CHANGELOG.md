@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- View mode now preserves nested-list source order and renders depth-specific bullets, declared ordered-list numbers, nested task markers, and aligned continuations.
 - View navigation now reuses the renderer-selected layout width without rebuilding and cloning the rendered document on every scroll key, eliminating width-dependent CPU thrash and lag.
 - Theme cycling now keeps light and dark config slots mode-compatible, the default dark TrueColor palette uses exact Zed OneDark Markdown RGB values, and View headings apply their per-level colors to heading text as well as markers.
 - The command palette now clears its full surface, grows responsively from a 40×12 floor, keeps the filter fixed, and scrolls to keep the selected command or Vim reference visible.

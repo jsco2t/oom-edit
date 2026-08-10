@@ -310,7 +310,7 @@ enum BuildContext {
     /// An inline stack (emphasis, strong, strikethrough, link, image).
     InlineStack {
         kind: InlineStackKind,
-        _start: usize,
+        start: usize,
         _dest: String,
         inlines: Vec<Inline>,
     },
@@ -331,6 +331,8 @@ impl BlockBuilder {
         match &event {
             // ── Block-level Start events ───────────────────────────────
             Event::Start(Tag::Paragraph) => {
+                self.flush_item_paragraph(span.start);
+                self.mark_direct_item_paragraph_loose();
                 self.stack.push(BuildContext::Paragraph {
                     start: span.start,
                     inlines: Vec::new(),
@@ -338,6 +340,7 @@ impl BlockBuilder {
             }
 
             Event::Start(Tag::Heading { level, .. }) => {
+                self.flush_item_paragraph(span.start);
                 self.stack.push(BuildContext::Heading {
                     level: (*level as u8).min(6),
                     start: span.start,
@@ -346,6 +349,7 @@ impl BlockBuilder {
             }
 
             Event::Start(Tag::BlockQuote(_kind)) => {
+                self.flush_item_paragraph(span.start);
                 self.stack.push(BuildContext::BlockQuote {
                     start: span.start,
                     children: Vec::new(),
@@ -353,6 +357,7 @@ impl BlockBuilder {
             }
 
             Event::Start(Tag::List(ordered)) => {
+                self.flush_item_paragraph(span.start);
                 self.stack.push(BuildContext::List {
                     start: span.start,
                     ordered: ordered.and_then(Some),
@@ -385,6 +390,7 @@ impl BlockBuilder {
             }
 
             Event::Start(Tag::Table(alignment)) => {
+                self.flush_item_paragraph(span.start);
                 let aligs: Vec<TableAlignment> = alignment
                     .iter()
                     .map(|a| TableAlignment::from_pulldown(*a))
@@ -400,6 +406,7 @@ impl BlockBuilder {
             }
 
             Event::Start(Tag::CodeBlock(kind)) => {
+                self.flush_item_paragraph(span.start);
                 let (lang, indented) = match kind {
                     CodeBlockKind::Fenced(lang) => (Some(lang.to_string()), false),
                     CodeBlockKind::Indented => (None, true),
@@ -419,11 +426,13 @@ impl BlockBuilder {
             }
 
             Event::Start(Tag::HtmlBlock) => {
+                self.flush_item_paragraph(span.start);
                 self.stack
                     .push(BuildContext::HtmlBlock { start: span.start });
             }
 
             Event::Start(Tag::FootnoteDefinition(label)) => {
+                self.flush_item_paragraph(span.start);
                 self.stack.push(BuildContext::FootnoteDef {
                     label: label.to_string(),
                     start: span.start,
@@ -435,7 +444,7 @@ impl BlockBuilder {
             Event::Start(Tag::Emphasis) => {
                 self.stack.push(BuildContext::InlineStack {
                     kind: InlineStackKind::Emph,
-                    _start: span.start,
+                    start: span.start,
                     _dest: String::new(),
                     inlines: Vec::new(),
                 });
@@ -444,7 +453,7 @@ impl BlockBuilder {
             Event::Start(Tag::Strong) => {
                 self.stack.push(BuildContext::InlineStack {
                     kind: InlineStackKind::Strong,
-                    _start: span.start,
+                    start: span.start,
                     _dest: String::new(),
                     inlines: Vec::new(),
                 });
@@ -453,7 +462,7 @@ impl BlockBuilder {
             Event::Start(Tag::Strikethrough) => {
                 self.stack.push(BuildContext::InlineStack {
                     kind: InlineStackKind::Strike,
-                    _start: span.start,
+                    start: span.start,
                     _dest: String::new(),
                     inlines: Vec::new(),
                 });
@@ -462,7 +471,7 @@ impl BlockBuilder {
             Event::Start(Tag::Link { dest_url, .. }) => {
                 self.stack.push(BuildContext::InlineStack {
                     kind: InlineStackKind::Link,
-                    _start: span.start,
+                    start: span.start,
                     _dest: dest_url.to_string(),
                     inlines: Vec::new(),
                 });
@@ -471,7 +480,7 @@ impl BlockBuilder {
             Event::Start(Tag::Image { dest_url, .. }) => {
                 self.stack.push(BuildContext::InlineStack {
                     kind: InlineStackKind::Image,
-                    _start: span.start,
+                    start: span.start,
                     _dest: dest_url.to_string(),
                     inlines: Vec::new(),
                 });
@@ -536,30 +545,9 @@ impl BlockBuilder {
             }
 
             Event::End(TagEnd::Item) => {
-                // Pop the implicit Paragraph that was pushed by Start(Item) to collect
-                // inline text (pulldown-cmark does NOT emit Start/End(Paragraph) for list items).
-                let mut paragraph_inlines: Option<Vec<Inline>> = None;
-                if matches!(self.stack.last(), Some(BuildContext::Paragraph { .. })) {
-                    if let Some(BuildContext::Paragraph { mut inlines, .. }) = self.stack.pop() {
-                        paragraph_inlines = Some(std::mem::take(&mut inlines));
-                    }
-                }
+                self.flush_item_paragraph(span.end);
 
-                if let Some(BuildContext::ListItem {
-                    start,
-                    mut children,
-                }) = self.stack.pop()
-                {
-                    // Add the implicit paragraph (if any inlines were collected) as a child
-                    if let Some(inlines) = paragraph_inlines {
-                        if !inlines.is_empty() || span.start != span.end {
-                            children.push(Block {
-                                span: start..span.end,
-                                kind: BlockKind::Paragraph { inlines },
-                            });
-                        }
-                    }
-
+                if let Some(BuildContext::ListItem { start, children }) = self.stack.pop() {
                     let task = self.detect_task_checkbox(start, span.end);
 
                     // Find the parent list to get tightness
@@ -731,58 +719,66 @@ impl BlockBuilder {
             Event::End(TagEnd::Emphasis) => {
                 if let Some(BuildContext::InlineStack {
                     kind: InlineStackKind::Emph,
+                    start,
                     mut inlines,
                     ..
                 }) = self.stack.pop()
                 {
                     let inner = std::mem::take(&mut inlines);
-                    self.push_inline(Inline::Emph(inner));
+                    self.push_inline(Inline::Emph(inner), start);
                 }
             }
 
             Event::End(TagEnd::Strong) => {
                 if let Some(BuildContext::InlineStack {
                     kind: InlineStackKind::Strong,
+                    start,
                     mut inlines,
                     ..
                 }) = self.stack.pop()
                 {
                     let inner = std::mem::take(&mut inlines);
-                    self.push_inline(Inline::Strong(inner));
+                    self.push_inline(Inline::Strong(inner), start);
                 }
             }
 
             Event::End(TagEnd::Strikethrough) => {
                 if let Some(BuildContext::InlineStack {
                     kind: InlineStackKind::Strike,
+                    start,
                     mut inlines,
                     ..
                 }) = self.stack.pop()
                 {
                     let inner = std::mem::take(&mut inlines);
-                    self.push_inline(Inline::Strike(inner));
+                    self.push_inline(Inline::Strike(inner), start);
                 }
             }
 
             Event::End(TagEnd::Link) => {
                 if let Some(BuildContext::InlineStack {
                     kind: InlineStackKind::Link,
+                    start,
                     _dest,
                     mut inlines,
                     ..
                 }) = self.stack.pop()
                 {
                     let text = std::mem::take(&mut inlines);
-                    self.push_inline(Inline::Link {
-                        text,
-                        dest: _dest.clone(),
-                    });
+                    self.push_inline(
+                        Inline::Link {
+                            text,
+                            dest: _dest.clone(),
+                        },
+                        start,
+                    );
                 }
             }
 
             Event::End(TagEnd::Image) => {
                 if let Some(BuildContext::InlineStack {
                     kind: InlineStackKind::Image,
+                    start,
                     _dest,
                     mut inlines,
                     ..
@@ -796,16 +792,20 @@ impl BlockBuilder {
                             _ => None,
                         })
                         .collect();
-                    self.push_inline(Inline::Image {
-                        alt,
-                        dest: _dest.clone(),
-                    });
+                    self.push_inline(
+                        Inline::Image {
+                            alt,
+                            dest: _dest.clone(),
+                        },
+                        start,
+                    );
                 }
             }
 
             // ── Rule (emitted as a standalone event, no Start/End pair) ──
             Event::Rule => {
-                self.blocks.push(Block {
+                self.flush_item_paragraph(span.start);
+                self.emit_block(Block {
                     span: span.start..span.end,
                     kind: BlockKind::Rule,
                 });
@@ -813,31 +813,31 @@ impl BlockBuilder {
 
             // ── Inline events ──────────────────────────────────────────
             Event::Text(text) => {
-                self.push_inline(Inline::Text(text.to_string()));
+                self.push_inline(Inline::Text(text.to_string()), span.start);
             }
 
             Event::Code(code) => {
-                self.push_inline(Inline::Code(code.to_string()));
+                self.push_inline(Inline::Code(code.to_string()), span.start);
             }
 
             Event::SoftBreak => {
-                self.push_inline(Inline::SoftBreak);
+                self.push_inline(Inline::SoftBreak, span.start);
             }
 
             Event::HardBreak => {
-                self.push_inline(Inline::HardBreak);
+                self.push_inline(Inline::HardBreak, span.start);
             }
 
             Event::FootnoteReference(label) => {
-                self.push_inline(Inline::FootnoteRef(label.to_string()));
+                self.push_inline(Inline::FootnoteRef(label.to_string()), span.start);
             }
 
             Event::Html(html) => {
-                self.push_inline(Inline::Html(html.to_string()));
+                self.push_inline(Inline::Html(html.to_string()), span.start);
             }
 
             Event::InlineHtml(html) => {
-                self.push_inline(Inline::Html(html.to_string()));
+                self.push_inline(Inline::Html(html.to_string()), span.start);
             }
 
             // ── Events we don't need to handle specially ───────────────
@@ -848,8 +848,57 @@ impl BlockBuilder {
         }
     }
 
+    /// Emit tight-list text before the direct child block that follows it.
+    ///
+    /// The synthetic paragraph created by `Start(Item)` is identifiable only
+    /// when it sits immediately above its owning list item. Explicit loose-list
+    /// paragraphs and paragraph-like table-cell contexts therefore remain
+    /// untouched.
+    fn flush_item_paragraph(&mut self, end: usize) {
+        let is_implicit_item_paragraph = matches!(
+            self.stack.as_slice(),
+            [
+                ..,
+                BuildContext::ListItem { .. },
+                BuildContext::Paragraph { .. }
+            ]
+        );
+        if !is_implicit_item_paragraph {
+            return;
+        }
+
+        let Some(BuildContext::Paragraph { start, inlines }) = self.stack.pop() else {
+            unreachable!("checked item paragraph must be on top of the stack");
+        };
+
+        if !inlines.is_empty() {
+            self.emit_block(Block {
+                span: start..end,
+                kind: BlockKind::Paragraph { inlines },
+            });
+        }
+    }
+
+    /// Pulldown emits explicit paragraph events only for loose-list items.
+    /// Restrict the update to a paragraph that is a direct child of the item,
+    /// so paragraphs inside nested containers do not loosen an ancestor list.
+    fn mark_direct_item_paragraph_loose(&mut self) {
+        if let [.., BuildContext::List { tight, .. }, BuildContext::ListItem { .. }] =
+            self.stack.as_mut_slice()
+        {
+            *tight = false;
+        }
+    }
+
     /// Push an inline onto the topmost inline-accumulating context.
-    fn push_inline(&mut self, inline: Inline) {
+    fn push_inline(&mut self, inline: Inline, start: usize) {
+        if matches!(self.stack.last(), Some(BuildContext::ListItem { .. })) {
+            self.stack.push(BuildContext::Paragraph {
+                start,
+                inlines: Vec::new(),
+            });
+        }
+
         if let Some(
             BuildContext::InlineStack { inlines, .. }
             | BuildContext::Paragraph { inlines, .. }

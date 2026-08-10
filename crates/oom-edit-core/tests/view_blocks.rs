@@ -1,7 +1,7 @@
 //! Tests for the view module (block model).
 
-use oom_edit_core::style::LineKind;
-use oom_edit_core::view::{Block, BlockKind, BlockModel, Inline};
+use oom_edit_core::style::{LineKind, SemanticStyle};
+use oom_edit_core::view::{Block, BlockKind, BlockModel, Inline, ListItem};
 use oom_edit_core::{Highlighter, ViewLayout};
 use std::path::Path;
 
@@ -58,6 +58,72 @@ fn flatten_blocks(blocks: &[Block]) -> Vec<&Block> {
         }
     }
     out
+}
+
+fn inline_text(inlines: &[Inline]) -> String {
+    let mut text = String::new();
+    for inline in inlines {
+        match inline {
+            Inline::Text(value) | Inline::Code(value) | Inline::Html(value) => {
+                text.push_str(value);
+            }
+            Inline::SoftBreak => text.push(' '),
+            Inline::HardBreak => text.push_str("  "),
+            Inline::Emph(children)
+            | Inline::Strong(children)
+            | Inline::Strike(children)
+            | Inline::Link { text: children, .. } => text.push_str(&inline_text(children)),
+            Inline::Image { alt, .. } => text.push_str(alt),
+            Inline::FootnoteRef(label) => text.push_str(label),
+        }
+    }
+    text
+}
+
+fn paragraph_text(block: &Block) -> Option<String> {
+    match &block.kind {
+        BlockKind::Paragraph { inlines } => Some(inline_text(inlines)),
+        _ => None,
+    }
+}
+
+fn collect_list_labels(items: &[ListItem], labels: &mut Vec<String>) {
+    for item in items {
+        for child in &item.children {
+            if let Some(text) = paragraph_text(child) {
+                labels.push(text);
+            }
+            if let BlockKind::List { items, .. } = &child.kind {
+                collect_list_labels(items, labels);
+            }
+        }
+    }
+}
+
+fn assert_list_item_spans(items: &[ListItem]) {
+    for item in items {
+        for child in &item.children {
+            assert!(
+                item.span.start <= child.span.start && child.span.end <= item.span.end,
+                "child span {:?} must be bounded by item span {:?}",
+                child.span,
+                item.span
+            );
+        }
+        for children in item.children.windows(2) {
+            assert!(
+                children[0].span.end <= children[1].span.start,
+                "item children must be ordered and non-overlapping: {:?} before {:?}",
+                children[0].span,
+                children[1].span
+            );
+        }
+        for child in &item.children {
+            if let BlockKind::List { items, .. } = &child.kind {
+                assert_list_item_spans(items);
+            }
+        }
+    }
 }
 
 // ── Heading tests ──────────────────────────────────────────────────────────
@@ -260,6 +326,203 @@ fn test_nested_lists_3_deep() {
 }
 
 #[test]
+fn tight_list_item_children_follow_source_order() {
+    let text = "Nested unordered lists:\n\n- Top-level item\n  - Second-level item\n    - Third-level item\n      - Fourth-level item\n  - Another second-level item\n- Back to top level";
+    let model = BlockModel::build(text, None);
+    let BlockKind::List { tight, items, .. } = &model.blocks[1].kind else {
+        panic!("expected the reported top-level list");
+    };
+
+    assert!(tight, "the blank-line-free reporter list must remain tight");
+    assert_eq!(items.len(), 2);
+    assert!(matches!(
+        items[0].children[0].kind,
+        BlockKind::Paragraph { .. }
+    ));
+    assert!(matches!(items[0].children[1].kind, BlockKind::List { .. }));
+
+    let mut labels = Vec::new();
+    collect_list_labels(items, &mut labels);
+    assert_eq!(
+        labels,
+        [
+            "Top-level item",
+            "Second-level item",
+            "Third-level item",
+            "Fourth-level item",
+            "Another second-level item",
+            "Back to top level",
+        ]
+    );
+    assert_list_item_spans(items);
+}
+
+#[test]
+fn loose_and_multiblock_list_items_preserve_event_order() {
+    let text = "- First paragraph.\n\n  Second paragraph before nested list.\n\n  - Nested child\n\n  Trailing paragraph after nested list.\n\n- Sibling paragraph.\n\n  > Quoted block\n\n  Final sibling paragraph.";
+    let model = BlockModel::build(text, None);
+    let BlockKind::List { tight, items, .. } = &model.blocks[0].kind else {
+        panic!("expected a loose top-level list");
+    };
+
+    assert!(!tight, "explicit item paragraphs must make the list loose");
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].children.len(), 4);
+    assert_eq!(
+        paragraph_text(&items[0].children[0]).as_deref(),
+        Some("First paragraph.")
+    );
+    assert_eq!(
+        paragraph_text(&items[0].children[1]).as_deref(),
+        Some("Second paragraph before nested list.")
+    );
+    assert!(matches!(items[0].children[2].kind, BlockKind::List { .. }));
+    assert_eq!(
+        paragraph_text(&items[0].children[3]).as_deref(),
+        Some("Trailing paragraph after nested list.")
+    );
+
+    assert_eq!(items[1].children.len(), 3);
+    assert_eq!(
+        paragraph_text(&items[1].children[0]).as_deref(),
+        Some("Sibling paragraph.")
+    );
+    assert!(matches!(
+        items[1].children[1].kind,
+        BlockKind::BlockQuote { .. }
+    ));
+    assert_eq!(
+        paragraph_text(&items[1].children[2]).as_deref(),
+        Some("Final sibling paragraph.")
+    );
+    assert_list_item_spans(items);
+}
+
+#[test]
+fn tight_multiblock_item_keeps_trailing_text_after_child_block() {
+    let text = "- Before fence\n  ```text\n  code\n  ```\n  After fence";
+    let model = BlockModel::build(text, None);
+    let BlockKind::List { tight, items, .. } = &model.blocks[0].kind else {
+        panic!("expected a tight top-level list");
+    };
+
+    assert!(tight);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].children.len(), 3);
+    assert_eq!(
+        paragraph_text(&items[0].children[0]).as_deref(),
+        Some("Before fence")
+    );
+    assert!(matches!(
+        items[0].children[1].kind,
+        BlockKind::CodeFence { .. }
+    ));
+    assert_eq!(
+        paragraph_text(&items[0].children[2]).as_deref(),
+        Some("After fence")
+    );
+    assert_list_item_spans(items);
+}
+
+#[test]
+fn nested_unordered_layout_preserves_preorder_and_vw6_markers() {
+    let text = "Nested unordered lists:\n\n- Top-level item\n  - Second-level item\n    - Third-level item\n      - Fourth-level item\n  - Another second-level item\n- Back to top level";
+    let layout = view_layout(text);
+    let lines: Vec<_> = layout
+        .lines
+        .iter()
+        .map(|line| line.styled.text.as_str())
+        .collect();
+
+    assert_eq!(
+        lines,
+        [
+            "Nested unordered lists:",
+            "",
+            "• Top-level item",
+            "  ◦ Second-level item",
+            "    ▪ Third-level item",
+            "      ▪ Fourth-level item",
+            "  ◦ Another second-level item",
+            "• Back to top level",
+        ]
+    );
+}
+
+#[test]
+fn ordered_lists_render_declared_start_and_nested_restart() {
+    let text = "10. Tenth item\n11. Eleventh item\n\n    3. Nested third\n    4. Nested fourth";
+    let layout = view_layout(text);
+    let lines: Vec<_> = layout
+        .lines
+        .iter()
+        .map(|line| line.styled.text.as_str())
+        .collect();
+
+    assert_eq!(
+        lines,
+        [
+            "10. Tenth item",
+            "11. Eleventh item",
+            "  3. Nested third",
+            "  4. Nested fourth",
+        ]
+    );
+}
+
+#[test]
+fn wrapped_list_continuations_align_after_marker() {
+    let layout = view_layout_at_width("10. alpha beta gamma delta", 14);
+    let lines: Vec<_> = layout
+        .lines
+        .iter()
+        .map(|line| line.styled.text.as_str())
+        .collect();
+
+    assert_eq!(lines, ["10. alpha beta", "    gamma", "    delta"]);
+    assert_eq!(
+        lines.iter().filter(|line| line.contains("10.")).count(),
+        1,
+        "the marker must appear only on the first rendered line"
+    );
+}
+
+#[test]
+fn nested_task_lists_keep_checkbox_marker_at_depth() {
+    let layout = view_layout("- Parent\n  - [ ] Pending child\n  - [x] Completed child");
+    let lines: Vec<_> = layout
+        .lines
+        .iter()
+        .map(|line| line.styled.text.as_str())
+        .collect();
+
+    assert_eq!(
+        lines,
+        ["• Parent", "  ☐ Pending child", "  ☑ Completed child"]
+    );
+    let completed = &layout.lines[2].styled;
+    assert!(completed.spans.iter().any(|span| {
+        span.style == SemanticStyle::Muted && span.start_col == 4 && span.end_col == 19
+    }));
+}
+
+#[test]
+fn nested_list_only_item_keeps_parent_marker() {
+    let layout = view_layout("-\n  - child");
+    let lines: Vec<_> = layout
+        .lines
+        .iter()
+        .map(|line| line.styled.text.as_str())
+        .collect();
+
+    assert_eq!(lines, ["•", "  ◦ child"]);
+    assert_eq!(layout.lines[0].source, 0..11);
+    assert!(layout.lines[0].styled.spans.iter().any(|span| {
+        span.start_col == 0 && span.end_col == 1 && span.style == SemanticStyle::ListMarker
+    }));
+}
+
+#[test]
 fn test_task_list() {
     let text = "- [ ] unchecked\n- [x] checked\n- [ ] another unchecked";
     let model = BlockModel::build(text, None);
@@ -397,7 +660,7 @@ fn nested_container_metadata_is_preserved_recursively() {
     assert_eq!(layout.jump_targets.len(), 1);
     assert_eq!(
         layout.lines[layout.jump_targets[0].line].styled.text,
-        "┃ • ┃ █ Deep heading"
+        "┃   ┃ █ Deep heading"
     );
 }
 
