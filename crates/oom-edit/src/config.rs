@@ -10,6 +10,58 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// Persistence boundary injected into [`crate::app::App`].
+///
+/// Ordinary tests use [`DisabledConfigStore`], while production explicitly
+/// constructs [`FileConfigStore`] from the real configuration path.
+pub(crate) trait ConfigStore {
+    fn load(&self) -> Config;
+    fn save(&mut self, config: &Config) -> Result<(), String>;
+}
+
+/// A configuration store that performs no I/O.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct DisabledConfigStore;
+
+#[cfg(test)]
+impl ConfigStore for DisabledConfigStore {
+    fn load(&self) -> Config {
+        Config::default()
+    }
+
+    fn save(&mut self, _config: &Config) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// File-backed configuration persistence used by production and dedicated
+/// temporary-path tests.
+#[derive(Debug, Clone)]
+pub(crate) struct FileConfigStore {
+    path: PathBuf,
+}
+
+impl FileConfigStore {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    pub(crate) fn production() -> Self {
+        Self::new(config_path())
+    }
+}
+
+impl ConfigStore for FileConfigStore {
+    fn load(&self) -> Config {
+        Config::load_from_path(&self.path)
+    }
+
+    fn save(&mut self, config: &Config) -> Result<(), String> {
+        config.save_to_path(&self.path)
+    }
+}
+
 trait ConfigSaveOperations {
     type ParentDirectory;
 
@@ -147,7 +199,7 @@ fn dirs_home() -> Option<PathBuf> {
 /// Configuration loaded from disk (or defaults if missing/malformed).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Config {
-    /// Whether Normal, Visual, and Command modes use hybrid-relative line numbers.
+    /// Whether rendered Normal, Select, and Command use hybrid-relative numbers.
     #[serde(default)]
     pub relative_line_numbers: bool,
     #[serde(default)]
@@ -209,6 +261,13 @@ fn default_light() -> String {
     "default-light".to_string()
 }
 
+/// Theme slots that were explicitly authored in a valid config file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ConfigPresence {
+    pub(crate) dark: bool,
+    pub(crate) light: bool,
+}
+
 impl Config {
     /// Load configuration from disk, using defaults for missing files or
     /// malformed TOML. Warns to stderr on errors.
@@ -217,13 +276,38 @@ impl Config {
         Self::load_from_path(&path)
     }
 
+    /// Load production configuration and report whether a valid file won
+    /// over the built-in fallback.
+    pub(crate) fn load_with_presence() -> (Self, ConfigPresence) {
+        Self::load_from_path_with_presence(&config_path())
+    }
+
     pub(crate) fn load_from_path(path: &Path) -> Self {
+        Self::load_from_path_with_presence(path).0
+    }
+
+    fn load_from_path_with_presence(path: &Path) -> (Self, ConfigPresence) {
         match std::fs::read_to_string(path) {
-            Ok(contents) => match toml::from_str(&contents) {
-                Ok(config) => config,
+            Ok(contents) => match toml::from_str::<toml::Value>(&contents) {
+                Ok(value) => match value.clone().try_into() {
+                    Ok(config) => {
+                        let theme = value.get("theme").and_then(toml::Value::as_table);
+                        (
+                            config,
+                            ConfigPresence {
+                                dark: theme.is_some_and(|theme| theme.contains_key("dark")),
+                                light: theme.is_some_and(|theme| theme.contains_key("light")),
+                            },
+                        )
+                    }
+                    Err(e) => {
+                        eprintln!("oom-edit: config parse error: {e}, using defaults");
+                        (Config::default(), ConfigPresence::default())
+                    }
+                },
                 Err(e) => {
                     eprintln!("oom-edit: config parse error: {e}, using defaults");
-                    Config::default()
+                    (Config::default(), ConfigPresence::default())
                 }
             },
             Err(e) => {
@@ -231,7 +315,7 @@ impl Config {
                 if e.kind() != std::io::ErrorKind::NotFound {
                     eprintln!("oom-edit: config read error: {e}, using defaults");
                 }
-                Config::default()
+                (Config::default(), ConfigPresence::default())
             }
         }
     }
@@ -274,6 +358,7 @@ impl Config {
 mod tests {
     use std::io;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
 
     use super::*;
 
@@ -452,10 +537,10 @@ mod tests {
         // Write malformed TOML.
         std::fs::write(&config_file, "{{{not valid toml}}").unwrap();
 
-        // We can't easily override config_path() in tests, so we test
-        // the parsing logic directly.
-        let result: Result<Config, _> = toml::from_str("{{{not valid");
-        assert!(result.is_err());
+        let (config, present) = Config::load_from_path_with_presence(&config_file);
+        assert_eq!(present, ConfigPresence::default());
+        assert_eq!(config.theme.dark, "default-dark");
+        assert_eq!(config.theme.light, "default-light");
     }
 
     /// Partial config (missing keys) uses defaults via serde.
@@ -470,6 +555,47 @@ mode = "light"
         assert_eq!(config.theme.mode, Some("light".to_string()));
         assert_eq!(config.theme.dark, "default-dark");
         assert_eq!(config.theme.light, "default-light");
+    }
+
+    #[test]
+    fn partial_config_never_defaults_to_accessible() {
+        for source in [
+            "[theme]\n",
+            "[theme]\nmode = \"dark\"\n",
+            "[theme]\ndark = \"default-dark\"\n",
+            "[theme]\nlight = \"default-light\"\n",
+            "[editor]\nwrap = false\n",
+        ] {
+            let config: Config = toml::from_str(source).unwrap();
+            assert_eq!(config.theme.dark, "default-dark");
+            assert_eq!(config.theme.light, "default-light");
+            assert_ne!(config.theme.dark, "accessible");
+            assert_ne!(config.theme.light, "accessible");
+        }
+    }
+
+    #[test]
+    fn partial_config_tracks_only_explicit_theme_slots() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_file = temp_dir.path().join("config.toml");
+
+        std::fs::write(&config_file, "[editor]\nwrap = false\n").unwrap();
+        let (_, presence) = Config::load_from_path_with_presence(&config_file);
+        assert_eq!(presence, ConfigPresence::default());
+
+        std::fs::write(
+            &config_file,
+            "[theme]\ndark = \"accessible\"\nmode = \"dark\"\n",
+        )
+        .unwrap();
+        let (_, presence) = Config::load_from_path_with_presence(&config_file);
+        assert_eq!(
+            presence,
+            ConfigPresence {
+                dark: true,
+                light: false,
+            }
+        );
     }
 
     /// Empty config file uses all defaults.
@@ -632,5 +758,45 @@ light = "my-custom-light"
         assert_eq!(config.theme.mode, Some("dark".to_string()));
         assert_eq!(config.theme.dark, "my-custom-dark");
         assert_eq!(config.theme.light, "my-custom-light");
+    }
+
+    #[test]
+    fn isolated_helper_cleans_config_after_success_failure_and_signal() {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("scripts/with-isolated-config.sh");
+
+        for exit_code in [0, 7] {
+            let command = format!(
+                "printf '%s' \"$XDG_CONFIG_HOME\"; mkdir -p \"$XDG_CONFIG_HOME/oom-edit\"; touch \"$XDG_CONFIG_HOME/oom-edit/config.toml\"; exit {exit_code}"
+            );
+            let output = Command::new("bash")
+                .arg(&script)
+                .arg("bash")
+                .arg("-c")
+                .arg(command)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.success(), exit_code == 0);
+
+            let xdg_path = PathBuf::from(String::from_utf8(output.stdout).unwrap());
+            let isolation_root = xdg_path.parent().unwrap();
+            assert!(
+                !isolation_root.exists(),
+                "isolated config root survived helper exit: {}",
+                isolation_root.display()
+            );
+        }
+
+        let output = Command::new("bash")
+            .arg(&script)
+            .arg("bash")
+            .arg("-c")
+            .arg("printf '%s' \"$XDG_CONFIG_HOME\"; mkdir -p \"$XDG_CONFIG_HOME/oom-edit\"; touch \"$XDG_CONFIG_HOME/oom-edit/config.toml\"; kill -HUP $$")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let xdg_path = PathBuf::from(String::from_utf8(output.stdout).unwrap());
+        assert!(!xdg_path.parent().unwrap().exists());
     }
 }

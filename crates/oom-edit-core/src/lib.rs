@@ -1,8 +1,8 @@
 //! # oom-edit-core
 //!
 //! Embeddable markdown editing engine.  Provides a tree-sitter-highlighted
-//! document model, Vim-style modal editing, and a renderer-agnostic style
-//! system.
+//! document model, rendered Normal/Select navigation, raw-source Insert
+//! editing, and a renderer-agnostic style system.
 //!
 //! **Zero terminal dependencies** — this crate can be used headlessly or
 //! embedded in any application.
@@ -11,11 +11,12 @@
 //!
 //! The public API is re-exported from [`session`] and [`style`]:
 //! - [`session::EditorSession`] — the main editing session type
-//! - [`session::Mode`] — editor mode (Normal, Insert, Visual, View, etc.)
+//! - [`session::Mode`] — exactly Normal, Insert, Select, and Command
 //! - [`session::Effect`] — effects emitted by session operations
 //! - [`session::Viewport`] — viewport specification for rendering
-//! - [`style::SourceFrame`] — rendered source frame
-//! - [`style::ViewLayout`] — rendered view layout
+//! - [`style::SourceFrame`] — raw-source Insert frame
+//! - [`style::RenderedLayout`] — rendered Normal/Select layout
+//! - [`style::RenderedSelection`] — rendered Select rows and source range
 //! - [`style::SemanticStyle`] — renderer-agnostic style slots
 //!
 //! # Example
@@ -27,17 +28,9 @@
 //! assert_eq!(session.mode(), oom_edit_core::session::Mode::Normal);
 //! assert_eq!(session.line_count(), 4);
 //!
-//! // Render the source editor
-//! let vp = oom_edit_core::session::Viewport {
-//!     top_line: 0,
-//!     height: 10,
-//!     width: 80,
-//!     wrap: true,
-//!     left_col: 0,
-//!     skip_rows: 0,
-//! };
-//! let frame = session.render_source(vp);
-//! assert_eq!(frame.lines.len(), 10);
+//! // Normal is rendered Markdown. Hosts supply the actual text width.
+//! let layout = session.render_layout(80);
+//! assert!(!layout.lines.is_empty());
 //! ```
 
 #![deny(missing_docs)]
@@ -47,10 +40,10 @@ pub mod clipboard;
 pub mod document;
 pub mod error;
 pub mod frontmatter;
+mod rendered;
 pub mod session;
 pub mod style;
 pub mod syntax;
-pub mod view;
 mod vim;
 
 // ── Public re-exports ──────────────────────────────────────────────────────
@@ -64,5 +57,31 @@ pub use clipboard::{ClipboardError, ClipboardSink, RecordingClipboardSink};
 pub use error::{OpenError, SaveError};
 pub use session::EditorSession;
 pub use session::{Effect, KeyCode, KeyCodeKind, KeyInput, Mode, Modifiers, Severity, Viewport};
-pub use style::{SemanticStyle, SourceFrame, Span, StyledLine, ViewLayout};
+pub use style::{
+    JumpTarget, LineKind, RenderedLayout, RenderedLine, RenderedLineRole, RenderedPoint,
+    RenderedSearch, RenderedSelection, RenderedSelectionRow, RenderedSourceAtom, SearchDirection,
+    SelectionShape, SemanticStyle, SourceFrame, Span, StyledLine, TargetKind,
+};
 pub use syntax::Highlighter;
+
+#[cfg(test)]
+mod public_api_tests {
+    use crate::Mode;
+
+    #[test]
+    fn public_modes_are_normal_insert_select_command() {
+        fn label(mode: Mode) -> &'static str {
+            match mode {
+                Mode::Normal => "Normal",
+                Mode::Insert => "Insert",
+                Mode::Select => "Select",
+                Mode::Command => "Command",
+            }
+        }
+
+        let modes = [Mode::Normal, Mode::Insert, Mode::Select, Mode::Command];
+        let labels: Vec<_> = modes.into_iter().map(label).collect();
+        assert_eq!(labels, ["Normal", "Insert", "Select", "Command"]);
+        assert_eq!(format!("{:?}", Mode::Select), "Select");
+    }
+}

@@ -34,7 +34,7 @@ pub fn build_hint(km: &Keymap, ctx: Contexts) -> Option<String> {
         return None;
     }
 
-    // Format: "Space: v=toggle-view  h=help  w=save  q=quit  t=cycle-theme"
+    // Format: "Space: h=help  w=save  q=quit  t=cycle-theme"
     let parts: Vec<String> = conts
         .iter()
         .map(|(key, spec)| {
@@ -96,7 +96,6 @@ mod tests {
         assert!(hint.is_some());
         let hint = hint.unwrap();
         assert!(hint.contains("Space:"));
-        assert!(hint.contains("v="));
         assert!(hint.contains("h="));
     }
 

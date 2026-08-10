@@ -402,15 +402,30 @@ impl Document {
     /// Uses atomic write (temp file + fsync + rename) to prevent corruption
     /// on crash or interrupt.
     pub fn save_copy(&self, path: &Path) -> Result<(), SaveError> {
-        self.save_copy_using(path, &mut FileSystemAtomicSave)
+        self.save_copy_with_text(&self.text, path)
     }
 
+    /// Save supplied live editor text as a copy without retargeting.
+    pub(crate) fn save_copy_with_text(&self, text: &str, path: &Path) -> Result<(), SaveError> {
+        self.save_copy_with_text_using(text, path, &mut FileSystemAtomicSave)
+    }
+
+    #[cfg(test)]
     fn save_copy_using<O: AtomicSaveOperations>(
         &self,
         path: &Path,
         operations: &mut O,
     ) -> Result<(), SaveError> {
-        let serialized = self.serialize();
+        self.save_copy_with_text_using(&self.text, path, operations)
+    }
+
+    fn save_copy_with_text_using<O: AtomicSaveOperations>(
+        &self,
+        text: &str,
+        path: &Path,
+        operations: &mut O,
+    ) -> Result<(), SaveError> {
+        let serialized = self.serialize_text(text);
 
         // Atomic write: create temp file, write, fsync, rename
         let parent = parent_directory(path);
@@ -524,6 +539,7 @@ impl Document {
 
     /// Serialize the document to bytes, restoring the recorded line ending
     /// and final-newline state.
+    #[cfg(test)]
     fn serialize(&self) -> String {
         self.serialize_text(&self.text)
     }

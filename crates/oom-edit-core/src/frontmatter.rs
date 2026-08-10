@@ -8,6 +8,7 @@
 //! is unaffected, and the structural API returns the error (FR-5.6).
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 
 use crate::error::FmError;
 
@@ -176,6 +177,32 @@ pub fn parse_front_matter(text: &str) -> FrontMatter {
     } else {
         FrontMatter::None
     }
+}
+
+/// Return the source span occupied by leading YAML or TOML front matter.
+///
+/// The span includes both delimiter lines and their terminating newline when
+/// present. An unterminated opening delimiter owns the remainder of the file
+/// so rendered Markdown never misinterprets metadata as document content.
+pub(crate) fn front_matter_span(text: &str) -> Option<Range<usize>> {
+    let delimiter = match text.lines().next()? {
+        "---" => "---",
+        "+++" => "+++",
+        _ => return None,
+    };
+    let first_line_end = text.find('\n').map_or(text.len(), |index| index + 1);
+    if first_line_end == text.len() {
+        return Some(0..text.len());
+    }
+
+    let mut end = first_line_end;
+    for line in text[first_line_end..].split_inclusive('\n') {
+        end += line.len();
+        if line.trim_end_matches(['\r', '\n']) == delimiter {
+            return Some(0..end);
+        }
+    }
+    Some(0..text.len())
 }
 
 /// Parse YAML front matter from document text.

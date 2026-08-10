@@ -12,7 +12,7 @@ use std::path::PathBuf;
 pub struct Args {
     /// Positional file path to open, if any.
     pub path: Option<PathBuf>,
-    /// `--theme NAME`: theme name (T11 accepts only "default-dark").
+    /// `--theme NAME`: built-in theme name.
     pub theme: Option<String>,
     /// Hidden debug flag: trigger a panic for NFR-5 verification.
     #[allow(dead_code)]
@@ -135,7 +135,7 @@ USAGE:
     oom-edit [OPTIONS] [--] [path]
 
 OPTIONS:
-    --theme NAME        Theme name (built-in: default-dark)
+    --theme NAME        Theme (default-dark, default-light, accessible)
     -h, --help          Print this help and exit
     -V, --version       Print version and exit
 

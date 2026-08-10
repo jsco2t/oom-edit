@@ -12,13 +12,43 @@
 use std::path::PathBuf;
 
 use ratatui::backend::TestBackend;
+use ratatui::style::Modifier;
 use ratatui::Terminal;
 
 use oom_edit_core::clipboard::RecordingClipboardSink;
 use oom_edit_core::session::EditorSession;
 
 use crate::app::App;
-use crate::theme::{Tier, ZED_CYAN, ZED_ORANGE, ZED_UI_TEXT};
+use crate::command::Contexts;
+use crate::theme::{
+    get_theme, EnvParts, PaletteKind, ThemeSource, Tier, UiSlot, ZED_CYAN, ZED_ORANGE, ZED_UI_TEXT,
+};
+
+fn resolve_test_theme_at(name: &str, capability: Tier) -> crate::theme::ResolvedTheme {
+    let config = crate::Config::default();
+    let env = match capability {
+        Tier::TrueColor => EnvParts {
+            term: Some("xterm-256color"),
+            colorterm: Some("truecolor"),
+            ..EnvParts::default()
+        },
+        Tier::Color16 => EnvParts {
+            term: Some("xterm-256color"),
+            ..EnvParts::default()
+        },
+        Tier::Monochrome => EnvParts {
+            no_color: true,
+            term: Some("dumb"),
+            ..EnvParts::default()
+        },
+    };
+    crate::resolve_startup_theme(
+        Some(name),
+        &config,
+        crate::config::ConfigPresence::default(),
+        &env,
+    )
+}
 
 // ── Snapshot directory ───────────────────────────────────────────────────────
 
@@ -46,14 +76,15 @@ fn test_app(text: &str) -> App {
 }
 
 fn test_app_with_relative_line_numbers(text: &str, relative_line_numbers: bool) -> App {
+    let mut session = EditorSession::from_text(text);
+    session.render_layout(74);
     App::new(
-        EditorSession::from_text(text),
-        "default-dark".to_string(),
-        false,
-        Tier::TrueColor,
+        session,
+        crate::theme::ResolvedTheme::injected("default-dark", false, Tier::TrueColor),
         true,
         relative_line_numbers,
         Box::new(RecordingClipboardSink::default()),
+        Box::new(crate::config::DisabledConfigStore),
     )
 }
 
@@ -97,9 +128,27 @@ where
     result
 }
 
+fn find_buffer_token(
+    buffer: &ratatui::buffer::Buffer,
+    width: u16,
+    height: u16,
+    token: &str,
+) -> (u16, u16) {
+    (0..height)
+        .find_map(|y| {
+            let row: String = (0..width)
+                .filter_map(|x| buffer.cell((x, y)))
+                .map(|cell| cell.symbol())
+                .collect();
+            row.find(token)
+                .map(|byte_index| (row[..byte_index].chars().count() as u16, y))
+        })
+        .unwrap_or_else(|| panic!("rendered fixture is missing {token:?}"))
+}
+
 // ── Kitchen-sink fixture ────────────────────────────────────────────────────
 
-/// A kitchen-sink markdown document used for editor and view goldens.
+/// A kitchen-sink markdown document used for source and rendered goldens.
 ///
 /// Covers headings, front matter, code fences, blockquotes,
 /// links, and thematic breaks.
@@ -278,24 +327,24 @@ fn guard_update_creates() {
 
 // ── Editor screen goldens ───────────────────────────────────────────────────
 
-/// Editor Normal mode — kitchen-sink document, 80×24, absolute gutter, NORMAL badge.
+/// Rendered Normal — kitchen-sink document, 80×24, absolute gutter.
 #[test]
-fn golden_editor_normal() {
+fn golden_rendered_normal() {
     let mut app = test_app(kitchen_sink());
     let lines = render_app_lines(80, 24, |frame| {
         app.render(frame);
     });
-    assert_snapshot(&lines, "editor_normal");
+    assert_snapshot(&lines, "rendered_normal");
 }
 
-/// Editor Normal mode with hybrid-relative line numbers explicitly enabled.
+/// Rendered Normal with hybrid-relative line numbers explicitly enabled.
 #[test]
-fn golden_editor_relative_line_numbers() {
+fn golden_rendered_relative_line_numbers() {
     let mut app = test_app_with_relative_line_numbers(kitchen_sink(), true);
     let lines = render_app_lines(80, 24, |frame| {
         app.render(frame);
     });
-    assert_snapshot(&lines, "editor_relative_line_numbers");
+    assert_snapshot(&lines, "rendered_relative_line_numbers");
 }
 
 /// Editor Insert mode — absolute gutter, INSERT badge.
@@ -315,11 +364,11 @@ fn golden_editor_insert() {
     assert_snapshot(&lines, "editor_insert");
 }
 
-/// Editor Visual mode — selection highlight visible.
+/// Rendered Select — character-wise selection carrier visible.
 #[test]
-fn golden_editor_visual_selection() {
+fn golden_rendered_select() {
     let mut app = test_app(kitchen_sink());
-    // Enter visual mode: press 'v'.
+    // Enter Select: press `v` from rendered Normal.
     app.handle_event(&crossterm::event::Event::Key(
         crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char('v'),
@@ -329,7 +378,7 @@ fn golden_editor_visual_selection() {
     let lines = render_app_lines(80, 24, |frame| {
         app.render(frame);
     });
-    assert_snapshot(&lines, "editor_visual_selection");
+    assert_snapshot(&lines, "rendered_select");
 }
 
 /// Editor Command mode — `:w` typed in command line.
@@ -355,9 +404,9 @@ fn golden_editor_cmdline() {
     assert_snapshot(&lines, "editor_cmdline");
 }
 
-/// Editor — search matches highlighted.
+/// Rendered Normal — search matches highlighted.
 #[test]
-fn golden_editor_search_matches() {
+fn golden_rendered_search_matches() {
     let mut app = test_app(kitchen_sink());
     // Enter search mode and search for "Heading".
     app.handle_event(&crossterm::event::Event::Key(
@@ -383,83 +432,59 @@ fn golden_editor_search_matches() {
     let lines = render_app_lines(80, 24, |frame| {
         app.render(frame);
     });
-    assert_snapshot(&lines, "editor_search_matches");
+    assert_snapshot(&lines, "rendered_search_matches");
 }
 
-// ── View screen goldens ─────────────────────────────────────────────────────
+// ── Rendered screen goldens ─────────────────────────────────────────────────
 
-/// View mode top — kitchen-sink with heading + front-matter panel.
+/// rendered mode top — kitchen-sink with heading + front-matter panel.
 #[test]
-fn golden_view_top() {
+fn golden_rendered_top() {
     let mut app = test_app(kitchen_sink());
-    // Toggle to View mode: Space v.
-    app.handle_event(&crossterm::event::Event::Key(
-        crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char(' '),
-            crossterm::event::KeyModifiers::NONE,
-        ),
-    ));
-    app.handle_event(&crossterm::event::Event::Key(
-        crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('v'),
-            crossterm::event::KeyModifiers::NONE,
-        ),
-    ));
     let lines = render_app_lines(80, 24, |frame| {
         app.render(frame);
     });
-    assert_snapshot(&lines, "view_top");
+    assert_snapshot(&lines, "rendered_top");
 }
 
-/// View mode — table rendering.
+/// rendered mode — table rendering.
 #[test]
-fn golden_view_table() {
-    let mut app = test_app(kitchen_sink());
-    // Toggle to View mode.
-    app.handle_event(&crossterm::event::Event::Key(
-        crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char(' '),
-            crossterm::event::KeyModifiers::NONE,
-        ),
-    ));
-    app.handle_event(&crossterm::event::Event::Key(
-        crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('v'),
-            crossterm::event::KeyModifiers::NONE,
-        ),
-    ));
-    // Navigate down to the table section (several j keypresses).
-    for _ in 0..15 {
-        app.handle_event(&crossterm::event::Event::Key(
-            crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Char('j'),
-                crossterm::event::KeyModifiers::NONE,
-            ),
-        ));
+fn golden_rendered_table() {
+    let table = "# Table\n\n| Left | Center | Right |\n|:-----|:------:|------:|\n| alpha | beta | 42 |\n| wide | 東京 | 7 |\n";
+    let mut probe = EditorSession::from_text(table);
+    let layout = probe.render_layout(74);
+    let mapped_source = layout
+        .lines
+        .iter()
+        .flat_map(|line| &line.atoms)
+        .filter_map(|atom| atom.source.as_ref())
+        .map(|range| &table[range.clone()])
+        .collect::<String>();
+    for token in ["alpha", "beta", "42", "東京"] {
+        assert!(
+            mapped_source.contains(token),
+            "missing table source mapping for {token}"
+        );
     }
+
+    let mut app = test_app(table);
     let lines = render_app_lines(80, 24, |frame| {
         app.render(frame);
     });
-    assert_snapshot(&lines, "view_table");
+    let rendered = lines.join("\n");
+    for token in ["┌", "┬", "┐", "Left", "Center", "Right", "alpha", "beta"] {
+        assert!(
+            rendered.contains(token),
+            "missing rendered table token {token:?}"
+        );
+    }
+    assert_snapshot(&lines, "rendered_table");
 }
 
-/// View mode — fenced Rust code block.
+/// rendered mode — fenced Rust code block.
 #[test]
-fn golden_view_fence_rust() {
+fn golden_rendered_fence_rust() {
     let mut app = test_app(kitchen_sink());
-    // Toggle to View mode.
-    app.handle_event(&crossterm::event::Event::Key(
-        crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char(' '),
-            crossterm::event::KeyModifiers::NONE,
-        ),
-    ));
-    app.handle_event(&crossterm::event::Event::Key(
-        crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('v'),
-            crossterm::event::KeyModifiers::NONE,
-        ),
-    ));
     // Navigate to the code fence.
     for _ in 0..12 {
         app.handle_event(&crossterm::event::Event::Key(
@@ -472,26 +497,13 @@ fn golden_view_fence_rust() {
     let lines = render_app_lines(80, 24, |frame| {
         app.render(frame);
     });
-    assert_snapshot(&lines, "view_fence_rust");
+    assert_snapshot(&lines, "rendered_fence_rust");
 }
 
-/// View mode — links index at document end.
+/// rendered mode — links index at document end.
 #[test]
-fn golden_view_links_index() {
+fn golden_rendered_links_index() {
     let mut app = test_app(kitchen_sink());
-    // Toggle to View mode.
-    app.handle_event(&crossterm::event::Event::Key(
-        crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char(' '),
-            crossterm::event::KeyModifiers::NONE,
-        ),
-    ));
-    app.handle_event(&crossterm::event::Event::Key(
-        crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('v'),
-            crossterm::event::KeyModifiers::NONE,
-        ),
-    ));
     // Go to the last line.
     app.handle_event(&crossterm::event::Event::Key(
         crossterm::event::KeyEvent::new(
@@ -502,26 +514,13 @@ fn golden_view_links_index() {
     let lines = render_app_lines(80, 24, |frame| {
         app.render(frame);
     });
-    assert_snapshot(&lines, "view_links_index");
+    assert_snapshot(&lines, "rendered_links_index");
 }
 
-/// View mode — search match.
+/// rendered mode — search match.
 #[test]
-fn golden_view_search_match() {
+fn golden_rendered_search_match() {
     let mut app = test_app(kitchen_sink());
-    // Toggle to View mode.
-    app.handle_event(&crossterm::event::Event::Key(
-        crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char(' '),
-            crossterm::event::KeyModifiers::NONE,
-        ),
-    ));
-    app.handle_event(&crossterm::event::Event::Key(
-        crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('v'),
-            crossterm::event::KeyModifiers::NONE,
-        ),
-    ));
     // Search for "Heading".
     app.handle_event(&crossterm::event::Event::Key(
         crossterm::event::KeyEvent::new(
@@ -562,7 +561,7 @@ fn golden_view_search_match() {
     let lines = render_app_lines(80, 24, |frame| {
         app.render(frame);
     });
-    assert_snapshot(&lines, "view_search_match");
+    assert_snapshot(&lines, "rendered_search_match");
 }
 
 // ── Palette goldens ─────────────────────────────────────────────────────────
@@ -745,37 +744,30 @@ fn golden_status_error_glyph() {
 
 // ── Narrow-degradation goldens ──────────────────────────────────────────────
 
-/// Editor at 40 columns — degradation test.
+/// Source Insert at 40 columns — degradation test.
 #[test]
-fn golden_editor_narrow_40() {
+fn golden_insert_narrow_40() {
     let mut app = test_app(simple_doc());
+    app.handle_event(&crossterm::event::Event::Key(
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('i'),
+            crossterm::event::KeyModifiers::NONE,
+        ),
+    ));
     let lines = render_app_lines(40, 10, |frame| {
         app.render(frame);
     });
-    assert_snapshot(&lines, "editor_narrow_40");
+    assert_snapshot(&lines, "insert_narrow_40");
 }
 
-/// View at 40 columns — degradation test.
+/// Rendered Normal at 40 columns — degradation test.
 #[test]
-fn golden_view_narrow_40() {
+fn golden_rendered_narrow_40() {
     let mut app = test_app(simple_doc());
-    // Toggle to View mode.
-    app.handle_event(&crossterm::event::Event::Key(
-        crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char(' '),
-            crossterm::event::KeyModifiers::NONE,
-        ),
-    ));
-    app.handle_event(&crossterm::event::Event::Key(
-        crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('v'),
-            crossterm::event::KeyModifiers::NONE,
-        ),
-    ));
     let lines = render_app_lines(40, 10, |frame| {
         app.render(frame);
     });
-    assert_snapshot(&lines, "view_narrow_40");
+    assert_snapshot(&lines, "rendered_narrow_40");
 }
 
 #[test]
@@ -784,14 +776,6 @@ fn default_dark_render_uses_zed_colors_for_plain_text_and_headings() {
     const HEIGHT: u16 = 10;
 
     let mut app = test_app("plain text\n\n# Cyan heading\n\n## Orange heading\n");
-    for ch in [' ', 'v'] {
-        app.handle_event(&crossterm::event::Event::Key(
-            crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Char(ch),
-                crossterm::event::KeyModifiers::NONE,
-            ),
-        ));
-    }
     let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
     terminal.draw(|frame| app.render(frame)).unwrap();
     let buffer = terminal.backend().buffer();
@@ -818,6 +802,139 @@ fn default_dark_render_uses_zed_colors_for_plain_text_and_headings() {
                 expected,
                 "unexpected foreground for {token:?} at ({x}, {y})"
             );
+        }
+    }
+}
+
+#[test]
+fn default_dark_styles_reach_all_four_modes() {
+    for theme_name in ["default-dark", "default-light"] {
+        for capability in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
+            for (mode_key, badge, slot) in [
+                (None, " NORMAL ", UiSlot::BadgeNormal),
+                (Some('i'), " INSERT ", UiSlot::BadgeInsert),
+                (Some('v'), " SELECT ", UiSlot::BadgeSelect),
+                (Some(':'), " :CMD ", UiSlot::BadgeCommand),
+            ] {
+                let mut session = EditorSession::from_text("plain\n\n# Colored heading\n");
+                session.render_layout(74);
+                let resolved = resolve_test_theme_at(theme_name, capability);
+                assert_eq!(resolved.source, ThemeSource::Cli);
+                assert_eq!(resolved.capability, capability);
+                let mut app = App::new(
+                    session,
+                    resolved,
+                    true,
+                    false,
+                    Box::new(RecordingClipboardSink::default()),
+                    Box::new(crate::config::DisabledConfigStore),
+                );
+                if let Some(key) = mode_key {
+                    app.handle_event(&crossterm::event::Event::Key(
+                        crossterm::event::KeyEvent::new(
+                            crossterm::event::KeyCode::Char(key),
+                            crossterm::event::KeyModifiers::NONE,
+                        ),
+                    ));
+                }
+                let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+                terminal.draw(|frame| app.render(frame)).unwrap();
+                let buffer = terminal.backend().buffer();
+                let heading_style =
+                    get_theme(theme_name).style(capability, oom_edit_core::SemanticStyle::Heading1);
+                let (heading_x, heading_y) = find_buffer_token(buffer, 60, 8, "Colored heading");
+                for x in heading_x..heading_x + "Colored heading".chars().count() as u16 {
+                    let cell = buffer.cell((x, heading_y)).unwrap();
+                    assert_eq!(cell.fg, heading_style.fg.unwrap_or_default());
+                    assert_eq!(cell.bg, heading_style.bg.unwrap_or_default());
+                    assert!(cell.modifier.contains(heading_style.add_modifier));
+                }
+                let badge_style = get_theme(theme_name).ui_style(capability, slot);
+                for (x, expected) in badge.chars().enumerate() {
+                    let cell = buffer.cell((x as u16, 7)).unwrap();
+                    assert_eq!(cell.symbol(), expected.to_string());
+                    assert_eq!(cell.fg, badge_style.fg.unwrap_or_default());
+                    assert_eq!(cell.bg, badge_style.bg.unwrap_or_default());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn accessible_styles_are_color_free_in_all_four_modes() {
+    for capability in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
+        for (mode_key, badge, slot) in [
+            (None, " NORMAL ", UiSlot::BadgeNormal),
+            (Some('i'), " INSERT ", UiSlot::BadgeInsert),
+            (Some('v'), " SELECT ", UiSlot::BadgeSelect),
+            (Some(':'), " :CMD ", UiSlot::BadgeCommand),
+        ] {
+            let mut session = EditorSession::from_text("plain\n\n# Accessible heading\n");
+            session.render_layout(74);
+            let resolved = resolve_test_theme_at("accessible", capability);
+            assert_eq!(resolved.source, ThemeSource::Cli);
+            assert_eq!(resolved.capability, capability);
+            assert_eq!(resolved.palette_kind, PaletteKind::Monochrome);
+            let mut app = App::new(
+                session,
+                resolved,
+                true,
+                false,
+                Box::new(RecordingClipboardSink::default()),
+                Box::new(crate::config::DisabledConfigStore),
+            );
+            if let Some(key) = mode_key {
+                app.handle_event(&crossterm::event::Event::Key(
+                    crossterm::event::KeyEvent::new(
+                        crossterm::event::KeyCode::Char(key),
+                        crossterm::event::KeyModifiers::NONE,
+                    ),
+                ));
+            }
+            let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+            terminal.draw(|frame| app.render(frame)).unwrap();
+            let monochrome_foreground = get_theme("accessible")
+                .style(capability, oom_edit_core::SemanticStyle::Text)
+                .fg
+                .unwrap_or_default();
+            let buffer = terminal.backend().buffer();
+            assert!(buffer
+                .content()
+                .iter()
+                .all(|cell| cell.fg == monochrome_foreground && cell.bg == Default::default()));
+            assert_eq!(
+                (0..badge.chars().count())
+                    .map(|x| buffer.cell((x as u16, 7)).unwrap().symbol())
+                    .collect::<String>(),
+                badge
+            );
+            assert!(buffer
+                .content()
+                .iter()
+                .any(|cell| cell.modifier.contains(Modifier::BOLD)));
+            let heading_style =
+                get_theme("accessible").style(capability, oom_edit_core::SemanticStyle::Heading1);
+            let (heading_x, heading_y) = find_buffer_token(buffer, 60, 8, "Accessible heading");
+            for x in heading_x..heading_x + "Accessible heading".chars().count() as u16 {
+                let cell = buffer.cell((x, heading_y)).unwrap();
+                assert_eq!(cell.fg, heading_style.fg.unwrap_or_default());
+                assert_eq!(cell.bg, heading_style.bg.unwrap_or_default());
+                assert!(cell.modifier.contains(heading_style.add_modifier));
+            }
+            let badge_style = get_theme("accessible").ui_style(capability, slot);
+            for x in 0..badge.chars().count() as u16 {
+                let cell = buffer.cell((x, 7)).unwrap();
+                assert_eq!(cell.fg, badge_style.fg.unwrap_or_default());
+                assert_eq!(cell.bg, badge_style.bg.unwrap_or_default());
+                assert!(cell.modifier.contains(badge_style.add_modifier));
+            }
+            if mode_key == Some('v') {
+                assert!(buffer
+                    .content()
+                    .iter()
+                    .any(|cell| cell.modifier.contains(Modifier::REVERSED)));
+            }
         }
     }
 }
@@ -971,7 +1088,7 @@ fn drift_all_semantic_styles_mapped_per_theme() {
 }
 
 /// Render without panic across a size sweep: small sizes (1..=5) × (1..=5)
-/// plus canonical sizes (80×24, 200×60, 40×10) for editor, view, and each overlay.
+/// plus canonical sizes for rendered Normal, source Insert, and each overlay.
 #[test]
 fn drift_render_without_panic_across_sizes() {
     use crate::overlay::Overlay;
@@ -990,7 +1107,7 @@ fn drift_render_without_panic_across_sizes() {
     let kitchen = kitchen_sink();
 
     for (w, h) in &sizes {
-        // Editor (Normal mode).
+        // Rendered Normal.
         {
             let mut app = test_app(kitchen);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -998,13 +1115,13 @@ fn drift_render_without_panic_across_sizes() {
                     app.render(frame);
                 });
             }));
-            assert!(result.is_ok(), "editor panicked at {w}×{h}");
+            assert!(result.is_ok(), "rendered Normal panicked at {w}×{h}");
         }
 
         // Editor with palette overlay.
         {
             let mut app = test_app(kitchen);
-            app.set_overlay(Overlay::open_palette());
+            app.set_overlay(Overlay::open_palette(Contexts::NORMAL));
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _ = render_app_lines(*w, *h, |frame| {
                     app.render(frame);
@@ -1040,18 +1157,12 @@ fn drift_render_without_panic_across_sizes() {
             );
         }
 
-        // View mode.
+        // Source Insert.
         {
             let mut app = test_app(kitchen);
             app.handle_event(&crossterm::event::Event::Key(
                 crossterm::event::KeyEvent::new(
-                    crossterm::event::KeyCode::Char(' '),
-                    crossterm::event::KeyModifiers::NONE,
-                ),
-            ));
-            app.handle_event(&crossterm::event::Event::Key(
-                crossterm::event::KeyEvent::new(
-                    crossterm::event::KeyCode::Char('v'),
+                    crossterm::event::KeyCode::Char('i'),
                     crossterm::event::KeyModifiers::NONE,
                 ),
             ));
@@ -1060,7 +1171,7 @@ fn drift_render_without_panic_across_sizes() {
                     app.render(frame);
                 });
             }));
-            assert!(result.is_ok(), "view panicked at {w}×{h}");
+            assert!(result.is_ok(), "source Insert panicked at {w}×{h}");
         }
     }
 }
@@ -1077,8 +1188,8 @@ fn golden_deterministic() {
         ('x', false),    // insert char
         ('\x1b', false), // esc
         (' ', false),    // space
-        ('v', false),    // toggle view
-        ('\x1b', false), // esc back to normal
+        ('v', false),    // enter Select
+        ('\x1b', false), // cancel Select
     ] {
         let code = if key.0 == '\x1b' {
             crossterm::event::KeyCode::Esc

@@ -1,6 +1,6 @@
-█ Kitchen Sink — All View Elements
+█ Kitchen Sink — All Rendered Elements
 
-This fixture exercises every view element (VW-1 through
+This fixture exercises every rendered element (VW-1 through
 VW-14) for span-integrity testing.
 
 ▌ VW-1: Headings H1–H6

@@ -1,6 +1,7 @@
 //! Headless example: demonstrates `EditorSession` usage without any terminal
 //! dependencies. Builds a session from an embedded markdown string, plays a
-//! key script, renders source and view output, and exits.
+//! source-mapped rendered selections, enters raw-source Insert, renders both models, and
+//! exits.
 //!
 //! This is the reference host application that proves `oom-edit-core` is
 //! embeddable (FR-8.4, SC-4).
@@ -85,6 +86,21 @@ fn key(ch: char) -> KeyInput {
     }
 }
 
+fn esc() -> KeyInput {
+    KeyInput {
+        code: KeyCode {
+            kind: KeyCodeKind::Esc,
+        },
+        mods: Modifiers::default(),
+    }
+}
+
+fn ctrl(ch: char) -> KeyInput {
+    let mut input = key(ch);
+    input.mods.ctrl = true;
+    input
+}
+
 fn main() {
     let markdown = "# Hello World\n\nThis is **bold** and `code`.\n\n- item one\n- item two\n";
     let mut session = EditorSession::from_text(markdown);
@@ -93,7 +109,54 @@ fn main() {
     println!("Mode: {:?}", session.mode());
     println!("Lines: {}", session.line_count());
 
-    // Render source
+    // Render Normal at the host's actual text width.
+    let layout = session.render_layout(80);
+    println!("\n=== Rendered Normal layout ===");
+    println!("Lines: {}", layout.lines.len());
+    println!("Jump targets: {}", layout.jump_targets.len());
+    println!("Rendered cursor: {:?}", session.rendered_cursor());
+
+    // Character-wise Select exposes display geometry and raw-source ranges.
+    let before_yank = session.document();
+    session.handle_key(key('v'));
+    println!("Mode during selection: {:?}", session.mode());
+    session.handle_key(key('l'));
+    let character = session.rendered_selection().expect("character selection");
+    println!(
+        "Character selection: {:?} {:?}",
+        character.shape, character.source_ranges
+    );
+    session.handle_key(key('y'));
+    println!(
+        "Yank preserved document: {}",
+        session.document() == before_yank
+    );
+
+    session.render_layout(80);
+    session.handle_key(key('V'));
+    println!(
+        "Line selection: {:?}",
+        session.rendered_selection().expect("line selection").shape
+    );
+    session.handle_key(esc());
+
+    session.handle_key(ctrl('v'));
+    println!(
+        "Block selection: {:?}",
+        session.rendered_selection().expect("block selection").shape
+    );
+    session.handle_key(esc());
+
+    // Enter Insert at the mapped source position, add one marker, and return
+    // to rendered Normal.
+    session.handle_key(key('i'));
+    println!("Mode during source edit: {:?}", session.mode());
+    session.handle_key(key('!'));
+    session.handle_key(esc());
+    println!("Mode after Insert: {:?}", session.mode());
+
+    // Render the raw source surface by entering Insert once more.
+    session.handle_key(key('i'));
     let vp = Viewport {
         top_line: 0,
         height: 10,
@@ -103,42 +166,35 @@ fn main() {
         skip_rows: 0,
     };
     let frame = session.render_source(vp);
-    println!("\n=== Source frame ({} lines) ===", frame.lines.len());
+    println!(
+        "\n=== Insert source frame ({} lines) ===",
+        frame.lines.len()
+    );
     for line in &frame.lines {
         print_styled_line(line);
     }
 
-    // Play a key script: ggVGd (go to top, visual line, to bottom, delete)
-    println!("\n=== Playing key script: ggVGd ===");
-    session.handle_key(key('g'));
-    session.handle_key(key('g'));
-    session.handle_key(key('V'));
-    session.handle_key(key('G'));
-    session.handle_key(key('d'));
-
-    println!("Mode after script: {:?}", session.mode());
-    println!("Lines after script: {}", session.line_count());
-
-    // Render source after edits
-    let frame = session.render_source(vp);
-    println!("\n=== Source frame after ggVGd ===");
-    for line in &frame.lines {
-        print_styled_line(line);
-    }
-
-    // Render view layout
-    let layout = session.render_view(80);
-    println!("\n=== View layout ===");
-    println!("Lines: {}", layout.lines.len());
-    println!("Jump targets: {}", layout.jump_targets.len());
+    session.handle_key(esc());
 
     // Test :help effect
     let _effects = session.handle_key(key(':'));
     let _effects = session.handle_key(key('h'));
     let _effects = session.handle_key(key('e'));
     let _effects = session.handle_key(key('l'));
+    let _effects = session.handle_key(key('p'));
     println!("\n=== Help effect ===");
-    println!("(HelpRequested effect is emitted during :help chord)");
+    let effects = session.handle_key(KeyInput {
+        code: KeyCode {
+            kind: KeyCodeKind::Enter,
+        },
+        mods: Modifiers::default(),
+    });
+    println!(
+        "Help requested: {}",
+        effects
+            .iter()
+            .any(|effect| matches!(effect, oom_edit_core::Effect::HelpRequested))
+    );
 
     println!("\n=== Done ===");
 }

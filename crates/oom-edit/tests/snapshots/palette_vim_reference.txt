@@ -1,24 +1,24 @@
-   1  ---
-   2  title: Kitchen Sink
-   3  au┌ Command Palette ─────────────────────────────────────────────┐
-   4  --│>                                                             │
-   5    │                                                              │
-   6  # │  quit                 quit                           Space q │
-   7    │  cycle-theme          cycle theme                    Space t │
-   8  So│  next-tab             next tab                       (no bind│
-      [l│  prev-tab             previous tab                   (no bind│
-   9    │  jump-to-tab          jump to tab                    (no bind│
-  10  > │  tab-new              new tab                        (no bind│
-  11    │  tab-close            close tab                      (no bind│
-  12  ``│  quit-all             quit all tabs                  (no bind│
-  13  fn│  h, ←                 Char/line movement left. No line wrap. │
-  14    │  j, ↓                 Line down, preserves desired column on │
-  15  } │  k, ↑                 Line up, preserves desired column on sh│
-  16  ``│  l, →                 Char/line movement right. No line wrap.│
-  17    │  w                    Word forward (Vim word rules: punctuati│
-  18  --│  b                    Word backward.                      V-M│
-  19    │▸ e                    End of word.                        V-M│
-  20  An└──────────────────────────────────────────────────────────────┘
-  21
+   1  ┌─ metadata ─────────────────────────────────────────────────────────────┐
+   2  │ title: Kitchen Sink                                                    │
+   3  │ ┌ Command Palette ─────────────────────────────────────────────┐       │
+   4  └─│>                                                             │───────┘
+        │                                                              │
+   6  █ │  cancel-select        cancel selection               Esc     │
+        │  select-yank          yank selection                 y       │
+   8  So│  select-delete        delete selection               d / x   │
+        │  select-change        change selection               c       │
+  10  ┃ │  select-indent        indent selection               >       │
+        │  select-outdent       outdent selection              <       │
+      ▏ │  select-swap-anchor   swap selection endpoint        o       │
+  13  ▏ │  help                 help / command palette         Space h │
+  14  ▏ │  save                 save                           Space w │
+  15  ▏ │  quit                 quit                           Space q │
+      ▏ │  cycle-theme          cycle theme                    Space t │
+        │  next-tab             next tab                       (no bind│
+  18  ──│  prev-tab             previous tab                   (no bind│────────
+        │  jump-to-tab          jump to tab                    (no bind│
+  20  An│▸ tab-new              new tab                        (no bind│
+        └──────────────────────────────────────────────────────────────┘
   22  More text here.
+
  NORMAL  ↑↓ navigate · type to filter · Enter execute · Esc close

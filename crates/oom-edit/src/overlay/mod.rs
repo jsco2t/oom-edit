@@ -12,7 +12,7 @@ pub mod palette;
 pub use confirm::{ConfirmOverwrite, ConfirmQuit, ConfirmResult};
 pub use palette::PaletteState;
 
-use crate::command::Command;
+use crate::command::{Command, Contexts};
 use crate::theme::{Theme, Tier};
 
 /// An active overlay slot. Only one overlay can be open at a time.
@@ -43,8 +43,8 @@ impl Overlay {
 
     /// Open the command palette.
     #[allow(dead_code)]
-    pub fn open_palette() -> Self {
-        Overlay::Palette(PaletteState::default())
+    pub fn open_palette(context: Contexts) -> Self {
+        Overlay::Palette(PaletteState::new(context))
     }
 
     /// Open the confirm-quit overlay.

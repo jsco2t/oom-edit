@@ -1,0 +1,24 @@
+   1  ┌─ metadata ─────────────────────────────────────────────────────────────┐
+  +1  │ title: Kitchen Sink                                                    │
+  +2  │ author: Test                                                           │
+  +3  └────────────────────────────────────────────────────────────────────────┘
+
+  +5  █ Heading One
+
+  +7  Some bold and italic text with inline code and a link [0].
+
+  +9  ┃ A blockquote with emphasis inside.
+
+      ▏ rust
+ +12  ▏ fn main() {
+ +13  ▏     println!("Hello!");
+ +14  ▏ }
+      ▏
+
+ +17  ──────────────────────────────────────────────────────────────────────────
+
+ +19  Another heading.
+
+ +21  More text here.
+
+ NORMAL  v=character-wise selection  Space w=save                    1:1  4% Top

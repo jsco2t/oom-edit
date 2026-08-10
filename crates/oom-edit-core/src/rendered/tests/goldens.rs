@@ -1,14 +1,15 @@
-//! Golden tests for ViewLayout rendering.
+//! Golden tests for RenderedLayout rendering.
 //!
 //! Each VW row (VW-1..VW-14) has a dedicated fixture that produces a golden
-//! file. The harness renders `ViewLayout::build()` at width 60 and compares
+//! file. The harness renders `RenderedLayout::build()` at width 60 and compares
 //! the plain-text output (styles stripped) against committed golden files.
 //!
 //! Run with `OOM_UPDATE_SNAPSHOTS=1` to rewrite golden files.
 
-use oom_edit_core::style::ViewLayout;
-use oom_edit_core::syntax::Highlighter;
-use oom_edit_core::view::BlockModel;
+use crate::rendered::BlockModel;
+use crate::style::{LineKind, RenderedLayout, SemanticStyle};
+use crate::syntax::Highlighter;
+use crate::EditorSession;
 use std::path::Path;
 
 /// Default width for golden tests.
@@ -30,7 +31,7 @@ fn golden_path(name: &str) -> std::path::PathBuf {
 }
 
 fn render_plain(model: &BlockModel, width: u16, highlighter: &Highlighter) -> String {
-    let layout = ViewLayout::build(model, width, highlighter);
+    let layout = RenderedLayout::build(model, width, highlighter);
     layout
         .lines
         .iter()
@@ -82,6 +83,56 @@ fn assert_golden(name: &str, markdown: &str, width: u16) {
             diff_lines[..diff_lines.len().min(20)].join("\n")
         );
     }
+}
+
+fn assert_session_golden(name: &str, markdown: &str, width: u16) {
+    let mut session = EditorSession::from_text(markdown);
+    let rendered = session
+        .render_layout(width)
+        .lines
+        .iter()
+        .map(|line| {
+            format!(
+                "{:>3} {:?} {:?} {}",
+                line.source.start, line.role, line.source, line.styled.text
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let golden = golden_path(name);
+    if std::env::var_os("OOM_UPDATE_SNAPSHOTS").is_some() {
+        std::fs::write(&golden, rendered)
+            .unwrap_or_else(|_| panic!("failed to write golden: {}", golden.display()));
+        return;
+    }
+    assert_eq!(
+        std::fs::read_to_string(&golden)
+            .unwrap_or_else(|_| panic!("golden file not found: {}", golden.display())),
+        rendered
+    );
+}
+
+const FRONT_MATTER_KITCHEN_SINK: &str = "---\n# metadata comment\ntitle: \"A long café 東京 title that wraps in narrow terminals\"\nauthor:\n  name: Ada\n  bio: |\n    First line.\n    Second line.\naliases:\n  - first\n  - 'second alias'\n\nempty_value:\n---\n\n# Body\n";
+
+const TOML_FRONT_MATTER: &str = "+++\ntitle = \"Quoted café 東京\"\nenabled = true\ncount = 0x2A\n\n[author]\nname = 'Ada'\nbio = \"\"\"First line.\nSecond line.\"\"\"\n+++\n\n# Body\n";
+
+#[test]
+fn golden_front_matter_panel_80() {
+    assert_session_golden("front_matter_panel_80.txt", FRONT_MATTER_KITCHEN_SINK, 80);
+}
+
+#[test]
+fn golden_front_matter_panel_narrow() {
+    assert_session_golden(
+        "front_matter_panel_narrow.txt",
+        FRONT_MATTER_KITCHEN_SINK,
+        18,
+    );
+}
+
+#[test]
+fn golden_front_matter_toml_80() {
+    assert_session_golden("front_matter_toml_80.txt", TOML_FRONT_MATTER, 80);
 }
 
 // ── VW-1: Headings ─────────────────────────────────────────────────────────
@@ -196,20 +247,6 @@ fn golden_vw14_footnotes() {
     assert_golden("vw14_footnotes.txt", &md, GOLDEN_WIDTH);
 }
 
-// ── FR-3.6: Front Matter Panel ─────────────────────────────────────────────
-
-#[test]
-fn golden_frontmatter_yaml() {
-    let md = fixture("highlight_frontmatter_yaml.md");
-    assert_golden("frontmatter_yaml.txt", &md, GOLDEN_WIDTH);
-}
-
-#[test]
-fn golden_frontmatter_toml() {
-    let md = fixture("highlight_frontmatter_toml.md");
-    assert_golden("frontmatter_toml.txt", &md, GOLDEN_WIDTH);
-}
-
 // ── Kitchen Sink ───────────────────────────────────────────────────────────
 
 #[test]
@@ -235,14 +272,14 @@ fn golden_kitchen_sink_deterministic() {
     );
 }
 
-// ── ViewLayout Line Invariants ─────────────────────────────────────────────
+// ── RenderedLayout Line Invariants ─────────────────────────────────────────────
 
 #[test]
 fn golden_line_source_invariants() {
     let md = fixture("kitchen-sink.md");
     let model = BlockModel::build(&md, None);
     let highlighter = Highlighter::new(&md);
-    let layout = ViewLayout::build(&model, 60, &highlighter);
+    let layout = RenderedLayout::build(&model, 60, &highlighter);
 
     for (i, line) in layout.lines.iter().enumerate() {
         // Each line's spans must be within the styled text range
@@ -280,7 +317,7 @@ fn golden_style_survives_wrap() {
     let highlighter = Highlighter::new(md);
 
     // Render at width 20 (forces wrapping)
-    let layout_narrow = ViewLayout::build(&model, 20, &highlighter);
+    let layout_narrow = RenderedLayout::build(&model, 20, &highlighter);
     assert!(
         layout_narrow.lines.len() > 1,
         "narrow render should produce multiple lines"
@@ -306,8 +343,8 @@ fn golden_style_survives_wrap() {
     for line in layout_narrow.lines.iter() {
         for span in &line.styled.spans {
             match span.style {
-                oom_edit_core::style::SemanticStyle::Strong => found_bold = true,
-                oom_edit_core::style::SemanticStyle::Emphasis => found_italic = true,
+                SemanticStyle::Strong => found_bold = true,
+                SemanticStyle::Emphasis => found_italic = true,
                 _ => {}
             }
         }
@@ -325,7 +362,7 @@ fn golden_width_deterministic() {
     let highlighter = Highlighter::new(&md);
 
     for width in [40, 60, 80, 120] {
-        let layout = ViewLayout::build(&model, width, &highlighter);
+        let layout = RenderedLayout::build(&model, width, &highlighter);
 
         // Verify rendered structure is consistent (same number of lines)
         let line_count = layout.lines.len();
@@ -363,7 +400,7 @@ fn golden_width_deterministic() {
 
 // ── Structural Invariants ──────────────────────────────────────────────────
 //
-// These tests validate the structure of ViewLayout independently of exact
+// These tests validate the structure of RenderedLayout independently of exact
 // rendering output. They allow rendering refactors (character changes,
 // spacing updates) without breaking tests — only the golden files need
 // updating, not the structural assertions.
@@ -373,7 +410,7 @@ fn golden_structural_line_spans_valid() {
     let md = fixture("kitchen-sink.md");
     let model = BlockModel::build(&md, None);
     let highlighter = Highlighter::new(&md);
-    let layout = ViewLayout::build(&model, GOLDEN_WIDTH, &highlighter);
+    let layout = RenderedLayout::build(&model, GOLDEN_WIDTH, &highlighter);
 
     for (i, line) in layout.lines.iter().enumerate() {
         for span in &line.styled.spans {
@@ -394,7 +431,7 @@ fn golden_structural_source_spans_valid() {
     let md = fixture("kitchen-sink.md");
     let model = BlockModel::build(&md, None);
     let highlighter = Highlighter::new(&md);
-    let layout = ViewLayout::build(&model, GOLDEN_WIDTH, &highlighter);
+    let layout = RenderedLayout::build(&model, GOLDEN_WIDTH, &highlighter);
 
     for (i, line) in layout.lines.iter().enumerate() {
         assert!(
@@ -413,7 +450,7 @@ fn golden_structural_jump_targets_sorted() {
     let md = fixture("kitchen-sink.md");
     let model = BlockModel::build(&md, None);
     let highlighter = Highlighter::new(&md);
-    let layout = ViewLayout::build(&model, GOLDEN_WIDTH, &highlighter);
+    let layout = RenderedLayout::build(&model, GOLDEN_WIDTH, &highlighter);
 
     for windows in layout.jump_targets.windows(2) {
         assert!(
@@ -428,11 +465,11 @@ fn golden_structural_line_kinds_valid() {
     let md = fixture("kitchen-sink.md");
     let model = BlockModel::build(&md, None);
     let highlighter = Highlighter::new(&md);
-    let layout = ViewLayout::build(&model, GOLDEN_WIDTH, &highlighter);
+    let layout = RenderedLayout::build(&model, GOLDEN_WIDTH, &highlighter);
 
     for (i, line) in layout.lines.iter().enumerate() {
         // And the styled text should not be empty for Content lines
-        if matches!(line.kind, oom_edit_core::style::LineKind::Content) {
+        if matches!(line.kind, LineKind::Content) {
             assert!(
                 !line.styled.text.is_empty() || line.styled.spans.is_empty(),
                 "content line {} should have text or spans",
@@ -447,18 +484,18 @@ fn golden_structural_block_kind_counts() {
     let md = fixture("kitchen-sink.md");
     let model = BlockModel::build(&md, None);
     let highlighter = Highlighter::new(&md);
-    let layout = ViewLayout::build(&model, GOLDEN_WIDTH, &highlighter);
+    let layout = RenderedLayout::build(&model, GOLDEN_WIDTH, &highlighter);
 
     // Count different line kinds
     let content_count = layout
         .lines
         .iter()
-        .filter(|l| matches!(l.kind, oom_edit_core::style::LineKind::Content))
+        .filter(|l| matches!(l.kind, LineKind::Content))
         .count();
     let synthetic_count = layout
         .lines
         .iter()
-        .filter(|l| matches!(l.kind, oom_edit_core::style::LineKind::Synthetic))
+        .filter(|l| matches!(l.kind, LineKind::Synthetic))
         .count();
 
     // Kitchen sink should have content lines

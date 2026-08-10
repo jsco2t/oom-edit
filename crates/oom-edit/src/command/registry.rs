@@ -28,7 +28,16 @@ macro_rules! command_variants {
 }
 
 command_variants! {
-    ToggleView,
+    EnterCharacterSelect,
+    EnterLineSelect,
+    EnterBlockSelect,
+    CancelSelect,
+    SelectYank,
+    SelectDelete,
+    SelectChange,
+    SelectIndent,
+    SelectOutdent,
+    SelectSwapAnchor,
     Help,
     Save,
     Quit,
@@ -57,17 +66,18 @@ impl Contexts {
     #[allow(dead_code)]
     pub const INSERT: Contexts = Contexts(1 << 1);
     #[allow(dead_code)]
-    pub const VISUAL: Contexts = Contexts(1 << 2);
+    pub const SELECT: Contexts = Contexts(1 << 2);
     #[allow(dead_code)]
     pub const COMMAND: Contexts = Contexts(1 << 3);
-    pub const VIEW: Contexts = Contexts(1 << 4);
     #[allow(dead_code)]
-    pub const OVERLAY: Contexts = Contexts(1 << 5);
+    pub const OVERLAY: Contexts = Contexts(1 << 4);
 
     /// Bit count — every declared context bit above.
-    const BIT_COUNT: u8 = 6;
+    #[cfg(test)]
+    const BIT_COUNT: u8 = 5;
 
     /// Every context — for globally-available commands.
+    #[cfg(test)]
     pub const ALL: Contexts = Contexts((1 << Self::BIT_COUNT) - 1);
 
     /// Union of two context sets (const so it composes in `static` initialisers).
@@ -103,7 +113,7 @@ impl Contexts {
 pub struct CommandSpec {
     /// The command this row describes.
     pub id: Command,
-    /// Kebab-case identifier (`toggle-view`).
+    /// Kebab-case identifier (for example, `enter-select`).
     pub name: &'static str,
     /// Human-readable description for help / hints / palette.
     pub desc: &'static str,
@@ -125,25 +135,99 @@ pub struct CommandSpec {
 ///
 /// | Command id   | name         | keys          | contexts            | quick_bar |
 /// |--------------|--------------|---------------|---------------------|-----------|
-/// | `ToggleView` | `toggle-view`| `Space v`     | NORMAL, VIEW        | yes       |
-/// | `Help`       | `help`       | `Space h`      | all non-OVERLAY     | yes       |
-/// | `Save`       | `save`       | `Space w`     | NORMAL              | yes       |
-/// | `Quit`       | `quit`       | `Space q`     | NORMAL, VIEW        | yes       |
-/// | `CycleTheme` | `cycle-theme`| `Space t`     | NORMAL, VIEW        | no        |
+/// | `EnterCharacterSelect` | `select-character` | `v` | NORMAL | yes |
+/// | `EnterLineSelect` | `select-line` | `V` | NORMAL | no |
+/// | `EnterBlockSelect` | `select-block` | `Ctrl-V` | NORMAL | no |
+/// | `Help`        | `help`         | `Space h`   | NORMAL, SELECT      | yes       |
+/// | `Save`        | `save`         | `Space w`   | NORMAL, SELECT      | yes       |
+/// | `Quit`        | `quit`         | `Space q`   | NORMAL, SELECT      | yes       |
+/// | `CycleTheme`  | `cycle-theme`  | `Space t`   | NORMAL, SELECT      | no        |
 pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
-        id: Command::ToggleView,
-        name: "toggle-view",
-        desc: "toggle view",
-        contexts: Contexts::NORMAL.or(Contexts::VIEW),
+        id: Command::EnterCharacterSelect,
+        name: "select-character",
+        desc: "character-wise selection",
+        contexts: Contexts::NORMAL,
         order: 0,
         quick_bar: true,
+    },
+    CommandSpec {
+        id: Command::EnterLineSelect,
+        name: "select-line",
+        desc: "line-wise selection",
+        contexts: Contexts::NORMAL,
+        order: 1,
+        quick_bar: false,
+    },
+    CommandSpec {
+        id: Command::EnterBlockSelect,
+        name: "select-block",
+        desc: "block-wise selection",
+        contexts: Contexts::NORMAL,
+        order: 2,
+        quick_bar: false,
+    },
+    CommandSpec {
+        id: Command::CancelSelect,
+        name: "cancel-select",
+        desc: "cancel selection",
+        contexts: Contexts::SELECT,
+        order: 1,
+        quick_bar: true,
+    },
+    CommandSpec {
+        id: Command::SelectYank,
+        name: "select-yank",
+        desc: "yank selection",
+        contexts: Contexts::SELECT,
+        order: 2,
+        quick_bar: true,
+    },
+    CommandSpec {
+        id: Command::SelectDelete,
+        name: "select-delete",
+        desc: "delete selection",
+        contexts: Contexts::SELECT,
+        order: 3,
+        quick_bar: true,
+    },
+    CommandSpec {
+        id: Command::SelectChange,
+        name: "select-change",
+        desc: "change selection",
+        contexts: Contexts::SELECT,
+        order: 4,
+        quick_bar: false,
+    },
+    CommandSpec {
+        id: Command::SelectIndent,
+        name: "select-indent",
+        desc: "indent selection",
+        contexts: Contexts::SELECT,
+        order: 5,
+        quick_bar: false,
+    },
+    CommandSpec {
+        id: Command::SelectOutdent,
+        name: "select-outdent",
+        desc: "outdent selection",
+        contexts: Contexts::SELECT,
+        order: 6,
+        quick_bar: false,
+    },
+    CommandSpec {
+        id: Command::SelectSwapAnchor,
+        name: "select-swap-anchor",
+        desc: "swap selection endpoint",
+        contexts: Contexts::SELECT,
+        order: 7,
+        quick_bar: false,
     },
     CommandSpec {
         id: Command::Help,
         name: "help",
         desc: "help / command palette",
-        contexts: Contexts::NORMAL.or(Contexts::VIEW),
+        contexts: Contexts::NORMAL.or(Contexts::SELECT),
         order: 10,
         quick_bar: true,
     },
@@ -151,7 +235,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         id: Command::Save,
         name: "save",
         desc: "save",
-        contexts: Contexts::NORMAL,
+        contexts: Contexts::NORMAL.or(Contexts::SELECT),
         order: 20,
         quick_bar: true,
     },
@@ -159,7 +243,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         id: Command::Quit,
         name: "quit",
         desc: "quit",
-        contexts: Contexts::NORMAL.or(Contexts::VIEW),
+        contexts: Contexts::NORMAL.or(Contexts::SELECT),
         order: 30,
         quick_bar: true,
     },
@@ -167,7 +251,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         id: Command::CycleTheme,
         name: "cycle-theme",
         desc: "cycle theme",
-        contexts: Contexts::NORMAL.or(Contexts::VIEW),
+        contexts: Contexts::NORMAL.or(Contexts::SELECT),
         order: 40,
         quick_bar: false,
     },
@@ -175,7 +259,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         id: Command::NextTab,
         name: "next-tab",
         desc: "next tab",
-        contexts: Contexts::NORMAL.or(Contexts::VIEW),
+        contexts: Contexts::NORMAL.or(Contexts::SELECT),
         order: 50,
         quick_bar: false,
     },
@@ -183,7 +267,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         id: Command::PrevTab,
         name: "prev-tab",
         desc: "previous tab",
-        contexts: Contexts::NORMAL.or(Contexts::VIEW),
+        contexts: Contexts::NORMAL.or(Contexts::SELECT),
         order: 51,
         quick_bar: false,
     },
@@ -191,7 +275,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         id: Command::JumpToTab,
         name: "jump-to-tab",
         desc: "jump to tab",
-        contexts: Contexts::NORMAL.or(Contexts::VIEW),
+        contexts: Contexts::NORMAL.or(Contexts::SELECT),
         order: 52,
         quick_bar: false,
     },
@@ -199,7 +283,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         id: Command::TabNew,
         name: "tab-new",
         desc: "new tab",
-        contexts: Contexts::NORMAL.or(Contexts::VIEW),
+        contexts: Contexts::NORMAL.or(Contexts::SELECT),
         order: 60,
         quick_bar: false,
     },
@@ -207,7 +291,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         id: Command::TabClose,
         name: "tab-close",
         desc: "close tab",
-        contexts: Contexts::NORMAL.or(Contexts::VIEW),
+        contexts: Contexts::NORMAL.or(Contexts::SELECT),
         order: 61,
         quick_bar: false,
     },

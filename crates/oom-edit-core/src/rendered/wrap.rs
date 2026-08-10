@@ -167,6 +167,74 @@ pub fn wrap_lines(input: &StyledLine, width: u16, hanging_indent: u16) -> Vec<St
     result
 }
 
+/// Hard-wrap a source line without dropping or inserting any source character.
+///
+/// Unlike [`wrap_lines`], this function does not prefer word boundaries or
+/// trim continuation whitespace. Source mode must display raw Markdown
+/// exactly, so concatenating the returned line texts always reproduces the
+/// input text. Zero-width suffixes remain attached to the preceding scalar,
+/// and an over-wide scalar is emitted whole so wrapping always makes progress.
+pub(crate) fn wrap_source_line(input: &StyledLine, width: u16) -> Vec<StyledLine> {
+    if width == 0 {
+        return vec![StyledLine {
+            text: String::new(),
+            spans: Vec::new(),
+        }];
+    }
+
+    let max_width = usize::from(width);
+    if text_width(&input.text) <= max_width {
+        return vec![input.clone()];
+    }
+
+    let chars: Vec<char> = input.text.chars().collect();
+    if chars.is_empty() {
+        return vec![input.clone()];
+    }
+
+    let mut result = Vec::new();
+    let mut start = 0;
+    while start < chars.len() {
+        let mut end = start;
+        let mut display_width = 0;
+        while end < chars.len() {
+            let character_width = chars[end].width().unwrap_or(0);
+            if end > start && character_width > 0 && display_width + character_width > max_width {
+                break;
+            }
+
+            display_width += character_width;
+            end += 1;
+
+            if display_width >= max_width {
+                while end < chars.len() && chars[end].width().unwrap_or(0) == 0 {
+                    end += 1;
+                }
+                break;
+            }
+        }
+
+        let text = chars[start..end].iter().collect();
+        let spans = input
+            .spans
+            .iter()
+            .filter_map(|span| {
+                let span_start = span.start_col.max(start);
+                let span_end = span.end_col.min(end);
+                (span_start < span_end).then(|| Span {
+                    start_col: span_start - start,
+                    end_col: span_end - start,
+                    style: span.style,
+                })
+            })
+            .collect();
+        result.push(StyledLine { text, spans });
+        start = end;
+    }
+
+    result
+}
+
 /// Find the best wrap point starting from `start` in `chars`, such that the
 /// text from `start` to the returned index fits within `max_cols` display
 /// columns.
@@ -550,5 +618,65 @@ mod tests {
             .spans
             .iter()
             .any(|s| s.style == SemanticStyle::Strong));
+    }
+
+    #[test]
+    fn source_wrap_preserves_whitespace_and_styles() {
+        let input = StyledLine {
+            text: "# xxxxxxxxxxxx".to_string(),
+            spans: vec![Span {
+                start_col: 0,
+                end_col: 14,
+                style: SemanticStyle::Heading1,
+            }],
+        };
+
+        let result = wrap_source_line(&input, 5);
+
+        assert_eq!(
+            result
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["# xxx", "xxxxx", "xxxx"]
+        );
+        assert_eq!(
+            result
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<String>(),
+            input.text
+        );
+        assert!(result.iter().all(|line| line.spans
+            == vec![Span {
+                start_col: 0,
+                end_col: line.text.chars().count(),
+                style: SemanticStyle::Heading1,
+            }]));
+    }
+
+    #[test]
+    fn source_wrap_keeps_zero_width_suffixes_with_wide_atoms() {
+        let input = StyledLine {
+            text: "a\u{301}甲x".to_string(),
+            spans: Vec::new(),
+        };
+
+        let result = wrap_source_line(&input, 2);
+
+        assert_eq!(
+            result
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["a\u{301}", "甲", "x"]
+        );
+        assert_eq!(
+            result
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<String>(),
+            input.text
+        );
     }
 }

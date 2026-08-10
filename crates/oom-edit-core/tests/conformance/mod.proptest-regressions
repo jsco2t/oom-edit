@@ -1,0 +1,13 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc dbf040382559d8a5d65ffb381617fea996f1ad2ced8b29ffe9e265e7798d919b # shrinks to payload = [], widths = [1, 1, 8], actions = [1, 1, 5, 1, 1, 2, 3, 3, 0]
+cc 66653ef3ea0362524cc4eeb2e1833f1d533db0f1480657715e2b220db1e7e623 # shrinks to payload = ['A', ' ', '¡', '¡', 'a', ' ', ' ', ' ', '¡', '¡', 'A', '¡', ' ', ' '], widths = [4, 1, 1, 1, 1, 1, 1, 1, 1, 5, 11], actions = [0, 3, 3, 3, 0, 2, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+cc a4125432c3b29ec44122f380b61a576137e5b042393d4a323b5e00ec004d012f # shrinks to width = 20, horizontal = 0, vertical = 3, shape_index = 0
+cc 4878404f43fb2faa28dd5f8fe840b56d419bfeecd205ddc478eaf7a6a0bd829b # shrinks to width = 22, horizontal = 0, vertical = 5, shape_index = 0
+cc dc8a9a1703998f1f4900f5a9bdc05372d164be46aa9f4f08cc88847819f58a78 # shrinks to width = 13, horizontal = 0, vertical = 3, shape_index = 2
+cc 5333111d94c9498548953808b0b5c941851de9582788c4771100c5f76f54ea08 # shrinks to payload = [], widths = [1, 1, 1, 8], actions = [2, 1, 1, 0]
+cc af9acc59d207223a65f2f54c99e437bc3fc218e7926f7f6e091296cecff938a1 # shrinks to width = 13, horizontal = 0, vertical = 7, shape_index = 2

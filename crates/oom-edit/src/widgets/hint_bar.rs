@@ -14,7 +14,7 @@ use crate::command::{commands_for, keymap::Keymap, registry::Contexts};
 /// A single hint cell for the hint bar.
 #[derive(Debug, Clone)]
 pub struct HintCell {
-    /// The hint text (e.g. "Space v=toggle-view").
+    /// The hint text (for example, `v=character-wise selection`).
     pub text: String,
     /// Whether this command is disabled in the current context.
     pub disabled: bool,
@@ -122,9 +122,9 @@ mod tests {
     fn build_hints_quick_bar_commands() {
         let km = Keymap::default();
         let cells = build_hints(Contexts::NORMAL, &km);
-        // Should include ToggleView, Help, Save, Quit hints (CycleTheme is not quick_bar)
+        // Normal exposes Select, Help, Save, and Quit in priority order.
         let text: String = cells.iter().map(|c| &c.text).cloned().collect();
-        assert!(text.contains("toggle view"));
+        assert!(text.contains("character-wise selection"));
         assert!(text.contains("save"));
         assert!(text.contains("quit"));
     }
@@ -179,7 +179,7 @@ mod tests {
     fn format_hints_never_partially_renders_a_cell() {
         let cells = vec![
             HintCell {
-                text: "Space v=toggle-view".to_string(),
+                text: "v=select-lines".to_string(),
                 disabled: false,
             },
             HintCell {
@@ -187,8 +187,8 @@ mod tests {
                 disabled: false,
             },
         ];
-        assert_eq!(format_hints(&cells, 19), "Space v=toggle-view");
-        assert_eq!(format_hints(&cells, 18), "Space h=help");
+        assert_eq!(format_hints(&cells, 19), "v=select-lines");
+        assert_eq!(format_hints(&cells, 13), "Space h=help");
         assert_eq!(format_hints(&cells, 11), "");
     }
 

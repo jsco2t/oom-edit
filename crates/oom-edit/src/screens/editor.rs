@@ -1,4 +1,4 @@
-//! Editor screen — the source-view rendering.
+//! Source Insert screen rendering.
 //!
 //! T11 shipped a minimal body-only layout (status row is a single line).
 //! T13 adds gutter, hint bar, proper status bar, selections, and match rendering.
@@ -12,7 +12,7 @@ use ratatui::Frame;
 
 use crate::command::registry::Contexts;
 use crate::command::Keymap;
-use crate::theme::{Theme, Tier, UiSlot};
+use crate::theme::{Theme, Tier};
 use crate::widgets::hint_bar;
 use crate::widgets::spans;
 use crate::widgets::status_bar;
@@ -138,19 +138,6 @@ fn render_body(
     let paragraph = Paragraph::new(lines).block(Block::default().borders(Borders::NONE));
     frame.render_widget(paragraph, text_area);
 
-    // Draw cursor line highlight in Normal/Visual modes (not Insert).
-    let cursor_row = frame_data.cursor.0 as usize;
-    if matches!(
-        mode,
-        oom_edit_core::session::Mode::Normal
-            | oom_edit_core::session::Mode::Visual
-            | oom_edit_core::session::Mode::VisualLine
-            | oom_edit_core::session::Mode::VisualBlock
-    ) && cursor_row < height
-    {
-        render_cursor_line_highlight(frame, text_area, cursor_row, theme, tier);
-    }
-
     // Draw cursor.
     let (cursor_row, cursor_col) = frame_data.cursor;
     let row = (text_area.y + cursor_row).min(text_area.y + text_area.height.saturating_sub(1));
@@ -164,15 +151,10 @@ fn render_body(
         .unwrap_or(0);
     let col = text_area.x + display_col;
     frame.set_cursor_position(ratatui::layout::Position::new(col, row));
-
-    // Render visual selections.
-    for sel in &frame_data.selections {
-        render_selection(frame, text_area, sel);
-    }
 }
 
 /// Render the line-number gutter.
-fn render_gutter(
+pub(crate) fn render_gutter(
     frame: &mut Frame<'_>,
     mode: oom_edit_core::session::Mode,
     cursor_line: usize,
@@ -214,38 +196,6 @@ fn render_gutter(
     frame.render_widget(paragraph, area);
 }
 
-/// Render cursor line highlight in Normal/Visual modes.
-fn render_cursor_line_highlight(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    cursor_row: usize,
-    theme: &Theme,
-    tier: Tier,
-) {
-    let row = area.y + cursor_row as u16;
-    if row < area.y + area.height {
-        let highlight_area = Rect {
-            x: area.x,
-            y: row,
-            width: area.width,
-            height: 1,
-        };
-        let style = theme.ui_style(tier, UiSlot::CursorLine);
-        // Render a blank rectangle with the cursor line background.
-        let paragraph = Paragraph::new("").style(style);
-        frame.render_widget(paragraph, highlight_area);
-    }
-}
-
-/// Render a visual selection as reversed text.
-///
-/// Full implementation would map byte ranges to viewport coordinates
-/// and render a highlighted overlay. Placeholder for now.
-fn render_selection(_frame: &mut Frame<'_>, _area: Rect, _sel: &std::ops::Range<usize>) {
-    // Selection highlighting would map byte ranges to viewport coordinates
-    // and render a highlighted overlay here.
-}
-
 /// Render the full status row using one fixed-badge geometry.
 pub fn render_status_row(
     frame: &mut Frame<'_>,
@@ -272,7 +222,7 @@ pub fn render_status_row(
     let command_line = session
         .command_line()
         .map(|text| format!(":{text}"))
-        .or_else(|| session.view_search_prompt());
+        .or_else(|| session.rendered_search_prompt());
 
     let status = status_bar::StatusBar {
         mode,
@@ -280,6 +230,7 @@ pub fn render_status_row(
         dirty,
         is_new: session.document_ref().is_new(),
         cursor_line: cursor.0 + 1, // 1-based for display
+        cursor_col: cursor.1 + 1,
         line_count: session.line_count(),
         command_line: command_line.clone(),
     };
@@ -318,11 +269,8 @@ fn mode_to_context(mode: oom_edit_core::session::Mode) -> Contexts {
     match mode {
         oom_edit_core::session::Mode::Normal => Contexts::NORMAL,
         oom_edit_core::session::Mode::Insert => Contexts::INSERT,
-        oom_edit_core::session::Mode::Visual
-        | oom_edit_core::session::Mode::VisualLine
-        | oom_edit_core::session::Mode::VisualBlock => Contexts::VISUAL,
+        oom_edit_core::session::Mode::Select => Contexts::SELECT,
         oom_edit_core::session::Mode::Command => Contexts::COMMAND,
-        oom_edit_core::session::Mode::View => Contexts::VIEW,
     }
 }
 
@@ -341,6 +289,17 @@ mod tests {
             session.handle_key(KeyInput {
                 code: KeyCode {
                     kind: KeyCodeKind::Char(ch),
+                },
+                mods: Modifiers::default(),
+            });
+        }
+    }
+
+    fn move_right(session: &mut EditorSession, count: usize) {
+        for _ in 0..count {
+            session.handle_key(KeyInput {
+                code: KeyCode {
+                    kind: KeyCodeKind::Right,
                 },
                 mods: Modifiers::default(),
             });
@@ -383,37 +342,59 @@ mod tests {
         );
         assert!(buffer_row(&command_terminal, 0, 80).starts_with(" :CMD    :w"));
 
-        let mut view_search = EditorSession::from_text("# heading");
-        view_search.toggle_view();
-        feed(&mut view_search, "/head");
-        let view_terminal = render_session_status(&view_search, 80);
+        let mut rendered_search = EditorSession::from_text("# heading");
+        rendered_search.render_layout(76);
+        feed(&mut rendered_search, "/head");
+        let view_terminal = render_session_status(&rendered_search, 80);
         assert_eq!(
             view_terminal.backend().cursor_position(),
             ratatui::layout::Position::new(status_bar::MODE_BADGE_COLS + 5, 0)
         );
-        assert!(buffer_row(&view_terminal, 0, 80).starts_with(" VIEW    /head"));
+        assert!(buffer_row(&view_terminal, 0, 80).starts_with(" NORMAL  /head"));
     }
 
     #[test]
-    fn entering_and_leaving_view_changes_fixed_badge_label_and_background() {
+    fn entering_and_leaving_select_changes_fixed_badge_label_and_background() {
         let mut session = EditorSession::from_text("# heading");
         let normal = render_session_status(&session, 80);
         let normal_cell = normal.backend().buffer().cell((1, 0)).unwrap();
         assert!(buffer_row(&normal, 0, 80).starts_with(" NORMAL "));
 
-        session.toggle_view();
-        let view = render_session_status(&session, 80);
-        let view_cell = view.backend().buffer().cell((1, 0)).unwrap();
-        assert!(buffer_row(&view, 0, 80).starts_with(" VIEW "));
-        assert_ne!(normal_cell.bg, view_cell.bg);
+        session.render_layout(76);
+        feed(&mut session, "v");
+        let select = render_session_status(&session, 80);
+        let select_cell = select.backend().buffer().cell((1, 0)).unwrap();
+        assert!(buffer_row(&select, 0, 80).starts_with(" SELECT "));
+        assert_ne!(normal_cell.bg, select_cell.bg);
 
-        session.toggle_view();
+        session.handle_key(KeyInput {
+            code: KeyCode {
+                kind: KeyCodeKind::Esc,
+            },
+            mods: Modifiers::default(),
+        });
         let normal_again = render_session_status(&session, 80);
         assert!(buffer_row(&normal_again, 0, 80).starts_with(" NORMAL "));
         assert_eq!(
             normal_again.backend().buffer().cell((1, 0)).unwrap().bg,
             normal_cell.bg
         );
+    }
+
+    #[test]
+    fn rendered_motion_updates_source_ruler() {
+        let mut session = EditorSession::from_text("# one\n\n# two\n\n# three\n");
+        session.render_layout(74);
+        for _ in 0..10 {
+            if session.cursor().0 >= 4 {
+                break;
+            }
+            feed(&mut session, "j");
+        }
+        assert_eq!(session.cursor(), (4, 2));
+
+        let terminal = render_session_status(&session, 80);
+        assert!(buffer_row(&terminal, 0, 80).ends_with("5:3  83%"));
     }
 
     #[test]
@@ -477,31 +458,6 @@ mod tests {
         assert_eq!(buffer.cell((4, 0)).unwrap().symbol(), " ");
         assert_eq!(buffer.cell((5, 0)).unwrap().symbol(), " ");
         assert_eq!(buffer.cell((6, 0)).unwrap().symbol(), "x");
-    }
-
-    #[test]
-    fn cursor_line_preserves_semantic_foreground() {
-        let semantic_style =
-            DEFAULT_DARK.style(Tier::TrueColor, oom_edit_core::SemanticStyle::Heading1);
-        let cursor_style = DEFAULT_DARK.ui_style(Tier::TrueColor, UiSlot::CursorLine);
-        let mut terminal = Terminal::new(TestBackend::new(3, 1)).unwrap();
-
-        terminal
-            .draw(|frame| {
-                let area = frame.area();
-                frame.render_widget(Paragraph::new(Line::styled("abc", semantic_style)), area);
-                render_cursor_line_highlight(frame, area, 0, &DEFAULT_DARK, Tier::TrueColor);
-            })
-            .unwrap();
-
-        let cell = terminal
-            .backend()
-            .buffer()
-            .cell((0, 0))
-            .expect("rendered cursor-line cell");
-        assert_eq!(cell.fg, semantic_style.fg.expect("semantic foreground"));
-        assert_eq!(cell.bg, cursor_style.bg.expect("cursor-line background"));
-        assert!(cell.modifier.contains(cursor_style.add_modifier));
     }
 
     #[test]
@@ -574,7 +530,8 @@ mod tests {
     #[test]
     fn editor_cursor_not_clamped_with_wrap() {
         let mut session = EditorSession::from_text(&"x".repeat(25));
-        feed(&mut session, "15l");
+        feed(&mut session, "i");
+        move_right(&mut session, 15);
         let mut terminal = Terminal::new(TestBackend::new(14, 3)).unwrap();
         terminal
             .draw(|frame| {
@@ -599,7 +556,8 @@ mod tests {
     #[test]
     fn editor_cursor_not_clamped_with_hscroll() {
         let mut session = EditorSession::from_text(&"x".repeat(25));
-        feed(&mut session, "15l");
+        feed(&mut session, "i");
+        move_right(&mut session, 15);
         let mut terminal = Terminal::new(TestBackend::new(14, 1)).unwrap();
         terminal
             .draw(|frame| {
@@ -649,7 +607,8 @@ mod tests {
     #[test]
     fn editor_cursor_display_column_handles_cjk_wrap() {
         let mut session = EditorSession::from_text("甲乙丙丁");
-        feed(&mut session, "2l");
+        feed(&mut session, "i");
+        move_right(&mut session, 2);
         let mut terminal = Terminal::new(TestBackend::new(8, 2)).unwrap();
         terminal
             .draw(|frame| {
@@ -674,7 +633,8 @@ mod tests {
     #[test]
     fn editor_cursor_display_column_handles_combining_mark() {
         let mut session = EditorSession::from_text("a\u{301}bcdef");
-        feed(&mut session, "2l");
+        feed(&mut session, "i");
+        move_right(&mut session, 2);
         let mut terminal = Terminal::new(TestBackend::new(10, 1)).unwrap();
         terminal
             .draw(|frame| {
@@ -699,7 +659,8 @@ mod tests {
     #[test]
     fn editor_cursor_display_column_handles_cjk_hscroll() {
         let mut session = EditorSession::from_text("甲乙丙丁戊己庚辛");
-        feed(&mut session, "6l");
+        feed(&mut session, "i");
+        move_right(&mut session, 6);
         let mut terminal = Terminal::new(TestBackend::new(10, 1)).unwrap();
         terminal
             .draw(|frame| {
@@ -722,39 +683,6 @@ mod tests {
     }
 
     #[test]
-    fn editor_cursor_line_highlight_on_visual_row() {
-        let mut session = EditorSession::from_text(&"x".repeat(25));
-        feed(&mut session, "15l");
-        let mut terminal = Terminal::new(TestBackend::new(14, 3)).unwrap();
-        terminal
-            .draw(|frame| {
-                let area = frame.area();
-                render_editor(
-                    frame,
-                    &mut session,
-                    EditorViewport::new(0, true, 0, 0),
-                    false,
-                    area,
-                    &DEFAULT_DARK,
-                    Tier::TrueColor,
-                );
-            })
-            .unwrap();
-        let cursor_bg = DEFAULT_DARK
-            .ui_style(Tier::TrueColor, UiSlot::CursorLine)
-            .bg
-            .expect("cursor-line background");
-        assert_ne!(
-            terminal.backend().buffer().cell((7, 0)).unwrap().bg,
-            cursor_bg
-        );
-        assert_eq!(
-            terminal.backend().buffer().cell((7, 1)).unwrap().bg,
-            cursor_bg
-        );
-    }
-
-    #[test]
     fn mode_to_context_normal() {
         assert_eq!(
             mode_to_context(oom_edit_core::session::Mode::Normal),
@@ -771,26 +699,10 @@ mod tests {
     }
 
     #[test]
-    fn mode_to_context_visual() {
+    fn mode_to_context_select() {
         assert_eq!(
-            mode_to_context(oom_edit_core::session::Mode::Visual),
-            Contexts::VISUAL
-        );
-    }
-
-    #[test]
-    fn mode_to_context_visual_line() {
-        assert_eq!(
-            mode_to_context(oom_edit_core::session::Mode::VisualLine),
-            Contexts::VISUAL
-        );
-    }
-
-    #[test]
-    fn mode_to_context_visual_block() {
-        assert_eq!(
-            mode_to_context(oom_edit_core::session::Mode::VisualBlock),
-            Contexts::VISUAL
+            mode_to_context(oom_edit_core::session::Mode::Select),
+            Contexts::SELECT
         );
     }
 
@@ -799,14 +711,6 @@ mod tests {
         assert_eq!(
             mode_to_context(oom_edit_core::session::Mode::Command),
             Contexts::COMMAND
-        );
-    }
-
-    #[test]
-    fn mode_to_context_view() {
-        assert_eq!(
-            mode_to_context(oom_edit_core::session::Mode::View),
-            Contexts::VIEW
         );
     }
 }

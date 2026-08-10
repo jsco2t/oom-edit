@@ -7,11 +7,10 @@
 //! ## Key routing order (arch §7.1)
 //!
 //! 1. Overlay open → overlay's key handler (take-and-return-bool).
-//! 2. Mode ∈ {Normal, View}: try app keymap — `Space`-leader and `g`-chords.
+//! 2. Mode ∈ {Normal, Select}: try registry keymap projections and app chords.
 //!    On match → `execute_command`. No match → fall through.
 //! 3. Everything else → active session's `handle_key(key)`, then drain `Effect`s.
 
-use std::path::PathBuf;
 use std::time::Instant;
 
 use crossterm::event::{Event, KeyCode as CrosstermKeyCode, KeyEvent, KeyModifiers};
@@ -23,10 +22,11 @@ use oom_edit_core::session::{EditorSession, Effect, KeyCode, KeyCodeKind, KeyInp
 use crossterm::event::MouseEventKind;
 
 use crate::command::{keymap::PendingChord, Command, Keymap};
+use crate::config::ConfigStore;
 use crate::overlay::Overlay;
 use crate::screens::editor::{render_editor, render_status_row, source_text_width, EditorViewport};
-use crate::screens::view::render_view;
-use crate::theme::{self, Theme, Tier};
+use crate::screens::rendered::render_rendered;
+use crate::theme::{self, ResolvedTheme, Theme, Tier};
 use crate::widgets::status_bar;
 use crate::widgets::which_key;
 
@@ -40,6 +40,32 @@ fn body_height(total_height: u16, has_multiple_tabs: bool) -> u16 {
     total_height.saturating_sub(tab_bar_height + 1)
 }
 
+fn rendered_scroll_top(
+    cursor: usize,
+    viewport_height: usize,
+    layout_height: usize,
+    current_top: usize,
+) -> usize {
+    if viewport_height == 0 || layout_height == 0 {
+        return 0;
+    }
+    let cursor = cursor.min(layout_height.saturating_sub(1));
+    let max_top = layout_height.saturating_sub(viewport_height);
+    let center_start = viewport_height / 3;
+    let center_end = 2 * viewport_height / 3;
+    if cursor < center_start {
+        0
+    } else if cursor >= max_top + center_end {
+        max_top
+    } else if cursor < current_top + center_start {
+        cursor.saturating_sub(center_start)
+    } else if cursor >= current_top + center_end {
+        cursor.saturating_sub(center_end)
+    } else {
+        current_top.min(max_top)
+    }
+}
+
 /// A single tab entry: an [`EditorSession`] with per-tab UI state.
 pub(crate) struct TabEntry {
     /// The core editing session for this tab.
@@ -50,8 +76,8 @@ pub(crate) struct TabEntry {
     left_col: usize,
     /// Visual rows skipped within `top_line` when wrapping is enabled.
     skip_rows: usize,
-    /// The first visible view line (owned by the TUI for scroll-follow in View mode).
-    view_top: usize,
+    /// The first visible rendered row (owned by the TUI for scroll-follow in rendered mode).
+    rendered_top: usize,
 }
 
 impl TabEntry {
@@ -61,7 +87,7 @@ impl TabEntry {
             top_line: 0,
             left_col: 0,
             skip_rows: 0,
-            view_top: 0,
+            rendered_top: 0,
         }
     }
 
@@ -96,7 +122,7 @@ pub struct App {
     viewport_width: usize,
     /// Runtime source-wrap option, initialized from config.
     wrap_enabled: bool,
-    /// Whether normal-like source modes use hybrid-relative line numbers.
+    /// Whether rendered Normal, Select, and Command use hybrid-relative numbers.
     relative_line_numbers: bool,
     /// Current time (injected by tick for testability of which-key delay gate).
     now: Instant,
@@ -109,8 +135,8 @@ pub struct App {
     theme_name: String,
     /// Whether the active display mode was resolved as light at startup.
     is_light: bool,
-    /// Config file used to persist explicit theme changes.
-    config_path: PathBuf,
+    /// Explicitly injected persistence for theme changes.
+    config_store: Box<dyn ConfigStore>,
     /// Active capability tier.
     tier: Tier,
     /// Clipboard sink for OSC 52 clipboard writes (T16).
@@ -121,13 +147,15 @@ impl App {
     /// Create a new App from an open session (starts with one tab).
     pub fn new(
         session: EditorSession,
-        theme_name: String,
-        is_light: bool,
-        tier: Tier,
+        resolved_theme: ResolvedTheme,
         wrap_enabled: bool,
         relative_line_numbers: bool,
         clipboard_sink: Box<dyn ClipboardSink>,
+        config_store: Box<dyn ConfigStore>,
     ) -> Self {
+        let is_light = resolved_theme.is_light();
+        let tier = resolved_theme.capability;
+        let theme_name = resolved_theme.name;
         Self {
             tabs: vec![TabEntry::new(session)],
             active_tab: 0,
@@ -145,7 +173,7 @@ impl App {
             transient: None,
             theme_name,
             is_light,
-            config_path: crate::config::config_path(),
+            config_store,
             tier,
             clipboard_sink,
         }
@@ -173,7 +201,7 @@ impl App {
     }
 
     /// Get a mutable reference to the active session.
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     fn session_mut(&mut self) -> Option<&mut EditorSession> {
         self.active_mut().map(|t| &mut t.session)
     }
@@ -248,6 +276,10 @@ impl App {
             .active()
             .map(|entry| source_text_width(area.width, entry.session.line_count()) as usize)
             .unwrap_or(area.width as usize);
+        // Frame geometry can change before a Resize event is observed (and
+        // Insert edits may have invalidated the rendered cache). Rebuild and
+        // follow using the exact width this frame will render.
+        self.scroll_follow();
 
         let mut draw_y = area.y;
 
@@ -288,11 +320,12 @@ impl App {
 
         // Render the appropriate screen behind the overlay.
         if let Some(ref mut entry) = self.tabs.get_mut(self.active_tab) {
-            if entry.session.mode() == oom_edit_core::session::Mode::View {
-                render_view(
+            if entry.session.mode() != oom_edit_core::session::Mode::Insert {
+                render_rendered(
                     frame,
                     &mut entry.session,
-                    entry.view_top,
+                    entry.rendered_top,
+                    self.relative_line_numbers,
                     body_area,
                     active_theme,
                     self.tier,
@@ -340,7 +373,7 @@ impl App {
     /// Render the which-key hint bar.
     ///
     /// Pure gate + pure build + thin render: the which-key popup appears
-    /// only after 150ms of pending Space prefix, in Normal/View mode,
+    /// only after 150ms of pending Space prefix, in Normal/rendered mode,
     /// and only when there are ≥2 continuations.
     /// Return the [`Contexts`] bitset for the current session mode.
     fn mode_context(&self) -> crate::command::registry::Contexts {
@@ -348,8 +381,16 @@ impl App {
             Some(oom_edit_core::session::Mode::Normal) => {
                 crate::command::registry::Contexts::NORMAL
             }
-            Some(oom_edit_core::session::Mode::View) => crate::command::registry::Contexts::VIEW,
-            _ => crate::command::registry::Contexts::NORMAL,
+            Some(oom_edit_core::session::Mode::Insert) => {
+                crate::command::registry::Contexts::INSERT
+            }
+            Some(oom_edit_core::session::Mode::Select) => {
+                crate::command::registry::Contexts::SELECT
+            }
+            Some(oom_edit_core::session::Mode::Command) => {
+                crate::command::registry::Contexts::COMMAND
+            }
+            None => crate::command::registry::Contexts::NORMAL,
         }
     }
 
@@ -359,7 +400,7 @@ impl App {
             .map(|s| {
                 matches!(
                     s.mode(),
-                    oom_edit_core::session::Mode::Normal | oom_edit_core::session::Mode::View
+                    oom_edit_core::session::Mode::Normal | oom_edit_core::session::Mode::Select
                 )
             })
             .unwrap_or(false)
@@ -368,7 +409,7 @@ impl App {
     /// Render the which-key hint bar.
     ///
     /// Pure gate + pure build + thin render: the which-key popup appears
-    /// only after 150ms of pending Space prefix, in Normal/View mode,
+    /// only after 150ms of pending Space prefix, in Normal/rendered mode,
     /// and only when there are ≥2 continuations.
     fn render_which_key(&self, frame: &mut Frame<'_>, status_area: ratatui::layout::Rect) {
         if !self.in_chord_context() {
@@ -439,22 +480,22 @@ impl App {
         }
     }
 
-    /// Get the active tab's view_top.
+    /// Get the active tab's rendered_top.
     #[expect(dead_code)]
-    fn view_top(&self) -> usize {
-        self.active().map(|t| t.view_top).unwrap_or(0)
+    fn rendered_top(&self) -> usize {
+        self.active().map(|t| t.rendered_top).unwrap_or(0)
     }
 
-    /// Set the active tab's view_top.
-    fn set_view_top(&mut self, val: usize) {
+    /// Set the active tab's rendered_top.
+    fn set_rendered_top(&mut self, val: usize) {
         if let Some(entry) = self.tabs.get_mut(self.active_tab) {
-            entry.view_top = val;
+            entry.rendered_top = val;
         }
     }
 
     /// Handle a crossterm event, following arch §7.1 fixed order.
     pub fn handle_event(&mut self, event: &Event) {
-        // Handle resize events — rebuild view layout on width change.
+        // Handle resize events — rebuild rendered layout on width change.
         if let Event::Resize(_width, height) = event {
             // Clamp viewport height using the same chrome rows as render().
             self.viewport_height = body_height(*height, self.has_multiple_tabs()) as usize;
@@ -462,23 +503,10 @@ impl App {
                 .active()
                 .map(|entry| source_text_width(*_width, entry.session.line_count()) as usize)
                 .unwrap_or(*_width as usize);
-            // View mode: remap cursor from edit coordinates so it stays on
-            // the same content line after re-wrap (FR-3.1).
-            if self.session().map(|s| s.mode()) == Some(oom_edit_core::session::Mode::View) {
-                if let Some(ref mut entry) = self.tabs.get_mut(self.active_tab) {
-                    let text = entry.session.document();
-                    let (edit_line, edit_col) =
-                        match (entry.session.view_cursor(), entry.session.view_layout()) {
-                            (Some(cursor), Some(layout)) => {
-                                oom_edit_core::view::nav::leave_view(&cursor, layout, &text)
-                            }
-                            _ => entry.session.cursor(),
-                        };
-                    // Force layout rebuild so enter_view has a layout to work with.
-                    entry.session.render_view(*_width);
-                    entry
-                        .session
-                        .remap_view_cursor_from_edit(edit_line, edit_col);
+            if let Some(ref mut entry) = self.tabs.get_mut(self.active_tab) {
+                if entry.session.mode() != oom_edit_core::session::Mode::Insert {
+                    let text_width = source_text_width(*_width, entry.session.line_count());
+                    entry.session.render_layout(text_width);
                 }
             }
             self.scroll_follow();
@@ -551,7 +579,7 @@ impl App {
             return;
         }
 
-        // 2. Mode ∈ {Normal, View}: try app keymap.
+        // 2. Mode ∈ {Normal, Select}: try app keymap.
         if self.in_chord_context() {
             let ctx = self.mode_context();
 
@@ -576,7 +604,11 @@ impl App {
                         return;
                     }
                     _ => {
-                        // Not a g-chord we handle — fall through to engine.
+                        // Not a tab chord: replay both keys so rendered Vim
+                        // sequences such as `gg` are never swallowed.
+                        self.forward_session_key(KeyCodeKind::Char('g'));
+                        self.forward_session_input(key_input);
+                        return;
                     }
                 }
             }
@@ -613,9 +645,13 @@ impl App {
                 crate::command::keymap::Resolution::None => {}
             }
 
-            // Check if this key starts a 'g' chord (only in Normal/View).
+            // Check if this key starts a 'g' chord (only in Normal/Select).
             if let KeyCodeKind::Char('g') = key_input.code.kind {
-                if !key_input.mods.ctrl && !key_input.mods.alt && !key_input.mods.shift {
+                if !key_input.mods.ctrl
+                    && !key_input.mods.alt
+                    && !key_input.mods.shift
+                    && self.tab_count() > 1
+                {
                     self.pending_g = true;
                     return;
                 }
@@ -774,6 +810,7 @@ impl App {
                                 if let Some(ref mut entry) = self.tabs.get_mut(self.active_tab) {
                                     entry.session = new_session;
                                     entry.top_line = 0;
+                                    entry.rendered_top = 0;
                                     self.set_transient(
                                         "Reloaded from disk".to_string(),
                                         oom_edit_core::session::Severity::Info,
@@ -799,14 +836,27 @@ impl App {
     /// Execute a command from the registry.
     fn execute_command(&mut self, cmd: Command) {
         match cmd {
-            Command::ToggleView => {
-                if let Some(ref mut entry) = self.tabs.get_mut(self.active_tab) {
-                    entry.session.toggle_view();
-                }
-            }
+            Command::EnterCharacterSelect => self.forward_session_key(KeyCodeKind::Char('v')),
+            Command::EnterLineSelect => self.forward_session_key(KeyCodeKind::Char('V')),
+            Command::EnterBlockSelect => self.forward_session_input(KeyInput {
+                code: KeyCode {
+                    kind: KeyCodeKind::Char('v'),
+                },
+                mods: Modifiers {
+                    ctrl: true,
+                    ..Modifiers::default()
+                },
+            }),
+            Command::CancelSelect => self.forward_session_key(KeyCodeKind::Esc),
+            Command::SelectYank => self.forward_session_key(KeyCodeKind::Char('y')),
+            Command::SelectDelete => self.forward_session_key(KeyCodeKind::Char('d')),
+            Command::SelectChange => self.forward_session_key(KeyCodeKind::Char('c')),
+            Command::SelectIndent => self.forward_session_key(KeyCodeKind::Char('>')),
+            Command::SelectOutdent => self.forward_session_key(KeyCodeKind::Char('<')),
+            Command::SelectSwapAnchor => self.forward_session_key(KeyCodeKind::Char('o')),
             Command::Help => {
                 // Open the command palette.
-                self.overlay = Overlay::open_palette();
+                self.overlay = Overlay::open_palette(self.mode_context());
             }
             Command::Save => {
                 if let Some(ref mut entry) = self.tabs.get_mut(self.active_tab) {
@@ -848,17 +898,21 @@ impl App {
                 let next = theme::cycle_theme(&self.theme_name, self.is_light);
                 self.theme_name = next.to_string();
                 // Persist to config.
-                let mut config = crate::config::Config::load_from_path(&self.config_path);
+                let mut config = self.config_store.load();
                 if self.is_light {
                     config.theme.light = next.to_string();
                 } else {
                     config.theme.dark = next.to_string();
                 }
-                if let Err(e) = config.save_to_path(&self.config_path) {
+                if let Err(e) = self.config_store.save(&config) {
                     eprintln!("oom-edit: failed to save config: {e}");
                 }
                 self.set_transient(
-                    format!("theme: {next}"),
+                    if next == "accessible" {
+                        "theme: accessible (monochrome)".to_string()
+                    } else {
+                        format!("theme: {next}")
+                    },
                     oom_edit_core::session::Severity::Info,
                 );
             }
@@ -889,18 +943,46 @@ impl App {
         }
     }
 
+    fn forward_session_key(&mut self, kind: KeyCodeKind) {
+        self.forward_session_input(KeyInput {
+            code: KeyCode { kind },
+            mods: Modifiers::default(),
+        });
+    }
+
+    fn forward_session_input(&mut self, input: KeyInput) {
+        let effects = self
+            .tabs
+            .get_mut(self.active_tab)
+            .map(|entry| entry.session.handle_key(input))
+            .unwrap_or_default();
+        for effect in effects {
+            self.handle_effect(effect);
+        }
+        self.scroll_follow();
+    }
+
     /// Handle a single core effect.
     fn handle_effect(&mut self, effect: Effect) {
         match effect {
             Effect::SaveRequested {
                 path,
                 force,
+                retarget,
                 then_quit,
             } => {
                 if let Some(ref mut entry) = self.tabs.get_mut(self.active_tab) {
-                    match entry.session.save(path.as_deref(), force) {
+                    let save_result = if let Some(copy_path) = path.as_deref().filter(|_| !retarget)
+                    {
+                        entry.session.save_copy(copy_path)
+                    } else {
+                        entry.session.save(path.as_deref(), force)
+                    };
+                    match save_result {
                         Ok(()) => {
-                            entry.session.save_point();
+                            if retarget || path.is_none() {
+                                entry.session.save_point();
+                            }
                             let line_count = entry.session.line_count();
                             let file_name = entry
                                 .session
@@ -976,6 +1058,7 @@ impl App {
                                 entry.top_line = 0;
                                 entry.left_col = 0;
                                 entry.skip_rows = 0;
+                                entry.rendered_top = 0;
                             }
                             self.set_transient(
                                 format!("Opened: {}", path.display()),
@@ -999,6 +1082,7 @@ impl App {
                                 entry.top_line = 0;
                                 entry.left_col = 0;
                                 entry.skip_rows = 0;
+                                entry.rendered_top = 0;
                             }
                             self.set_transient(
                                 format!("Opened: {}", path.display()),
@@ -1060,7 +1144,7 @@ impl App {
             }
             Effect::HelpRequested => {
                 // Open command palette.
-                self.overlay = Overlay::open_palette();
+                self.overlay = Overlay::open_palette(self.mode_context());
             }
             Effect::TabNewRequested { path } => {
                 self.open_tab(&path);
@@ -1105,33 +1189,37 @@ impl App {
     }
 
     /// Scroll-follow: clamp `top_line` so the cursor row is visible with
-    /// `SCROLLOFF` lines of context (source editor) or `view_top` for View mode.
+    /// `SCROLLOFF` lines of context on either rendered or source surfaces.
     pub fn scroll_follow(&mut self) {
         // Determine the mode first, then apply scroll-follow.
-        let is_view = self
+        let is_rendered = self
             .active()
-            .map(|e| e.session.mode() == oom_edit_core::session::Mode::View)
+            .map(|e| e.session.mode() != oom_edit_core::session::Mode::Insert)
             .unwrap_or(false);
 
-        if is_view {
-            // View mode scroll-follow.
-            if let Some(entry) = self.active() {
-                let cursor_line = entry.session.view_cursor_line();
-                let layout = entry.session.view_layout();
+        if is_rendered {
+            let viewport_width = self.viewport_width.min(usize::from(u16::MAX)) as u16;
+            if let Some(entry) = self.tabs.get_mut(self.active_tab) {
+                // Insert edits invalidate the rendered cache. Rebuild before
+                // reading the rendered cursor so Escape can follow a cursor
+                // that moved beyond the current rendered viewport.
+                entry.session.render_layout(viewport_width);
+                let cursor_line = entry.session.rendered_cursor_line();
+                let layout = entry.session.rendered_layout();
                 let layout_height = layout.map(|l| l.lines.len()).unwrap_or(0);
-                let view_top = entry.view_top;
+                let rendered_top = entry.rendered_top;
 
                 if layout_height == 0 || self.viewport_height == 0 {
                     return;
                 }
 
-                let new_top = oom_edit_core::view::nav::view_scroll_top(
+                let new_top = rendered_scroll_top(
                     cursor_line,
                     self.viewport_height,
                     layout_height,
-                    view_top,
+                    rendered_top,
                 );
-                self.set_view_top(new_top);
+                self.set_rendered_top(new_top);
             }
         } else {
             if let Some(entry) = self.active() {
@@ -1267,12 +1355,14 @@ impl App {
     }
 
     /// Scroll up by `lines` rows — Vim Ctrl-e / Ctrl-y style (viewport moves,
-    /// cursor stays put). In View mode, scrolls `view_top`.
+    /// cursor stays put). Rendered modes scroll `rendered_top`.
     fn scroll_up(&mut self, lines: usize) {
         if let Some(entry) = self.active() {
             match entry.session.mode() {
-                oom_edit_core::session::Mode::View => {
-                    self.set_view_top(entry.view_top.saturating_sub(lines));
+                oom_edit_core::session::Mode::Normal
+                | oom_edit_core::session::Mode::Select
+                | oom_edit_core::session::Mode::Command => {
+                    self.set_rendered_top(entry.rendered_top.saturating_sub(lines));
                 }
                 _ => {
                     self.set_top_line(entry.top_line.saturating_sub(lines));
@@ -1282,15 +1372,17 @@ impl App {
     }
 
     /// Scroll down by `lines` rows — Vim Ctrl-e style (viewport moves,
-    /// cursor stays put). In View mode, scrolls `view_top`.
+    /// cursor stays put). Rendered modes scroll `rendered_top`.
     fn scroll_down(&mut self, lines: usize) {
         if let Some(entry) = self.active() {
             match entry.session.mode() {
-                oom_edit_core::session::Mode::View => {
-                    let layout = entry.session.view_layout();
+                oom_edit_core::session::Mode::Normal
+                | oom_edit_core::session::Mode::Select
+                | oom_edit_core::session::Mode::Command => {
+                    let layout = entry.session.rendered_layout();
                     let layout_height = layout.map(|l| l.lines.len()).unwrap_or(0);
                     let max_top = layout_height.saturating_sub(self.viewport_height);
-                    self.set_view_top((entry.view_top + lines).min(max_top));
+                    self.set_rendered_top((entry.rendered_top + lines).min(max_top));
                 }
                 _ => {
                     let line_count = entry.session.line_count();
@@ -1439,8 +1531,10 @@ fn render_tab_bar(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::Contexts;
     use crossterm::event::{MediaKeyCode, ModifierKeyCode};
     use oom_edit_core::clipboard::{ClipboardError, ClipboardSink, RecordingClipboardSink};
+    use oom_edit_core::Mode;
 
     struct FailingClipboardSink;
 
@@ -1451,23 +1545,34 @@ mod tests {
     }
 
     /// Create a test App with a recording clipboard sink.
-    fn test_app(session: EditorSession) -> App {
+    fn test_app(mut session: EditorSession) -> App {
+        session.render_layout(74);
         App::new(
             session,
-            "default-dark".to_string(),
-            false,
-            Tier::TrueColor,
+            theme::ResolvedTheme::injected("default-dark", false, Tier::TrueColor),
             true,
             false,
             Box::new(RecordingClipboardSink::default()),
+            Box::new(crate::config::DisabledConfigStore),
         )
     }
 
     fn yank_current_line_to_system_clipboard(app: &mut App) {
-        for ch in ['"', '+', 'y', 'y'] {
+        for ch in ['v', '"', '+', 'y'] {
             let key = KeyEvent::new(CrosstermKeyCode::Char(ch), KeyModifiers::NONE);
             app.handle_event(&Event::Key(key));
         }
+    }
+
+    fn enter_insert(app: &mut App) {
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('i'),
+            KeyModifiers::NONE,
+        )));
+    }
+
+    fn press(app: &mut App, code: CrosstermKeyCode) {
+        app.handle_event(&Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
     }
 
     fn open_palette_with_space_h(app: &mut App) {
@@ -1562,14 +1667,15 @@ mod tests {
 
     #[test]
     fn clipboard_error_preserves_error_transient() {
+        let mut session = EditorSession::from_text("hello\n");
+        session.render_layout(74);
         let mut app = App::new(
-            EditorSession::from_text("hello\n"),
-            "default-dark".to_string(),
-            false,
-            Tier::TrueColor,
+            session,
+            theme::ResolvedTheme::injected("default-dark", false, Tier::TrueColor),
             true,
             false,
             Box::new(FailingClipboardSink),
+            Box::new(crate::config::DisabledConfigStore),
         );
 
         yank_current_line_to_system_clipboard(&mut app);
@@ -1722,12 +1828,43 @@ mod tests {
         let session = EditorSession::from_text(&text);
         let mut app = test_app(session);
 
-        // Go to line 50
-        let key = KeyEvent::new(CrosstermKeyCode::Char('G'), KeyModifiers::NONE);
-        app.handle_event(&Event::Key(key));
+        enter_insert(&mut app);
+        for _ in 0..50 {
+            press(&mut app, CrosstermKeyCode::Down);
+        }
 
         // Scroll follow should have adjusted top_line
         assert!(app.top_line() > 0, "top_line should have scrolled down");
+    }
+
+    #[test]
+    fn insert_edit_escape_rebuilds_rendered_cursor_before_scroll_follow() {
+        let text: String = (0..40).map(|line| format!("line {line}\n")).collect();
+        let mut app = test_app(EditorSession::from_text(&text));
+        app.viewport_width = 20;
+        app.viewport_height = 5;
+        enter_insert(&mut app);
+        for _ in 0..30 {
+            press(&mut app, CrosstermKeyCode::Down);
+        }
+        press(&mut app, CrosstermKeyCode::Char('X'));
+        press(&mut app, CrosstermKeyCode::Esc);
+
+        let entry = &app.tabs[0];
+        let cursor = entry.session.rendered_cursor_line();
+        assert_eq!(entry.session.mode(), Mode::Normal);
+        assert!(entry.rendered_top > 0);
+        assert!(cursor >= entry.rendered_top);
+        assert!(cursor < entry.rendered_top + app.viewport_height);
+        assert!(entry.session.line(30).unwrap().starts_with('X'));
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 7)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let entry = &app.tabs[0];
+        let cursor = entry.session.rendered_cursor_line();
+        assert!(cursor >= entry.rendered_top);
+        assert!(cursor < entry.rendered_top + app.viewport_height);
     }
 
     #[test]
@@ -1735,10 +1872,8 @@ mod tests {
         let mut app = test_app(EditorSession::from_text(&"x".repeat(100)));
         app.wrap_enabled = false;
         app.viewport_width = 20;
-        app.handle_event(&Event::Key(KeyEvent::new(
-            CrosstermKeyCode::Char('$'),
-            KeyModifiers::NONE,
-        )));
+        enter_insert(&mut app);
+        press(&mut app, CrosstermKeyCode::End);
         assert!(app.left_col() > 0);
     }
 
@@ -1747,10 +1882,8 @@ mod tests {
         let mut app = test_app(EditorSession::from_text(&"x".repeat(100)));
         app.wrap_enabled = false;
         app.viewport_width = 20;
-        app.handle_event(&Event::Key(KeyEvent::new(
-            CrosstermKeyCode::Char('$'),
-            KeyModifiers::NONE,
-        )));
+        enter_insert(&mut app);
+        press(&mut app, CrosstermKeyCode::End);
         assert_eq!(app.left_col(), 85);
     }
 
@@ -1759,12 +1892,9 @@ mod tests {
         let mut app = test_app(EditorSession::from_text(&"x".repeat(100)));
         app.wrap_enabled = false;
         app.viewport_width = 20;
-        for ch in ['$', '0'] {
-            app.handle_event(&Event::Key(KeyEvent::new(
-                CrosstermKeyCode::Char(ch),
-                KeyModifiers::NONE,
-            )));
-        }
+        enter_insert(&mut app);
+        press(&mut app, CrosstermKeyCode::End);
+        press(&mut app, CrosstermKeyCode::Home);
         assert_eq!(app.left_col(), 0);
     }
 
@@ -1775,10 +1905,8 @@ mod tests {
         app.viewport_width = 10;
         app.viewport_height = 4;
 
-        app.handle_event(&Event::Key(KeyEvent::new(
-            CrosstermKeyCode::Char('j'),
-            KeyModifiers::NONE,
-        )));
+        enter_insert(&mut app);
+        press(&mut app, CrosstermKeyCode::Down);
         assert_eq!(app.top_line(), 1, "the wrapped first line no longer fits");
     }
 
@@ -1801,6 +1929,7 @@ mod tests {
             CrosstermKeyCode::Enter,
             KeyModifiers::NONE,
         )));
+        enter_insert(&mut app);
         app.tabs[0].top_line = 10;
 
         app.scroll_follow();
@@ -1814,10 +1943,8 @@ mod tests {
         let mut app = test_app(EditorSession::from_text(&text));
         app.viewport_width = 10;
         app.viewport_height = 6;
-        app.handle_event(&Event::Key(KeyEvent::new(
-            CrosstermKeyCode::Char('j'),
-            KeyModifiers::NONE,
-        )));
+        enter_insert(&mut app);
+        press(&mut app, CrosstermKeyCode::Down);
         assert_eq!(app.top_line(), 1);
     }
 
@@ -1826,10 +1953,8 @@ mod tests {
         let mut app = test_app(EditorSession::from_text(&"x".repeat(100)));
         app.viewport_width = 10;
         app.viewport_height = 5;
-        app.handle_event(&Event::Key(KeyEvent::new(
-            CrosstermKeyCode::Char('$'),
-            KeyModifiers::NONE,
-        )));
+        enter_insert(&mut app);
+        press(&mut app, CrosstermKeyCode::End);
         assert_eq!(app.skip_rows(), 7);
     }
 
@@ -1839,15 +1964,10 @@ mod tests {
         let mut app = test_app(EditorSession::from_text(&text));
         app.viewport_width = 10;
         app.viewport_height = 5;
-        app.handle_event(&Event::Key(KeyEvent::new(
-            CrosstermKeyCode::Char('$'),
-            KeyModifiers::NONE,
-        )));
+        enter_insert(&mut app);
+        press(&mut app, CrosstermKeyCode::End);
         assert!(app.skip_rows() > 0);
-        app.handle_event(&Event::Key(KeyEvent::new(
-            CrosstermKeyCode::Char('j'),
-            KeyModifiers::NONE,
-        )));
+        press(&mut app, CrosstermKeyCode::Down);
         assert_eq!(app.top_line(), 1);
         assert_eq!(app.skip_rows(), 0);
     }
@@ -1857,10 +1977,8 @@ mod tests {
         let mut app = test_app(EditorSession::from_text(&"x".repeat(100)));
         app.viewport_width = 10;
         app.viewport_height = 5;
-        app.handle_event(&Event::Key(KeyEvent::new(
-            CrosstermKeyCode::Char('$'),
-            KeyModifiers::NONE,
-        )));
+        enter_insert(&mut app);
+        press(&mut app, CrosstermKeyCode::End);
         let (cursor_line, cursor_col) = app.session().unwrap().cursor();
         let (visual_row, _) =
             app.session()
@@ -1885,10 +2003,8 @@ mod tests {
     fn app_set_nowrap_triggers_horizontal_follow() {
         let mut app = test_app(EditorSession::from_text(&"x".repeat(100)));
         app.viewport_width = 20;
-        app.handle_event(&Event::Key(KeyEvent::new(
-            CrosstermKeyCode::Char('$'),
-            KeyModifiers::NONE,
-        )));
+        enter_insert(&mut app);
+        press(&mut app, CrosstermKeyCode::End);
         app.handle_effect(Effect::SetOption {
             key: "wrap".to_string(),
             value: false,
@@ -1918,7 +2034,6 @@ mod tests {
             .save_to_path(&config_path)
             .unwrap();
         let mut app = test_app(EditorSession::from_text("text"));
-        app.config_path = config_path.clone();
         app.handle_effect(Effect::SetOption {
             key: "wrap".to_string(),
             value: false,
@@ -2101,13 +2216,10 @@ mod tests {
         assert!(app.pending_chord.since.is_some());
 
         app.handle_event(&Event::Key(KeyEvent::new(
-            CrosstermKeyCode::Char('v'),
+            CrosstermKeyCode::Char('h'),
             KeyModifiers::NONE,
         )));
-        assert_eq!(
-            app.session().unwrap().mode(),
-            oom_edit_core::session::Mode::View
-        );
+        assert!(app.overlay.is_palette());
     }
 
     #[test]
@@ -2154,24 +2266,85 @@ mod tests {
         assert!(app.overlay.is_palette());
     }
 
-    /// T12: Space-v toggles View mode.
     #[test]
-    fn app_space_v_toggles_view() {
+    fn app_plain_v_enters_select() {
         let session = EditorSession::from_text("hello");
         let mut app = test_app(session);
-
-        // Space starts pending chord.
-        let space = KeyEvent::new(CrosstermKeyCode::Char(' '), KeyModifiers::NONE);
-        app.handle_event(&Event::Key(space));
-        assert!(app.pending_chord.since.is_some());
-
-        // v completes the chord → toggle view.
         let v = KeyEvent::new(CrosstermKeyCode::Char('v'), KeyModifiers::NONE);
         app.handle_event(&Event::Key(v));
         assert_eq!(
             app.session().unwrap().mode(),
-            oom_edit_core::session::Mode::View
+            oom_edit_core::session::Mode::Select
         );
+    }
+
+    #[test]
+    fn replacing_a_session_resets_rendered_scroll_to_the_canonical_top() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("short.md");
+        std::fs::write(&path, "short\n").unwrap();
+        let mut app = test_app(EditorSession::from_text(
+            "one\n\ntwo\n\nthree\n\nfour\n\nfive\n",
+        ));
+        app.set_rendered_top(8);
+
+        app.handle_effect(Effect::OpenRequested { path, force: true });
+
+        assert_eq!(app.active().unwrap().rendered_top, 0);
+        assert_eq!(app.session().unwrap().cursor(), (0, 0));
+    }
+
+    #[test]
+    fn app_dispatches_every_select_binding_in_select_context() {
+        fn send(app: &mut App, ch: char) {
+            app.handle_event(&Event::Key(KeyEvent::new(
+                CrosstermKeyCode::Char(ch),
+                KeyModifiers::NONE,
+            )));
+        }
+
+        let mut cancel = test_app(EditorSession::from_text("# one\n# two\n"));
+        send(&mut cancel, 'v');
+        cancel.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(cancel.session().unwrap().mode(), Mode::Normal);
+
+        let mut yank = test_app(EditorSession::from_text("# one\n# two\n"));
+        send(&mut yank, 'V');
+        send(&mut yank, 'y');
+        send(&mut yank, 'p');
+        assert_eq!(yank.session().unwrap().document(), "# one\n# one\n# two\n");
+
+        for operator in ['d', 'x'] {
+            let mut delete = test_app(EditorSession::from_text("# one\n# two\n"));
+            send(&mut delete, 'V');
+            send(&mut delete, operator);
+            assert_eq!(delete.session().unwrap().document(), "# two\n");
+        }
+
+        let mut change = test_app(EditorSession::from_text("# one\n# two\n"));
+        send(&mut change, 'V');
+        send(&mut change, 'c');
+        assert_eq!(change.session().unwrap().mode(), Mode::Insert);
+
+        let mut indent = test_app(EditorSession::from_text("# one\n# two\n"));
+        send(&mut indent, 'V');
+        send(&mut indent, '>');
+        assert_eq!(indent.session().unwrap().document(), "    # one\n# two\n");
+        indent.session_mut().unwrap().render_layout(74);
+        send(&mut indent, 'V');
+        send(&mut indent, '<');
+        assert_eq!(indent.session().unwrap().document(), "# one\n# two\n");
+
+        let mut swap = test_app(EditorSession::from_text("# one\n# two\n"));
+        send(&mut swap, 'v');
+        send(&mut swap, 'j');
+        let before = swap.session().unwrap().rendered_selection().unwrap();
+        send(&mut swap, 'o');
+        let after = swap.session().unwrap().rendered_selection().unwrap();
+        assert_eq!((after.anchor, after.active), (before.active, before.anchor));
     }
 
     /// T12: Space-w saves.
@@ -2351,15 +2524,15 @@ mod tests {
         open_palette_with_space_h(&mut app);
         assert!(app.overlay.is_palette());
 
-        // Enter executes the selected command (first row = ToggleView).
+        // Enter executes the selected command (first row = character Select).
         let enter = KeyEvent::new(CrosstermKeyCode::Enter, KeyModifiers::NONE);
         app.handle_event(&Event::Key(enter));
 
-        // Palette should be closed and ToggleView should have been executed.
+        // Palette should be closed and character Select should have executed.
         assert!(!app.overlay.is_some());
         assert_eq!(
             app.session().unwrap().mode(),
-            oom_edit_core::session::Mode::View
+            oom_edit_core::session::Mode::Select
         );
     }
 
@@ -2372,9 +2545,8 @@ mod tests {
         open_palette_with_space_h(&mut app);
         assert!(app.overlay.is_palette(), "palette should be open");
 
-        // Navigate down past the app commands to a Vim reference entry.
-        // There are 11 app commands (5 original + 6 tab commands), so navigate to row 12 (index 11).
-        for _ in 0..11 {
+        // Navigate down past every executable command to the first reference row.
+        for _ in 0..crate::command::registry::COMMANDS.len() {
             let down = KeyEvent::new(CrosstermKeyCode::Down, KeyModifiers::NONE);
             app.handle_event(&Event::Key(down));
         }
@@ -2487,7 +2659,9 @@ mod tests {
         let session = EditorSession::from_text("hello");
         let mut app = test_app(session);
         let temp_dir = tempfile::tempdir().unwrap();
-        app.config_path = temp_dir.path().join("oom-edit/config.toml");
+        app.config_store = Box::new(crate::config::FileConfigStore::new(
+            temp_dir.path().join("oom-edit/config.toml"),
+        ));
 
         // Space-t should trigger CycleTheme.
         let space = KeyEvent::new(CrosstermKeyCode::Char(' '), KeyModifiers::NONE);
@@ -2507,6 +2681,24 @@ mod tests {
         );
         // Should show a transient message about cycling.
         assert!(app.transient.is_some());
+    }
+
+    #[test]
+    fn generic_test_app_cannot_persist_config() {
+        let mut app = test_app(EditorSession::from_text("hello"));
+        let original = app.theme_name.clone();
+        app.execute_command(Command::CycleTheme);
+        assert_ne!(app.theme_name, original);
+        assert!(app
+            .transient
+            .as_ref()
+            .is_some_and(|message| message.text.contains("theme:")));
+        // `test_app` injects DisabledConfigStore, whose save operation has no
+        // filesystem path and therefore cannot resolve the production config.
+        assert!(app
+            .config_store
+            .save(&crate::config::Config::default())
+            .is_ok());
     }
 
     #[test]
@@ -2556,14 +2748,12 @@ mod tests {
 
             let mut app = App::new(
                 EditorSession::from_text(""),
-                case.current_theme.to_string(),
-                case.is_light,
-                Tier::TrueColor,
+                theme::ResolvedTheme::injected(case.current_theme, case.is_light, Tier::TrueColor),
                 initial_config.editor.wrap,
                 initial_config.relative_line_numbers,
                 Box::new(RecordingClipboardSink::default()),
+                Box::new(crate::config::FileConfigStore::new(config_path.clone())),
             );
-            app.config_path = config_path.clone();
 
             app.execute_command(Command::CycleTheme);
 
@@ -2598,7 +2788,7 @@ mod tests {
             };
             initial_config.save_to_path(&config_path).unwrap();
 
-            let (theme_name, is_light) = theme::resolve_theme(
+            let resolved = theme::resolve_theme(
                 None,
                 initial_config.theme.mode.as_deref(),
                 Some(&initial_config.theme.dark),
@@ -2607,20 +2797,18 @@ mod tests {
             );
             let mut app = App::new(
                 EditorSession::from_text(""),
-                theme_name,
-                is_light,
-                Tier::TrueColor,
+                resolved.clone(),
                 true,
                 false,
                 Box::new(RecordingClipboardSink::default()),
+                Box::new(crate::config::FileConfigStore::new(config_path.clone())),
             );
-            app.config_path = config_path.clone();
 
             app.execute_command(Command::CycleTheme);
 
             let persisted = crate::config::Config::load_from_path(&config_path);
             let mut expected_config = initial_config.clone();
-            if is_light {
+            if resolved.is_light() {
                 expected_config.theme.light = expected_theme.to_string();
             } else {
                 expected_config.theme.dark = expected_theme.to_string();
@@ -2630,30 +2818,28 @@ mod tests {
         }
     }
 
-    /// T14: Resize in View mode remaps cursor to same content line.
+    /// Resize in rendered Normal remaps cursor to the same source content.
     #[test]
-    fn app_resize_view_remaps_cursor() {
+    fn app_resize_rendered_remaps_cursor() {
         // Multi-line text that wraps differently at different widths.
         let text = "# Intro\n\nThis opening paragraph is deliberately long enough to wrap at forty columns but not at eighty columns.\n\n## Target heading\n\nThis trailing paragraph is also deliberately long enough to make the narrow layout visibly different.\n";
         let session = EditorSession::from_text(text);
         let mut app = test_app(session);
 
-        // Enter View mode.
-        let space = KeyEvent::new(CrosstermKeyCode::Char(' '), KeyModifiers::NONE);
-        app.handle_event(&Event::Key(space));
-        let v = KeyEvent::new(CrosstermKeyCode::Char('v'), KeyModifiers::NONE);
-        app.handle_event(&Event::Key(v));
+        app.handle_event(&Event::Resize(80, 6));
         assert_eq!(
             app.session().unwrap().mode(),
-            oom_edit_core::session::Mode::View
+            oom_edit_core::session::Mode::Normal
         );
 
-        // Navigate to the target heading in View mode.
+        // Navigate to the target heading in rendered mode.
         let down = KeyEvent::new(CrosstermKeyCode::Down, KeyModifiers::NONE);
         let content_line = |app: &App| {
             let session = app.session().unwrap();
-            let cursor = session.view_cursor_line();
-            let source_start = session.view_layout().unwrap().lines[cursor].source.start;
+            let cursor = session.rendered_cursor_line();
+            let source_start = session.rendered_layout().unwrap().lines[cursor]
+                .source
+                .start;
             text[..source_start]
                 .bytes()
                 .filter(|byte| *byte == b'\n')
@@ -2663,47 +2849,62 @@ mod tests {
             app.handle_event(&Event::Key(down));
         }
         assert_eq!(content_line(&app), 4);
-        let wide_line_count = app.session().unwrap().view_layout().unwrap().lines.len();
+        let wide_line_count = app
+            .session()
+            .unwrap()
+            .rendered_layout()
+            .unwrap()
+            .lines
+            .len();
 
         // Simulate a narrow resize that changes wrapping.
         let resize = Event::Resize(40, 6);
         app.handle_event(&resize);
 
-        let narrow_line_count = app.session().unwrap().view_layout().unwrap().lines.len();
+        let narrow_line_count = app
+            .session()
+            .unwrap()
+            .rendered_layout()
+            .unwrap()
+            .lines
+            .len();
         assert!(
             narrow_line_count > wide_line_count,
-            "narrow resize should reflow the View layout"
+            "narrow resize should reflow the rendered layout"
         );
         assert_eq!(
             content_line(&app),
             4,
-            "view cursor should remain on the target heading's logical source line"
+            "rendered cursor should remain on the target heading's logical source line"
         );
-        let cursor = app.session().unwrap().view_cursor_line();
-        let view_top = app.active().unwrap().view_top;
+        let cursor = app.session().unwrap().rendered_cursor_line();
+        let rendered_top = app.active().unwrap().rendered_top;
         assert!(
-            (view_top..view_top + app.viewport_height).contains(&cursor),
-            "remapped View cursor should remain visible after resize"
+            (rendered_top..rendered_top + app.viewport_height).contains(&cursor),
+            "remapped rendered cursor should remain visible after resize"
         );
     }
 
     #[test]
-    fn app_resize_with_tabs_keeps_view_cursor_visible() {
+    fn app_resize_with_tabs_keeps_rendered_cursor_visible() {
         let text = "# Intro\n\nThis opening paragraph is deliberately long enough to wrap at forty columns but not at eighty columns.\n\n## Target heading\n\nThis trailing paragraph is also deliberately long enough to make the narrow layout visibly different.\n";
         let mut app = test_app(EditorSession::from_text(text));
 
-        let space = KeyEvent::new(CrosstermKeyCode::Char(' '), KeyModifiers::NONE);
-        app.handle_event(&Event::Key(space));
-        let v = KeyEvent::new(CrosstermKeyCode::Char('v'), KeyModifiers::NONE);
-        app.handle_event(&Event::Key(v));
+        app.handle_event(&Event::Resize(80, 6));
 
-        let wide_line_count = app.session().unwrap().view_layout().unwrap().lines.len();
+        let wide_line_count = app
+            .session()
+            .unwrap()
+            .rendered_layout()
+            .unwrap()
+            .lines
+            .len();
         let down = KeyEvent::new(CrosstermKeyCode::Down, KeyModifiers::NONE);
         for _ in 0..wide_line_count {
             app.handle_event(&Event::Key(down));
         }
         assert_eq!(
-            app.session().unwrap().view_cursor_line(),
+            app.session().unwrap().rendered_cursor_line(),
             wide_line_count - 1
         );
 
@@ -2712,11 +2913,11 @@ mod tests {
         app.handle_event(&Event::Resize(40, 6));
 
         assert_eq!(app.viewport_height, 4);
-        let cursor = app.session().unwrap().view_cursor_line();
-        let view_top = app.active().unwrap().view_top;
+        let cursor = app.session().unwrap().rendered_cursor_line();
+        let rendered_top = app.active().unwrap().rendered_top;
         assert!(
-            (view_top..view_top + app.viewport_height).contains(&cursor),
-            "remapped View cursor should remain visible below the tab bar"
+            (rendered_top..rendered_top + app.viewport_height).contains(&cursor),
+            "remapped rendered cursor should remain visible below the tab bar"
         );
     }
 
@@ -2726,13 +2927,12 @@ mod tests {
         use ratatui::Terminal;
 
         let mut app = App::new(
-            EditorSession::from_text("first\nplain"),
-            "default-light".to_string(),
-            true,
-            Tier::TrueColor,
+            EditorSession::from_text("first\n\nplain"),
+            theme::ResolvedTheme::injected("default-light", true, Tier::TrueColor),
             true,
             false,
             Box::new(RecordingClipboardSink::default()),
+            Box::new(crate::config::DisabledConfigStore),
         );
         app.tabs
             .push(TabEntry::new(EditorSession::from_text("second")));
@@ -2744,19 +2944,17 @@ mod tests {
         let theme = &theme::DEFAULT_LIGHT;
         let text_style = theme.style(Tier::TrueColor, oom_edit_core::SemanticStyle::Text);
         let cursor_style = theme.ui_style(Tier::TrueColor, theme::UiSlot::CursorLine);
-        let cursor_cell = buffer.cell((6, 1)).expect("cursor-line document cell");
-        assert_eq!(
-            cursor_cell.fg,
-            text_style.fg.expect("light text foreground")
-        );
-        assert_eq!(
-            cursor_cell.bg,
-            cursor_style.bg.expect("light cursor-line background")
-        );
-        assert_eq!(
-            buffer.cell((6, 2)).expect("plain document cell").fg,
-            text_style.fg.expect("light text foreground")
-        );
+        let body_cells = (1..9).flat_map(|y| (6..80).filter_map(move |x| buffer.cell((x, y))));
+        let cells: Vec<_> = body_cells.collect();
+        assert!(cells.iter().any(|cell| {
+            cell.fg == text_style.fg.expect("light text foreground")
+                && cell.bg == cursor_style.bg.expect("light cursor-line background")
+        }));
+        assert!(cells.iter().any(|cell| {
+            cell.symbol() != " "
+                && cell.fg == text_style.fg.expect("light text foreground")
+                && cell.bg != cursor_style.bg.expect("light cursor-line background")
+        }));
 
         assert_eq!(
             buffer.cell((0, 0)).expect("active tab cell").fg,
@@ -2816,15 +3014,14 @@ mod tests {
 
         let mut app = App::new(
             EditorSession::from_text("text"),
-            "default-dark".to_string(),
-            false,
-            Tier::Monochrome,
+            theme::ResolvedTheme::injected("default-dark", false, Tier::Monochrome),
             true,
             false,
             Box::new(RecordingClipboardSink::default()),
+            Box::new(crate::config::DisabledConfigStore),
         );
-        app.overlay = Overlay::open_palette();
-        for ch in "beginning".chars() {
+        app.overlay = Overlay::open_palette(Contexts::NORMAL);
+        for ch in "rendered row".chars() {
             app.handle_event(&Event::Key(KeyEvent::new(
                 CrosstermKeyCode::Char(ch),
                 KeyModifiers::NONE,

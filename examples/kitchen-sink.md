@@ -196,7 +196,7 @@ Mixed nesting:
 | --------------- | --------- | -------- | -------- | ------------------------------------------------- |
 | Vim motions     | Done      | P0       | core     | `hjkl`, `w`, `b`, `e`, `0`, `$`, `gg`, `G`       |
 | Syntax highlight| Done      | P0       | core     | Tree-sitter based, **all** built-in grammars      |
-| View mode       | Done      | P1       | core     | Rendered markdown with navigation                 |
+| Rendered Normal | Done      | P1       | core     | Rendered markdown with navigation                 |
 | Search          | Planned   | P1       | core     | `/pattern` with `n`/`N` for next/prev             |
 | Command palette | Planned   | P2       | tui      | `:` prefix, fuzzy matching                        |
 | Clipboard       | Planned   | P1       | core     | OSC 52 — *no external dependencies*               |
@@ -208,7 +208,7 @@ This table has cells with content long enough to force horizontal scrolling or w
 | Component | Description | Implementation Details |
 | --------- | ----------- | ---------------------- |
 | Incremental Highlighter | The incremental highlighting engine re-highlights only the ranges affected by an edit, using tree-sitter's edit + reparse cycle. | Uses `InputEdit` to inform the old tree of byte-range changes, then calls `parser.parse()` with the old tree to produce a new tree. Only changed node ranges are re-queried for highlights, keeping large-file edits fast. |
-| View Renderer | Converts the raw markdown buffer into a rendered view with styled headings, wrapped paragraphs, and navigable structure. | Walks the pulldown-cmark event stream, applying semantic styles per block type. Headings become bold + colored, code blocks get background fill, and links show their URL in a muted style. Cursor maps bi-directionally between edit and view positions. |
+| Rendered Layout | Converts the canonical markdown buffer into styled headings, wrapped paragraphs, and navigable structure. | Walks the pulldown-cmark event stream, applying semantic styles per block type. Headings become bold + colored, code blocks get background fill, and links show their URL in a muted style. Cursor maps bi-directionally between rendered and source positions. |
 | Atomic Save | Ensures that a crash or kill signal during write never corrupts the file being edited. | Writes to a temporary file in the same directory, calls `fsync()`, then atomically renames over the target. If rename fails, the original file is untouched. The temp file name includes the PID to avoid collisions. |
 
 ---

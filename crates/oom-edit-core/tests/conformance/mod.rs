@@ -1,3642 +1,1633 @@
-//! hjkl conformance test harness — conformance part 1.
-//!
-//! This module implements a table-driven test runner with a key-notation parser
-//! to verify that the `VimCore` wrapper correctly delegates to the hjkl engine
-//! and that no hjkl types leak into the public API.
-//!
-//! See tasks/T03-vim-wrapper-conformance-1.md for the full acceptance criteria.
+//! Conformance manifest for the rendered-first four-mode public contract.
 
-use oom_edit_core::session::{
-    EditorSession, Effect, KeyCode, KeyCodeKind, KeyInput, Modifiers, Severity, Viewport,
+use oom_edit_core::{
+    EditorSession, Effect, KeyCode, KeyCodeKind, KeyInput, Mode, Modifiers, SelectionShape,
 };
-use oom_edit_core::style::SemanticStyle;
+use proptest::prelude::*;
 
-// ── Key-notation parser ────────────────────────────────────────────────────
+const REQUIRED_PUBLIC_BEHAVIORS: &[&str] = &[
+    "VN-1:j",
+    "VN-1:k",
+    "VN-1:Down",
+    "VN-1:Up",
+    "VN-2:gg",
+    "VN-2:G",
+    "VN-2:count-gg",
+    "VN-2:count-G",
+    "VN-2:Ctrl-d",
+    "VN-2:Ctrl-u",
+    "VN-2:Ctrl-f",
+    "VN-2:Ctrl-b",
+    "VN-2:{",
+    "VN-2:}",
+    "VN-3:Tab",
+    "VN-3:Shift-Tab",
+    "VN-3:Enter",
+    "VN-4:[[",
+    "VN-4:]]",
+    "VN-5:/",
+    "VN-5:?",
+    "VN-5:n",
+    "VN-5:N",
+    "VN-6:gt",
+    "VN-6:gT",
+    "VN-6:unbound",
+    "VP-1:ranges",
+    "VP-2:mapping",
+    "VP-3:canonical",
+    "VP-4:property",
+    "SEL-1:v",
+    "SEL-1:V",
+    "SEL-1:Ctrl-V",
+    "SEL-1:motion",
+    "SEL-1:swap",
+    "SEL-1:cancel",
+    "SEL-2:character",
+    "SEL-2:empty",
+    "SEL-3:line",
+    "SEL-4:block",
+    "SEL-5:character-y",
+    "SEL-5:character-d",
+    "SEL-5:character-x",
+    "SEL-5:character-c",
+    "SEL-5:line-y",
+    "SEL-5:line-d",
+    "SEL-5:line-x",
+    "SEL-5:line-c",
+    "SEL-5:block-y",
+    "SEL-5:block-d",
+    "SEL-5:block-x",
+    "SEL-5:block-c",
+    "SEL-6:named",
+    "SEL-6:black-hole",
+    "SEL-6:numbered-small-delete",
+    "SEL-6:system-clipboard",
+    "SEL-7:block-undo",
+    "SEL-7:block-redo",
+    "SEL-7:put-shape",
+    "SEL-8:indent",
+    "SEL-8:outdent",
+    "SEL-9:metadata",
+    "SEL-10:intervals",
+    "SEL-11:manifest",
+    "CMI-1:start",
+    "CMI-2:insert",
+    "CMI-2:select",
+    "CMI-2:command",
+    "CMI-2:resize",
+    "CMI-3:gutter-ruler",
+    "CMI-4:styles",
+    "V-X1:write",
+    "V-X2:quit",
+    "V-X3:write-quit",
+    "V-X4:edit",
+    "V-X5:saveas",
+    "V-X6:line",
+    "V-X7:substitute",
+    "V-X8:noh-help",
+];
 
-/// Parse a human-readable key notation into a `KeyInput`.
-///
-/// Supports:
-/// - Single characters: `a`, `1`, ` ` (space), `.`
-/// - Special keys: `Enter`, `Esc`, `Backspace`, `Tab`, `Up`, `Down`, `Left`,
-///   `Right`, `Home`, `End`, `PageUp`, `PageDown`, `Delete`, `F1`..`F12`
-/// - Modifiers: `<C-a>`, `<A-a>`, `<S-a>`, `<C-A-a>`
-/// - Chords (multi-key sequences): `gg`, `dd`, `3j`, `5k`, `H`, `M`, `L`,
-///   `0`, `$`, `w`, `b`, `e`, `W`, `B`, `E`, `f{x}`, `t{x}`, `F{x}`, `T{x}`,
-///   `;`, `,`, `i{char}`, `a{char}`, `I`, `A`, `o`, `O`, `u`, `U`
-///
-/// Returns `None` if the notation is invalid.
-fn parse_key(input: &str) -> Option<KeyInput> {
-    // Handle space specially — trim would remove it
-    let input = if input == " " { " " } else { input.trim() };
-    if input.is_empty() {
-        return None;
+type ConformanceCase = (&'static str, &'static [&'static str], fn());
+
+const COVERAGE_CASES: &[ConformanceCase] = &[
+    (
+        "rendered vertical j/k/arrows",
+        &["VN-1:j", "VN-1:k", "VN-1:Down", "VN-1:Up"],
+        rendered_vertical_motions,
+    ),
+    (
+        "rendered document/page/block/count motions",
+        &[
+            "VN-2:gg",
+            "VN-2:G",
+            "VN-2:count-gg",
+            "VN-2:count-G",
+            "VN-2:Ctrl-d",
+            "VN-2:Ctrl-u",
+            "VN-2:Ctrl-f",
+            "VN-2:Ctrl-b",
+            "VN-2:{",
+            "VN-2:}",
+        ],
+        rendered_document_page_block_and_count_motions,
+    ),
+    (
+        "rendered jump targets",
+        &["VN-3:Tab", "VN-3:Shift-Tab", "VN-3:Enter"],
+        rendered_jump_targets_both_directions_and_enter,
+    ),
+    (
+        "rendered heading motions",
+        &["VN-4:[[", "VN-4:]]"],
+        rendered_heading_motions,
+    ),
+    (
+        "rendered search directions/repeats",
+        &["VN-5:/", "VN-5:?", "VN-5:n", "VN-5:N"],
+        rendered_search_directions_and_repeats,
+    ),
+    (
+        "rendered reserved/unbound no-op",
+        &["VN-6:gt", "VN-6:gT", "VN-6:unbound"],
+        rendered_reserved_and_unbound_keys_are_noops,
+    ),
+    (
+        "source spans and mapping",
+        &["VP-1:ranges", "VP-2:mapping"],
+        exact_markdown_structure_ranges,
+    ),
+    (
+        "canonical rendered movement",
+        &["VP-3:canonical", "CMI-3:gutter-ruler"],
+        rendered_navigation_and_search_update_canonical_source,
+    ),
+    (
+        "cross-mode property",
+        &["VP-4:property"],
+        random_mode_width_and_motion_mapping_stays_in_bounds,
+    ),
+    (
+        "Select endpoint mechanics",
+        &["SEL-1:v", "SEL-1:V", "SEL-1:Ctrl-V", "SEL-1:swap"],
+        select_forward_reverse_swap_and_escape,
+    ),
+    (
+        "Select required motion surface",
+        &["SEL-1:motion"],
+        select_required_motion_surface,
+    ),
+    (
+        "Select exact shape projections",
+        &[
+            "SEL-2:character",
+            "SEL-2:empty",
+            "SEL-3:line",
+            "SEL-4:block",
+        ],
+        select_shape_projections_are_exact,
+    ),
+    (
+        "Select metadata intervals and semantic styles",
+        &["SEL-9:metadata", "SEL-10:intervals", "CMI-4:styles"],
+        select_metadata_intervals_and_styles,
+    ),
+    (
+        "Select register/put/history",
+        &[
+            "SEL-6:named",
+            "SEL-6:black-hole",
+            "SEL-6:numbered-small-delete",
+            "SEL-6:system-clipboard",
+            "SEL-7:put-shape",
+        ],
+        select_operators_registers_put_and_history_conform,
+    ),
+    (
+        "Select shape/operator matrix",
+        &[
+            "SEL-5:character-y",
+            "SEL-5:character-d",
+            "SEL-5:character-x",
+            "SEL-5:character-c",
+            "SEL-5:line-y",
+            "SEL-5:line-d",
+            "SEL-5:line-x",
+            "SEL-5:line-c",
+            "SEL-5:block-y",
+            "SEL-5:block-d",
+            "SEL-5:block-x",
+            "SEL-5:block-c",
+            "SEL-7:block-undo",
+            "SEL-7:block-redo",
+        ],
+        select_shape_operator_matrix_conforms,
+    ),
+    (
+        "Select line operators and cancel",
+        &["SEL-1:cancel", "SEL-8:indent", "SEL-8:outdent"],
+        select_delete_x_change_indent_and_outdent_conform,
+    ),
+    (
+        "Select manifest",
+        &["SEL-11:manifest"],
+        select_manifest_meta_test_covers_every_declared_requirement,
+    ),
+    (
+        "initial mode",
+        &["CMI-1:start"],
+        session_starts_in_rendered_normal,
+    ),
+    (
+        "mode transitions",
+        &["CMI-2:insert", "CMI-2:select", "CMI-2:command"],
+        all_mode_roundtrips_preserve_source_anchor,
+    ),
+    (
+        "exact Select resize provenance",
+        &["CMI-2:resize"],
+        select_resize_preserves_exact_endpoint_provenance,
+    ),
+    ("Ex write", &["V-X1:write"], v_x1_write),
+    ("Ex quit", &["V-X2:quit"], v_x2_quit),
+    ("Ex write quit", &["V-X3:write-quit"], v_x3_write_quit),
+    ("Ex edit", &["V-X4:edit"], v_x4_edit),
+    ("Ex saveas", &["V-X5:saveas"], v_x5_saveas),
+    ("Ex line jump", &["V-X6:line"], v_x6_line_jump),
+    ("Ex substitute", &["V-X7:substitute"], v_x7_substitute),
+    ("Ex noh/help", &["V-X8:noh-help"], v_x8_noh_and_help),
+];
+
+fn key(ch: char) -> KeyInput {
+    KeyInput {
+        code: KeyCode {
+            kind: KeyCodeKind::Char(ch),
+        },
+        mods: Modifiers::default(),
     }
+}
 
-    // Check for modifier prefix: <C-...>, <A-...>, <S-...>, <C-A-...>, <C-S-...>, <A-S-...>, <C-A-S-...>
-    let modifier_payload = |prefix| {
-        input
-            .strip_prefix(prefix)
-            .and_then(|rest| rest.strip_suffix('>'))
-            .filter(|rest| !rest.is_empty())
-    };
-    let (ctrl, alt, shift, rest) = if let Some(rest) = modifier_payload("<C-A-S-") {
-        (true, true, true, rest)
-    } else if let Some(rest) = modifier_payload("<C-A-") {
-        (true, true, false, rest)
-    } else if let Some(rest) = modifier_payload("<C-S-") {
-        (true, false, true, rest)
-    } else if let Some(rest) = modifier_payload("<A-S-") {
-        (false, true, true, rest)
-    } else if let Some(rest) = modifier_payload("<C-") {
-        (true, false, false, rest)
-    } else if let Some(rest) = modifier_payload("<A-") {
-        (false, true, false, rest)
-    } else if let Some(rest) = modifier_payload("<S-") {
-        (false, false, true, rest)
-    } else if let Some(rest) = input
-        .strip_prefix('<')
-        .and_then(|rest| rest.strip_suffix('>'))
-        .filter(|rest| !rest.is_empty())
-    {
-        (false, false, false, rest)
-    } else if input.starts_with('<') {
-        return None;
-    } else {
-        (false, false, false, input)
-    };
-
-    // Don't trim rest — space is a valid character
-
-    // Parse the key code
-    let kind = match rest {
-        "Enter" => KeyCodeKind::Enter,
-        "Esc" | "Escape" => KeyCodeKind::Esc,
-        "Backspace" => KeyCodeKind::Backspace,
-        "Tab" => KeyCodeKind::Tab,
-        "Up" => KeyCodeKind::Up,
-        "Down" => KeyCodeKind::Down,
-        "Left" => KeyCodeKind::Left,
-        "Right" => KeyCodeKind::Right,
-        "Home" => KeyCodeKind::Home,
-        "End" => KeyCodeKind::End,
-        "PageUp" => KeyCodeKind::PageUp,
-        "PageDown" => KeyCodeKind::PageDown,
-        "Delete" => KeyCodeKind::Delete,
-        _ => {
-            // Check for function key
-            if let Some(num_str) = rest.strip_prefix('F') {
-                if let Ok(num) = num_str.parse::<u8>() {
-                    if (1..=24).contains(&num) {
-                        return Some(KeyInput {
-                            code: KeyCode {
-                                kind: KeyCodeKind::F(num),
-                            },
-                            mods: Modifiers { ctrl, alt, shift },
-                        });
-                    }
-                }
-            }
-            // Single character
-            let mut chars = rest.chars();
-            let c = chars.next()?;
-            if chars.next().is_some() {
-                // More than one character without being a special key
-                return None;
-            }
-            KeyCodeKind::Char(c)
-        }
-    };
-
-    Some(KeyInput {
+fn special(kind: KeyCodeKind) -> KeyInput {
+    KeyInput {
         code: KeyCode { kind },
-        mods: Modifiers { ctrl, alt, shift },
-    })
-}
-
-/// Parse a chord (multi-key sequence) into a vector of `KeyInput`.
-///
-/// A chord is a sequence of key notations concatenated together.
-/// For example: `gg` → `[g, g]`, `3j` → `[3, j]`, `dd` → `[d, d]`.
-/// Also handles `<...>` grouped keys: `<C-[>` → `[Ctrl+[]`, `<Esc>` → `[Esc]`.
-fn parse_chord(input: &str) -> Vec<KeyInput> {
-    let mut keys = Vec::new();
-    let input = input.trim();
-
-    let mut i = 0;
-    let chars: Vec<char> = input.chars().collect();
-    let len = chars.len();
-    while i < len {
-        // Handle <...> grouped keys (e.g. <C-[>, <Esc>, <C-A-a>)
-        if chars[i] == '<' {
-            if let Some(offset) = chars[i..].iter().position(|&c| c == '>') {
-                let end = i + offset + 1;
-                let bracket_str: String = chars[i..end].iter().collect();
-                if let Some(key) = parse_key(&bracket_str) {
-                    keys.push(key);
-                    i = end;
-                    continue;
-                }
-            }
-            // If we can't parse the bracket, fall through to char-by-char
-        }
-        // Count prefix — parse all consecutive digits
-        if chars[i].is_ascii_digit() {
-            let mut num_str = String::new();
-            while i < len && chars[i].is_ascii_digit() {
-                num_str.push(chars[i]);
-                i += 1;
-            }
-            // Counts are sequences of digit key presses, not one multi-character key.
-            for digit in num_str.chars() {
-                if let Some(key) = parse_key(&digit.to_string()) {
-                    keys.push(key);
-                }
-            }
-            continue;
-        }
-        // Single character key (or multi-char name like Esc, Enter, etc.)
-        if let Some((consumed, matched_len)) =
-            try_parse_multi_char_key(&chars, i, false, false, false)
-        {
-            keys.push(consumed);
-            i += matched_len;
-            continue;
-        }
-        if let Some(key) = parse_key(&chars[i].to_string()) {
-            keys.push(key);
-        }
-        i += 1;
+        mods: Modifiers::default(),
     }
-
-    keys
 }
 
-/// Try to match a multi-character key name at position `i`.
-/// Returns the parsed `KeyInput` and matched character length if found.
-fn try_parse_multi_char_key(
-    chars: &[char],
-    i: usize,
-    ctrl: bool,
-    alt: bool,
-    shift: bool,
-) -> Option<(KeyInput, usize)> {
-    // Multi-character key names (ordered by length, longest first)
-    const MULTI: &[&str] = &[
-        "Backspace",
-        "PageUp",
-        "PageDown",
-        "Enter",
-        "Escape",
-        "Delete",
-        "BackTab",
-        "Left",
-        "Right",
-        "Up",
-        "Down",
-        "Home",
-        "End",
-        "Esc",
-    ];
-    for name in MULTI {
-        let n = name.len();
-        if i + n <= chars.len() {
-            let slice: String = chars[i..i + n].iter().collect();
-            if slice.as_str() == *name {
-                let key_str = if ctrl {
-                    format!("<C-{}>", name)
-                } else if alt {
-                    format!("<A-{}>", name)
-                } else if shift {
-                    format!("<S-{}>", name)
-                } else {
-                    name.to_string()
-                };
-                return parse_key(&key_str).map(|key| (key, n));
-            }
-        }
+fn ctrl(ch: char) -> KeyInput {
+    KeyInput {
+        code: KeyCode {
+            kind: KeyCodeKind::Char(ch),
+        },
+        mods: Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        },
     }
-    None
 }
 
-// ── Test helpers ───────────────────────────────────────────────────────────
-
-/// Create a new `EditorSession` with the given initial text.
-fn session(text: &str) -> EditorSession {
-    EditorSession::from_text(text)
-}
-
-/// Feed a key chord to the session and drain all effects.
-fn feed(session: &mut EditorSession, chord: &str) -> Vec<Effect> {
-    let keys = parse_chord(chord);
-    let mut all_effects = Vec::new();
-    for key in keys {
-        let effects = session.handle_key(key);
-        all_effects.extend(effects);
+fn move_to_text(session: &mut EditorSession, needle: &str, width: u16) {
+    let target = session
+        .render_layout(width)
+        .lines
+        .iter()
+        .position(|line| line.styled.text.contains(needle))
+        .unwrap();
+    while session.rendered_cursor_line() < target {
+        session.handle_key(key('j'));
     }
-    all_effects
-}
-
-/// Get the current mode from the session.
-fn mode(session: &EditorSession) -> oom_edit_core::session::Mode {
-    session.mode()
-}
-
-// ── Tests ──────────────────────────────────────────────────────────────────
-
-#[test]
-fn key_notation_parser_single_char() {
-    assert_eq!(
-        parse_key("a"),
-        Some(KeyInput {
-            code: KeyCode {
-                kind: KeyCodeKind::Char('a')
-            },
-            mods: Modifiers::default()
-        })
-    );
-    assert_eq!(
-        parse_key("1"),
-        Some(KeyInput {
-            code: KeyCode {
-                kind: KeyCodeKind::Char('1')
-            },
-            mods: Modifiers::default()
-        })
-    );
-    assert_eq!(
-        parse_key(" "),
-        Some(KeyInput {
-            code: KeyCode {
-                kind: KeyCodeKind::Char(' ')
-            },
-            mods: Modifiers::default()
-        })
-    );
 }
 
 #[test]
-fn key_notation_parser_special_keys() {
-    assert_eq!(
-        parse_key("Enter"),
-        Some(KeyInput {
-            code: KeyCode {
-                kind: KeyCodeKind::Enter
-            },
-            mods: Modifiers::default()
-        })
-    );
-    assert_eq!(
-        parse_key("Esc"),
-        Some(KeyInput {
-            code: KeyCode {
-                kind: KeyCodeKind::Esc
-            },
-            mods: Modifiers::default()
-        })
-    );
-    assert_eq!(
-        parse_key("Backspace"),
-        Some(KeyInput {
-            code: KeyCode {
-                kind: KeyCodeKind::Backspace
-            },
-            mods: Modifiers::default()
-        })
-    );
-    assert_eq!(
-        parse_key("Up"),
-        Some(KeyInput {
-            code: KeyCode {
-                kind: KeyCodeKind::Up
-            },
-            mods: Modifiers::default()
-        })
-    );
-    assert_eq!(
-        parse_key("Down"),
-        Some(KeyInput {
-            code: KeyCode {
-                kind: KeyCodeKind::Down
-            },
-            mods: Modifiers::default()
-        })
-    );
-    assert_eq!(
-        parse_key("Left"),
-        Some(KeyInput {
-            code: KeyCode {
-                kind: KeyCodeKind::Left
-            },
-            mods: Modifiers::default()
-        })
-    );
-    assert_eq!(
-        parse_key("Right"),
-        Some(KeyInput {
-            code: KeyCode {
-                kind: KeyCodeKind::Right
-            },
-            mods: Modifiers::default()
-        })
-    );
-    assert_eq!(
-        parse_key("Home"),
-        Some(KeyInput {
-            code: KeyCode {
-                kind: KeyCodeKind::Home
-            },
-            mods: Modifiers::default()
-        })
-    );
-    assert_eq!(
-        parse_key("End"),
-        Some(KeyInput {
-            code: KeyCode {
-                kind: KeyCodeKind::End
-            },
-            mods: Modifiers::default()
-        })
-    );
-    assert_eq!(
-        parse_key("PageUp"),
-        Some(KeyInput {
-            code: KeyCode {
-                kind: KeyCodeKind::PageUp
-            },
-            mods: Modifiers::default()
-        })
-    );
-    assert_eq!(
-        parse_key("PageDown"),
-        Some(KeyInput {
-            code: KeyCode {
-                kind: KeyCodeKind::PageDown
-            },
-            mods: Modifiers::default()
-        })
-    );
-    assert_eq!(
-        parse_key("Delete"),
-        Some(KeyInput {
-            code: KeyCode {
-                kind: KeyCodeKind::Delete
-            },
-            mods: Modifiers::default()
-        })
-    );
+fn select_manifest_meta_test_covers_every_declared_requirement() {
+    let mut covered: Vec<_> = COVERAGE_CASES
+        .iter()
+        .flat_map(|(_, ids, _)| ids.iter().copied())
+        .collect();
+    covered.sort_unstable();
+    let mut required = REQUIRED_PUBLIC_BEHAVIORS.to_vec();
+    required.sort_unstable();
+    assert_eq!(covered, required, "public behavior manifest drift");
+    let unique: std::collections::HashSet<_> = covered.iter().copied().collect();
+    assert_eq!(unique.len(), covered.len(), "duplicate behavior mappings");
+    assert!(COVERAGE_CASES.iter().all(|(name, ids, _)| {
+        !name.trim().is_empty() && !ids.is_empty() && ids.iter().all(|id| id.contains('-'))
+    }));
 }
 
 #[test]
-fn key_notation_parser_function_keys() {
-    for n in 1..=12 {
-        let key = parse_key(&format!("F{}", n));
+fn session_starts_in_rendered_normal() {
+    let session = EditorSession::from_text("");
+    assert_eq!((session.mode(), session.cursor()), (Mode::Normal, (0, 0)));
+}
+
+#[test]
+fn rendered_vertical_motions() {
+    for down in [key('j'), special(KeyCodeKind::Down)] {
+        let mut session = EditorSession::from_text("one\n\ntwo\n\nthree\n");
+        session.render_layout(40);
+        let start = session.rendered_cursor_line();
+        session.handle_key(down);
+        assert!(session.rendered_cursor_line() > start);
+        let moved = session.rendered_cursor_line();
+        session.handle_key(if matches!(down.code.kind, KeyCodeKind::Down) {
+            special(KeyCodeKind::Up)
+        } else {
+            key('k')
+        });
+        assert!(session.rendered_cursor_line() < moved);
+    }
+}
+
+#[test]
+fn rendered_document_page_block_and_count_motions() {
+    let text = (1..=20)
+        .map(|number| format!("paragraph {number}\n\n"))
+        .collect::<String>();
+    let mut session = EditorSession::from_text(&text);
+    let last = session.render_layout(40).lines.len() - 1;
+
+    session.handle_key(ctrl('d'));
+    assert!(session.rendered_cursor_line() > 0);
+    session.handle_key(ctrl('u'));
+    assert_eq!(session.rendered_cursor_line(), 0);
+    session.handle_key(ctrl('f'));
+    assert_eq!(session.rendered_cursor_line(), last);
+    session.handle_key(ctrl('b'));
+    assert_eq!(session.rendered_cursor_line(), 0);
+
+    session.handle_key(key('}'));
+    assert!(session.rendered_cursor_line() > 0);
+    session.handle_key(key('{'));
+    assert!(session.rendered_cursor_line() < last);
+
+    for ch in "3gg".chars() {
+        session.handle_key(key(ch));
+    }
+    assert_eq!(session.rendered_cursor_line(), 2);
+    for ch in "5G".chars() {
+        session.handle_key(key(ch));
+    }
+    assert_eq!(session.rendered_cursor_line(), 4);
+    session.handle_key(key('G'));
+    assert_eq!(session.rendered_cursor_line(), last);
+    session.handle_key(key('g'));
+    session.handle_key(key('g'));
+    assert_eq!(session.rendered_cursor_line(), 0);
+}
+
+#[test]
+fn rendered_jump_targets_both_directions_and_enter() {
+    let mut session =
+        EditorSession::from_text("[first](https://first.test)\n\n[second](https://second.test)\n");
+    session.render_layout(50);
+    session.handle_key(special(KeyCodeKind::Tab));
+    let second = session.rendered_cursor_line();
+    assert!(second > 0);
+    let effects = session.handle_key(special(KeyCodeKind::Enter));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Message { text, .. } if text.contains("https://second.test")
+    )));
+    session.handle_key(special(KeyCodeKind::BackTab));
+    assert!(session.rendered_cursor_line() < second);
+}
+
+#[test]
+fn rendered_heading_motions() {
+    let mut session = EditorSession::from_text("# One\n\nbody\n\n# Two\n\nbody\n\n# Three\n");
+    session.render_layout(50);
+    session.handle_key(key(']'));
+    session.handle_key(key(']'));
+    assert_eq!(session.cursor().0, 4);
+    session.handle_key(key('['));
+    session.handle_key(key('['));
+    assert_eq!(session.cursor().0, 0);
+}
+
+#[test]
+fn rendered_search_directions_and_repeats() {
+    let mut forward = EditorSession::from_text("alpha\n\nbeta\n\nalpha\n");
+    forward.render_layout(40);
+    forward.handle_key(key('/'));
+    for ch in "alpha".chars() {
+        forward.handle_key(key(ch));
+    }
+    forward.handle_key(special(KeyCodeKind::Enter));
+    assert_eq!(forward.cursor().0, 4);
+    forward.handle_key(key('n'));
+    assert_eq!(forward.cursor().0, 0);
+    forward.handle_key(key('N'));
+    assert_eq!(forward.cursor().0, 4);
+
+    let mut backward = EditorSession::from_text("alpha\n\nbeta\n\nalpha\n");
+    backward.render_layout(40);
+    backward.handle_key(key('G'));
+    backward.handle_key(key('?'));
+    for ch in "beta".chars() {
+        backward.handle_key(key(ch));
+    }
+    backward.handle_key(special(KeyCodeKind::Enter));
+    assert_eq!(backward.cursor().0, 2);
+}
+
+#[test]
+fn rendered_reserved_and_unbound_keys_are_noops() {
+    for keys in ["gt", "gT", "x", "Q"] {
+        let mut session = EditorSession::from_text("one\n\ntwo\n");
+        session.render_layout(40);
+        let before = (
+            session.document(),
+            session.cursor(),
+            session.rendered_cursor_line(),
+        );
+        for ch in keys.chars() {
+            session.handle_key(key(ch));
+        }
         assert_eq!(
-            key,
-            Some(KeyInput {
-                code: KeyCode {
-                    kind: KeyCodeKind::F(n)
-                },
-                mods: Modifiers::default()
-            })
+            (
+                session.document(),
+                session.cursor(),
+                session.rendered_cursor_line()
+            ),
+            before,
+            "unbound sequence {keys:?}"
         );
     }
 }
 
 #[test]
-fn key_notation_parser_modifiers() {
-    // Ctrl
-    assert_eq!(
-        parse_key("<C-a>"),
-        Some(KeyInput {
-            code: KeyCode {
-                kind: KeyCodeKind::Char('a')
-            },
-            mods: Modifiers {
-                ctrl: true,
-                alt: false,
-                shift: false,
-            }
-        })
-    );
-    // Alt
-    assert_eq!(
-        parse_key("<A-a>"),
-        Some(KeyInput {
-            code: KeyCode {
-                kind: KeyCodeKind::Char('a')
-            },
-            mods: Modifiers {
-                ctrl: false,
-                alt: true,
-                shift: false,
-            }
-        })
-    );
-    // Shift
-    assert_eq!(
-        parse_key("<S-a>"),
-        Some(KeyInput {
-            code: KeyCode {
-                kind: KeyCodeKind::Char('a')
-            },
-            mods: Modifiers {
-                ctrl: false,
-                alt: false,
-                shift: true,
-            }
-        })
-    );
-    // Ctrl+Alt
-    assert_eq!(
-        parse_key("<C-A-a>"),
-        Some(KeyInput {
-            code: KeyCode {
-                kind: KeyCodeKind::Char('a')
-            },
-            mods: Modifiers {
-                ctrl: true,
-                alt: true,
-                shift: false,
-            }
-        })
-    );
-}
-
-#[test]
-fn key_notation_parser_empty_returns_none() {
-    assert!(parse_key("").is_none());
-    assert!(parse_key("   ").is_none());
-}
-
-#[test]
-fn key_notation_parser_invalid_returns_none() {
-    assert!(parse_key("xyz").is_none()); // Multiple characters
-    assert!(parse_key("F0").is_none()); // F0 is invalid
-    assert!(parse_key("F25").is_none()); // F25 is invalid
-    assert!(parse_key("<C-").is_none());
-    assert!(parse_key("<A-").is_none());
-    assert!(parse_key("<S-").is_none());
-    assert!(parse_key("<C-A-S-").is_none());
-    assert!(parse_key("<C-a").is_none());
-    assert!(parse_key("<Enter").is_none());
-}
-
-#[test]
-fn chord_parser_basic() {
-    let keys = parse_chord("gg");
-    assert_eq!(keys.len(), 2);
-    assert_eq!(
-        keys[0],
-        KeyInput {
-            code: KeyCode {
-                kind: KeyCodeKind::Char('g')
-            },
-            mods: Modifiers::default()
-        }
-    );
-    assert_eq!(
-        keys[1],
-        KeyInput {
-            code: KeyCode {
-                kind: KeyCodeKind::Char('g')
-            },
-            mods: Modifiers::default()
-        }
-    );
-}
-
-#[test]
-fn chord_parser_with_count() {
-    let keys = parse_chord("3j");
-    assert_eq!(keys.len(), 2);
-    assert_eq!(
-        keys[0],
-        KeyInput {
-            code: KeyCode {
-                kind: KeyCodeKind::Char('3')
-            },
-            mods: Modifiers::default()
-        }
-    );
-    assert_eq!(
-        keys[1],
-        KeyInput {
-            code: KeyCode {
-                kind: KeyCodeKind::Char('j')
-            },
-            mods: Modifiers::default()
-        }
-    );
-}
-
-#[test]
-fn key_notation_parser_multi_digit_count() {
-    let keys = parse_chord("10j");
-
-    assert_eq!(keys.len(), 3);
-    assert_eq!(keys[0].code.kind, KeyCodeKind::Char('1'));
-    assert_eq!(keys[1].code.kind, KeyCodeKind::Char('0'));
-    assert_eq!(keys[2].code.kind, KeyCodeKind::Char('j'));
-}
-
-#[test]
-fn key_notation_parser_bare_esc_in_sequence() {
-    let keys = parse_chord("iHelloEsc");
-
-    assert_eq!(keys.len(), 7);
-    assert_eq!(keys.last().map(|key| key.code.kind), Some(KeyCodeKind::Esc));
-}
-
-#[test]
-fn key_notation_parser_bare_esc_preserves_following_key() {
-    let keys = parse_chord("Escj");
-
-    assert_eq!(keys.len(), 2);
-    assert_eq!(keys[0].code.kind, KeyCodeKind::Esc);
-    assert_eq!(keys[1].code.kind, KeyCodeKind::Char('j'));
-}
-
-#[test]
-fn chord_parser_empty() {
-    let keys = parse_chord("");
-    assert!(keys.is_empty());
-}
-
-#[test]
-fn hjkl_types_do_not_leak() {
-    // Compile-time check: the public API must not expose any hjkl types.
-    // This test verifies that `EditorSession` and its methods use only
-    // oom-edit-core types, not hjkl types.
-    //
-    // If this test compiles, the check passes. If any hjkl type leaks
-    // into a public signature, the compiler will reject it.
-    fn assert_session_is_hjkl_free(session: &EditorSession) {
-        let _ = session.mode();
-        let _ = session.document();
-        let _ = session.cursor();
-        let _ = session.selections();
-        let _ = session.is_dirty();
-        let _ = session.line_count();
+fn rendered_navigation_and_search_update_canonical_source() {
+    let mut session =
+        EditorSession::from_text("# One\n\nTwo\n\n# Links\n\n[link](https://example.test)\n");
+    session.render_layout(32);
+    session.handle_key(key('j'));
+    session.handle_key(key('j'));
+    assert_eq!(session.cursor(), (2, 0));
+    session.handle_key(special(KeyCodeKind::Tab));
+    assert!(session.rendered_cursor_line() > 0);
+    let before_gg = session.rendered_cursor_line();
+    session.handle_key(key('g'));
+    assert_eq!(session.rendered_cursor_line(), before_gg);
+    session.handle_key(key('g'));
+    assert_eq!(session.cursor(), (0, 2));
+    session.handle_key(key('G'));
+    assert!(session.cursor().0 >= 4);
+    session.handle_key(key('/'));
+    for ch in "Two".chars() {
+        session.handle_key(key(ch));
     }
-    // Suppress unused variable warning
-    let _ = assert_session_is_hjkl_free;
-}
-
-// ── Conformance part 1: FR-1.1 through FR-1.4 ─────────────────────────────
-
-/// Test fixture: a simple 3-line markdown document.
-const FIXTURE_3LINES: &str = "line one\nline two\nline three";
-
-/// Test fixture: a 5-line document for motion tests.
-const FIXTURE_5LINES: &str = "first\nsecond\nthird\nfourth\nfifth";
-
-#[test]
-fn fr_1_1_initial_state_is_normal_mode() {
-    let sess = session(FIXTURE_3LINES);
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Normal);
+    session.handle_key(special(KeyCodeKind::Enter));
+    assert_eq!(session.cursor(), (2, 0));
 }
 
 #[test]
-fn fr_1_2_enter_insert_mode_i() {
-    let mut sess = session(FIXTURE_3LINES);
-    let effects = feed(&mut sess, "i");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Insert);
-    // Should have emitted a ModeChanged effect
+fn select_forward_reverse_swap_and_escape() {
+    let text = "one\ntwo\nthree\n";
+    let mut session = EditorSession::from_text(text);
+    session.render_layout(40);
+    session.handle_key(key('V'));
+    session.handle_key(key('j'));
+    let before_swap = session.rendered_selection().unwrap();
+    session.handle_key(key('o'));
+    let after_swap = session.rendered_selection().unwrap();
+    assert_eq!(before_swap.anchor, after_swap.active);
+    assert_eq!(before_swap.active, after_swap.anchor);
+    assert_eq!(before_swap.source_ranges, after_swap.source_ranges);
+    session.handle_key(special(KeyCodeKind::Esc));
+    assert_eq!(
+        (session.mode(), session.document()),
+        (Mode::Normal, text.to_string())
+    );
+
+    let mut shapes = EditorSession::from_text("alpha\n\nbeta\n");
+    shapes.render_layout(40);
+    shapes.handle_key(key('v'));
+    assert_eq!(
+        shapes.rendered_selection().unwrap().shape,
+        SelectionShape::Character
+    );
+    shapes.handle_key(key('l'));
+    assert!(shapes.rendered_selection().unwrap().source_ranges[0].len() > 1);
+    shapes.handle_key(key('V'));
+    assert_eq!(
+        shapes.rendered_selection().unwrap().shape,
+        SelectionShape::Line
+    );
+    shapes.handle_key(ctrl('v'));
+    assert_eq!(
+        shapes.rendered_selection().unwrap().shape,
+        SelectionShape::Block
+    );
+    shapes.handle_key(ctrl('v'));
+    assert_eq!(shapes.mode(), Mode::Normal);
+
+    shapes.handle_key(key('v'));
+    shapes.handle_key(ctrl('c'));
+    assert_eq!(shapes.mode(), Mode::Normal);
+}
+
+#[test]
+fn select_shape_projections_are_exact() {
+    let mut character = EditorSession::from_text("abcd\n");
+    character.render_layout(40);
+    character.handle_key(key('v'));
+    character.handle_key(key('l'));
+    let selection = character.rendered_selection().unwrap();
+    assert_eq!(selection.shape, SelectionShape::Character);
+    assert_eq!(selection.source_ranges, vec![0..2]);
+    assert_eq!(selection.rows[0].columns, 0..2);
+
+    let wrapped_text = "alpha beta gamma delta\n";
+    let mut line = EditorSession::from_text(wrapped_text);
+    let rendered_rows = line.render_layout(8).lines.len();
+    assert!(rendered_rows > 1);
+    line.handle_key(key('V'));
+    let selection = line.rendered_selection().unwrap();
+    assert_eq!(selection.shape, SelectionShape::Line);
+    assert_eq!(selection.source_ranges, vec![0..wrapped_text.len()]);
+    assert_eq!(selection.rows.len(), rendered_rows);
+    assert!(selection
+        .rows
+        .iter()
+        .all(|row| row.columns.start == 0 && row.columns.start < row.columns.end));
+
+    let mut block = EditorSession::from_text("abcd\n\nwxyz\n");
+    block.render_layout(40);
+    block.handle_key(ctrl('v'));
+    block.handle_key(key('l'));
+    block.handle_key(key('j'));
+    block.handle_key(key('j'));
+    let selection = block.rendered_selection().unwrap();
+    assert_eq!(selection.shape, SelectionShape::Block);
+    assert_eq!(selection.source_ranges, vec![0..2, 6..8]);
+    assert_eq!(selection.block_width, Some(2));
+    assert_eq!(
+        selection
+            .rows
+            .iter()
+            .map(|row| row.columns.clone())
+            .collect::<Vec<_>>(),
+        vec![0..2, 0..2, 0..2]
+    );
+
+    let mut empty = EditorSession::from_text("one\n\ntwo\n");
+    empty.render_layout(40);
+    empty.handle_key(key('j'));
+    empty.handle_key(key('v'));
+    assert!(empty.rendered_selection().unwrap().source_ranges.is_empty());
+}
+
+#[test]
+fn select_required_motion_surface() {
+    for (motion, column, source_column, ranges) in [
+        (key('l'), 1, 1, 0..2),
+        (special(KeyCodeKind::Right), 1, 1, 0..2),
+        (key('w'), 6, 6, 0..7),
+        (key('W'), 6, 6, 0..7),
+        (key('e'), 4, 4, 0..5),
+        (key('E'), 4, 4, 0..5),
+        (key('$'), 21, 21, 0..22),
+    ] {
+        let mut session = EditorSession::from_text("alpha beta-gamma delta\n");
+        session.render_layout(40);
+        session.handle_key(key('v'));
+        session.handle_key(motion);
+        let selection = session.rendered_selection().unwrap();
+        assert_eq!(
+            selection.active,
+            oom_edit_core::RenderedPoint { row: 0, column },
+            "{motion:?}"
+        );
+        assert_eq!(session.cursor(), (0, source_column), "{motion:?}");
+        assert_eq!(
+            selection.source_ranges.as_slice(),
+            std::slice::from_ref(&ranges),
+            "{motion:?}"
+        );
+    }
+
+    for (motion, column, source_column, ranges) in [
+        (key('h'), 20, 20, 20..22),
+        (special(KeyCodeKind::Left), 20, 20, 20..22),
+        (key('b'), 17, 17, 17..22),
+        (key('B'), 17, 17, 17..22),
+        (key('0'), 0, 0, 0..22),
+        (key('^'), 0, 0, 0..22),
+    ] {
+        let mut session = EditorSession::from_text("alpha beta-gamma delta\n");
+        session.render_layout(40);
+        session.handle_key(key('$'));
+        session.handle_key(key('v'));
+        session.handle_key(motion);
+        let selection = session.rendered_selection().unwrap();
+        assert_eq!(
+            selection.active,
+            oom_edit_core::RenderedPoint { row: 0, column },
+            "{motion:?}"
+        );
+        assert_eq!(session.cursor(), (0, source_column), "{motion:?}");
+        assert_eq!(
+            selection.source_ranges.as_slice(),
+            std::slice::from_ref(&ranges),
+            "{motion:?}"
+        );
+    }
+
+    let document = (1..=24)
+        .map(|number| format!("paragraph {number}\n\n"))
+        .collect::<String>();
+    for (motion, row, source, range_count, last_end) in [
+        (key('j'), 1, (0, 0), 1, 11),
+        (special(KeyCodeKind::Down), 1, (0, 0), 1, 11),
+        (ctrl('d'), 23, (22, 0), 12, 157),
+        (ctrl('f'), 46, (46, 0), 24, 314),
+        (key('G'), 46, (46, 0), 24, 314),
+        (key('}'), 1, (0, 0), 1, 11),
+    ] {
+        let mut session = EditorSession::from_text(&document);
+        session.render_layout(20);
+        session.handle_key(key('v'));
+        session.handle_key(motion);
+        let selection = session.rendered_selection().unwrap();
+        assert_eq!(
+            selection.active,
+            oom_edit_core::RenderedPoint { row, column: 0 },
+            "{motion:?}"
+        );
+        assert_eq!(session.cursor(), source, "{motion:?}");
+        assert_eq!(selection.source_ranges.len(), range_count, "{motion:?}");
+        assert_eq!(
+            selection.source_ranges.first().unwrap().start,
+            0,
+            "{motion:?}"
+        );
+        assert_eq!(
+            selection.source_ranges.last().unwrap().end,
+            last_end,
+            "{motion:?}"
+        );
+    }
+
+    for (motion, row, source, range_count, first_start) in [
+        (key('k'), 45, (44, 0), 1, 313),
+        (special(KeyCodeKind::Up), 45, (44, 0), 1, 313),
+        (ctrl('u'), 23, (22, 0), 12, 159),
+        (ctrl('b'), 0, (0, 0), 24, 0),
+        (key('{'), 45, (44, 0), 1, 313),
+    ] {
+        let mut session = EditorSession::from_text(&document);
+        session.render_layout(20);
+        session.handle_key(key('G'));
+        session.handle_key(key('v'));
+        session.handle_key(motion);
+        let selection = session.rendered_selection().unwrap();
+        assert_eq!(
+            selection.active,
+            oom_edit_core::RenderedPoint { row, column: 0 },
+            "{motion:?}"
+        );
+        assert_eq!(session.cursor(), source, "{motion:?}");
+        assert_eq!(selection.source_ranges.len(), range_count, "{motion:?}");
+        assert_eq!(
+            selection.source_ranges.first().unwrap().start,
+            first_start,
+            "{motion:?}"
+        );
+        assert_eq!(
+            selection.source_ranges.last().unwrap().end,
+            314,
+            "{motion:?}"
+        );
+    }
+
+    let mut gg = EditorSession::from_text(&document);
+    gg.render_layout(20);
+    gg.handle_key(key('G'));
+    gg.handle_key(key('v'));
+    gg.handle_key(key('g'));
+    gg.handle_key(key('g'));
+    let selection = gg.rendered_selection().unwrap();
+    assert_eq!(
+        selection.active,
+        oom_edit_core::RenderedPoint { row: 0, column: 0 }
+    );
+    assert_eq!(gg.cursor(), (0, 0));
+    assert_eq!(selection.source_ranges.len(), 24);
+    assert_eq!(selection.source_ranges.first().unwrap().start, 0);
+    assert_eq!(selection.source_ranges.last().unwrap().end, 314);
+
+    let mut search = EditorSession::from_text("one\n\ntarget\n");
+    search.render_layout(20);
+    search.handle_key(key('v'));
+    search.handle_key(key('/'));
+    for character in "target".chars() {
+        search.handle_key(key(character));
+    }
+    search.handle_key(special(KeyCodeKind::Enter));
+    let selection = search.rendered_selection().unwrap();
+    assert_eq!(
+        selection.active,
+        oom_edit_core::RenderedPoint { row: 2, column: 0 }
+    );
+    assert_eq!(search.cursor(), (2, 0));
+    assert_eq!(selection.source_ranges, vec![0..3, 5..6]);
+
+    let mut jump = EditorSession::from_text("before\n\n[link](https://example.test)\n");
+    jump.render_layout(40);
+    jump.handle_key(key('v'));
+    jump.handle_key(special(KeyCodeKind::Tab));
+    let selection = jump.rendered_selection().unwrap();
+    assert_eq!(
+        selection.active,
+        oom_edit_core::RenderedPoint { row: 2, column: 0 }
+    );
+    assert_eq!(jump.cursor(), (2, 1));
+    assert_eq!(selection.source_ranges, vec![0..6, 9..10]);
+
+    let mut desired = EditorSession::from_text("abcdefghij\n\nxy\n\nabcdefghij\n");
+    desired.render_layout(40);
+    desired.handle_key(key('$'));
+    desired.handle_key(key('v'));
+    for _ in 0..4 {
+        desired.handle_key(key('j'));
+    }
+    assert_eq!(desired.rendered_selection().unwrap().active.column, 9);
+}
+
+#[test]
+fn select_metadata_intervals_and_styles() {
+    let text = "---\ntitle: Example\n---\n\nbody\n";
+    let mut session = EditorSession::from_text(text);
+    let before = session.render_layout(40).clone();
+    session.handle_key(key('j'));
+    session.handle_key(key('v'));
+    session.handle_key(key('l'));
+    let selection = session.rendered_selection().unwrap();
+    assert_eq!(selection.shape, SelectionShape::Character);
+    assert_eq!(selection.rows.len(), 1);
+    assert_eq!(
+        selection.rows[0].columns.end - selection.rows[0].columns.start,
+        2
+    );
+    assert!(selection.source_ranges.iter().all(|range| {
+        range.start < range.end && range.end <= text.len() && !text[range.clone()].contains('│')
+    }));
+    let selected_row = selection.rows[0].row;
+    let after = session.rendered_layout().unwrap();
+    assert_eq!(
+        after.lines[selected_row].role,
+        oom_edit_core::RenderedLineRole::Metadata
+    );
+    assert_eq!(
+        after.lines[selected_row].styled,
+        before.lines[selected_row].styled
+    );
+    assert!(!after.lines[selected_row].styled.spans.is_empty());
+}
+
+#[test]
+fn select_operators_registers_put_and_history_conform() {
+    let mut session = EditorSession::from_text("# one\n# two\n# three\n");
+    session.render_layout(40);
+    session.handle_key(key('V'));
+    session.handle_key(key('"'));
+    session.handle_key(key('+'));
+    let effects = session.handle_key(key('y'));
     assert!(effects
         .iter()
-        .any(|e| matches!(e, Effect::ModeChanged(oom_edit_core::session::Mode::Insert))));
+        .any(|effect| matches!(effect, Effect::ClipboardWrite(text) if text == "# one\n")));
+
+    session.handle_key(key('V'));
+    session.handle_key(key('d'));
+    assert_eq!(session.document(), "# two\n# three\n");
+    session.render_layout(40);
+    session.handle_key(key('P'));
+    assert_eq!(session.document(), "# one\n# two\n# three\n");
+    session.handle_key(key('u'));
+    assert_eq!(session.document(), "# two\n# three\n");
+    session.handle_key(ctrl('r'));
+    assert_eq!(session.document(), "# one\n# two\n# three\n");
+
+    let mut named = EditorSession::from_text("abcd\n");
+    named.render_layout(40);
+    named.handle_key(key('v'));
+    named.handle_key(key('l'));
+    named.handle_key(key('"'));
+    named.handle_key(key('a'));
+    named.handle_key(key('y'));
+    named.handle_key(key('"'));
+    named.handle_key(key('a'));
+    named.handle_key(key('p'));
+    assert_eq!(named.document().len(), "abcd\n".len() + 2);
+
+    for register in ['d', 'v', 'o', 'y', 'c', 'x'] {
+        let mut named = EditorSession::from_text("abcd\n");
+        named.render_layout(40);
+        named.handle_key(key('v'));
+        named.handle_key(key('l'));
+        named.handle_key(key('"'));
+        named.handle_key(key(register));
+        named.handle_key(key('y'));
+        assert_eq!(named.document(), "abcd\n", "register {register}");
+        named.render_layout(40);
+        named.handle_key(key('g'));
+        named.handle_key(key('g'));
+        named.handle_key(key('0'));
+        named.handle_key(key('"'));
+        named.handle_key(key(register));
+        named.handle_key(key('P'));
+        assert_eq!(named.document(), "ababcd\n", "register {register}");
+    }
+
+    let mut numbered = EditorSession::from_text("# one\n# two\n");
+    numbered.render_layout(40);
+    numbered.handle_key(key('V'));
+    numbered.handle_key(key('d'));
+    numbered.render_layout(40);
+    numbered.handle_key(key('"'));
+    numbered.handle_key(key('1'));
+    numbered.handle_key(key('P'));
+    assert_eq!(numbered.document(), "# one\n# two\n");
+
+    let mut small_delete = EditorSession::from_text("abcd\n");
+    small_delete.render_layout(40);
+    small_delete.handle_key(key('v'));
+    small_delete.handle_key(key('l'));
+    small_delete.handle_key(key('d'));
+    small_delete.render_layout(40);
+    small_delete.handle_key(key('"'));
+    small_delete.handle_key(key('-'));
+    small_delete.handle_key(key('P'));
+    assert_eq!(small_delete.document(), "abcd\n");
+
+    let mut black_hole = EditorSession::from_text("# one\n# two\n");
+    black_hole.render_layout(40);
+    black_hole.handle_key(key('V'));
+    black_hole.handle_key(key('y'));
+    black_hole.render_layout(40);
+    black_hole.handle_key(key('j'));
+    black_hole.handle_key(key('j'));
+    black_hole.handle_key(key('V'));
+    black_hole.handle_key(key('"'));
+    black_hole.handle_key(key('_'));
+    black_hole.handle_key(key('d'));
+    assert_eq!(black_hole.document(), "# one\n");
+    black_hole.render_layout(40);
+    black_hole.handle_key(key('p'));
+    assert!(!black_hole.document().contains("# two"));
+    assert_eq!(black_hole.document().matches("# one").count(), 2);
+
+    let mut empty = EditorSession::from_text("one\n\ntwo\n");
+    empty.render_layout(40);
+    empty.handle_key(key('j'));
+    empty.handle_key(key('v'));
+    assert!(empty.rendered_selection().unwrap().source_ranges.is_empty());
+    empty.handle_key(key('c'));
+    assert_eq!(
+        (empty.mode(), empty.document()),
+        (Mode::Select, "one\n\ntwo\n".into())
+    );
+    assert!(!empty.is_dirty());
 }
 
 #[test]
-fn fr_1_3_enter_insert_mode_a() {
-    let mut sess = session(FIXTURE_3LINES);
-    let _effects = feed(&mut sess, "a");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Insert);
+fn select_delete_x_change_indent_and_outdent_conform() {
+    let mut delete = EditorSession::from_text("# one\n# two\n");
+    delete.render_layout(40);
+    delete.handle_key(key('V'));
+    delete.handle_key(key('x'));
+    assert_eq!(delete.document(), "# two\n");
+
+    let mut change = EditorSession::from_text("# one\n# two\n");
+    change.render_layout(40);
+    change.handle_key(key('V'));
+    change.handle_key(key('c'));
+    assert_eq!(change.mode(), Mode::Insert);
+
+    let mut indent = EditorSession::from_text("# one\n# two\n");
+    indent.render_layout(40);
+    indent.handle_key(key('V'));
+    indent.handle_key(key('j'));
+    indent.handle_key(key('j'));
+    indent.handle_key(key('>'));
+    assert_eq!(indent.document(), "    # one\n    # two\n");
+    indent.render_layout(40);
+    indent.handle_key(key('V'));
+    indent.handle_key(key('j'));
+    indent.handle_key(key('j'));
+    indent.handle_key(key('<'));
+    assert_eq!(indent.document(), "# one\n# two\n");
 }
 
 #[test]
-fn fr_1_4_exit_insert_mode_esc() {
-    let mut sess = session(FIXTURE_3LINES);
-    // Enter insert mode
-    feed(&mut sess, "i");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Insert);
-    // Exit with Esc
-    let effects = feed(&mut sess, "Esc");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Normal);
-    assert!(effects
-        .iter()
-        .any(|e| matches!(e, Effect::ModeChanged(oom_edit_core::session::Mode::Normal))));
-}
+fn select_shape_operator_matrix_conforms() {
+    for shape in [
+        SelectionShape::Character,
+        SelectionShape::Line,
+        SelectionShape::Block,
+    ] {
+        for operator in ['y', 'd', 'x', 'c'] {
+            let (text, payload, deleted) = match shape {
+                SelectionShape::Character => ("abcd\n", "ab", "cd\n"),
+                SelectionShape::Line => ("# one\n# two\n", "# one\n", "# two\n"),
+                SelectionShape::Block => ("abcd\n\nwxyz\n", "ab\n\nwx", "cd\n\nyz\n"),
+            };
+            let mut session = EditorSession::from_text(text);
+            session.render_layout(40);
+            match shape {
+                SelectionShape::Character => {
+                    session.handle_key(key('v'));
+                    session.handle_key(key('l'));
+                }
+                SelectionShape::Line => {
+                    session.handle_key(key('V'));
+                }
+                SelectionShape::Block => {
+                    session.handle_key(ctrl('v'));
+                    session.handle_key(key('l'));
+                    session.handle_key(key('j'));
+                    session.handle_key(key('j'));
+                }
+            }
+            session.handle_key(key('"'));
+            session.handle_key(key('+'));
+            let effects = session.handle_key(key(operator));
+            assert!(effects.iter().any(
+                |effect| matches!(effect, Effect::ClipboardWrite(actual) if actual == payload)
+            ));
+            if operator == 'y' {
+                assert_eq!(session.document(), text, "{shape:?}/{operator}");
+                assert_eq!(session.mode(), Mode::Normal, "{shape:?}/{operator}");
+            } else {
+                assert_eq!(session.document(), deleted, "{shape:?}/{operator}");
+                assert_eq!(session.cursor(), (0, 0), "{shape:?}/{operator}");
+                assert_eq!(
+                    session.mode(),
+                    if operator == 'c' {
+                        Mode::Insert
+                    } else {
+                        Mode::Normal
+                    },
+                    "{shape:?}/{operator}"
+                );
+            }
+        }
+    }
 
-// ── V-M motions: cursor movement ──────────────────────────────────────────
+    for (shape, text, expected) in [
+        (SelectionShape::Character, "abcd\n", "ababcd\n"),
+        (
+            SelectionShape::Line,
+            "# one\n# two\n",
+            "# one\n# one\n# two\n",
+        ),
+        (
+            SelectionShape::Block,
+            "abcd\n\nwxyz\n",
+            "ababcd\n\nwxwxyz\n",
+        ),
+    ] {
+        let mut session = EditorSession::from_text(text);
+        session.render_layout(40);
+        match shape {
+            SelectionShape::Character => {
+                session.handle_key(key('v'));
+                session.handle_key(key('l'));
+            }
+            SelectionShape::Line => {
+                session.handle_key(key('V'));
+            }
+            SelectionShape::Block => {
+                session.handle_key(ctrl('v'));
+                session.handle_key(key('l'));
+                session.handle_key(key('j'));
+                session.handle_key(key('j'));
+            }
+        }
+        session.handle_key(key('y'));
+        session.render_layout(40);
+        session.handle_key(key('g'));
+        session.handle_key(key('g'));
+        session.handle_key(key('0'));
+        session.handle_key(key('P'));
+        assert_eq!(session.document(), expected, "{shape:?} put shape");
+        session.handle_key(key('u'));
+        assert_eq!(session.document(), text, "{shape:?} put undo");
+    }
 
-#[test]
-fn v_m_h_left_arrow() {
-    let mut sess = session(FIXTURE_5LINES);
-    // Move to end of first line
-    feed(&mut sess, "$");
-    let (row, start_col) = sess.cursor();
-    assert_eq!(row, 0);
-    // Move left 4 times
-    feed(&mut sess, "hhhh");
-    let (row, end_col) = sess.cursor();
-    assert_eq!(row, 0);
-    assert!(end_col < start_col, "cursor should have moved left");
-}
-
-#[test]
-fn v_m_j_down_arrow() {
-    let mut sess = session(FIXTURE_5LINES);
-    // Move down 3 times
-    feed(&mut sess, "jjj");
-    let (row, _col) = sess.cursor();
-    assert_eq!(row, 3);
-}
-
-#[test]
-fn v_m_k_up_arrow() {
-    let mut sess = session(FIXTURE_5LINES);
-    // Move down to last line
-    feed(&mut sess, "G");
-    let (row, _) = sess.cursor();
-    assert_eq!(row, 4);
-    // Move up 2 times
-    feed(&mut sess, "kk");
-    let (row, _) = sess.cursor();
-    assert_eq!(row, 2);
-}
-
-#[test]
-fn v_m_l_right_arrow() {
-    let mut sess = session(FIXTURE_5LINES);
-    // Move right 3 times
-    feed(&mut sess, "lll");
-    let (row, col) = sess.cursor();
-    assert_eq!(row, 0);
-    assert_eq!(col, 3);
-}
-
-#[test]
-fn v_m_arrow_keys() {
-    let mut sess = session("abc\ndef");
-    feed(&mut sess, "<Right>");
-    assert_eq!(sess.cursor(), (0, 1));
-    feed(&mut sess, "<Down>");
-    assert_eq!(sess.cursor(), (1, 1));
-    feed(&mut sess, "<Left>");
-    assert_eq!(sess.cursor(), (1, 0));
-    feed(&mut sess, "<Up>");
-    assert_eq!(sess.cursor(), (0, 0));
-}
-
-#[test]
-fn v_m_0_first_non_blank() {
-    let mut sess = session(FIXTURE_5LINES);
-    // Move to end of line
-    feed(&mut sess, "$");
-    // Move to first non-blank
-    feed(&mut sess, "0");
-    let (row, col) = sess.cursor();
-    assert_eq!(row, 0);
-    assert_eq!(col, 0);
-}
-
-#[test]
-fn v_m_dollar_end_of_line() {
-    let mut sess = session(FIXTURE_5LINES);
-    feed(&mut sess, "$");
-    let (row, col) = sess.cursor();
-    // hjkl's $ moves to the last character (col = line_length - 1)
-    let line_len = FIXTURE_5LINES.lines().next().unwrap().chars().count();
-    assert_eq!(row, 0);
-    assert_eq!(col, line_len.saturating_sub(1));
-}
-
-#[test]
-fn v_m_gg_first_line() {
-    let mut sess = session(FIXTURE_5LINES);
-    // Move to last line first
-    feed(&mut sess, "G");
-    assert_eq!(sess.cursor().0, 4);
-    // Move to first line
-    feed(&mut sess, "gg");
-    assert_eq!(sess.cursor().0, 0);
-}
-
-#[test]
-fn v_m_g_last_line() {
-    let mut sess = session(FIXTURE_5LINES);
-    feed(&mut sess, "G");
-    assert_eq!(sess.cursor().0, 4);
+    let mut block = EditorSession::from_text("abcd\n\nwxyz\n");
+    block.render_layout(40);
+    block.handle_key(ctrl('v'));
+    block.handle_key(key('l'));
+    block.handle_key(key('j'));
+    block.handle_key(key('j'));
+    block.handle_key(key('d'));
+    assert_eq!(block.document(), "cd\n\nyz\n");
+    block.handle_key(key('u'));
+    assert_eq!(block.document(), "abcd\n\nwxyz\n");
+    block.handle_key(ctrl('r'));
+    assert_eq!(block.document(), "cd\n\nyz\n");
 }
 
 #[test]
-fn v_m_h_top_of_screen() {
-    let mut sess = session(FIXTURE_5LINES);
-    // Move to middle of document
-    feed(&mut sess, "2j");
-    // Move to top of screen
-    feed(&mut sess, "H");
-    assert_eq!(sess.cursor().0, 0);
+fn rendered_character_operators_preserve_unselected_markdown_syntax() {
+    let cases = [
+        ("\\*escaped\\*\n", 8, "\\*escaped\\*", "\n"),
+        ("*emphasis*\n", 7, "emphasis", "**\n"),
+        ("`code`\n", 3, "code", "``\n"),
+        (
+            "[label](https://example.test)\n",
+            4,
+            "label",
+            "[](https://example.test)\n",
+        ),
+        ("![alt](image.png)\n", 2, "alt", "![](image.png)\n"),
+        ("**[nested](target)**\n", 5, "nested", "**[](target)**\n"),
+    ];
+
+    for (source, right_moves, payload, deleted) in cases {
+        for operator in ['y', 'd', 'c'] {
+            let mut session = EditorSession::from_text(source);
+            session.render_layout(80);
+            session.handle_key(key('v'));
+            for _ in 0..right_moves {
+                session.handle_key(key('l'));
+            }
+            session.handle_key(key('"'));
+            session.handle_key(key('+'));
+            let effects = session.handle_key(key(operator));
+            assert!(effects.iter().any(
+                |effect| matches!(effect, Effect::ClipboardWrite(actual) if actual == payload)
+            ));
+            assert_eq!(
+                session.document(),
+                if operator == 'y' { source } else { deleted },
+                "{source:?}/{operator}"
+            );
+            assert_eq!(
+                session.mode(),
+                if operator == 'c' {
+                    Mode::Insert
+                } else {
+                    Mode::Normal
+                },
+                "{source:?}/{operator}"
+            );
+
+            let document = session.document();
+            for range in session
+                .render_layout(80)
+                .lines
+                .iter()
+                .flat_map(|line| &line.atoms)
+                .filter_map(|atom| atom.source.as_ref())
+            {
+                assert!(document.is_char_boundary(range.start));
+                assert!(document.is_char_boundary(range.end));
+            }
+        }
+    }
 }
 
 #[test]
-fn v_m_m_middle_of_screen() {
-    let mut sess = session(FIXTURE_5LINES);
-    // Move to middle of screen
-    feed(&mut sess, "M");
-    // Middle of 5 lines is line 2 (0-indexed)
-    assert_eq!(sess.cursor().0, 2);
+fn wide_block_registers_put_without_character_count_padding() {
+    let source = "- 東x\n- 大y\n";
+    let mut session = EditorSession::from_text(source);
+    session.render_layout(40);
+    session.handle_key(ctrl('v'));
+    session.handle_key(key('j'));
+    session.handle_key(key('y'));
+    session.render_layout(40);
+    session.handle_key(key('g'));
+    session.handle_key(key('g'));
+    session.handle_key(key('p'));
+    assert_eq!(session.document(), "- 東東x\n- 大大y\n");
+    session.handle_key(key('u'));
+    assert_eq!(session.document(), source);
+
+    session.render_layout(40);
+    session.handle_key(key('g'));
+    session.handle_key(key('g'));
+    session.handle_key(ctrl('v'));
+    session.handle_key(key('j'));
+    session.handle_key(key('d'));
+    assert_eq!(session.document(), "- x\n- y\n");
+    session.render_layout(40);
+    session.handle_key(key('P'));
+    assert_eq!(session.document(), source);
+
+    let mixed = "- 東\n- a\n\n- xx\n- yy\n";
+    let mut ragged = EditorSession::from_text(mixed);
+    ragged.render_layout(40);
+    ragged.handle_key(ctrl('v'));
+    ragged.handle_key(key('j'));
+    let selection = ragged.rendered_selection().unwrap();
+    assert_eq!(selection.block_width, Some(2));
+    assert_eq!(selection.source_ranges, vec![2..5, 8..9]);
+    ragged.handle_key(key('y'));
+    ragged.render_layout(40);
+    ragged.handle_key(key('/'));
+    ragged.handle_key(key('x'));
+    ragged.handle_key(key('x'));
+    ragged.handle_key(special(KeyCodeKind::Enter));
+    ragged.handle_key(key('P'));
+    assert_eq!(ragged.document(), "- 東\n- a\n\n- 東xx\n- a yy\n");
+
+    let mixed_prefixes = "- z\n- q\n\n- 東X\n- abY\n";
+    let mut aligned = EditorSession::from_text(mixed_prefixes);
+    aligned.render_layout(40);
+    aligned.handle_key(ctrl('v'));
+    aligned.handle_key(key('j'));
+    aligned.handle_key(key('y'));
+    aligned.render_layout(40);
+    aligned.handle_key(key('/'));
+    aligned.handle_key(key('X'));
+    aligned.handle_key(special(KeyCodeKind::Enter));
+    aligned.handle_key(key('l'));
+    aligned.handle_key(key('P'));
+    assert_eq!(aligned.document(), "- z\n- q\n\n- 東zX\n- abqY\n");
+
+    let combining_prefixes = "- z\n- q\n\n- a\u{301}X\n- b\u{301}Y\n";
+    let mut atomic = EditorSession::from_text(combining_prefixes);
+    atomic.render_layout(40);
+    atomic.handle_key(ctrl('v'));
+    atomic.handle_key(key('j'));
+    atomic.handle_key(key('y'));
+    atomic.render_layout(40);
+    atomic.handle_key(key('/'));
+    atomic.handle_key(key('X'));
+    atomic.handle_key(special(KeyCodeKind::Enter));
+    atomic.handle_key(key('l'));
+    atomic.handle_key(key('P'));
+    assert_eq!(
+        atomic.document(),
+        "- z\n- q\n\n- a\u{301}zX\n- b\u{301}qY\n"
+    );
 }
 
 #[test]
-fn v_m_l_bottom_of_screen() {
-    let mut sess = session(FIXTURE_5LINES);
-    // Move to top of document
-    feed(&mut sess, "gg");
-    // Move to bottom of screen
-    feed(&mut sess, "L");
-    assert_eq!(sess.cursor().0, 4);
+fn block_change_typing_is_one_undo_redo_transaction() {
+    let source = "- ax\n- by\n";
+    let mut session = EditorSession::from_text(source);
+    session.render_layout(40);
+    session.handle_key(ctrl('v'));
+    session.handle_key(key('j'));
+    session.handle_key(key('c'));
+    assert_eq!(session.mode(), Mode::Insert);
+    session.handle_key(key('Z'));
+    session.handle_key(special(KeyCodeKind::Esc));
+    let changed = session.document();
+    assert_eq!(changed, "- Zx\n- y\n");
+    session.handle_key(key('u'));
+    assert_eq!(session.document(), source);
+    session.handle_key(ctrl('r'));
+    assert_eq!(session.document(), changed);
 }
 
 #[test]
-fn v_m_w_word_forward() {
-    let mut sess = session("hello world foo");
-    feed(&mut sess, "w");
-    let (row, col) = sess.cursor();
-    assert_eq!(row, 0);
-    assert_eq!(col, 6); // Start of "world"
+fn all_mode_roundtrips_preserve_source_anchor() {
+    let mut session = EditorSession::from_text("# One\n\nTwo\n");
+    move_to_text(&mut session, "Two", 40);
+    let source = session.cursor();
+    session.handle_key(key('v'));
+    session.handle_key(special(KeyCodeKind::Esc));
+    session.handle_key(key(':'));
+    session.handle_key(special(KeyCodeKind::Esc));
+    session.handle_key(key('i'));
+    session.handle_key(special(KeyCodeKind::Esc));
+    assert_eq!((session.mode(), session.cursor()), (Mode::Normal, source));
 }
 
 #[test]
-fn v_m_b_word_backward() {
-    let mut sess = session("hello world foo");
-    // Move to end
-    feed(&mut sess, "G");
-    feed(&mut sess, "0");
-    // Move back 2 words
-    feed(&mut sess, "bb");
-    let (row, col) = sess.cursor();
-    assert_eq!(row, 0);
-    assert!(col < 11); // Should be before "world"
+fn select_resize_preserves_exact_endpoint_provenance() {
+    let text = "alpha beta gamma delta epsilon\n";
+    let mut session = EditorSession::from_text(text);
+    session.render_layout(11);
+    session.handle_key(key('v'));
+    session.handle_key(key('w'));
+    assert_eq!(
+        session.rendered_selection().unwrap().source_ranges,
+        vec![0..7]
+    );
+
+    for width in [40, 7, 11] {
+        session.render_layout(width);
+        let selection = session.rendered_selection().unwrap();
+        let layout = session.rendered_layout().unwrap();
+        let point_source = |point: oom_edit_core::RenderedPoint| {
+            layout.lines[point.row]
+                .atoms
+                .iter()
+                .find(|atom| {
+                    atom.columns.contains(&point.column) || atom.columns.start == point.column
+                })
+                .and_then(|atom| atom.source.clone())
+        };
+        assert_eq!(point_source(selection.anchor), Some(0..1), "width {width}");
+        assert_eq!(point_source(selection.active), Some(6..7), "width {width}");
+        assert_eq!(selection.source_ranges, vec![0..7], "width {width}");
+
+        let mut painted_sources = selection
+            .rows
+            .iter()
+            .flat_map(|row| row.source_ranges.iter().cloned())
+            .collect::<Vec<_>>();
+        painted_sources.sort_by_key(|range| (range.start, range.end));
+        let mut normalized: Vec<std::ops::Range<usize>> = Vec::new();
+        for range in painted_sources {
+            if let Some(previous) = normalized.last_mut() {
+                if range.start <= previous.end {
+                    previous.end = previous.end.max(range.end);
+                    continue;
+                }
+            }
+            normalized.push(range);
+        }
+        let expected_painted = if width == 7 {
+            vec![0..5, 6..7]
+        } else {
+            std::iter::once(0..7).collect()
+        };
+        assert_eq!(normalized, expected_painted, "width {width}");
+    }
 }
 
 #[test]
-fn v_m_e_word_end() {
-    let mut sess = session("hello world");
-    feed(&mut sess, "e");
-    let (row, col) = sess.cursor();
-    assert_eq!(row, 0);
-    assert_eq!(col, 4); // End of "hello"
+fn collapsing_selected_metadata_cancels_the_hidden_projection() {
+    let text = "---\ntitle: Example\n---\n\nbody\n";
+    let mut session = EditorSession::from_text(text);
+    session.render_layout(40);
+    session.handle_key(key('j'));
+    session.handle_key(key('v'));
+    session.handle_key(key('l'));
+    assert!(!session
+        .rendered_selection()
+        .unwrap()
+        .source_ranges
+        .is_empty());
+
+    session.handle_key(key('z'));
+    session.render_layout(40);
+    assert_eq!(session.mode(), Mode::Normal);
+    assert!(session.rendered_selection().is_none());
+    session.handle_key(key('d'));
+    assert_eq!(session.document(), text);
 }
 
 #[test]
-fn v_m_find_char() {
-    let mut sess = session("hello world");
-    feed(&mut sess, "fw");
-    let (row, col) = sess.cursor();
-    assert_eq!(row, 0);
-    assert_eq!(col, 6); // Position of 'w' in "world"
+fn inherited_wrapped_rows_map_to_one_source_operation() {
+    let text =
+        "A paragraph with enough words to wrap across several narrow rendered rows.\n\nnext\n";
+    let mut session = EditorSession::from_text(text);
+    session.render_layout(12);
+    session.handle_key(key('V'));
+    session.handle_key(key('j'));
+    session.handle_key(key('j'));
+    assert_eq!(
+        &text[session.rendered_selection().unwrap().source_ranges[0].clone()],
+        "A paragraph with enough words to wrap across several narrow rendered rows.\n"
+    );
+    session.handle_key(key('d'));
+    assert_eq!(session.document(), "\nnext\n");
 }
 
 #[test]
-fn v_m_repeat_find() {
-    let mut sess = session("hello world world");
-    feed(&mut sess, "fw");
-    // Repeat find with ;
-    feed(&mut sess, ";");
-    let (row, col) = sess.cursor();
-    assert_eq!(row, 0);
-    assert_eq!(col, 12); // Position of second 'w'
-}
-
-#[test]
-fn v_m_repeat_find_reverse() {
-    let mut sess = session("hello world foo");
-    feed(&mut sess, "fw");
-    // Reverse find with ,
-    feed(&mut sess, ",");
-    let (row, col) = sess.cursor();
-    assert_eq!(row, 0);
-    assert_eq!(col, 6); // Back to 'w' in "world"
-}
-
-#[test]
-fn v_m_block_cursor_movement() {
-    let mut sess = session("abc\ndef\nghi");
-    // Move to bottom-right
-    feed(&mut sess, "G");
-    feed(&mut sess, "$");
-    // Move up with k
-    feed(&mut sess, "k");
-    let (row, col) = sess.cursor();
-    assert_eq!(row, 1);
-    assert_eq!(col, 2);
-}
-
-#[test]
-fn v_m_count_aware_movement() {
-    let mut sess = session("line1\nline2\nline3\nline4\nline5");
-    // Move down 3 lines
-    feed(&mut sess, "3j");
-    let (row, _) = sess.cursor();
-    assert_eq!(row, 3);
-}
-
-#[test]
-fn v_m_line_navigation() {
-    let mut sess = session("first\nsecond\nthird\nfourth\nfifth");
-    // Move to line 2 (0-indexed: line 1)
-    feed(&mut sess, "2gg");
-    let (row, _) = sess.cursor();
-    assert_eq!(row, 1);
-}
-
-#[test]
-fn v_m_cursor_stays_in_bounds() {
-    let mut sess = session(FIXTURE_5LINES);
-    // Try to move up from first line
-    feed(&mut sess, "k");
-    assert_eq!(sess.cursor().0, 0);
-    // Try to move down from last line
-    feed(&mut sess, "G");
-    feed(&mut sess, "j");
-    assert_eq!(sess.cursor().0, 4);
-}
-
-#[test]
-fn v_m_visual_mode_selection() {
-    let mut sess = session(FIXTURE_5LINES);
-    // Enter visual mode
-    feed(&mut sess, "v");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Visual);
-    // Move to select some text
-    feed(&mut sess, "3l");
-    let selections = sess.selections();
-    assert!(!selections.is_empty());
-}
-
-#[test]
-fn v_m_visual_line_mode() {
-    let mut sess = session(FIXTURE_5LINES);
-    // Enter visual line mode
-    feed(&mut sess, "V");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::VisualLine);
-}
-
-#[test]
-fn v_m_visual_block_mode() {
-    let mut sess = session("abc\ndef\nghi");
-    // Enter visual block mode
-    feed(&mut sess, "<C-v>");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::VisualBlock);
-}
-
-#[test]
-fn v_m_visual_block_cursor_movement() {
-    let mut sess = session("abc\ndef\nghi");
-    // Enter visual block mode
-    feed(&mut sess, "<C-v>");
-    // Move down
-    feed(&mut sess, "j");
-    let selections = sess.selections();
-    // Should have selections for multiple lines
-    assert!(!selections.is_empty());
-}
-
-// ── Conformance part 2: additional motion tests ───────────────────────────
-
-#[test]
-fn v_m_word_forward_big_word() {
-    let mut sess = session("hello_world foo-bar");
-    feed(&mut sess, "W");
-    let (row, col) = sess.cursor();
-    assert_eq!(row, 0);
-    assert_eq!(col, 12); // Start of "foo-bar" (big word ignores underscores)
-}
-
-#[test]
-fn v_m_word_backward_big_word() {
-    let mut sess = session("hello_world foo-bar");
-    // Move to end
-    feed(&mut sess, "G");
-    feed(&mut sess, "0");
-    // Move back 2 big words
-    feed(&mut sess, "BB");
-    let (row, col) = sess.cursor();
-    assert_eq!(row, 0);
-    assert!(col < 12);
-}
-
-#[test]
-fn v_m_word_end_big_word() {
-    let mut sess = session("hello_world foo-bar");
-    feed(&mut sess, "E");
-    let (row, col) = sess.cursor();
-    assert_eq!(row, 0);
-    // hjkl's E moves to last char of word (index 10 for 11-char "hello_world")
-    assert_eq!(col, 10);
-}
-
-#[test]
-fn v_m_sentence_forward() {
-    let mut sess = session("First sentence. Second sentence.");
-    feed(&mut sess, ")");
-    let (row, col) = sess.cursor();
-    assert_eq!(row, 0);
-    assert!(col > 0); // Moved to next sentence
-}
-
-#[test]
-fn v_m_sentence_backward() {
-    let mut sess = session("First sentence. Second sentence.");
-    // Move to end
-    feed(&mut sess, "G");
-    feed(&mut sess, "0");
-    feed(&mut sess, "bb");
-    feed(&mut sess, "(");
-    let (row, _) = sess.cursor();
-    assert_eq!(row, 0);
-}
-
-#[test]
-fn v_m_paragraph_forward() {
-    let mut sess = session("First paragraph.\n\nSecond paragraph.");
-    feed(&mut sess, "}");
-    let (row, _) = sess.cursor();
-    assert!(row > 0); // Moved to next paragraph
-}
-
-#[test]
-fn v_m_paragraph_backward() {
-    let mut sess = session("First paragraph.\n\nSecond paragraph.");
-    // Move to second paragraph
-    feed(&mut sess, "2gg");
-    feed(&mut sess, "0");
-    // Move back
-    feed(&mut sess, "{");
-    let (row, _) = sess.cursor();
-    assert_eq!(row, 0);
-}
-
-#[test]
-fn v_m_match_bracket() {
-    let mut sess = session("if (x > 0) { return x; }");
-    // Move to the opening parenthesis
-    feed(&mut sess, "ft");
-    feed(&mut sess, "l");
-    // Jump to matching bracket
-    feed(&mut sess, "%");
-    let (row, col) = sess.cursor();
-    assert_eq!(row, 0);
-    assert!(col > 10); // Should be at the closing brace
-}
-
-#[test]
-fn v_m_section_navigation() {
-    let mut sess = session("int main() {\n    // code\n}\n\nint helper() {\n    // more code\n}");
-    // Move to first section
-    feed(&mut sess, "gg");
-    feed(&mut sess, "0");
-    // Jump to next section
-    feed(&mut sess, "]]");
-    let (row, _) = sess.cursor();
-    assert!(row > 0);
-}
-
-#[test]
-fn v_m_find_char_backward() {
-    let mut sess = session("hello world");
-    // `Fw` finds the previous 'w' from the end of the line.
-    feed(&mut sess, "$Fw");
-    let (row, col) = sess.cursor();
-    assert_eq!(row, 0);
-    assert_eq!(col, 6);
-    assert!(col < 10, "F must move backward to the matching character");
-}
-
-#[test]
-fn v_m_find_char_till() {
-    let mut sess = session("hello world");
-    feed(&mut sess, "tw");
-    let (row, col) = sess.cursor();
-    assert_eq!(row, 0);
-    assert_eq!(col, 5); // Just before 'w' in "world"
-}
-
-#[test]
-fn v_m_find_char_till_backward() {
-    let mut sess = session("hello world!");
-    // `Tl` finds the previous 'l' and stops one character after it.
-    feed(&mut sess, "$Tl");
-    let (row, col) = sess.cursor();
-    assert_eq!(row, 0);
-    assert_eq!(col, 10);
-    assert!(col < 11, "T must move backward past the cursor");
-}
-
-#[test]
-fn v_m_first_non_blank() {
-    let mut sess = session("  hello  \n  world  ");
-    // Move to end of first line
-    feed(&mut sess, "$");
-    // `2_` — first non-blank of next line (vim: n_ moves n-1 lines down)
-    feed(&mut sess, "2_");
-    let (row, col) = sess.cursor();
-    assert_eq!(row, 1);
-    assert_eq!(col, 2); // First non-blank column
-}
-
-#[test]
-fn v_m_caret_first_non_blank() {
-    let mut sess = session("  hello");
-    feed(&mut sess, "$^");
-    assert_eq!(sess.cursor(), (0, 2));
-}
-
-#[test]
-fn v_m_goto_column() {
-    let mut sess = session("hello world");
-    // `6|` — hjkl uses 1-based column: `6|` → col 5 (0-indexed)
-    feed(&mut sess, "6|");
-    let (row, col) = sess.cursor();
-    assert_eq!(row, 0);
-    assert_eq!(col, 5);
-}
-
-#[test]
-fn v_m_line_start() {
-    let mut sess = session("  hello world");
-    // Move to line start
-    feed(&mut sess, "0");
-    let (row, col) = sess.cursor();
-    assert_eq!(row, 0);
-    assert_eq!(col, 0);
-}
-
-#[test]
-fn v_m_line_end() {
-    let mut sess = session("hello world");
-    feed(&mut sess, "$");
-    let (row, col) = sess.cursor();
-    // hjkl's $ moves to last character (col = length - 1)
-    assert_eq!(row, 0);
-    assert_eq!(col, 10);
-}
-
-#[test]
-fn v_m_file_top() {
-    let mut sess = session(FIXTURE_5LINES);
-    // Move to last line
-    feed(&mut sess, "G");
-    // Move to file top
-    feed(&mut sess, "gg");
-    assert_eq!(sess.cursor().0, 0);
-}
-
-#[test]
-fn v_m_file_bottom() {
-    let mut sess = session(FIXTURE_5LINES);
-    feed(&mut sess, "G");
-    assert_eq!(sess.cursor().0, 4);
-}
-
-#[test]
-fn v_m_screen_down() {
-    let mut sess = session(FIXTURE_5LINES);
-    // Move down 2 visual rows
-    feed(&mut sess, "gj");
-    let (row, _) = sess.cursor();
-    assert_eq!(row, 1);
-}
-
-#[test]
-fn v_m_screen_up() {
-    let mut sess = session(FIXTURE_5LINES);
-    // Move down then up
-    feed(&mut sess, "2gj");
-    feed(&mut sess, "gk");
-    let (row, _) = sess.cursor();
-    assert_eq!(row, 1);
-}
-
-#[test]
-fn v_m_page_down() {
-    let text = (1..=40)
-        .map(|line| format!("line {line}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let mut sess = session(&text);
-    sess.render_source(Viewport {
-        top_line: 0,
-        height: 10,
-        width: 80,
-        wrap: true,
-        left_col: 0,
-        skip_rows: 0,
-    });
-    feed(&mut sess, "<C-d>");
-    assert_eq!(sess.cursor().0, 5);
-}
-
-#[test]
-fn v_m_page_up() {
-    let text = (1..=40)
-        .map(|line| format!("line {line}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let mut sess = session(&text);
-    sess.render_source(Viewport {
-        top_line: 0,
-        height: 10,
-        width: 80,
-        wrap: true,
-        left_col: 0,
-        skip_rows: 0,
-    });
-    feed(&mut sess, "G");
-    feed(&mut sess, "<C-u>");
-    assert_eq!(sess.cursor().0, 34);
-}
-
-#[test]
-fn v_m_full_page_down() {
-    let text = (1..=40)
-        .map(|line| format!("line {line}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let mut sess = session(&text);
-    sess.render_source(Viewport {
-        top_line: 0,
-        height: 10,
-        width: 80,
-        wrap: true,
-        left_col: 0,
-        skip_rows: 0,
-    });
-    feed(&mut sess, "<C-f>");
-    assert_eq!(sess.cursor().0, 8);
-}
-
-#[test]
-fn v_m_full_page_up() {
-    let text = (1..=40)
-        .map(|line| format!("line {line}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let mut sess = session(&text);
-    sess.render_source(Viewport {
-        top_line: 0,
-        height: 10,
-        width: 80,
-        wrap: true,
-        left_col: 0,
-        skip_rows: 0,
-    });
-    feed(&mut sess, "G");
-    feed(&mut sess, "<C-b>");
-    assert_eq!(sess.cursor().0, 31);
-}
-
-#[test]
-fn v_m_viewport_top_is_published_for_screen_motions() {
-    let text = (1..=40)
-        .map(|line| format!("line {line}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let viewport = Viewport {
-        top_line: 10,
-        height: 10,
-        width: 80,
-        wrap: true,
-        left_col: 0,
-        skip_rows: 0,
+fn resized_block_uses_one_coherent_projection_for_payload_and_delete() {
+    let text = "abcdef ghijkl\n\nuvwxyz 123456\n";
+    let selected = || {
+        let mut session = EditorSession::from_text(text);
+        session.render_layout(40);
+        session.handle_key(ctrl('v'));
+        session.handle_key(key('l'));
+        session.handle_key(key('l'));
+        session.handle_key(key('j'));
+        session.handle_key(key('j'));
+        session.render_layout(8);
+        session
     };
 
-    let mut sess = session(&text);
-    sess.render_source(viewport);
-    feed(&mut sess, "H");
-    assert_eq!(sess.cursor().0, 10);
+    let mut yank = selected();
+    let selection = yank.rendered_selection().unwrap();
+    assert_eq!(
+        selection.anchor,
+        oom_edit_core::RenderedPoint { row: 0, column: 0 }
+    );
+    assert_eq!(
+        selection.active,
+        oom_edit_core::RenderedPoint { row: 3, column: 2 }
+    );
+    assert_eq!(selection.source_ranges, vec![0..3, 7..10, 15..18]);
+    assert_eq!(selection.block_width, Some(3));
+    assert_eq!(
+        selection
+            .rows
+            .iter()
+            .map(|row| (row.row, row.columns.clone(), row.source_ranges.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (0, 0..3, std::iter::once(0..3).collect()),
+            (1, 0..3, std::iter::once(7..10).collect()),
+            (2, 0..3, vec![]),
+            (3, 0..3, std::iter::once(15..18).collect()),
+        ]
+    );
+    yank.handle_key(key('"'));
+    yank.handle_key(key('+'));
+    let effects = yank.handle_key(key('y'));
+    assert!(effects.iter().any(
+        |effect| matches!(effect, Effect::ClipboardWrite(actual) if actual == "abc\nghi\n\nuvw")
+    ));
+    assert_eq!(yank.document(), text);
 
-    sess.render_source(viewport);
-    feed(&mut sess, "M");
-    assert_eq!(sess.cursor().0, 14);
-
-    sess.render_source(viewport);
-    feed(&mut sess, "L");
-    assert_eq!(sess.cursor().0, 19);
-
-    // Height must be published before top so a shorter-than-default viewport
-    // can reach its true maximum top row.
-    sess.render_source(Viewport {
-        top_line: 30,
-        height: 10,
-        width: 80,
-        wrap: true,
-        left_col: 0,
-        skip_rows: 0,
-    });
-    feed(&mut sess, "H");
-    assert_eq!(sess.cursor().0, 30);
+    let mut delete = selected();
+    delete.handle_key(key('"'));
+    delete.handle_key(key('+'));
+    let effects = delete.handle_key(key('d'));
+    assert!(effects.iter().any(
+        |effect| matches!(effect, Effect::ClipboardWrite(actual) if actual == "abc\nghi\n\nuvw")
+    ));
+    assert_eq!(delete.document(), "def jkl\n\nxyz 123456\n");
 }
 
 #[test]
-fn v_m_insert_mode_entry_i() {
-    let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, "i");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Insert);
+fn select_empty_and_footer_rows_are_safe() {
+    let mut empty = EditorSession::from_text("");
+    empty.render_layout(20);
+    empty.handle_key(key('v'));
+    assert!(empty.rendered_selection().unwrap().source_ranges.is_empty());
+
+    let text = "[link](https://example.test)\n";
+    let mut linked = EditorSession::from_text(text);
+    linked.render_layout(20);
+    linked.handle_key(key('G'));
+    let source_before_footer_move = linked.cursor();
+    linked.handle_key(key('j'));
+    assert_eq!(linked.cursor(), source_before_footer_move);
+    linked.handle_key(key('v'));
+    let selection = linked.rendered_selection().unwrap();
+    assert!(selection.source_ranges.is_empty());
+    assert_eq!(linked.cursor(), source_before_footer_move);
 }
 
 #[test]
-fn v_m_insert_mode_entry_a() {
-    let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, "a");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Insert);
+fn exact_markdown_structure_ranges() {
+    fn selected_text(text: &str, needle: &str) -> String {
+        let mut session = EditorSession::from_text(text);
+        let row = session
+            .render_layout(32)
+            .lines
+            .iter()
+            .position(|line| line.styled.text.contains(needle))
+            .unwrap_or_else(|| panic!("rendered layout did not contain {needle:?}"));
+        while session.rendered_cursor_line() < row {
+            let previous = session.rendered_cursor_line();
+            session.handle_key(key('j'));
+            assert_ne!(
+                session.rendered_cursor_line(),
+                previous,
+                "cannot navigate to {needle:?}"
+            );
+        }
+        session.handle_key(key('0'));
+        session.handle_key(key('V'));
+        session
+            .rendered_selection()
+            .unwrap()
+            .source_ranges
+            .iter()
+            .map(|range| &text[range.clone()])
+            .collect()
+    }
+
+    let front_matter = "---\ntitle: café\ntags:\n  - rust\n---\n\n# Body\n";
+    assert_eq!(selected_text(front_matter, "metadata"), "---\n");
+    assert_eq!(selected_text("- alpha\n- beta\n", "alpha"), "- alpha\n");
+    assert_eq!(
+        selected_text(
+            "| key | value |\n|---|---|\n| unique | cellvalue |\n",
+            "cellvalue"
+        ),
+        "| unique | cellvalue |\n"
+    );
+    assert_eq!(
+        selected_text("```rust\nfn unique() {}\n```\n", "fn unique"),
+        "fn unique() {}\n"
+    );
+    assert_eq!(selected_text("first\n\n東京 café", "東京"), "東京 café");
+
+    let linked = "[unique link](https://example.test)\n";
+    let mut session = EditorSession::from_text(linked);
+    session.render_layout(24);
+    session.handle_key(key('G'));
+    let canonical = session.cursor();
+    session.handle_key(key('j'));
+    session.handle_key(key('V'));
+    assert_eq!(session.cursor(), canonical);
+    assert_eq!(
+        session.rendered_selection().unwrap().source_ranges,
+        vec![0..linked.len()]
+    );
+}
+
+fn ex(session: &mut EditorSession, command: &str) -> Vec<Effect> {
+    session.handle_key(key(':'));
+    for ch in command.chars() {
+        session.handle_key(key(ch));
+    }
+    session.handle_key(special(KeyCodeKind::Enter))
 }
 
 #[test]
-fn v_m_insert_mode_entry_o() {
-    let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, "o");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Insert);
-}
-
-#[test]
-#[allow(non_snake_case)]
-fn v_m_insert_mode_entry_O() {
-    let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, "O");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Insert);
-}
-
-#[test]
-#[allow(non_snake_case)]
-fn v_m_insert_mode_entry_I() {
-    let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, "I");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Insert);
-}
-
-#[test]
-#[allow(non_snake_case)]
-fn v_m_insert_mode_entry_A() {
-    let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, "A");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Insert);
-}
-
-#[test]
-fn v_m_insert_mode_exit_esc() {
-    let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, "i");
-    feed(&mut sess, "Esc");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Normal);
-}
-
-#[test]
-fn v_m_insert_mode_exit_ctrl_c() {
-    let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, "i");
-    feed(&mut sess, "<C-[>");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Normal);
-}
-
-#[test]
-fn v_m_delete_char() {
-    let mut sess = session("hello");
-    feed(&mut sess, "x");
-    let doc = sess.document();
-    // x at cursor 0 deletes 'h'
-    assert_eq!(doc, "ello");
-}
-
-#[test]
-fn v_m_delete_line() {
-    let mut sess = session("line1\nline2\nline3");
-    feed(&mut sess, "dd");
-    let doc = sess.document();
-    assert_eq!(doc, "line2\nline3");
-}
-
-#[test]
-fn v_m_change_char() {
-    let mut sess = session("hello");
-    feed(&mut sess, "cw");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Insert);
-}
-
-#[test]
-fn v_m_yank_line() {
-    let mut sess = session("line1\nline2\nline3");
-    feed(&mut sess, "yy");
-    // Yank should not change the document
-    let doc = sess.document();
-    assert_eq!(doc, "line1\nline2\nline3");
-}
-
-#[test]
-fn v_m_undo() {
-    let mut sess = session("hello");
-    // Move to position 1, then x deletes 'e'
-    feed(&mut sess, "lx");
-    assert_eq!(sess.document(), "hllo");
-    feed(&mut sess, "u");
-    assert_eq!(sess.document(), "hello");
-}
-
-#[test]
-fn v_m_redo() {
-    let mut sess = session("hello");
-    // Move to position 1, delete 'e', undo, then redo
-    feed(&mut sess, "lx");
-    feed(&mut sess, "u");
-    assert_eq!(sess.document(), "hello");
-    feed(&mut sess, "<C-r>");
-    assert_eq!(sess.document(), "hllo");
-}
-
-#[test]
-fn v_m_visual_mode_v() {
-    let mut sess = session(FIXTURE_5LINES);
-    feed(&mut sess, "v");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Visual);
-}
-
-#[test]
-fn v_m_visual_line_mode_v() {
-    let mut sess = session(FIXTURE_5LINES);
-    feed(&mut sess, "V");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::VisualLine);
-}
-
-#[test]
-fn v_m_visual_block_mode_ctrl_v() {
-    let mut sess = session("abc\ndef\nghi");
-    feed(&mut sess, "<C-v>");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::VisualBlock);
-}
-
-#[test]
-fn v_m_visual_exit_esc() {
-    let mut sess = session(FIXTURE_5LINES);
-    feed(&mut sess, "v");
-    feed(&mut sess, "Esc");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Normal);
-}
-
-#[test]
-fn v_m_visual_exit_ctrl_c() {
-    let mut sess = session(FIXTURE_5LINES);
-    feed(&mut sess, "v");
-    feed(&mut sess, "<C-[>");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Normal);
-}
-
-#[test]
-fn v_m_command_mode_colon() {
-    let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, ":");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Command);
-}
-
-#[test]
-fn v_m_command_exit_esc() {
-    let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, ":");
-    feed(&mut sess, "Esc");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Normal);
-}
-
-#[test]
-fn v_m_command_save() {
-    let mut sess = session(FIXTURE_3LINES);
-    let effects = feed(&mut sess, ":w<Enter>");
-    assert!(effects.iter().any(|effect| matches!(
+fn v_x1_write() {
+    let mut session = EditorSession::from_text("text\n");
+    let bare = ex(&mut session, "w");
+    assert!(bare.iter().any(|effect| matches!(
         effect,
         Effect::SaveRequested {
             path: None,
-            force: false,
-            then_quit: false
+            retarget: false,
+            then_quit: false,
+            ..
         }
+    )));
+    let copy = ex(&mut session, "w copy.md");
+    assert!(copy.iter().any(|effect| matches!(
+        effect,
+        Effect::SaveRequested { path: Some(path), retarget: false, then_quit: false, .. }
+            if path.ends_with("copy.md")
     )));
 }
 
 #[test]
-fn v_m_command_quit() {
-    let mut sess = session(FIXTURE_3LINES);
-    let effects = feed(&mut sess, ":q<Enter>");
-    assert!(effects
+fn v_x2_quit() {
+    let mut session = EditorSession::from_text("text\n");
+    assert!(ex(&mut session, "q")
         .iter()
         .any(|effect| matches!(effect, Effect::QuitRequested { force: false })));
-}
-
-#[test]
-fn v_m_command_quit_force() {
-    let mut sess = session(FIXTURE_3LINES);
-    let effects = feed(&mut sess, ":q!<Enter>");
-    assert!(effects
+    assert!(ex(&mut session, "q!")
         .iter()
         .any(|effect| matches!(effect, Effect::QuitRequested { force: true })));
 }
 
 #[test]
-fn v_m_command_view() {
-    let mut sess = session(FIXTURE_3LINES);
-    // `:view` requires Enter to execute the ex command
-    feed(&mut sess, ":view<Enter>");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::View);
-}
-
-#[test]
-fn v_m_command_view_initializes_view_state() {
-    let mut sess = session("# First\n\nFirst paragraph.\n\n## Second\n\nSecond paragraph.");
-
-    let effects = feed(&mut sess, ":view<Enter>");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::View);
-    assert!(effects.iter().any(|effect| matches!(
-        effect,
-        Effect::ModeChanged(oom_edit_core::session::Mode::View)
-    )));
-    assert!(sess.view_cursor().is_some());
-    assert!(sess.view_layout().is_some());
-
-    let rendered = sess
-        .render_view(40)
-        .lines
-        .iter()
-        .map(|line| line.styled.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(rendered.contains("First"));
-    assert!(rendered.contains("Second paragraph."));
-
-    let initial_view_line = sess.view_cursor_line();
-    let navigation_effects = feed(&mut sess, "<Tab>");
-    assert!(sess.view_cursor_line() > initial_view_line);
-    assert!(navigation_effects
-        .iter()
-        .any(|effect| matches!(effect, Effect::CursorMoved)));
-
-    let exit_effects = feed(&mut sess, "Esc");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Normal);
-    assert!(exit_effects.iter().any(|effect| matches!(
-        effect,
-        Effect::ModeChanged(oom_edit_core::session::Mode::Normal)
-    )));
-    assert_eq!(sess.cursor(), (4, 0));
-}
-
-#[test]
-fn v_m_command_line_jump_bare_number() {
-    let mut requested_line = session(FIXTURE_3LINES);
-    feed(&mut requested_line, ":2");
-    let effects = feed(&mut requested_line, "<Enter>");
-    assert_eq!(requested_line.cursor(), (1, 0));
-    assert!(effects
-        .iter()
-        .any(|effect| matches!(effect, Effect::CursorMoved)));
-    assert!(!effects
-        .iter()
-        .any(|effect| matches!(effect, Effect::Message { .. })));
-
-    let mut first_line = session(FIXTURE_3LINES);
-    feed(&mut first_line, "G");
-    feed(&mut first_line, ":1");
-    let effects = feed(&mut first_line, "<Enter>");
-    assert_eq!(first_line.cursor(), (0, 0));
-    assert!(effects
-        .iter()
-        .any(|effect| matches!(effect, Effect::CursorMoved)));
-
-    let mut past_eof = session(FIXTURE_5LINES);
-    feed(&mut past_eof, ":");
-    feed(&mut past_eof, "4");
-    feed(&mut past_eof, "2");
-    let effects = feed(&mut past_eof, "<Enter>");
-    assert_eq!(past_eof.cursor(), (4, 0));
-    assert!(effects
-        .iter()
-        .any(|effect| matches!(effect, Effect::CursorMoved)));
-
-    let mut zero = session(FIXTURE_3LINES);
-    feed(&mut zero, "G");
-    let cursor_before = zero.cursor();
-    feed(&mut zero, ":0");
-    let effects = feed(&mut zero, "<Enter>");
-    assert_eq!(zero.cursor(), cursor_before);
-    assert!(!effects
-        .iter()
-        .any(|effect| matches!(effect, Effect::CursorMoved)));
-    assert!(effects.iter().any(|effect| matches!(
-        effect,
-        Effect::Message {
-            severity: Severity::Warning,
-            ..
-        }
-    )));
-}
-
-#[test]
-fn v_m_view_exit_esc() {
-    let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, ":view<Enter>");
-    feed(&mut sess, "Esc");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Normal);
-}
-
-#[test]
-fn v_m_view_enter_i() {
-    let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, ":view<Enter>");
-    feed(&mut sess, "i");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Insert);
-}
-
-#[test]
-fn v_m_view_enter_a() {
-    let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, ":view<Enter>");
-    feed(&mut sess, "a");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Insert);
-}
-
-#[test]
-fn v_m_view_enter_o() {
-    let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, ":view<Enter>");
-    feed(&mut sess, "o");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Insert);
-}
-
-#[test]
-fn v_m_document_text() {
-    let sess = session(FIXTURE_3LINES);
-    let doc = sess.document();
-    assert_eq!(doc, FIXTURE_3LINES);
-}
-
-#[test]
-fn v_m_cursor_position() {
-    let mut sess = session(FIXTURE_5LINES);
-    feed(&mut sess, "2j3l");
-    let (row, col) = sess.cursor();
-    assert_eq!(row, 2);
-    assert_eq!(col, 3);
-}
-
-#[test]
-fn v_m_line_count() {
-    let sess = session(FIXTURE_5LINES);
-    assert_eq!(sess.line_count(), 5);
-}
-
-#[test]
-fn v_m_line_at() {
-    let sess = session(FIXTURE_5LINES);
-    assert_eq!(sess.line(0), Some("first".to_string()));
-    assert_eq!(sess.line(2), Some("third".to_string()));
-    assert_eq!(sess.line(4), Some("fifth".to_string()));
-    assert_eq!(sess.line(5), None);
-}
-
-#[test]
-fn v_m_dirty_tracking() {
-    let mut sess = session(FIXTURE_3LINES);
-    assert!(!sess.is_dirty());
-    feed(&mut sess, "x");
-    assert!(sess.is_dirty());
-    sess.save_point();
-    assert!(!sess.is_dirty());
-}
-
-#[test]
-fn v_m_selections_visual() {
-    let mut sess = session(FIXTURE_5LINES);
-    feed(&mut sess, "v");
-    feed(&mut sess, "3l");
-    let selections = sess.selections();
-    assert!(!selections.is_empty());
-}
-
-#[test]
-fn v_m_selections_visual_line() {
-    let mut sess = session(FIXTURE_5LINES);
-    feed(&mut sess, "V");
-    feed(&mut sess, "2j");
-    let selections = sess.selections();
-    assert!(!selections.is_empty());
-}
-
-#[test]
-fn v_m_selections_visual_block() {
-    let mut sess = session("abc\ndef\nghi");
-    feed(&mut sess, "<C-v>");
-    feed(&mut sess, "2j");
-    feed(&mut sess, "l");
-    let selections = sess.selections();
-    assert!(!selections.is_empty());
-}
-
-#[test]
-fn v_m_no_selections_normal_mode() {
-    let sess = session(FIXTURE_5LINES);
-    let selections = sess.selections();
-    assert!(selections.is_empty());
-}
-
-#[test]
-fn v_m_effects_mode_changed() {
-    let mut sess = session(FIXTURE_3LINES);
-    let effects = feed(&mut sess, "i");
-    assert!(effects
-        .iter()
-        .any(|e| matches!(e, Effect::ModeChanged(oom_edit_core::session::Mode::Insert))));
-}
-
-#[test]
-fn v_m_effects_cursor_moved() {
-    let mut sess = session(FIXTURE_3LINES);
-    let effects = feed(&mut sess, "j");
-    assert!(effects.iter().any(|e| matches!(e, Effect::CursorMoved)));
-}
-
-#[test]
-fn v_m_effects_edited() {
-    let mut sess = session(FIXTURE_3LINES);
-    let effects = feed(&mut sess, "x");
-    assert!(effects.iter().any(|e| matches!(e, Effect::Edited)));
-}
-
-#[test]
-fn v_m_effects_message() {
-    let mut sess = session(FIXTURE_3LINES);
-    // Invalid ex command should produce a message
-    let effects = feed(&mut sess, ":bogus<Enter>");
-    assert!(effects.iter().any(|e| matches!(e, Effect::Message { .. })));
-}
-
-#[test]
-fn v_m_chord_gg() {
-    let mut sess = session(FIXTURE_5LINES);
-    feed(&mut sess, "G");
-    feed(&mut sess, "gg");
-    assert_eq!(sess.cursor().0, 0);
-}
-
-#[test]
-fn v_m_chord_dd() {
-    let mut sess = session("line1\nline2\nline3");
-    feed(&mut sess, "dd");
-    let doc = sess.document();
-    assert_eq!(doc, "line2\nline3");
-}
-
-#[test]
-fn v_m_chord_3j() {
-    let mut sess = session(FIXTURE_5LINES);
-    feed(&mut sess, "3j");
-    assert_eq!(sess.cursor().0, 3);
-}
-
-#[test]
-fn v_m_chord_5k() {
-    let mut sess = session(FIXTURE_5LINES);
-    feed(&mut sess, "G");
-    feed(&mut sess, "5k");
-    assert_eq!(sess.cursor().0, 0);
-}
-
-#[test]
-fn v_m_chord_h() {
-    let mut sess = session(FIXTURE_5LINES);
-    feed(&mut sess, "3j");
-    feed(&mut sess, "H");
-    assert_eq!(sess.cursor().0, 0);
-}
-
-#[test]
-fn v_m_chord_m() {
-    let mut sess = session(FIXTURE_5LINES);
-    feed(&mut sess, "M");
-    assert_eq!(sess.cursor().0, 2);
-}
-
-#[test]
-fn v_m_chord_l() {
-    let mut sess = session(FIXTURE_5LINES);
-    feed(&mut sess, "L");
-    assert_eq!(sess.cursor().0, 4);
-}
-
-#[test]
-fn v_m_chord_0() {
-    let mut sess = session("  hello");
-    feed(&mut sess, "$");
-    feed(&mut sess, "0");
-    assert_eq!(sess.cursor().1, 0);
-}
-
-#[test]
-fn v_m_chord_dollar() {
-    let mut sess = session("hello");
-    feed(&mut sess, "$");
-    // hjkl's $ puts cursor on last char (col=4 for 5-char string)
-    assert_eq!(sess.cursor().1, 4);
-}
-
-#[test]
-fn v_m_chord_w() {
-    let mut sess = session("hello world foo");
-    feed(&mut sess, "w");
-    assert_eq!(sess.cursor().1, 6);
-}
-
-#[test]
-fn v_m_chord_b() {
-    let mut sess = session("hello world foo");
-    feed(&mut sess, "G");
-    feed(&mut sess, "0");
-    feed(&mut sess, "bb");
-    assert!(sess.cursor().1 < 11);
-}
-
-#[test]
-fn v_m_chord_e() {
-    let mut sess = session("hello world");
-    feed(&mut sess, "e");
-    assert_eq!(sess.cursor().1, 4);
-}
-
-#[test]
-fn v_m_chord_f() {
-    let mut sess = session("hello world");
-    feed(&mut sess, "fw");
-    assert_eq!(sess.cursor().1, 6);
-}
-
-#[test]
-fn v_m_chord_t() {
-    let mut sess = session("hello world");
-    feed(&mut sess, "tw");
-    assert_eq!(sess.cursor().1, 5);
-}
-
-#[test]
-#[allow(non_snake_case)]
-fn v_m_chord_F() {
-    let mut sess = session("hello world");
-    // `Fw` finds the previous 'w' from the end of the line.
-    feed(&mut sess, "$Fw");
-    assert_eq!(sess.cursor().1, 6);
-    assert!(sess.cursor().1 < 10);
-}
-
-#[test]
-#[allow(non_snake_case)]
-fn v_m_chord_T() {
-    let mut sess = session("hello world!");
-    // `Tl` stops one character after the previous 'l'.
-    feed(&mut sess, "$Tl");
-    assert_eq!(sess.cursor().1, 10);
-    assert!(sess.cursor().1 < 11);
-}
-
-#[test]
-fn v_m_chord_semicolon() {
-    let mut sess = session("hello world world");
-    // `fw` → col 6 ('w'), `;` repeats → col 12 (next 'w')
-    feed(&mut sess, "fw");
-    feed(&mut sess, ";");
-    assert_eq!(sess.cursor().1, 12);
-}
-
-#[test]
-fn v_m_chord_comma() {
-    let mut sess = session("hello world foo");
-    feed(&mut sess, "fw");
-    feed(&mut sess, ",");
-    assert_eq!(sess.cursor().1, 6);
-}
-
-#[test]
-fn v_m_chord_i() {
-    let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, "i");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Insert);
-}
-
-#[test]
-fn v_m_chord_a() {
-    let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, "a");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Insert);
-}
-
-#[test]
-#[allow(non_snake_case)]
-fn v_m_chord_I() {
-    let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, "I");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Insert);
-}
-
-#[test]
-#[allow(non_snake_case)]
-fn v_m_chord_A() {
-    let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, "A");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Insert);
-}
-
-#[test]
-fn v_m_chord_o() {
-    let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, "o");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Insert);
-}
-
-#[test]
-#[allow(non_snake_case)]
-fn v_m_chord_O() {
-    let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, "O");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Insert);
-}
-
-#[test]
-fn v_m_chord_u() {
-    let mut sess = session("hello");
-    feed(&mut sess, "x");
-    feed(&mut sess, "u");
-    assert_eq!(sess.document(), "hello");
-}
-
-#[test]
-fn v_m_chord_colon() {
-    let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, ":");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Command);
-}
-
-#[test]
-fn v_m_chord_wq() {
-    let mut sess = session(FIXTURE_3LINES);
-    let effects = feed(&mut sess, ":wq<Enter>");
-    assert!(effects.iter().any(|effect| matches!(
-        effect,
-        Effect::SaveRequested {
-            then_quit: true,
-            ..
-        }
-    )));
-}
-
-#[test]
-fn v_m_chord_x() {
-    let mut sess = session(FIXTURE_3LINES);
-    let effects = feed(&mut sess, ":x<Enter>");
-    assert!(effects.iter().any(|effect| matches!(
-        effect,
-        Effect::SaveRequested {
-            then_quit: true,
-            ..
-        }
-    )));
-}
-
-#[test]
-fn v_m_chord_help() {
-    let mut sess = session(FIXTURE_3LINES);
-    let effects = feed(&mut sess, ":help<Enter>");
-    // :help should emit HelpRequested effect
-    assert!(
-        effects
-            .iter()
-            .any(|e| matches!(e, oom_edit_core::session::Effect::HelpRequested)),
-        ":help should emit HelpRequested effect, got: {:?}",
-        effects
-    );
-}
-
-#[test]
-fn v_m_chord_unknown_command() {
-    let mut sess = session(FIXTURE_3LINES);
-    let effects = feed(&mut sess, ":unknown<Enter>");
-    assert!(effects.iter().any(|effect| matches!(
-        effect,
-        Effect::Message {
-            text,
-            severity: Severity::Warning
-        } if text == "Unknown command: unknown"
-    )));
-}
-
-#[test]
-fn v_m_chord_set_wrap() {
-    let mut sess = session(FIXTURE_3LINES);
-    let effects = feed(&mut sess, ":set wrap<Enter>");
-    assert!(effects.iter().any(|effect| matches!(
-        effect,
-        Effect::SetOption { key, value } if key == "wrap" && *value
-    )));
-}
-
-#[test]
-fn v_m_chord_set_nocolor() {
-    let mut sess = session(FIXTURE_3LINES);
-    let effects = feed(&mut sess, ":set nocolor<Enter>");
-    assert!(effects.iter().any(|effect| matches!(
-        effect,
-        Effect::Message {
-            text,
-            severity: Severity::Warning
-        } if text == "Unknown option: nocolor"
-    )));
-}
-
-#[test]
-fn v_m_chord_repeat_dot() {
-    let mut sess = session("hello");
-    feed(&mut sess, "x");
-    feed(&mut sess, ".");
-    // Should have deleted another character
-    let doc = sess.document();
-    assert_eq!(doc.len(), 3);
-}
-
-#[test]
-fn v_m_chord_macro_record() {
-    let mut sess = session("hello");
-    feed(&mut sess, "qa");
-    // Recording starts
-    feed(&mut sess, "x");
-    feed(&mut sess, "q");
-    // Recording ends
-    // Play macro
-    feed(&mut sess, "@a");
-    assert_eq!(sess.document(), "llo");
-}
-
-#[test]
-fn v_m_chord_macro_replay_count() {
-    let mut sess = session("hello");
-    feed(&mut sess, "qa");
-    feed(&mut sess, "x");
-    feed(&mut sess, "q");
-    feed(&mut sess, "2@a");
-    // x deletes 'h' → "ello", 2@a deletes 2 more → "lo" (len=2)
-    let doc = sess.document();
-    assert_eq!(doc.len(), 2);
-}
-
-#[test]
-fn v_m_chord_macro_replay_all() {
-    let mut sess = session("hello");
-    feed(&mut sess, "qa");
-    feed(&mut sess, "x");
-    feed(&mut sess, "q");
-    feed(&mut sess, "@a");
-    assert_eq!(sess.document(), "llo");
-}
-
-#[test]
-fn v_m_chord_jumplist_forward() {
-    let mut sess = session(FIXTURE_5LINES);
-    feed(&mut sess, "2j");
-    feed(&mut sess, "gg");
-    feed(&mut sess, "<C-o>");
-    assert_eq!(sess.cursor(), (2, 0));
-    feed(&mut sess, "<C-i>");
-    assert_eq!(sess.cursor(), (0, 0));
-}
-
-#[test]
-fn v_m_chord_jumplist_backward() {
-    let mut sess = session(FIXTURE_5LINES);
-    feed(&mut sess, "2j");
-    feed(&mut sess, "gg");
-    feed(&mut sess, "<C-o>");
-    assert_eq!(sess.cursor(), (2, 0));
-}
-
-#[test]
-fn v_m_chord_mark_set() {
-    let mut sess = session(FIXTURE_5LINES);
-    feed(&mut sess, "2j");
-    feed(&mut sess, "2l");
-    feed(&mut sess, "ma");
-    feed(&mut sess, "gg");
-    feed(&mut sess, "`a");
-    assert_eq!(sess.cursor(), (2, 2));
-}
-
-#[test]
-fn v_m_chord_mark_jump() {
-    let mut sess = session(FIXTURE_5LINES);
-    feed(&mut sess, "2j");
-    feed(&mut sess, "ma");
-    feed(&mut sess, "gg");
-    feed(&mut sess, "'a");
-    // Should have jumped to mark 'a'
-    assert_eq!(sess.cursor().0, 2);
-}
-
-#[test]
-fn v_m_chord_mark_jump_charwise() {
-    let mut sess = session(FIXTURE_5LINES);
-    feed(&mut sess, "2j");
-    feed(&mut sess, "3lma");
-    feed(&mut sess, "gg");
-    feed(&mut sess, "`a");
-    assert_eq!(sess.cursor(), (2, 3));
-}
-
-#[test]
-fn v_m_chord_visual_gv() {
-    let mut sess = session(FIXTURE_5LINES);
-    feed(&mut sess, "v");
-    feed(&mut sess, "3l");
-    feed(&mut sess, "Esc");
-    feed(&mut sess, "gv");
-    // Should have re-selected the same range
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Visual);
-}
-
-#[test]
-fn v_m_chord_visual_d() {
-    let mut sess = session("hello world");
-    feed(&mut sess, "v");
-    feed(&mut sess, "6l");
-    feed(&mut sess, "d");
-    // Visual mode selects from cursor start (0) to cursor end (6), deleting "hello w"
-    let doc = sess.document();
-    assert_eq!(doc, "orld");
-}
-
-#[test]
-fn v_m_chord_visual_y() {
-    let mut sess = session("hello world");
-    feed(&mut sess, "v");
-    feed(&mut sess, "6l");
-    feed(&mut sess, "y");
-    let doc = sess.document();
-    assert_eq!(doc, "hello world");
-}
-
-#[test]
-fn v_m_chord_visual_c() {
-    let mut sess = session("hello world");
-    feed(&mut sess, "v");
-    feed(&mut sess, "6l");
-    feed(&mut sess, "c");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Insert);
-}
-
-#[test]
-fn v_m_chord_visual_line_d() {
-    let mut sess = session("line1\nline2\nline3");
-    feed(&mut sess, "V");
-    feed(&mut sess, "j");
-    feed(&mut sess, "d");
-    let doc = sess.document();
-    assert_eq!(doc, "line3");
-}
-
-#[test]
-fn v_m_chord_visual_block_d() {
-    let mut sess = session("abc\ndef\nghi");
-    feed(&mut sess, "<C-v>");
-    feed(&mut sess, "2j");
-    feed(&mut sess, "d");
-    // Visual block deletes column 0 from all 3 lines
-    let doc = sess.document();
-    assert_eq!(doc, "bc\nef\nhi");
-}
-
-#[test]
-fn v_m_chord_visual_block_i() {
-    let mut sess = session("abc\ndef\nghi");
-    feed(&mut sess, "<C-v>");
-    feed(&mut sess, "2j");
-    feed(&mut sess, "I");
-    feed(&mut sess, "X");
-    feed(&mut sess, "Esc");
-    let doc = sess.document();
-    assert!(doc.contains("Xabc"));
-}
-
-#[test]
-fn v_m_chord_visual_block_a() {
-    let mut sess = session("abc\ndef\nghi");
-    // Visual block selects column 0 on lines 0-2; A appends at col 1
-    feed(&mut sess, "<C-v>");
-    feed(&mut sess, "2j");
-    feed(&mut sess, "A");
-    feed(&mut sess, "Y");
-    feed(&mut sess, "Esc");
-    let doc = sess.document();
-    // Y inserted at column 1 on each line: "aYbc\ndYef\ngYhi"
-    assert!(doc.contains("aYbc"));
-}
-
-#[test]
-fn v_m_chord_visual_block_replace() {
-    let mut sess = session("abc\ndef\nghi");
-    feed(&mut sess, "<C-v>");
-    feed(&mut sess, "2j");
-    feed(&mut sess, "rX");
-    let doc = sess.document();
-    assert!(doc.contains("Xbc"));
-}
-
-#[test]
-fn v_m_chord_visual_block_uppercase() {
-    let mut sess = session("abc\ndef\nghi");
-    // Visual block selects column 0 on lines 0-2; gU uppercases column 0
-    feed(&mut sess, "<C-v>");
-    feed(&mut sess, "2j");
-    feed(&mut sess, "gU");
-    let doc = sess.document();
-    // Only column 0 uppercased: "Abc\ndEf\ngHi"
-    assert!(doc.contains("Abc"));
-}
-
-#[test]
-fn v_m_chord_visual_block_lowercase() {
-    let mut sess = session("ABC\nDEF\nGHI");
-    // Visual block selects column 0 on lines 0-2; gu lowercases column 0
-    feed(&mut sess, "<C-v>");
-    feed(&mut sess, "2j");
-    feed(&mut sess, "gu");
-    let doc = sess.document();
-    // Only column 0 lowercased: "aBC\ndEF\ngHI"
-    assert!(doc.contains("aBC"));
-}
-
-#[test]
-fn v_m_chord_visual_block_toggle_case() {
-    let mut sess = session("abc\ndef\nghi");
-    // Visual block selects column 0 on lines 0-2; ~ toggles case of column 0
-    feed(&mut sess, "<C-v>");
-    feed(&mut sess, "2j");
-    feed(&mut sess, "~");
-    let doc = sess.document();
-    // Only column 0 toggled: "Abc\ndEf\ngHi"
-    assert!(doc.contains("Abc"));
-}
-
-#[test]
-fn v_m_chord_text_object_iw() {
-    let mut sess = session("hello world");
-    feed(&mut sess, "diw");
-    let doc = sess.document();
-    assert_eq!(doc, " world");
-}
-
-#[test]
-fn v_m_chord_text_object_aw() {
-    let mut sess = session("hello  world");
-    feed(&mut sess, "daw");
-    let doc = sess.document();
-    assert_eq!(doc, "world");
-}
-
-#[test]
-#[allow(non_snake_case)]
-fn v_m_chord_text_object_iW() {
-    let mut sess = session("hello_world foo");
-    feed(&mut sess, "diW");
-    let doc = sess.document();
-    assert_eq!(doc, " foo");
-}
-
-#[test]
-#[allow(non_snake_case)]
-fn v_m_chord_text_object_awW() {
-    let mut sess = session("hello_world  foo");
-    feed(&mut sess, "daW");
-    let doc = sess.document();
-    assert_eq!(doc, "foo");
-}
-
-#[test]
-fn v_m_chord_text_object_iq() {
-    let mut sess = session("'hello'");
-    feed(&mut sess, "di'");
-    let doc = sess.document();
-    assert_eq!(doc, "''");
-}
-
-#[test]
-fn v_m_chord_text_object_aq() {
-    let mut sess = session("'hello'");
-    feed(&mut sess, "da'");
-    let doc = sess.document();
-    assert_eq!(doc, "");
-}
-
-#[test]
-fn v_m_chord_text_object_ib() {
-    let mut sess = session("(hello)");
-    feed(&mut sess, "di(");
-    let doc = sess.document();
-    assert_eq!(doc, "()");
-}
-
-#[test]
-fn v_m_chord_text_object_ab() {
-    let mut sess = session("(hello)");
-    feed(&mut sess, "da(");
-    let doc = sess.document();
-    assert_eq!(doc, "");
-}
-
-#[test]
-fn v_m_chord_text_object_is() {
-    let mut sess = session("Hello world. Goodbye world.");
-    feed(&mut sess, "dis");
-    let doc = sess.document();
-    assert!(doc.contains("."));
-}
-
-#[test]
-fn v_m_chord_text_object_as() {
-    let mut sess = session("Hello world. Goodbye world.");
-    feed(&mut sess, "das");
-    let doc = sess.document();
-    assert!(doc.contains("Goodbye"));
-}
-
-#[test]
-fn v_m_chord_text_object_ip() {
-    let mut sess = session("First paragraph.\n\nSecond paragraph.");
-    feed(&mut sess, "dip");
-    let doc = sess.document();
-    assert!(doc.contains("Second"));
-}
-
-#[test]
-fn v_m_chord_text_object_ap() {
-    let mut sess = session("First paragraph.\n\nSecond paragraph.");
-    feed(&mut sess, "dap");
-    let doc = sess.document();
-    assert!(doc.contains("Second"));
-}
-
-#[test]
-fn v_m_chord_text_object_it() {
-    let mut sess = session("<div>hello</div>");
-    feed(&mut sess, "dit");
-    let doc = sess.document();
-    assert_eq!(doc, "<div></div>");
-}
-
-#[test]
-fn v_m_chord_text_object_at() {
-    let mut sess = session("<div>hello</div>");
-    feed(&mut sess, "dat");
-    let doc = sess.document();
-    assert_eq!(doc, "");
-}
-
-// ── V-S search ────────────────────────────────────────────────────────────
-
-#[test]
-fn v_s_forward_search() {
-    let mut sess = session("hello\nworld\nhello");
-    // Move to end of first line, then search
-    feed(&mut sess, "fw");
-    feed(&mut sess, "/world<Enter>");
-    assert_eq!(sess.cursor(), (1, 0));
-}
-
-#[test]
-fn v_s_backward_search() {
-    let mut sess = session("hello\nworld\nhello");
-    feed(&mut sess, "G");
-    feed(&mut sess, "0");
-    feed(&mut sess, "?hello<Enter>");
-    // Should have moved to the first "hello"
-    assert!(sess.cursor().0 < 2);
-}
-
-#[test]
-fn v_s_n_repeat_forward() {
-    let mut sess = session("hello\nworld\nhello");
-    feed(&mut sess, "/world<Enter>");
-    let effects = feed(&mut sess, "n");
-    assert_eq!(sess.cursor(), (1, 0));
-    assert!(effects.iter().any(|effect| matches!(
-        effect,
-        Effect::Message {
-            text,
-            severity: Severity::Info
-        } if text == "Search wrapped around buffer"
-    )));
-}
-
-#[test]
-fn v_s_n_repeat_backward() {
-    let mut sess = session("hello\nworld\nhello\nworld");
-    feed(&mut sess, "/world<Enter>");
-    assert_eq!(sess.cursor(), (1, 0));
-    let effects = feed(&mut sess, "N");
-    assert_eq!(sess.cursor(), (3, 0));
-    assert!(effects.iter().any(|effect| matches!(
-        effect,
-        Effect::Message {
-            text,
-            severity: Severity::Info
-        } if text == "Search wrapped around buffer"
-    )));
-}
-
-#[test]
-fn v_s_counted_repeat_reports_intermediate_wrap() {
-    let mut sess = session("one one one");
-    feed(&mut sess, "/one<Enter>");
-    assert_eq!(sess.cursor(), (0, 4));
-    let effects = feed(&mut sess, "4n");
-    assert_eq!(sess.cursor(), (0, 8));
-    assert!(effects.iter().any(|effect| matches!(
-        effect,
-        Effect::Message {
-            text,
-            severity: Severity::Info
-        } if text == "Search wrapped around buffer"
-    )));
-}
-
-#[test]
-fn v_s_failed_repeat_does_not_report_wrap() {
-    let mut sess = session("one two three");
-    feed(&mut sess, "/missing<Enter>");
-    let cursor = sess.cursor();
-    let effects = feed(&mut sess, "n");
-    assert_eq!(sess.cursor(), cursor);
-    assert!(effects.iter().all(|effect| !matches!(
-        effect,
-        Effect::Message { text, .. } if text == "Search wrapped around buffer"
-    )));
-}
-
-#[test]
-fn v_s_non_ascii_same_line_repeat_reports_wrap() {
-    let mut sess = session("é one");
-    feed(&mut sess, "/one<Enter>");
-    assert_eq!(sess.cursor(), (0, 2));
-    let effects = feed(&mut sess, "n");
-    assert_eq!(sess.cursor(), (0, 2));
-    assert!(effects.iter().any(|effect| matches!(
-        effect,
-        Effect::Message {
-            text,
-            severity: Severity::Info
-        } if text == "Search wrapped around buffer"
-    )));
-}
-
-#[test]
-fn v_s_no_highlight() {
-    let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, "/line<Enter>");
-    let before = sess.render_source(Viewport {
-        top_line: 0,
-        height: 3,
-        width: 80,
-        wrap: true,
-        left_col: 0,
-        skip_rows: 0,
-    });
-    assert!(before.lines.iter().any(|line| line
-        .spans
-        .iter()
-        .any(|span| span.style == SemanticStyle::Match)));
-
-    let effects = feed(&mut sess, ":noh<Enter>");
-    assert!(effects.iter().any(|effect| matches!(
-        effect,
-        Effect::Message {
-            text,
-            severity: Severity::Info
-        } if text == "Search highlighting cleared"
-    )));
-    let after = sess.render_source(Viewport {
-        top_line: 0,
-        height: 3,
-        width: 80,
-        wrap: true,
-        left_col: 0,
-        skip_rows: 0,
-    });
-    assert!(after.lines.iter().all(|line| line
-        .spans
-        .iter()
-        .all(|span| span.style != SemanticStyle::Match)));
-}
-
-#[test]
-fn v_s_search_operator_target() {
-    let mut sess = session("hello world\nsecond line");
-    feed(&mut sess, "d/world<Enter>");
-    assert_eq!(sess.document(), "world\nsecond line");
-}
-
-// ── V-E editing primitives ────────────────────────────────────────────────
-
-#[test]
-fn v_e_replace_char() {
-    let mut sess = session("hello");
-    feed(&mut sess, "lrX");
-    let doc = sess.document();
-    assert_eq!(doc, "hXllo");
-}
-
-#[test]
-fn v_e_join_line() {
-    let mut sess = session("hello\nworld");
-    feed(&mut sess, "J");
-    let doc = sess.document();
-    assert_eq!(doc, "hello world");
-}
-
-#[test]
-fn v_e_toggle_case() {
-    let mut sess = session("hEllo");
-    feed(&mut sess, "~");
-    assert_eq!(sess.document(), "HEllo");
-    assert_eq!(sess.cursor(), (0, 1));
-}
-
-#[test]
-fn v_e_delete_to_eol() {
-    let mut sess = session("hello world");
-    // Move to position 5 (after "hello")
-    feed(&mut sess, "5l");
-    feed(&mut sess, "D");
-    let doc = sess.document();
-    assert_eq!(doc, "hello");
-}
-
-#[test]
-fn v_e_change_to_eol() {
-    let mut sess = session("hello world");
-    feed(&mut sess, "0");
-    feed(&mut sess, "C");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Insert);
-}
-
-#[test]
-fn v_e_substitute_char() {
-    let mut sess = session("hello");
-    assert!(feed(&mut sess, "s")
-        .iter()
-        .any(|effect| matches!(effect, Effect::Edited)));
-    assert_eq!(sess.document(), "ello");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Insert);
-    assert_eq!(sess.cursor(), (0, 0));
-}
-
-#[test]
-fn v_e_substitute_line() {
-    let mut sess = session("line1\nline2\nline3");
-    assert!(feed(&mut sess, "S")
-        .iter()
-        .any(|effect| matches!(effect, Effect::Edited)));
-    assert_eq!(sess.document(), "\nline2\nline3");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Insert);
-    assert_eq!(sess.cursor(), (0, 0));
-}
-
-#[test]
-fn v_e_undo_redo_granularity() {
-    let mut sess = session("hello");
-    // Delete 'e' with x
-    feed(&mut sess, "lx");
-    assert_eq!(sess.document(), "hllo");
-    // Undo should restore
-    feed(&mut sess, "u");
-    assert_eq!(sess.document(), "hello");
-    // Redo should restore deletion
-    feed(&mut sess, "<C-r>");
-    assert_eq!(sess.document(), "hllo");
-}
-
-// ── V-O operators ─────────────────────────────────────────────────────────
-
-#[test]
-fn v_o_delete_motion() {
-    let mut sess = session("hello world");
-    feed(&mut sess, "dw");
-    let doc = sess.document();
-    // hjkl's dw deletes "hello " (word + trailing space)
-    assert_eq!(doc, "world");
-}
-
-#[test]
-fn v_o_delete_count_line() {
-    let mut sess = session("line1\nline2\nline3\nline4\nline5");
-    feed(&mut sess, "d3j");
-    let doc = sess.document();
-    // d3j deletes current line + 3 lines below = all 5 lines, leaving "line5"
-    assert_eq!(doc, "line5");
-}
-
-#[test]
-fn v_o_delete_count_dd() {
-    let mut sess = session("line1\nline2\nline3\nline4\nline5");
-    feed(&mut sess, "3dd");
-    let doc = sess.document();
-    assert!(doc.contains("line4"));
-    assert!(doc.contains("line5"));
-}
-
-#[test]
-fn v_o_indent_motion() {
-    let mut sess = session("    hello\n    world");
-    feed(&mut sess, "2>>");
-    let doc = sess.document();
-    assert!(doc.starts_with("        "));
-}
-
-#[test]
-fn v_o_dedent_motion() {
-    let mut sess = session("    hello\n    world");
-    feed(&mut sess, "2<<");
-    let doc = sess.document();
-    assert!(doc.starts_with("  "));
-}
-
-#[test]
-fn v_o_change_motion() {
-    let mut sess = session("hello world");
-    feed(&mut sess, "cw");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Insert);
-}
-
-#[test]
-fn v_o_change_line() {
-    let mut sess = session("line1\nline2\nline3");
-    feed(&mut sess, "cc");
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Insert);
-}
-
-#[test]
-fn v_o_yank_motion() {
-    let mut sess = session("hello world");
-    feed(&mut sess, "yw");
-    let doc = sess.document();
-    assert_eq!(doc, "hello world");
-}
-
-#[test]
-fn v_o_yank_line() {
-    let mut sess = session("line1\nline2\nline3");
-    feed(&mut sess, "2yy");
-    let doc = sess.document();
-    assert_eq!(doc, "line1\nline2\nline3");
-}
-
-#[test]
-fn v_o_case_operators() {
-    let mut sess = session("HELLO world");
-    feed(&mut sess, "guw");
-    assert_eq!(sess.document(), "hello world");
-    feed(&mut sess, "gUw");
-    assert_eq!(sess.document(), "HELLO world");
-}
-
-// ── V-R registers ─────────────────────────────────────────────────────────
-
-#[test]
-fn v_r_put_after() {
-    let mut sess = session("hello world");
-    feed(&mut sess, "yw");
-    // Move to end of "hello"
-    feed(&mut sess, "5l");
-    feed(&mut sess, "p");
-    // "hello " was yanked, put after cursor at position 5
-    let doc = sess.document();
-    assert!(doc.contains("hello hello"));
-}
-
-#[test]
-fn v_r_put_before() {
-    let mut sess = session("hello world");
-    feed(&mut sess, "yw");
-    feed(&mut sess, "F<Enter>");
-    feed(&mut sess, "P");
-    // "hello " was yanked, put before cursor
-    let doc = sess.document();
-    assert!(doc.contains("hello hello"));
-}
-
-#[test]
-fn v_r_system_clipboard_yank() {
-    let mut sess = session("hello world");
-    let effects = feed(&mut sess, "\"+yw");
-    assert!(effects
-        .iter()
-        .any(|effect| matches!(effect, Effect::ClipboardWrite(text) if text == "hello ")));
-}
-
-// ── V-V visual mode operations ────────────────────────────────────────────
-
-#[test]
-fn v_v_selection_extend() {
-    let mut sess = session("hello world");
-    feed(&mut sess, "v");
-    feed(&mut sess, "6l");
-    let selections = sess.selections();
-    assert!(!selections.is_empty());
-}
-
-#[test]
-fn v_v_swap_cursor_anchor() {
-    let mut sess = session("hello world");
-    feed(&mut sess, "v");
-    feed(&mut sess, "6l");
-    feed(&mut sess, "o");
-    // After 'o', cursor should be at the start of the selection
-    assert_eq!(mode(&sess), oom_edit_core::session::Mode::Visual);
-}
-
-#[test]
-fn v_v_linewise_indent() {
-    let mut sess = session("hello\nworld");
-    feed(&mut sess, "V");
-    feed(&mut sess, "j");
-    feed(&mut sess, ">");
-    let doc = sess.document();
-    assert!(doc.starts_with("    "));
-}
-
-// ── V-X ex commands ──────────────────────────────────────────────────────
-
-#[test]
-fn v_x_substitute_first() {
-    let mut sess = session("hello world hello");
-    feed(&mut sess, ":s/hello/hi/<Enter>");
-    let doc = sess.document();
-    assert!(doc.contains("hi world hello"));
-}
-
-#[test]
-fn v_x_substitute_global() {
-    let mut sess = session("hello world hello");
-    feed(&mut sess, ":s/hello/hi/g<Enter>");
-    let doc = sess.document();
-    assert_eq!(doc, "hi world hi");
-    assert!(sess.is_dirty());
-}
-
-#[test]
-fn v_x_substitute_range() {
-    let mut sess = session("line1\nline2\nline3");
-    feed(&mut sess, ":1,2s/line/row/<Enter>");
-    assert_eq!(sess.document(), "row1\nrow2\nline3");
-}
-
-#[test]
-fn v_x_substitute_defaults_to_cursor_line() {
-    let mut sess = session("hello one\nhello two\nhello three");
-    feed(&mut sess, "j");
-    assert!(feed(&mut sess, ":s/hello/hi/<Enter>")
-        .iter()
-        .any(|effect| matches!(effect, Effect::Edited)));
-    assert_eq!(sess.document(), "hello one\nhi two\nhello three");
-}
-
-#[test]
-fn v_x_substitute_rejects_invalid_ranges() {
-    for command in [
-        ":2,1s/row/changed/<Enter>",
-        ":0s/row/changed/<Enter>",
-        ":1,3s/row/changed/<Enter>",
-    ] {
-        let mut sess = session("row one\nrow two");
-        let effects = feed(&mut sess, command);
-        assert!(effects.iter().any(|effect| matches!(
+fn v_x3_write_quit() {
+    for command in ["wq", "x"] {
+        let mut session = EditorSession::from_text("text\n");
+        assert!(ex(&mut session, command).iter().any(|effect| matches!(
             effect,
-            Effect::Message {
-                text,
-                severity: Severity::Warning,
-            } if text == "Invalid substitute range"
+            Effect::SaveRequested {
+                then_quit: true,
+                ..
+            }
         )));
-        assert!(effects
-            .iter()
-            .all(|effect| !matches!(effect, Effect::Edited)));
-        assert_eq!(sess.document(), "row one\nrow two");
-        assert!(!sess.is_dirty());
     }
 }
 
 #[test]
-fn v_x_substitute_percent() {
-    let mut sess = session("hello\nhello\nhello");
-    feed(&mut sess, ":%s/hello/hi/g<Enter>");
-    let doc = sess.document();
-    assert_eq!(doc, "hi\nhi\nhi");
-}
-
-#[test]
-fn v_x_substitute_refreshes_highlighter_and_view_cache() {
-    let mut sess = session("plain\n");
-    sess.toggle_view();
-    sess.view_layout_mut(80)
-        .expect("View mode must build a cached layout");
-    sess.toggle_view();
-
-    assert!(feed(&mut sess, ":s/plain/*bold*/<Enter>")
-        .iter()
-        .any(|effect| matches!(effect, Effect::Edited)));
-    assert_eq!(sess.highlighter().text(), "*bold*\n");
-    assert!(sess.view_layout().is_none());
-
-    let frame = sess.render_source(Viewport {
-        top_line: 0,
-        height: 1,
-        width: 80,
-        wrap: true,
-        left_col: 0,
-        skip_rows: 0,
-    });
-    assert!(frame.lines[0]
-        .spans
-        .iter()
-        .any(|span| span.style == SemanticStyle::Emphasis));
-}
-
-#[test]
-fn v_x_substitute_is_one_undoable_step() {
-    let mut sess = session("hello hello\nhello\n");
-    feed(&mut sess, ":%s/hello/hi/g<Enter>");
-    assert_eq!(sess.document(), "hi hi\nhi\n");
-
-    assert!(feed(&mut sess, "u")
-        .iter()
-        .any(|effect| matches!(effect, Effect::Edited)));
-    assert_eq!(sess.document(), "hello hello\nhello\n");
-    assert_eq!(sess.highlighter().text(), "hello hello\nhello\n");
-
-    assert!(feed(&mut sess, "<C-r>")
-        .iter()
-        .any(|effect| matches!(effect, Effect::Edited)));
-    assert_eq!(sess.document(), "hi hi\nhi\n");
-    assert_eq!(sess.highlighter().text(), "hi hi\nhi\n");
-}
-
-#[test]
-fn v_x_quit_dirty_refuses() {
-    let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, "x");
-    assert!(sess.is_dirty());
-    let effects = feed(&mut sess, ":q<Enter>");
-    // The core reports a non-forced request; the host owns dirty-buffer refusal UI.
-    assert!(effects
-        .iter()
-        .any(|effect| matches!(effect, Effect::QuitRequested { force: false })));
-}
-
-#[test]
-fn v_x_quit_force_discards() {
-    let mut sess = session(FIXTURE_3LINES);
-    feed(&mut sess, "x");
-    let effects = feed(&mut sess, ":q!<Enter>");
-    assert!(effects
-        .iter()
-        .any(|effect| matches!(effect, Effect::QuitRequested { force: true })));
-}
-
-#[test]
-fn v_x_edit_file() {
-    let mut sess = session(FIXTURE_3LINES);
-    let effects = feed(&mut sess, ":e next.md<Enter>");
-    assert!(effects.iter().any(|effect| matches!(
+fn v_x4_edit() {
+    let mut session = EditorSession::from_text("text\n");
+    assert!(ex(&mut session, "e next.md").iter().any(|effect| matches!(
         effect,
-        Effect::OpenRequested { path, force: false } if path == std::path::Path::new("next.md")
+        Effect::OpenRequested { path, force: false } if path.ends_with("next.md")
+    )));
+    assert!(ex(&mut session, "e! next.md").iter().any(|effect| matches!(
+        effect,
+        Effect::OpenRequested { path, force: true } if path.ends_with("next.md")
     )));
 }
 
 #[test]
-fn v_x_edit_file_force() {
-    let mut sess = session(FIXTURE_3LINES);
-    let effects = feed(&mut sess, ":e! next.md<Enter>");
-    assert!(effects.iter().any(|effect| matches!(
-        effect,
-        Effect::OpenRequested { path, force: true } if path == std::path::Path::new("next.md")
-    )));
-}
-
-#[test]
-fn v_x_goto_line() {
-    let mut sess = session(FIXTURE_5LINES);
-    feed(&mut sess, ":3<Enter>");
-    assert_eq!(sess.cursor(), (2, 0));
-}
-
-#[test]
-fn v_x_saveas() {
-    let mut sess = session(FIXTURE_3LINES);
-    let effects = feed(&mut sess, ":saveas copy.md<Enter>");
-    assert!(effects.iter().any(|effect| matches!(
-        effect,
-        Effect::SaveRequested {
-            path: Some(path),
-            force: false,
-            then_quit: false
-        } if path == std::path::Path::new("copy.md")
-    )));
-}
-
-// ── Counts sweep ──────────────────────────────────────────────────────────
-
-#[test]
-fn counts_word_forward() {
-    let mut sess = session("one two three four five");
-    feed(&mut sess, "3w");
-    // 3w from col 0: w→"two" (col 4), w→"three" (col 8), w→"four" (col 14)
-    assert_eq!(sess.cursor().1, 14);
-}
-
-#[test]
-fn counts_delete_line() {
-    let mut sess = session("line1\nline2\nline3\nline4\nline5");
-    feed(&mut sess, "3dd");
-    let doc = sess.document();
-    assert!(doc.contains("line4"));
-    assert!(doc.contains("line5"));
-}
-
-#[test]
-fn counts_delete_motion() {
-    let mut sess = session("line1\nline2\nline3\nline4\nline5");
-    feed(&mut sess, "d3j");
-    let doc = sess.document();
-    // d3j deletes current line + 3 lines below = all 5 lines, leaving "line5"
-    assert_eq!(doc, "line5");
-}
-
-#[test]
-fn counts_goto_line() {
-    let mut sess = session("line1\nline2\nline3\nline4\nline5");
-    feed(&mut sess, "3G");
-    assert_eq!(sess.cursor().0, 2);
-}
-
-#[test]
-fn counts_paragraph_forward() {
-    let mut sess = session("Para1.\n\nPara2.\n\nPara3.");
-    feed(&mut sess, "2}");
-    assert!(sess.cursor().0 > 2);
-}
-
-#[test]
-fn counts_repeat_n() {
-    let mut sess = session("hello\nworld\nhello\nworld");
-    feed(&mut sess, "/world<Enter>");
-    feed(&mut sess, "2n");
-    // Should have found the second "world"
-    assert!(sess.cursor().0 >= 1);
-}
-
-// ── VN: View mode navigation ──────────────────────────────────────────────
-
-/// Helper to create a session and toggle to View mode.
-fn view_session(text: &str) -> EditorSession {
-    let mut sess = session(text);
-    // Enter View mode via toggle_view
-    sess.toggle_view();
-    assert_eq!(sess.mode(), oom_edit_core::session::Mode::View);
-    sess
-}
-
-#[test]
-fn vn1_j_down_navigation() {
-    let mut sess = view_session("line1\nline2\nline3\nline4\nline5");
-    // Move down 3 lines
-    let effects = sess.handle_key(KeyInput {
-        code: KeyCode {
-            kind: KeyCodeKind::Char('j'),
-        },
-        mods: Modifiers::default(),
-    });
-    assert!(effects.iter().any(|e| matches!(e, Effect::CursorMoved)));
-}
-
-#[test]
-fn vn1_k_up_navigation() {
-    let mut sess = view_session("line1\nline2\nline3\nline4\nline5");
-    // Move down first, then up
-    sess.handle_key(KeyInput {
-        code: KeyCode {
-            kind: KeyCodeKind::Char('j'),
-        },
-        mods: Modifiers::default(),
-    });
-    let effects = sess.handle_key(KeyInput {
-        code: KeyCode {
-            kind: KeyCodeKind::Char('k'),
-        },
-        mods: Modifiers::default(),
-    });
-    assert!(effects.iter().any(|e| matches!(e, Effect::CursorMoved)));
-}
-
-#[test]
-fn vn1_arrows_navigation() {
-    let mut sess = view_session("line1\n\nline2\n\nline3");
-    let start = sess.view_cursor_line();
-    let down_effects = sess.handle_key(KeyInput {
-        code: KeyCode {
-            kind: KeyCodeKind::Down,
-        },
-        mods: Modifiers::default(),
-    });
-    assert_eq!(sess.view_cursor_line(), start + 1);
-    assert!(down_effects
+fn v_x5_saveas() {
+    let mut session = EditorSession::from_text("text\n");
+    assert!(ex(&mut session, "saveas next.md")
         .iter()
-        .any(|effect| matches!(effect, Effect::CursorMoved)));
-
-    let up_effects = sess.handle_key(KeyInput {
-        code: KeyCode {
-            kind: KeyCodeKind::Up,
-        },
-        mods: Modifiers::default(),
-    });
-    assert_eq!(sess.view_cursor_line(), start);
-    assert!(up_effects
-        .iter()
-        .any(|effect| matches!(effect, Effect::CursorMoved)));
+        .any(|effect| matches!(
+            effect,
+            Effect::SaveRequested { path: Some(path), retarget: true, .. }
+                if path.ends_with("next.md")
+        )));
 }
 
 #[test]
-fn vn3_gg_first_line() {
-    let mut sess = view_session("line1\nline2\nline3");
-    // Move down a few lines
-    sess.handle_key(KeyInput {
-        code: KeyCode {
-            kind: KeyCodeKind::Char('j'),
-        },
-        mods: Modifiers::default(),
-    });
-    sess.handle_key(KeyInput {
-        code: KeyCode {
-            kind: KeyCodeKind::Char('j'),
-        },
-        mods: Modifiers::default(),
-    });
-    // Go to first line
-    let effects = sess.handle_key(KeyInput {
-        code: KeyCode {
-            kind: KeyCodeKind::Char('g'),
-        },
-        mods: Modifiers::default(),
-    });
-    assert!(effects.iter().any(|e| matches!(e, Effect::CursorMoved)));
+fn v_x6_line_jump() {
+    let mut session = EditorSession::from_text("one\ntwo\nthree\n");
+    session.render_layout(40);
+    ex(&mut session, "3");
+    assert_eq!(session.cursor(), (2, 0));
 }
 
 #[test]
-fn vn3_g_last_line() {
-    let mut sess = view_session("line1\nline2\nline3");
-    // Go to last line
-    let effects = sess.handle_key(KeyInput {
-        code: KeyCode {
-            kind: KeyCodeKind::Char('G'),
-        },
-        mods: Modifiers::default(),
-    });
-    assert!(effects.iter().any(|e| matches!(e, Effect::CursorMoved)));
+fn v_x7_substitute() {
+    let mut session = EditorSession::from_text("one one\ntwo one\n");
+    session.render_layout(40);
+    ex(&mut session, "%s/one/ONE/g");
+    assert_eq!(session.document(), "ONE ONE\ntwo ONE\n");
+    session.handle_key(key('u'));
+    assert_eq!(session.document(), "one one\ntwo one\n");
 }
 
 #[test]
-fn vn4_tab_jump_targets() {
-    let mut sess = view_session("# Heading1\n\n## Heading2\n\n## Heading3");
-    // Tab should jump to next heading
-    let effects = sess.handle_key(KeyInput {
-        code: KeyCode {
-            kind: KeyCodeKind::Tab,
-        },
-        mods: Modifiers::default(),
-    });
-    assert!(effects.iter().any(|e| matches!(e, Effect::CursorMoved)));
-}
-
-#[test]
-fn vn4_backtab_jump_targets() {
-    let mut sess = view_session("# Heading1\n\n## Heading2\n\n## Heading3");
-    // Move to end first
-    sess.handle_key(KeyInput {
-        code: KeyCode {
-            kind: KeyCodeKind::Char('G'),
-        },
-        mods: Modifiers::default(),
-    });
-    // Shift-Tab should jump to previous heading
-    let effects = sess.handle_key(KeyInput {
-        code: KeyCode {
-            kind: KeyCodeKind::BackTab,
-        },
-        mods: Modifiers::default(),
-    });
-    assert!(effects.iter().any(|e| matches!(e, Effect::CursorMoved)));
-}
-
-#[test]
-fn vn5_forward_search() {
-    let mut sess = view_session("hello world\n\nfoo bar\n\nhello again");
-    let target_line = sess
-        .view_layout_mut(80)
-        .expect("View mode must have a layout")
-        .lines
-        .iter()
-        .position(|line| line.styled.text.contains("foo bar"))
-        .expect("fixture must render the forward-search target");
-    let effects = feed(&mut sess, "/foo<Enter>");
-    assert_eq!(sess.view_cursor_line(), target_line);
-    assert!(effects
-        .iter()
-        .any(|effect| matches!(effect, Effect::CursorMoved)));
-}
-
-#[test]
-fn vn5_backward_search() {
-    let mut sess = view_session("hello world\n\nfoo bar\n\nhello again");
-    let target_line = sess
-        .view_layout_mut(80)
-        .expect("View mode must have a layout")
-        .lines
-        .iter()
-        .rposition(|line| line.styled.text.contains("hello again"))
-        .expect("fixture must render the backward-search target");
-    let effects = feed(&mut sess, "?hello<Enter>");
-    assert_eq!(sess.view_cursor_line(), target_line);
-    assert!(effects
-        .iter()
-        .any(|effect| matches!(effect, Effect::CursorMoved)));
-}
-
-#[test]
-fn vn5_incremental_search_keeps_prompt_origin() {
-    let mut sess = view_session("start\n\nfoo first\n\nfoo second");
-    let first_target = sess
-        .view_layout_mut(80)
-        .expect("View mode must have a layout")
-        .lines
-        .iter()
-        .position(|line| line.styled.text.contains("foo first"))
-        .expect("fixture must render the first target");
-
-    feed(&mut sess, "/fo");
-    assert_eq!(sess.view_cursor_line(), first_target);
-}
-
-#[test]
-fn vn6_n_repeat_search() {
-    let mut sess = view_session("hello\nworld\nhello\nworld");
-    // Start search and type pattern
-    sess.handle_key(KeyInput {
-        code: KeyCode {
-            kind: KeyCodeKind::Char('/'),
-        },
-        mods: Modifiers::default(),
-    });
-    // Type "hello"
-    for c in "hello".chars() {
-        sess.handle_key(KeyInput {
-            code: KeyCode {
-                kind: KeyCodeKind::Char(c),
-            },
-            mods: Modifiers::default(),
-        });
+fn v_x8_noh_and_help() {
+    let mut session = EditorSession::from_text("one\ntwo one\n");
+    session.render_layout(40);
+    session.handle_key(key('/'));
+    for ch in "one".chars() {
+        session.handle_key(key(ch));
     }
-    sess.handle_key(KeyInput {
-        code: KeyCode {
-            kind: KeyCodeKind::Enter,
-        },
-        mods: Modifiers::default(),
-    });
-    // Press n to repeat
-    let effects = sess.handle_key(KeyInput {
-        code: KeyCode {
-            kind: KeyCodeKind::Char('n'),
-        },
-        mods: Modifiers::default(),
-    });
-    assert!(effects.iter().any(|e| matches!(e, Effect::CursorMoved)));
-}
-
-#[test]
-fn vn6_repeated_upper_n_keeps_reverse_direction_and_reports_wrap() {
-    let mut sess = view_session("hit\n\nmiddle\n\nhit\n\nlast\n\nhit");
-    let hit_lines = sess
-        .view_layout_mut(80)
-        .expect("View mode must have a layout")
-        .lines
+    session.handle_key(special(KeyCodeKind::Enter));
+    assert!(session.rendered_search().is_some());
+    ex(&mut session, "noh");
+    assert!(session.rendered_search().is_none());
+    assert!(ex(&mut session, "help")
         .iter()
-        .enumerate()
-        .filter_map(|(index, line)| line.styled.text.contains("hit").then_some(index))
-        .collect::<Vec<_>>();
-    assert_eq!(hit_lines.len(), 3);
-
-    feed(&mut sess, "/hit<Enter>");
-    assert_eq!(sess.view_cursor_line(), hit_lines[1]);
-    feed(&mut sess, "N");
-    assert_eq!(sess.view_cursor_line(), hit_lines[0]);
-    let effects = feed(&mut sess, "N");
-    assert_eq!(sess.view_cursor_line(), hit_lines[2]);
-    assert!(effects.iter().any(|effect| matches!(
-        effect,
-        Effect::Message { text, severity: Severity::Info } if text.contains("wrapped")
-    )));
+        .any(|effect| matches!(effect, Effect::HelpRequested)));
 }
-
-#[test]
-fn vn6_single_match_repeat_reports_wrap() {
-    let mut sess = view_session("only hit here");
-    feed(&mut sess, "/hit<Enter>");
-    let line = sess.view_cursor_line();
-    let effects = feed(&mut sess, "n");
-    assert_eq!(sess.view_cursor_line(), line);
-    assert!(effects.iter().any(|effect| matches!(
-        effect,
-        Effect::Message { text, severity: Severity::Info } if text.contains("wrapped")
-    )));
-
-    let effects = feed(&mut sess, "N");
-    assert_eq!(sess.view_cursor_line(), line);
-    assert!(effects.iter().any(|effect| matches!(
-        effect,
-        Effect::Message { text, severity: Severity::Info } if text.contains("wrapped")
-    )));
-}
-
-#[test]
-fn fr_1_6_read_only_view() {
-    let mut sess = view_session("line1\nline2\nline3");
-    // Typing a character in View mode should show read-only message
-    let effects = sess.handle_key(KeyInput {
-        code: KeyCode {
-            kind: KeyCodeKind::Char('x'),
-        },
-        mods: Modifiers::default(),
-    });
-    assert!(effects
-        .iter()
-        .any(|e| matches!(e, Effect::Message { text, severity: _ } if text.contains("read-only"))));
-}
-
-#[test]
-fn fr_1_6_i_exit_to_edit() {
-    let mut sess = view_session("line1\nline2\nline3");
-    // Press 'i' to exit to edit mode
-    let effects = sess.handle_key(KeyInput {
-        code: KeyCode {
-            kind: KeyCodeKind::Char('i'),
-        },
-        mods: Modifiers::default(),
-    });
-    assert!(effects
-        .iter()
-        .any(|e| matches!(e, Effect::ModeChanged(oom_edit_core::session::Mode::Insert))));
-}
-
-#[test]
-fn fr_1_6_a_exit_to_edit() {
-    let mut sess = view_session("line1\nline2\nline3");
-    // Press 'a' to exit to edit mode
-    let effects = sess.handle_key(KeyInput {
-        code: KeyCode {
-            kind: KeyCodeKind::Char('a'),
-        },
-        mods: Modifiers::default(),
-    });
-    assert!(effects
-        .iter()
-        .any(|e| matches!(e, Effect::ModeChanged(oom_edit_core::session::Mode::Insert))));
-}
-
-#[test]
-fn fr_1_6_o_exit_to_edit() {
-    let mut sess = view_session("line1\nline2\nline3");
-    // Press 'o' to exit to edit mode
-    let effects = sess.handle_key(KeyInput {
-        code: KeyCode {
-            kind: KeyCodeKind::Char('o'),
-        },
-        mods: Modifiers::default(),
-    });
-    assert!(effects
-        .iter()
-        .any(|e| matches!(e, Effect::ModeChanged(oom_edit_core::session::Mode::Insert))));
-}
-
-#[test]
-fn fr_1_6_esc_exit_to_edit() {
-    let mut sess = view_session("line1\nline2\nline3");
-    // Press Esc to exit to edit mode
-    let effects = sess.handle_key(KeyInput {
-        code: KeyCode {
-            kind: KeyCodeKind::Esc,
-        },
-        mods: Modifiers::default(),
-    });
-    assert!(effects
-        .iter()
-        .any(|e| matches!(e, Effect::ModeChanged(oom_edit_core::session::Mode::Normal))));
-}
-
-#[test]
-fn vp_4_toggle_roundtrip() {
-    let mut sess = session("line1\nline2\nline3");
-    // Toggle to View
-    let effects = sess.toggle_view();
-    assert!(effects
-        .iter()
-        .any(|e| matches!(e, Effect::ModeChanged(oom_edit_core::session::Mode::View))));
-    // Toggle back to Normal
-    let effects = sess.toggle_view();
-    assert!(effects
-        .iter()
-        .any(|e| matches!(e, Effect::ModeChanged(oom_edit_core::session::Mode::Normal))));
-}
-
-#[test]
-fn view_cursor_accessible() {
-    let sess = view_session("line1\nline2\nline3");
-    // View cursor should be accessible
-    assert!(sess.view_cursor().is_some());
-    let cursor = sess.view_cursor().unwrap();
-    assert!(cursor.line < 10); // Should be within reasonable bounds
-}
-
-#[test]
-fn view_layout_accessible() {
-    let sess = view_session("line1\nline2\nline3");
-    // View layout should be accessible
-    assert!(sess.view_layout().is_some());
-}
-
-#[test]
-fn view_scroll_top_centered() {
-    use oom_edit_core::view::nav::view_scroll_top;
-    // With a 24-line viewport, cursor at line 12 should keep scroll at 0
-    let top = view_scroll_top(12, 24, 100, 0);
-    assert_eq!(top, 0);
-}
-
-#[test]
-fn view_scroll_top_bottom() {
-    use oom_edit_core::view::nav::view_scroll_top;
-    // With a 24-line viewport and 100 lines, cursor at line 99 should scroll to bottom
-    let top = view_scroll_top(99, 24, 100, 0);
-    assert_eq!(top, 76); // 100 - 24 = 76
-}
-
-#[test]
-fn view_scroll_top_hysteresis() {
-    use oom_edit_core::view::nav::view_scroll_top;
-    // Cursor moves within center third — scroll shouldn't change
-    let top1 = view_scroll_top(15, 24, 100, 0);
-    let top2 = view_scroll_top(16, 24, 100, top1);
-    assert_eq!(top1, top2);
-}
-
-// ── VP-4: Proptest — enter_view → leave_view identity + random nav ────────
-
-use proptest::prelude::*;
 
 proptest! {
     #[test]
-    fn vp_4_enter_leave_identity(
-        text in r"[\x20-\x7e\n]{10,200}",
-        edit_line in 0usize..20usize,
+    fn random_mode_width_and_motion_mapping_stays_in_bounds(
+        payload in prop::collection::vec(any::<char>(), 0..30),
+        widths in prop::collection::vec(1u16..100, 1..20),
+        actions in prop::collection::vec(0u8..9, 1..80),
     ) {
-        let mut sess = session(&text);
-        let max_lines = sess.line_count();
-        let target_line = edit_line.min(max_lines.saturating_sub(1));
-        // Use ex command to jump to line
-        sess.handle_key(KeyInput {
-            code: KeyCode { kind: KeyCodeKind::Char(':') },
-            mods: Modifiers::default(),
-        });
-        for c in target_line.to_string().chars() {
-            sess.handle_key(KeyInput {
-                code: KeyCode { kind: KeyCodeKind::Char(c) },
-                mods: Modifiers::default(),
-            });
+        let payload: String = payload.into_iter().collect();
+        let text = format!("# Héading\n\n{payload}\n\nUnicode café 東京 wrapping words.\n\n- item\n");
+        let mut session = EditorSession::from_text(&text);
+        for (index, action) in actions.iter().copied().enumerate() {
+            let width = widths[index % widths.len()];
+            session.render_layout(width);
+            let anchor_before_resize = session.cursor();
+            let selection_before = session.rendered_selection().map(|selection| selection.source_ranges);
+            session.render_layout(width.saturating_add(1));
+            prop_assert_eq!(session.cursor(), anchor_before_resize);
+            prop_assert_eq!(session.rendered_selection().map(|selection| selection.source_ranges), selection_before);
+
+            match action {
+                0 => { session.handle_key(key('j')); }
+                1 => { session.handle_key(key('k')); }
+                2 if session.mode() == Mode::Normal => { session.handle_key(key('v')); }
+                2 if session.mode() == Mode::Select => { session.handle_key(special(KeyCodeKind::Esc)); }
+                3 if session.mode() == Mode::Normal => {
+                    session.handle_key(key(':'));
+                    session.handle_key(special(KeyCodeKind::Esc));
+                }
+                4 if session.mode() == Mode::Normal => {
+                    session.handle_key(key('i'));
+                    session.handle_key(key('Ω'));
+                    session.handle_key(special(KeyCodeKind::Esc));
+                    session.render_layout(width);
+                }
+                5 if session.mode() == Mode::Normal => {
+                    session.handle_key(key('/'));
+                    for ch in "東京".chars() { session.handle_key(key(ch)); }
+                    session.handle_key(special(KeyCodeKind::Enter));
+                }
+                6 if session.mode() == Mode::Normal => { session.handle_key(key('u')); }
+                7 if session.mode() == Mode::Normal => { session.handle_key(ctrl('r')); }
+                _ => {}
+            }
+            let (line, col) = session.cursor();
+            prop_assert!(line < session.line_count());
+            prop_assert!(col <= session.line(line).unwrap_or_default().chars().count());
+            if session.mode() != Mode::Insert {
+                session.render_layout(width);
+                prop_assert!(session.rendered_cursor_line() < session.rendered_layout().unwrap().lines.len().max(1));
+            }
         }
-        sess.handle_key(KeyInput {
-            code: KeyCode { kind: KeyCodeKind::Enter },
-            mods: Modifiers::default(),
-        });
-
-        // Enter View
-        let effects = sess.toggle_view();
-        prop_assert!(effects.iter().any(|e| matches!(e, Effect::ModeChanged(oom_edit_core::session::Mode::View))));
-
-        // Immediate leave View
-        let effects = sess.toggle_view();
-        prop_assert!(effects.iter().any(|e| matches!(e, Effect::ModeChanged(oom_edit_core::session::Mode::Normal))));
-
-        // Cursor should be in-bounds
-        let (line, _col) = sess.cursor();
-        prop_assert!(line < sess.line_count());
     }
 
     #[test]
-    fn vp_4_random_nav_sequence(
-        text in r"[\x20-\x7e\n]{10,200}",
+    fn every_selection_shape_is_utf8_safe_ordered_and_resize_deterministic(
+        width in 4u16..60,
+        horizontal in 0usize..12,
+        vertical in 0usize..8,
+        shape_index in 0u8..3,
     ) {
-        let mut sess = session(&text);
-        let line_count = sess.line_count();
-
-        // Enter View
-        sess.toggle_view();
-
-        // Simulate a nav sequence (up to 50 keys)
-        let nav_keys = [
-            KeyInput { code: KeyCode { kind: KeyCodeKind::Char('j') }, mods: Modifiers::default() },
-            KeyInput { code: KeyCode { kind: KeyCodeKind::Char('k') }, mods: Modifiers::default() },
-            KeyInput { code: KeyCode { kind: KeyCodeKind::Char('g') }, mods: Modifiers::default() },
-            KeyInput { code: KeyCode { kind: KeyCodeKind::Char('G') }, mods: Modifiers::default() },
-            KeyInput { code: KeyCode { kind: KeyCodeKind::Down }, mods: Modifiers::default() },
-            KeyInput { code: KeyCode { kind: KeyCodeKind::Up }, mods: Modifiers::default() },
-        ];
-
-        for i in 0..50usize {
-            let key = &nav_keys[i % nav_keys.len()];
-            sess.handle_key(*key);
+        let text = "---\ntitle: café 東京\n---\n\nalpha beta gamma delta\n\n- item one\n- item two\n";
+        let mut session = EditorSession::from_text(text);
+        session.render_layout(width);
+        match shape_index {
+            0 => { session.handle_key(key('v')); }
+            1 => { session.handle_key(key('V')); }
+            _ => { session.handle_key(ctrl('v')); }
         }
+        for _ in 0..horizontal { session.handle_key(key('l')); }
+        for _ in 0..vertical { session.handle_key(key('j')); }
 
-        // Leave View — cursor should still be in-bounds
-        sess.toggle_view();
-        let (line, _col) = sess.cursor();
-        prop_assert!(line < line_count);
-    }
-}
-
-// ── Coverage meta-test (SC-1) ─────────────────────────────────────────────
-
-/// Every Standard-Vim row in plan section 6.2.
-const REQUIRED_ROW_IDS: &[&str] = &[
-    "V-M1", "V-M2", "V-M3", "V-M4", "V-M5", "V-M6", "V-M7", "V-M8", "V-M9", "V-S1", "V-S2", "V-S3",
-    "V-S4", "V-S5", "V-E1", "V-E2", "V-E3", "V-E4", "V-E5", "V-E6", "V-E7", "V-E8", "V-O1", "V-O2",
-    "V-O3", "V-O4", "V-O5", "V-T1", "V-T2", "V-T3", "V-T4", "V-T5", "V-R1", "V-R2", "V-R3", "V-V1",
-    "V-V2", "V-V3", "V-V4", "V-V5", "V-X1", "V-X2", "V-X3", "V-X4", "V-X5", "V-X6", "V-X7", "V-X8",
-];
-
-/// Exact Standard-Vim row-to-test coverage manifest.
-const COVERAGE_CASES: &[(&str, &str)] = &[
-    ("V-M1", "v_m_h_left_arrow"),
-    ("V-M1", "v_m_j_down_arrow"),
-    ("V-M1", "v_m_k_up_arrow"),
-    ("V-M1", "v_m_l_right_arrow"),
-    ("V-M1", "v_m_arrow_keys"),
-    ("V-M2", "v_m_w_word_forward"),
-    ("V-M2", "v_m_b_word_backward"),
-    ("V-M2", "v_m_e_word_end"),
-    ("V-M3", "v_m_word_forward_big_word"),
-    ("V-M3", "v_m_word_backward_big_word"),
-    ("V-M3", "v_m_word_end_big_word"),
-    ("V-M4", "v_m_line_start"),
-    ("V-M4", "v_m_caret_first_non_blank"),
-    ("V-M4", "v_m_line_end"),
-    ("V-M5", "v_m_file_top"),
-    ("V-M5", "v_m_file_bottom"),
-    ("V-M5", "counts_goto_line"),
-    ("V-M6", "v_m_page_down"),
-    ("V-M6", "v_m_page_up"),
-    ("V-M7", "v_m_full_page_down"),
-    ("V-M7", "v_m_full_page_up"),
-    ("V-M8", "v_m_paragraph_forward"),
-    ("V-M8", "v_m_paragraph_backward"),
-    ("V-M8", "counts_paragraph_forward"),
-    ("V-M9", "v_m_match_bracket"),
-    ("V-S1", "v_s_forward_search"),
-    ("V-S2", "v_s_backward_search"),
-    ("V-S3", "v_s_n_repeat_forward"),
-    ("V-S3", "v_s_n_repeat_backward"),
-    ("V-S4", "v_s_no_highlight"),
-    ("V-S5", "v_s_search_operator_target"),
-    ("V-E1", "v_m_delete_char"),
-    ("V-E2", "v_e_replace_char"),
-    ("V-E3", "v_e_toggle_case"),
-    ("V-E4", "v_e_join_line"),
-    ("V-E5", "v_e_delete_to_eol"),
-    ("V-E5", "v_e_change_to_eol"),
-    ("V-E6", "v_e_substitute_char"),
-    ("V-E6", "v_e_substitute_line"),
-    ("V-E7", "v_e_undo_redo_granularity"),
-    ("V-E8", "v_m_chord_repeat_dot"),
-    ("V-O1", "v_o_delete_motion"),
-    ("V-O1", "v_o_delete_count_dd"),
-    ("V-O2", "v_o_change_motion"),
-    ("V-O2", "v_o_change_line"),
-    ("V-O3", "v_o_yank_motion"),
-    ("V-O3", "v_o_yank_line"),
-    ("V-O4", "v_o_indent_motion"),
-    ("V-O4", "v_o_dedent_motion"),
-    ("V-O5", "v_o_case_operators"),
-    ("V-T1", "v_m_chord_text_object_iw"),
-    ("V-T1", "v_m_chord_text_object_aw"),
-    ("V-T2", "v_m_chord_text_object_iW"),
-    ("V-T2", "v_m_chord_text_object_awW"),
-    ("V-T3", "v_m_chord_text_object_iq"),
-    ("V-T3", "v_m_chord_text_object_aq"),
-    ("V-T4", "v_m_chord_text_object_ib"),
-    ("V-T4", "v_m_chord_text_object_ab"),
-    ("V-T5", "v_m_chord_text_object_ip"),
-    ("V-T5", "v_m_chord_text_object_ap"),
-    ("V-R1", "v_r_put_after"),
-    ("V-R1", "v_r_put_before"),
-    ("V-R2", "v_r_put_after"),
-    ("V-R3", "v_r_system_clipboard_yank"),
-    ("V-V1", "v_v_selection_extend"),
-    ("V-V2", "v_m_chord_visual_d"),
-    ("V-V2", "v_m_chord_visual_c"),
-    ("V-V2", "v_m_chord_visual_y"),
-    ("V-V3", "v_v_linewise_indent"),
-    ("V-V4", "v_v_swap_cursor_anchor"),
-    ("V-V5", "v_m_chord_visual_block_i"),
-    ("V-V5", "v_m_chord_visual_block_a"),
-    ("V-X1", "v_m_command_save"),
-    ("V-X2", "v_x_quit_dirty_refuses"),
-    ("V-X2", "v_x_quit_force_discards"),
-    ("V-X3", "v_m_chord_wq"),
-    ("V-X3", "v_m_chord_x"),
-    ("V-X4", "v_x_edit_file"),
-    ("V-X4", "v_x_edit_file_force"),
-    ("V-X5", "v_x_saveas"),
-    ("V-X6", "v_x_goto_line"),
-    ("V-X7", "v_x_substitute_first"),
-    ("V-X7", "v_x_substitute_global"),
-    ("V-X7", "v_x_substitute_range"),
-    ("V-X7", "v_x_substitute_percent"),
-    ("V-X8", "v_s_no_highlight"),
-    ("V-X8", "v_m_command_view"),
-    ("V-X8", "v_m_chord_help"),
-];
-
-fn declared_test_functions(source: &str) -> std::collections::BTreeSet<String> {
-    let mut names = std::collections::BTreeSet::new();
-    let mut has_test_attribute = false;
-    let mut has_disabling_attribute = false;
-    let mut block_comment_depth = 0usize;
-
-    for line in source.lines() {
-        let line = line.trim();
-        if block_comment_depth > 0 {
-            block_comment_depth += line.matches("/*").count();
-            block_comment_depth = block_comment_depth.saturating_sub(line.matches("*/").count());
-            continue;
-        }
-        if line.starts_with("/*") {
-            block_comment_depth = line
-                .matches("/*")
-                .count()
-                .saturating_sub(line.matches("*/").count());
-            continue;
-        }
-        if line.is_empty() || line.starts_with("//") {
-            continue;
-        }
-        if line.starts_with("#[") {
-            has_test_attribute |= line == "#[test]";
-            has_disabling_attribute |= line.starts_with("#[ignore") || line.starts_with("#[cfg");
-            continue;
-        }
-        if has_test_attribute {
-            if let Some(signature) = line.strip_prefix("fn ") {
-                if !has_disabling_attribute {
-                    if let Some((name, _)) = signature.split_once('(') {
-                        names.insert(name.to_string());
-                    }
+        let assert_projection = |selection: &oom_edit_core::RenderedSelection| {
+            prop_assert_eq!(selection.shape, match shape_index {
+                0 => SelectionShape::Character,
+                1 => SelectionShape::Line,
+                _ => SelectionShape::Block,
+            });
+            for pair in selection.source_ranges.windows(2) {
+                prop_assert!(pair[0].end < pair[1].start);
+            }
+            for range in &selection.source_ranges {
+                prop_assert!(range.start < range.end);
+                prop_assert!(range.end <= text.len());
+                prop_assert!(text.is_char_boundary(range.start));
+                prop_assert!(text.is_char_boundary(range.end));
+                if shape_index == 1 {
+                    prop_assert!(range.start == 0 || text.as_bytes().get(range.start - 1) == Some(&b'\n'));
+                    prop_assert!(range.end == text.len() || text.as_bytes().get(range.end - 1) == Some(&b'\n'));
                 }
             }
-        }
-        has_test_attribute = false;
-        has_disabling_attribute = false;
-    }
+            for pair in selection.rows.windows(2) {
+                prop_assert!(pair[0].row < pair[1].row);
+            }
+            Ok(())
+        };
 
-    names
-}
-
-fn coverage_errors(source: &str, required: &[&str], cases: &[(&str, &str)]) -> Vec<String> {
-    let declared_tests = declared_test_functions(source);
-    let mut errors = Vec::new();
-    let mut required_ids = std::collections::BTreeSet::new();
-    let mut covered_ids = std::collections::BTreeSet::new();
-    let mut mapped_pairs = std::collections::BTreeSet::new();
-
-    for row_id in required {
-        if !required_ids.insert(*row_id) {
-            errors.push(format!("duplicate required row ID: {row_id}"));
-        }
-    }
-
-    for &(row_id, test_name) in cases {
-        if !mapped_pairs.insert((row_id, test_name)) {
-            errors.push(format!(
-                "duplicate coverage mapping: {row_id} -> {test_name}"
-            ));
-        }
-        if !required_ids.contains(row_id) {
-            errors.push(format!("unknown row ID in coverage manifest: {row_id}"));
-            continue;
-        }
-        covered_ids.insert(row_id);
-        if !declared_tests.contains(test_name) {
-            errors.push(format!(
-                "{row_id} maps to missing test function: {test_name}"
-            ));
-        }
-    }
-
-    for row_id in required_ids {
-        if !covered_ids.contains(row_id) {
-            errors.push(format!("required row ID has no mapped test: {row_id}"));
-        }
-    }
-
-    errors
-}
-#[test]
-fn sc_1_coverage_meta_test() {
-    let source = include_str!("mod.rs");
-    let errors = coverage_errors(source, REQUIRED_ROW_IDS, COVERAGE_CASES);
-    assert!(errors.is_empty(), "{}", errors.join("\n"));
-}
-
-#[test]
-fn sc_1_coverage_validator_detects_removed_final_mapping() {
-    let source = include_str!("mod.rs");
-    let cases = COVERAGE_CASES
-        .iter()
-        .copied()
-        .filter(|(row_id, _)| *row_id != "V-S1")
-        .collect::<Vec<_>>();
-
-    let errors = coverage_errors(source, REQUIRED_ROW_IDS, &cases);
-    assert!(errors
-        .iter()
-        .any(|error| error == "required row ID has no mapped test: V-S1"));
-}
-
-#[test]
-fn sc_1_coverage_validator_detects_removed_test_function() {
-    let source = include_str!("mod.rs")
-        .replace("fn v_s_forward_search()", "fn removed_v_s_forward_search()");
-
-    let errors = coverage_errors(&source, REQUIRED_ROW_IDS, COVERAGE_CASES);
-    assert!(errors
-        .iter()
-        .any(|error| error == "V-S1 maps to missing test function: v_s_forward_search"));
-}
-
-#[test]
-fn sc_1_coverage_validator_rejects_broad_category_prefixes() {
-    let source = "#[test]\nfn v_m_anything() {}";
-    let errors = coverage_errors(source, &["V-M1"], &[("v_m", "v_m_anything")]);
-
-    assert!(errors
-        .iter()
-        .any(|error| error == "unknown row ID in coverage manifest: v_m"));
-    assert!(errors
-        .iter()
-        .any(|error| error == "required row ID has no mapped test: V-M1"));
-}
-
-#[test]
-fn sc_1_coverage_validator_rejects_duplicate_mappings() {
-    let source = "#[test]\nfn v_m_h_left_arrow() {}";
-    let duplicate = ("V-M1", "v_m_h_left_arrow");
-    let errors = coverage_errors(source, &["V-M1"], &[duplicate, duplicate]);
-
-    assert!(errors
-        .iter()
-        .any(|error| error == "duplicate coverage mapping: V-M1 -> v_m_h_left_arrow"));
-}
-
-#[test]
-fn sc_1_coverage_validator_rejects_commented_out_tests() {
-    let source = "/*\n#[test]\nfn mapped_test() {}\n*/";
-    let errors = coverage_errors(source, &["V-M1"], &[("V-M1", "mapped_test")]);
-
-    assert!(errors
-        .iter()
-        .any(|error| error == "V-M1 maps to missing test function: mapped_test"));
-}
-
-#[test]
-fn sc_1_coverage_validator_rejects_disabled_tests() {
-    for source in [
-        "#[test]\n#[ignore]\nfn mapped_test() {}",
-        "#[cfg(any())]\n#[test]\nfn mapped_test() {}",
-    ] {
-        let errors = coverage_errors(source, &["V-M1"], &[("V-M1", "mapped_test")]);
-        assert!(errors
-            .iter()
-            .any(|error| error == "V-M1 maps to missing test function: mapped_test"));
+        let original = session.rendered_selection().unwrap();
+        assert_projection(&original)?;
+        session.render_layout(width.saturating_add(7));
+        let resized = session.rendered_selection().unwrap();
+        assert_projection(&resized)?;
+        session.render_layout(width);
+        let restored = session.rendered_selection().unwrap();
+        assert_projection(&restored)?;
+        prop_assert_eq!(restored.shape, original.shape);
+        prop_assert_eq!(restored.source_ranges, original.source_ranges);
     }
 }

@@ -1,7 +1,7 @@
 //! Clipboard sink trait for the core.
 //!
 //! The core emits `Effect::ClipboardWrite` and the host routes it to its
-//! [`ClipboardSink`] implementation. The TUI provides [`Osc52Clipboard`]
+//! [`ClipboardSink`] implementation. The TUI provides `Osc52Clipboard`
 //! (architecture §7.2).
 //!
 //! See plan V-R3.

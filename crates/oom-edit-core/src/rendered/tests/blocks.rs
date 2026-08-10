@@ -1,8 +1,8 @@
-//! Tests for the view module (block model).
+//! Tests for the rendered block model and layout.
 
-use oom_edit_core::style::{LineKind, SemanticStyle};
-use oom_edit_core::view::{Block, BlockKind, BlockModel, Inline, ListItem};
-use oom_edit_core::{Highlighter, ViewLayout};
+use crate::rendered::{Block, BlockKind, BlockModel, Inline, ListItem};
+use crate::style::{LineKind, SemanticStyle};
+use crate::{Highlighter, RenderedLayout, TargetKind};
 use std::path::Path;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -14,14 +14,149 @@ fn fixture(name: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("fixture not found: {name}"))
 }
 
-fn view_layout(text: &str) -> ViewLayout {
-    view_layout_at_width(text, 80)
+fn rendered_layout(text: &str) -> RenderedLayout {
+    rendered_layout_at_width(text, 80)
 }
 
-fn view_layout_at_width(text: &str, width: u16) -> ViewLayout {
+fn rendered_layout_at_width(text: &str, width: u16) -> RenderedLayout {
     let model = BlockModel::build(text, None);
     let highlighter = Highlighter::new(text);
-    ViewLayout::build(&model, width, &highlighter)
+    RenderedLayout::build(&model, width, &highlighter)
+}
+
+#[test]
+fn inline_source_atoms_cover_markdown_transformations() {
+    let cases = [
+        ("plain text", "plain text"),
+        (r"escaped \* punctuation", r"escaped \* punctuation"),
+        ("*emphasis* and `code`", "emphasis and code"),
+        ("[link label](https://example.test)", "link label"),
+        ("![image alt](image.png)", "image alt"),
+        ("- list item", "list item"),
+        ("- [x] completed task", "completed task"),
+        ("repeated aaa aaa", "repeated aaa aaa"),
+        ("wide 東京 and cafe\u{301}", "wide 東京 and cafe\u{301}"),
+    ];
+    for (text, expected_raw) in cases {
+        let layout = rendered_layout_at_width(text, 80);
+        let sources: Vec<_> = layout
+            .lines
+            .iter()
+            .flat_map(|line| &line.atoms)
+            .filter_map(|atom| atom.source.as_ref())
+            .collect();
+        assert!(!sources.is_empty(), "no source atoms for {text:?}");
+        for source in &sources {
+            assert!(source.start < source.end, "empty atom for {text:?}");
+            assert!(source.end <= text.len(), "out-of-bounds atom for {text:?}");
+            assert!(text.is_char_boundary(source.start));
+            assert!(text.is_char_boundary(source.end));
+        }
+        assert_eq!(
+            sources
+                .iter()
+                .map(|source| &text[(**source).clone()])
+                .collect::<String>(),
+            expected_raw,
+            "wrong rendered-atom source ownership for {text:?}"
+        );
+    }
+
+    let table = "| phrase | tag |\n|---|---|\n| hello world | x |";
+    let layout = rendered_layout(table);
+    let row = layout
+        .lines
+        .iter()
+        .find(|line| line.styled.text.contains("hello world"))
+        .expect("rendered table body");
+    let byte_start = row.styled.text.find("hello world").unwrap();
+    let start = row.styled.text[..byte_start]
+        .chars()
+        .map(|character| unicode_width::UnicodeWidthChar::width(character).unwrap_or(0))
+        .sum::<usize>();
+    let raw = row
+        .atoms
+        .iter()
+        .filter(|atom| atom.columns.start >= start && atom.columns.start < start + 11)
+        .map(|atom| {
+            atom.source
+                .as_ref()
+                .map_or("", |source| &table[source.clone()])
+        })
+        .collect::<String>();
+    let ownership = row
+        .atoms
+        .iter()
+        .map(|atom| {
+            (
+                atom.columns.clone(),
+                atom.source
+                    .as_ref()
+                    .map(|source| table[source.clone()].to_string()),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(raw, "hello world", "{ownership:?}");
+    assert_eq!(
+        row.atoms
+            .iter()
+            .find(|atom| atom.columns.start == start + 5)
+            .and_then(|atom| atom.source.as_ref())
+            .map(|source| &table[source.clone()]),
+        Some(" ")
+    );
+}
+
+#[test]
+fn synthetic_layout_cells_are_explicitly_unmapped() {
+    let text = "- item\n\n[link](https://example.test)\n\n| a | b |\n|---|---|\n| c | d |\n\n```rust\nfn main() {}\n```\n";
+    let layout = rendered_layout(text);
+    assert!(layout
+        .lines
+        .iter()
+        .flat_map(|line| &line.atoms)
+        .any(|atom| { atom.source.is_none() && atom.columns.start < atom.columns.end }));
+    assert!(layout
+        .lines
+        .iter()
+        .flat_map(|line| &line.atoms)
+        .any(|atom| atom.source.is_some()));
+
+    for line in &layout.lines {
+        for (character, atom) in line.styled.text.chars().zip(&line.atoms) {
+            if matches!(character, '•' | '│' | '┌' | '┐' | '└' | '┘' | '─' | '▏') {
+                assert_eq!(atom.source, None, "synthetic {character:?} was mapped");
+            }
+        }
+        if line.styled.text.starts_with("▏ ") {
+            assert_eq!(line.atoms[1].source, None);
+        }
+        if let Some(marker) = line.styled.text.find("[0]") {
+            assert!(line.atoms[marker..marker + 3]
+                .iter()
+                .all(|atom| atom.source.is_none()));
+        }
+    }
+}
+
+#[test]
+fn wrapped_source_atoms_keep_their_byte_ownership() {
+    let text = "alpha beta gamma delta epsilon 東京 cafe\u{301}";
+    let wide = rendered_layout_at_width(text, 80);
+    let narrow = rendered_layout_at_width(text, 9);
+    let ranges = |layout: &RenderedLayout| {
+        let mut ranges: Vec<_> = layout
+            .lines
+            .iter()
+            .flat_map(|line| &line.atoms)
+            .filter_map(|atom| atom.source.clone())
+            .filter(|range| !text[range.clone()].trim().is_empty())
+            .collect();
+        ranges.sort_by_key(|range| (range.start, range.end));
+        ranges.dedup();
+        ranges
+    };
+    assert_eq!(ranges(&wide), ranges(&narrow));
 }
 
 /// Assert that a block's span points at non-empty source text.
@@ -154,7 +289,7 @@ fn test_headings() {
 
 #[test]
 fn heading_jump_target_wrapping() {
-    let layout = view_layout_at_width(
+    let layout = rendered_layout_at_width(
         "Intro paragraph.\n\n# This is a heading that wraps across multiple lines",
         20,
     );
@@ -175,7 +310,7 @@ fn heading_jump_target_wrapping() {
 
 #[test]
 fn heading_jump_target_no_wrap() {
-    let layout = view_layout_at_width("Intro paragraph.\n\n# Short heading", 80);
+    let layout = rendered_layout_at_width("Intro paragraph.\n\n# Short heading", 80);
 
     assert_eq!(layout.jump_targets.len(), 1);
     let first_heading_line = layout
@@ -427,7 +562,7 @@ fn tight_multiblock_item_keeps_trailing_text_after_child_block() {
 #[test]
 fn nested_unordered_layout_preserves_preorder_and_vw6_markers() {
     let text = "Nested unordered lists:\n\n- Top-level item\n  - Second-level item\n    - Third-level item\n      - Fourth-level item\n  - Another second-level item\n- Back to top level";
-    let layout = view_layout(text);
+    let layout = rendered_layout(text);
     let lines: Vec<_> = layout
         .lines
         .iter()
@@ -452,7 +587,7 @@ fn nested_unordered_layout_preserves_preorder_and_vw6_markers() {
 #[test]
 fn ordered_lists_render_declared_start_and_nested_restart() {
     let text = "10. Tenth item\n11. Eleventh item\n\n    3. Nested third\n    4. Nested fourth";
-    let layout = view_layout(text);
+    let layout = rendered_layout(text);
     let lines: Vec<_> = layout
         .lines
         .iter()
@@ -472,7 +607,7 @@ fn ordered_lists_render_declared_start_and_nested_restart() {
 
 #[test]
 fn wrapped_list_continuations_align_after_marker() {
-    let layout = view_layout_at_width("10. alpha beta gamma delta", 14);
+    let layout = rendered_layout_at_width("10. alpha beta gamma delta", 14);
     let lines: Vec<_> = layout
         .lines
         .iter()
@@ -489,7 +624,7 @@ fn wrapped_list_continuations_align_after_marker() {
 
 #[test]
 fn nested_task_lists_keep_checkbox_marker_at_depth() {
-    let layout = view_layout("- Parent\n  - [ ] Pending child\n  - [x] Completed child");
+    let layout = rendered_layout("- Parent\n  - [ ] Pending child\n  - [x] Completed child");
     let lines: Vec<_> = layout
         .lines
         .iter()
@@ -508,7 +643,7 @@ fn nested_task_lists_keep_checkbox_marker_at_depth() {
 
 #[test]
 fn nested_list_only_item_keeps_parent_marker() {
-    let layout = view_layout("-\n  - child");
+    let layout = rendered_layout("-\n  - child");
     let lines: Vec<_> = layout
         .lines
         .iter()
@@ -582,7 +717,7 @@ fn test_blockquote() {
 
 #[test]
 fn link_inside_list_item_in_index() {
-    let layout = view_layout("- See [Rust](https://www.rust-lang.org/).");
+    let layout = rendered_layout("- See [Rust](https://www.rust-lang.org/).");
 
     assert_eq!(
         layout.link_index,
@@ -596,7 +731,7 @@ fn link_inside_list_item_in_index() {
 
 #[test]
 fn link_inside_blockquote_in_index() {
-    let layout = view_layout("> Read [the guide](https://example.com/guide).");
+    let layout = rendered_layout("> Read [the guide](https://example.com/guide).");
 
     assert_eq!(
         layout.link_index,
@@ -610,7 +745,7 @@ fn link_inside_blockquote_in_index() {
 
 #[test]
 fn heading_inside_blockquote_jump_target() {
-    let layout = view_layout("> # Nested heading");
+    let layout = rendered_layout("> # Nested heading");
 
     assert_eq!(layout.jump_targets.len(), 1);
     let target = &layout.jump_targets[0];
@@ -619,7 +754,7 @@ fn heading_inside_blockquote_jump_target() {
 
 #[test]
 fn nested_link_markers_sequential() {
-    let layout = view_layout(
+    let layout = rendered_layout(
         "[outside](https://example.com/0)\n\n- [first](https://example.com/1)\n- [second](https://example.com/2)\n\n> [quoted](https://example.com/3)",
     );
 
@@ -647,7 +782,7 @@ fn nested_link_markers_sequential() {
 
 #[test]
 fn nested_container_metadata_is_preserved_recursively() {
-    let layout = view_layout("> - [deep link](https://example.com/deep)\n>   > # Deep heading");
+    let layout = rendered_layout("> - [deep link](https://example.com/deep)\n>   > # Deep heading");
 
     assert_eq!(
         layout.link_index,
@@ -657,17 +792,29 @@ fn nested_container_metadata_is_preserved_recursively() {
         .lines
         .iter()
         .any(|line| line.styled.text == "┃ • deep link [0]"));
-    assert_eq!(layout.jump_targets.len(), 1);
+    assert_eq!(layout.jump_targets.len(), 2);
+    let link = layout
+        .jump_targets
+        .iter()
+        .find(|target| target.kind == TargetKind::Link(0))
+        .expect("nested link should be navigable");
+    assert_eq!(layout.lines[link.line].styled.text, "┃ • deep link [0]");
+    let heading = layout
+        .jump_targets
+        .iter()
+        .find(|target| target.kind == TargetKind::Heading(1))
+        .expect("nested heading should be navigable");
     assert_eq!(
-        layout.lines[layout.jump_targets[0].line].styled.text,
+        layout.lines[heading.line].styled.text,
         "┃   ┃ █ Deep heading"
     );
 }
 
 #[test]
 fn no_spurious_link_panel_in_nested() {
-    let layout =
-        view_layout("Before.\n\n- [nested](https://example.com/nested)\n\nAfter nested content.");
+    let layout = rendered_layout(
+        "Before.\n\n- [nested](https://example.com/nested)\n\nAfter nested content.",
+    );
     let after_line = layout
         .lines
         .iter()
@@ -687,7 +834,7 @@ fn no_spurious_link_panel_in_nested() {
 
 #[test]
 fn nested_footnotes_are_finalized_once_at_document_end() {
-    let layout = view_layout(
+    let layout = rendered_layout(
         "- Listed note[^list].\n\n  [^list]: From a list item.\n\n> Quoted note[^quote].\n>\n> [^quote]: From a blockquote.\n\nAfter nested footnotes.",
     );
     let after_line = layout

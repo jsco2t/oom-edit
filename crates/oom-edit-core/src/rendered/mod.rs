@@ -1,6 +1,6 @@
-//! View layout renderer — produces styled, wrapped, source-mapped rendered lines.
+//! rendered layout renderer — produces styled, wrapped, source-mapped rendered lines.
 //!
-//! `ViewLayout::build(&BlockModel, width, &Highlighter)` implements every VW
+//! `RenderedLayout::build(&BlockModel, width, &Highlighter)` implements every VW
 //! row (VW-1..VW-14) from plan §6.3.2, plus the front-matter panel (FR-3.6).
 //!
 //! See architecture §6.4 for the pipeline description.
@@ -20,16 +20,18 @@ mod table;
 mod wrap;
 
 use std::ops::Range;
+use unicode_width::UnicodeWidthChar;
 
 use crate::style::{
-    JumpTarget, LineKind, SemanticStyle, Span, StyledLine, TargetKind, ViewLayout, ViewLine,
+    JumpTarget, LineKind, RenderedLayout, RenderedLine, RenderedLineRole, SemanticStyle, Span,
+    StyledLine, TargetKind,
 };
 use crate::syntax;
 
 // ── Public API ─────────────────────────────────────────────────────────────
 
-impl ViewLayout {
-    /// Build a `ViewLayout` from a `BlockModel`, layout width, and highlighter.
+impl RenderedLayout {
+    /// Build a `RenderedLayout` from a `BlockModel`, layout width, and highlighter.
     ///
     /// Produces styled, wrapped, source-mapped rendered lines implementing
     /// every VW row (VW-1..VW-14) and the front-matter panel (FR-3.6).
@@ -37,32 +39,49 @@ impl ViewLayout {
     /// Blank-line policy: exactly one synthetic blank line between top-level
     /// blocks; no leading blank before the first line; no trailing blank after
     /// the last.
-    pub fn build(model: &BlockModel, width: u16, highlighter: &syntax::Highlighter) -> Self {
+    #[cfg(test)]
+    pub(crate) fn build(model: &BlockModel, width: u16, highlighter: &syntax::Highlighter) -> Self {
+        Self::build_with_front_matter_state(model, width, highlighter, false)
+    }
+
+    /// Build a layout while controlling the front-matter panel's collapsed state.
+    pub(crate) fn build_with_front_matter_state(
+        model: &BlockModel,
+        width: u16,
+        highlighter: &syntax::Highlighter,
+        front_matter_collapsed: bool,
+    ) -> Self {
         if width == 0 {
             return Self::default();
         }
 
-        let layout = ViewLayoutBuilder::new(model, width, highlighter);
+        let layout = RenderedLayoutBuilder::new(model, width, highlighter, front_matter_collapsed);
         layout.build()
     }
 }
 
 // ── Builder ────────────────────────────────────────────────────────────────
 
-struct ViewLayoutBuilder<'a> {
+struct RenderedLayoutBuilder<'a> {
     model: &'a BlockModel,
     width: u16,
     highlighter: &'a syntax::Highlighter,
-    lines: Vec<ViewLine>,
+    lines: Vec<RenderedLine>,
     jump_targets: Vec<JumpTarget>,
     link_index: Vec<(usize, String)>,
     last_content_source: Option<Range<usize>>,
     next_link_marker: usize,
     footnote_defs: Vec<FootnoteDef>,
+    front_matter_collapsed: bool,
 }
 
-impl<'a> ViewLayoutBuilder<'a> {
-    fn new(model: &'a BlockModel, width: u16, highlighter: &'a syntax::Highlighter) -> Self {
+impl<'a> RenderedLayoutBuilder<'a> {
+    fn new(
+        model: &'a BlockModel,
+        width: u16,
+        highlighter: &'a syntax::Highlighter,
+        front_matter_collapsed: bool,
+    ) -> Self {
         Self {
             model,
             width,
@@ -73,10 +92,11 @@ impl<'a> ViewLayoutBuilder<'a> {
             last_content_source: None,
             next_link_marker: 0,
             footnote_defs: Vec::new(),
+            front_matter_collapsed,
         }
     }
 
-    fn build(mut self) -> ViewLayout {
+    fn build(mut self) -> RenderedLayout {
         // Process top-level blocks
         for (i, block) in self.model.blocks.iter().enumerate() {
             if i > 0 && !self.lines.is_empty() {
@@ -95,8 +115,11 @@ impl<'a> ViewLayoutBuilder<'a> {
             self.append_link_index();
         }
 
-        ViewLayout {
+        populate_source_atoms(&mut self.lines, self.model, self.highlighter.text());
+        let line_numbers = rendered_line_numbers(&self.lines, self.highlighter.text());
+        RenderedLayout {
             lines: self.lines,
+            line_numbers,
             jump_targets: self.jump_targets,
             link_index: self.link_index,
         }
@@ -104,13 +127,16 @@ impl<'a> ViewLayoutBuilder<'a> {
 
     fn add_synthetic_blank(&mut self, source: Range<usize>) {
         let source = self.last_content_source.clone().unwrap_or(source);
-        self.lines.push(ViewLine {
+        self.lines.push(RenderedLine {
             styled: StyledLine {
                 text: String::new(),
                 spans: Vec::new(),
             },
             source: source.clone(),
             kind: LineKind::Synthetic,
+            role: RenderedLineRole::Document,
+            atoms: Vec::new(),
+            synthetic_columns: Vec::new(),
         });
     }
 
@@ -119,20 +145,26 @@ impl<'a> ViewLayoutBuilder<'a> {
     }
 
     fn make_content_line(&mut self, styled: StyledLine, source: Range<usize>) {
-        self.lines.push(ViewLine {
+        self.lines.push(RenderedLine {
             styled,
             source: source.clone(),
             kind: LineKind::Content,
+            role: RenderedLineRole::Document,
+            atoms: Vec::new(),
+            synthetic_columns: Vec::new(),
         });
         self.set_last_content_source(source);
     }
 
     fn make_synthetic_line(&mut self, styled: StyledLine, source: Range<usize>) {
         let source = self.last_content_source.clone().unwrap_or(source);
-        self.lines.push(ViewLine {
+        self.lines.push(RenderedLine {
             styled,
             source,
             kind: LineKind::Synthetic,
+            role: RenderedLineRole::Document,
+            atoms: Vec::new(),
+            synthetic_columns: Vec::new(),
         });
     }
 
@@ -192,14 +224,20 @@ impl<'a> ViewLayoutBuilder<'a> {
         self.width = parent_width;
 
         let prefix_char_len = prefix.chars().count();
-        for view_line in &mut self.lines[first_child_line..] {
-            view_line.styled.text.insert_str(0, prefix);
-            for span in &mut view_line.styled.spans {
+        let prefix_width = text_width(prefix);
+        for rendered_line in &mut self.lines[first_child_line..] {
+            for columns in &mut rendered_line.synthetic_columns {
+                columns.start += prefix_width;
+                columns.end += prefix_width;
+            }
+            rendered_line.synthetic_columns.insert(0, 0..prefix_width);
+            rendered_line.styled.text.insert_str(0, prefix);
+            for span in &mut rendered_line.styled.spans {
                 span.start_col += prefix_char_len;
                 span.end_col += prefix_char_len;
             }
             if let Some(style) = prefix_style {
-                view_line.styled.spans.push(Span {
+                rendered_line.styled.spans.push(Span {
                     start_col: 0,
                     end_col: prefix_char_len,
                     style,
@@ -263,8 +301,15 @@ impl<'a> ViewLayoutBuilder<'a> {
         // Wrap the heading
         let jump_line = self.lines.len();
         let wrapped = wrap_lines(&combined, self.width, 0);
-        for line in wrapped {
+        for (index, line) in wrapped.into_iter().enumerate() {
             self.make_content_line(line, source.clone());
+            if index == 0 {
+                self.lines
+                    .last_mut()
+                    .expect("heading line was just appended")
+                    .synthetic_columns
+                    .push(0..text_width(&prefix));
+            }
         }
 
         // Register heading as jump target
@@ -277,10 +322,18 @@ impl<'a> ViewLayoutBuilder<'a> {
     // ── VW-2: Paragraphs ─────────────────────────────────────────────
 
     fn render_paragraph(&mut self, inlines: &[Inline], source: &Range<usize>) {
+        let first_line = self.lines.len();
+        let first_link = self.link_index.len();
         let styled = self.render_inlines(inlines, SemanticStyle::Text);
         let wrapped = wrap_lines(&styled, self.width, 0);
         for line in wrapped {
             self.make_content_line(line, source.clone());
+        }
+        for link_index in first_link..self.link_index.len() {
+            self.jump_targets.push(JumpTarget {
+                line: first_line,
+                kind: TargetKind::Link(link_index),
+            });
         }
     }
 
@@ -366,11 +419,9 @@ impl<'a> ViewLayoutBuilder<'a> {
         indented: bool,
         source: &Range<usize>,
     ) {
-        let source_range = source.clone();
-
         if indented {
             // Indented code block: same treatment minus language tag
-            self.render_fenced_code_body(lang, content_span, &source_range);
+            self.render_fenced_code_body(lang, content_span, source);
             return;
         }
 
@@ -400,8 +451,8 @@ impl<'a> ViewLayoutBuilder<'a> {
 
         // Build gutter lines
         let lang_line_text = format!("{} {}", gutter, lang_tag);
-        self.make_content_line(
-            StyledLine {
+        self.lines.push(RenderedLine {
+            styled: StyledLine {
                 text: lang_line_text.clone(),
                 spans: vec![Span {
                     start_col: 0,
@@ -409,10 +460,15 @@ impl<'a> ViewLayoutBuilder<'a> {
                     style: SemanticStyle::Muted,
                 }],
             },
-            source_range.clone(),
-        );
+            source: source.start..content_span.start.min(source.end),
+            kind: LineKind::Synthetic,
+            role: RenderedLineRole::Document,
+            atoms: Vec::new(),
+            synthetic_columns: Vec::new(),
+        });
 
-        for line in &highlighted {
+        let content_lines = source_line_spans(self.highlighter.text(), content_span);
+        for (index, line) in highlighted.iter().enumerate() {
             let text = format!("{} {}", gutter, line.text);
             let mut spans = line.spans.clone();
             // Shift spans by gutter width
@@ -427,12 +483,16 @@ impl<'a> ViewLayoutBuilder<'a> {
                 end_col: gutter.chars().count(),
                 style: SemanticStyle::Muted,
             });
-            self.make_content_line(StyledLine { text, spans }, source_range.clone());
+            let line_source = content_lines
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| content_span.clone());
+            self.make_content_line(StyledLine { text, spans }, line_source);
         }
 
         // Closing fence
-        self.make_content_line(
-            StyledLine {
+        self.lines.push(RenderedLine {
+            styled: StyledLine {
                 text: gutter.to_string(),
                 spans: vec![Span {
                     start_col: 0,
@@ -440,8 +500,12 @@ impl<'a> ViewLayoutBuilder<'a> {
                     style: SemanticStyle::Muted,
                 }],
             },
-            source_range,
-        );
+            source: content_span.end.min(source.end)..source.end,
+            kind: LineKind::Synthetic,
+            role: RenderedLineRole::Document,
+            atoms: Vec::new(),
+            synthetic_columns: Vec::new(),
+        });
     }
 
     fn render_fenced_code_body(
@@ -464,21 +528,28 @@ impl<'a> ViewLayoutBuilder<'a> {
             })
             .collect();
 
-        for line in lines {
-            self.make_content_line(line, source.clone());
+        let source_lines = source_line_spans(self.highlighter.text(), content_span);
+        for (index, line) in lines.into_iter().enumerate() {
+            self.make_content_line(
+                line,
+                source_lines
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(|| source.clone()),
+            );
         }
     }
 
     // ── VW-6: Bulleted lists ─────────────────────────────────────────
 
-    fn render_list(&mut self, ordered: Option<u64>, items: &[crate::view::blocks::ListItem]) {
+    fn render_list(&mut self, ordered: Option<u64>, items: &[crate::rendered::blocks::ListItem]) {
         self.render_list_at_depth(ordered, items, 0);
     }
 
     fn render_list_at_depth(
         &mut self,
         ordered: Option<u64>,
-        items: &[crate::view::blocks::ListItem],
+        items: &[crate::rendered::blocks::ListItem],
         depth: usize,
     ) {
         for (index, item) in items.iter().enumerate() {
@@ -500,7 +571,7 @@ impl<'a> ViewLayoutBuilder<'a> {
 
     fn render_list_item(
         &mut self,
-        item: &crate::view::blocks::ListItem,
+        item: &crate::rendered::blocks::ListItem,
         depth: usize,
         marker: &str,
     ) {
@@ -540,37 +611,46 @@ impl<'a> ViewLayoutBuilder<'a> {
             self.render_block(child);
             self.width = parent_width;
 
-            for view_line in &mut self.lines[first_child_line..] {
-                let uses_marker = marker_pending && view_line.kind == LineKind::Content;
+            for rendered_line in &mut self.lines[first_child_line..] {
+                let uses_marker = marker_pending && rendered_line.kind == LineKind::Content;
                 let prefix = if uses_marker {
                     marker_pending = false;
                     &first_prefix
                 } else {
                     &continuation_prefix
                 };
+                let prefix_width = text_width(prefix);
 
                 if item.task == Some(true) {
-                    for span in &mut view_line.styled.spans {
+                    for span in &mut rendered_line.styled.spans {
                         if span.style == SemanticStyle::Text {
                             span.style = SemanticStyle::Muted;
                         }
                     }
                 }
 
-                view_line.styled.text.insert_str(0, prefix);
-                for span in &mut view_line.styled.spans {
+                rendered_line.styled.text.insert_str(0, prefix);
+                for columns in &mut rendered_line.synthetic_columns {
+                    columns.start += prefix_width;
+                    columns.end += prefix_width;
+                }
+                rendered_line.synthetic_columns.insert(0, 0..prefix_width);
+                for span in &mut rendered_line.styled.spans {
                     span.start_col += prefix_char_len;
                     span.end_col += prefix_char_len;
                 }
 
                 if uses_marker {
                     let marker_start = indent.chars().count();
-                    view_line.styled.spans.push(Span {
+                    rendered_line.styled.spans.push(Span {
                         start_col: marker_start,
                         end_col: marker_start + marker.chars().count(),
                         style: SemanticStyle::ListMarker,
                     });
-                    view_line.styled.spans.sort_by_key(|span| span.start_col);
+                    rendered_line
+                        .styled
+                        .spans
+                        .sort_by_key(|span| span.start_col);
                 }
             }
         }
@@ -607,10 +687,36 @@ impl<'a> ViewLayoutBuilder<'a> {
         rows: &[Vec<Vec<Inline>>],
         source: &Range<usize>,
     ) {
-        let table_lines = table::render_table(alignments, header, rows, source.clone());
+        let row_spans = markdown_table_row_spans(self.highlighter.text(), source, rows.len());
+        let table_lines = table::render_table_with_rows(alignments, header, rows, source.clone());
 
-        for line in table_lines {
-            self.make_content_line(line, source.clone());
+        for (index, line) in table_lines.into_iter().enumerate() {
+            let logical_row = line.logical_row;
+            let nearest_row = logical_row.unwrap_or(if index == 0 { 0 } else { rows.len() });
+            let row_source = row_spans
+                .get(nearest_row)
+                .cloned()
+                .unwrap_or_else(|| source.clone());
+            if logical_row.is_some() {
+                self.lines.push(RenderedLine {
+                    styled: line.styled,
+                    source: row_source.clone(),
+                    kind: LineKind::Content,
+                    role: RenderedLineRole::Document,
+                    atoms: Vec::new(),
+                    synthetic_columns: line.synthetic_columns,
+                });
+                self.set_last_content_source(row_source);
+            } else {
+                self.lines.push(RenderedLine {
+                    styled: line.styled,
+                    source: row_source,
+                    kind: LineKind::Synthetic,
+                    role: RenderedLineRole::Document,
+                    atoms: Vec::new(),
+                    synthetic_columns: line.synthetic_columns,
+                });
+            }
         }
     }
 
@@ -761,125 +867,171 @@ impl<'a> ViewLayoutBuilder<'a> {
     // ── FR-3.6: Front matter panel ───────────────────────────────────
 
     fn render_front_matter(&mut self, block: &Block) {
-        // We need to check the document's front matter to render the panel
-        // For now, render a placeholder — the full implementation reads
-        // FrontMatter from the document context.
-        //
-        // Since ViewLayout::build only takes BlockModel + width + Highlighter,
-        // we render front matter as a synthetic block.
         let fm_span = &block.span;
+        let key_count = match crate::frontmatter::parse_front_matter(self.highlighter.text()) {
+            crate::frontmatter::FrontMatter::Yaml(Ok(value))
+            | crate::frontmatter::FrontMatter::Toml(Ok(value)) => {
+                value.as_map().map_or(0, |map| map.len())
+            }
+            _ => 0,
+        };
+        self.render_fm_panel(fm_span, self.front_matter_collapsed, key_count);
+    }
 
-        // Try to get front matter from the highlighter's document text
-        // The highlighter has the full text; we parse front matter from it
-        let text = self.highlighter.text();
-        let fm = crate::frontmatter::parse_front_matter(text);
+    fn render_fm_panel(&mut self, source: &Range<usize>, collapsed: bool, key_count: usize) {
+        let physical_lines = source_line_spans(self.highlighter.text(), source);
+        let Some(opening_source) = physical_lines.first().cloned() else {
+            return;
+        };
+        let opening_delimiter =
+            self.highlighter.text()[opening_source.clone()].trim_end_matches(['\r', '\n']);
+        let has_closing_delimiter = physical_lines.last().is_some_and(|line_source| {
+            physical_lines.len() > 1
+                && self.highlighter.text()[line_source.clone()].trim_end_matches(['\r', '\n'])
+                    == opening_delimiter
+        });
 
-        if matches!(fm, crate::frontmatter::FrontMatter::None) {
+        if collapsed {
+            let mut text = format!("▸ metadata ({key_count} keys)");
+            text = text.chars().take(self.width as usize).collect();
+            self.make_metadata_line(
+                StyledLine {
+                    spans: vec![Span {
+                        start_col: 0,
+                        end_col: text.chars().count(),
+                        style: SemanticStyle::FmDelimiter,
+                    }],
+                    text,
+                },
+                opening_source,
+            );
             return;
         }
-        if let crate::frontmatter::FrontMatter::Yaml(Ok(value))
-        | crate::frontmatter::FrontMatter::Toml(Ok(value)) = fm
-        {
-            self.render_fm_panel(&value, fm_span, false);
-        } else if let crate::frontmatter::FrontMatter::Yaml(Err(_))
-        | crate::frontmatter::FrontMatter::Toml(Err(_)) = fm
-        {
-            self.render_fm_error(fm_span);
+
+        let last_index = physical_lines.len().saturating_sub(1);
+        for (index, line_source) in physical_lines.into_iter().enumerate() {
+            if index == 0 || (index == last_index && has_closing_delimiter) {
+                let text = metadata_border(self.width as usize, index == 0);
+                self.make_metadata_line(
+                    StyledLine {
+                        spans: vec![Span {
+                            start_col: 0,
+                            end_col: text.chars().count(),
+                            style: SemanticStyle::FmDelimiter,
+                        }],
+                        text,
+                    },
+                    line_source,
+                );
+                continue;
+            }
+
+            let source_line_number = self.highlighter.text()[..line_source.start]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count();
+            let styled = self
+                .highlighter
+                .highlight_lines(source_line_number..source_line_number + 1)
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| StyledLine {
+                    text: self.highlighter.text()[line_source.clone()]
+                        .trim_end_matches(['\r', '\n'])
+                        .to_string(),
+                    spans: Vec::new(),
+                });
+            self.render_metadata_body_line(styled, line_source);
         }
     }
 
-    fn render_fm_panel(
-        &mut self,
-        value: &crate::frontmatter::Value,
-        source: &Range<usize>,
-        collapsed: bool,
-    ) {
-        if let Some(map) = value.as_map() {
-            let key_count = map.len();
-
-            if collapsed {
-                // Collapsed form: single line
-                let meta_type = "metadata";
-                let line_text = format!("▸ {} ({} keys)", meta_type, key_count);
-                self.make_content_line(
-                    StyledLine {
-                        text: line_text,
-                        spans: Vec::new(),
-                    },
-                    source.clone(),
-                );
-                return;
-            }
-
-            // Expanded form: bordered box with key: value rows
-            let border_top = "┌─ metadata ─┐";
-            self.make_content_line(
-                StyledLine {
-                    text: border_top.to_string(),
-                    spans: Vec::new(),
-                },
-                source.clone(),
-            );
-
-            for (key, val) in map {
-                let val_str = fm_value_to_compact(val);
-                let line_text = format!("│ {}: {} │", key, val_str);
-                let line_char_count = line_text.chars().count();
-                let colon_pos = line_text
-                    .chars()
-                    .enumerate()
-                    .filter_map(|(position, ch)| (ch == ':').then_some(position + 2))
-                    .last()
-                    .unwrap_or(line_char_count);
-                self.make_content_line(
-                    StyledLine {
-                        text: line_text.clone(),
-                        spans: vec![
-                            Span {
-                                start_col: 2,
-                                end_col: 2 + key.chars().count(),
-                                style: SemanticStyle::FmKey,
-                            },
-                            Span {
-                                start_col: colon_pos,
-                                end_col: line_char_count.saturating_sub(2),
-                                style: SemanticStyle::FmValue,
-                            },
-                        ],
-                    },
-                    source.clone(),
-                );
-            }
-
-            let border_bottom = "└──────────────┘";
-            self.make_content_line(
-                StyledLine {
-                    text: border_bottom.to_string(),
-                    spans: Vec::new(),
-                },
-                source.clone(),
-            );
-        }
+    fn make_metadata_line(&mut self, styled: StyledLine, source: Range<usize>) {
+        self.lines.push(RenderedLine {
+            styled,
+            source: source.clone(),
+            kind: LineKind::Content,
+            role: RenderedLineRole::Metadata,
+            atoms: Vec::new(),
+            synthetic_columns: Vec::new(),
+        });
+        self.set_last_content_source(source);
     }
 
-    fn render_fm_error(&mut self, source: &Range<usize>) {
-        let text = "⚠ front matter unparsed";
-        self.make_content_line(
-            StyledLine {
-                text: text.to_string(),
-                spans: vec![Span {
-                    start_col: 0,
-                    end_col: text.chars().count(),
-                    style: SemanticStyle::Muted,
-                }],
-            },
-            source.clone(),
-        );
+    fn render_metadata_body_line(&mut self, styled: StyledLine, source: Range<usize>) {
+        let width = self.width as usize;
+        if width < 4 {
+            for mut line in wrap_lines(&styled, self.width, 0) {
+                if text_width(&line.text) > width {
+                    let mut used = 0;
+                    line.text = line
+                        .text
+                        .chars()
+                        .take_while(|character| {
+                            let character_width = character.width().unwrap_or(0);
+                            let fits = used + character_width <= width;
+                            if fits {
+                                used += character_width;
+                            }
+                            fits
+                        })
+                        .collect();
+                    let kept = line.text.chars().count();
+                    for span in &mut line.spans {
+                        span.start_col = span.start_col.min(kept);
+                        span.end_col = span.end_col.min(kept);
+                    }
+                    line.spans.retain(|span| span.start_col < span.end_col);
+                }
+                self.make_metadata_line(line, source.clone());
+            }
+            return;
+        }
+
+        let content_width = self.width.saturating_sub(4).max(1);
+        for mut line in wrap_lines(&styled, content_width, 0) {
+            for span in &mut line.spans {
+                span.start_col += 2;
+                span.end_col += 2;
+            }
+            let body_width = text_width(&line.text);
+            let padding = content_width as usize - body_width.min(content_width as usize);
+            line.text = format!("│ {}{} │", line.text, " ".repeat(padding));
+            line.spans.push(Span {
+                start_col: 0,
+                end_col: 2,
+                style: SemanticStyle::FmDelimiter,
+            });
+            let suffix_start = line.text.chars().count().saturating_sub(2);
+            line.spans.push(Span {
+                start_col: suffix_start,
+                end_col: suffix_start + 2,
+                style: SemanticStyle::FmDelimiter,
+            });
+            line.spans.sort_by_key(|span| span.start_col);
+            self.make_metadata_line(line, source.clone());
+        }
     }
 
     fn highlighter_as_ref(&self) -> Option<&syntax::Highlighter> {
         Some(self.highlighter)
     }
+}
+
+fn rendered_line_numbers(lines: &[RenderedLine], text: &str) -> Vec<Option<usize>> {
+    let mut previous_content_source: Option<Range<usize>> = None;
+    lines
+        .iter()
+        .map(|line| {
+            if line.kind != LineKind::Content
+                || previous_content_source.as_ref() == Some(&line.source)
+            {
+                return None;
+            }
+            previous_content_source = Some(line.source.clone());
+            let start = line.source.start.min(text.len());
+            Some(text[..start].bytes().filter(|byte| *byte == b'\n').count() + 1)
+        })
+        .collect()
 }
 
 // ── Footnote storage ────────────────────────────────────────────────────────
@@ -891,41 +1043,275 @@ struct FootnoteDef {
     source: Range<usize>,
 }
 
-// ── Front matter value → compact string ────────────────────────────────────
+/// Map logical table rows to their exact Markdown source lines, excluding the
+/// alignment delimiter line between the header and body.
+fn markdown_table_row_spans(
+    text: &str,
+    source: &Range<usize>,
+    body_rows: usize,
+) -> Vec<Range<usize>> {
+    let Some(table_source) = text.get(source.clone()) else {
+        return vec![source.clone()];
+    };
+    let mut physical = Vec::new();
+    let mut start = source.start;
+    for line in table_source.split_inclusive('\n') {
+        let end = start + line.len();
+        physical.push(start..end);
+        start = end;
+    }
+    if start < source.end {
+        physical.push(start..source.end);
+    }
 
-fn fm_value_to_compact(value: &crate::frontmatter::Value) -> String {
-    match value {
-        crate::frontmatter::Value::Str(s) => format!("\"{}\"", s),
-        crate::frontmatter::Value::Num(n) => match n {
-            crate::frontmatter::Num::Int(i) => i.to_string(),
-            crate::frontmatter::Num::Float(f) => {
-                if f.fract() == 0.0 && f.abs() < 1e15 {
-                    format!("{}.0", f)
+    let mut logical = Vec::with_capacity(body_rows + 1);
+    if let Some(header) = physical.first() {
+        logical.push(header.clone());
+    }
+    logical.extend(physical.into_iter().skip(2).take(body_rows));
+    logical
+}
+
+fn source_line_spans(text: &str, source: &Range<usize>) -> Vec<Range<usize>> {
+    let Some(source_text) = text.get(source.clone()) else {
+        return vec![source.clone()];
+    };
+    let mut spans = Vec::new();
+    let mut start = source.start;
+    for line in source_text.split_inclusive('\n') {
+        let end = start + line.len();
+        spans.push(start..end);
+        start = end;
+    }
+    if start < source.end {
+        spans.push(start..source.end);
+    }
+    spans
+}
+
+#[derive(Debug)]
+struct SourceCandidate {
+    rendered: String,
+    source: Range<usize>,
+    used: bool,
+}
+
+fn populate_source_atoms(lines: &mut [RenderedLine], model: &BlockModel, text: &str) {
+    use std::collections::HashMap;
+
+    let mut candidates = Vec::new();
+    for inline in &model.inline_sources {
+        candidates.extend(source_candidates(
+            &inline.rendered,
+            inline.source.clone(),
+            text,
+        ));
+    }
+
+    let mut metadata_sources: Vec<Range<usize>> = lines
+        .iter()
+        .filter(|line| line.role == RenderedLineRole::Metadata)
+        .map(|line| line.source.clone())
+        .collect();
+    metadata_sources.sort_by_key(|source| (source.start, source.end));
+    metadata_sources.dedup();
+    for source in metadata_sources {
+        let raw = text
+            .get(source.clone())
+            .unwrap_or_default()
+            .trim_end_matches(['\r', '\n']);
+        candidates.extend(source_candidates(raw, source, text));
+    }
+    candidates.sort_by_key(|candidate| (candidate.source.start, candidate.source.end));
+    let mut candidate_lookup: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        candidate_lookup
+            .entry(candidate.rendered.clone())
+            .or_default()
+            .push(index);
+    }
+
+    for line in lines {
+        let groups = display_groups(&line.styled.text);
+        let is_metadata_body = line.role == RenderedLineRole::Metadata
+            && line.styled.text.starts_with("│ ")
+            && line.styled.text.ends_with(" │");
+        let group_count = groups.len();
+        let mut column = 0;
+        line.atoms = groups
+            .into_iter()
+            .enumerate()
+            .map(|(index, group)| {
+                let width = group
+                    .chars()
+                    .map(|character| character.width().unwrap_or(0))
+                    .sum::<usize>();
+                let columns = column..column + width;
+                column += width;
+
+                let generated_prefix_space = index == 1
+                    && line
+                        .styled
+                        .text
+                        .chars()
+                        .next()
+                        .is_some_and(|character| matches!(character, '▏' | '┃' | '│'));
+                let generated_image_prefix = line.styled.text.starts_with("⧉ ") && index < 2;
+                let generated_column = line.synthetic_columns.iter().any(|synthetic| {
+                    columns.end > synthetic.start && columns.start < synthetic.end
+                });
+                let source = if line.kind == LineKind::Synthetic
+                    || (is_metadata_body && (index < 2 || index + 2 >= group_count))
+                    || generated_prefix_space
+                    || generated_image_prefix
+                    || generated_column
+                {
+                    None
                 } else {
-                    f.to_string()
-                }
+                    candidate_lookup.get(&group).and_then(|indices| {
+                        let first = indices.partition_point(|index| {
+                            candidates[*index].source.start < line.source.start
+                        });
+                        let index = indices[first..]
+                            .iter()
+                            .copied()
+                            .take_while(|index| candidates[*index].source.start < line.source.end)
+                            .find(|index| {
+                                let candidate = &candidates[*index];
+                                candidate.source.end <= line.source.end && !candidate.used
+                            })?;
+                        let candidate = &mut candidates[index];
+                        Some({
+                            candidate.used = true;
+                            candidate.source.clone()
+                        })
+                    })
+                };
+
+                crate::style::RenderedSourceAtom { columns, source }
+            })
+            .collect();
+    }
+}
+
+fn source_candidates(rendered: &str, source: Range<usize>, text: &str) -> Vec<SourceCandidate> {
+    let Some(raw_source) = text.get(source.clone()) else {
+        return Vec::new();
+    };
+    let groups = display_groups(rendered);
+    let mut search_start = 0;
+    let mut candidates = Vec::with_capacity(groups.len());
+
+    let mut group_index = 0;
+    while group_index < groups.len() {
+        let group = &groups[group_index];
+        if let Some((entity_len, decoded_groups)) = decoded_entity(&raw_source[search_start..]) {
+            if groups[group_index..].starts_with(&decoded_groups) {
+                let decoded_count = decoded_groups.len();
+                let entity_source =
+                    source.start + search_start..source.start + search_start + entity_len;
+                candidates.extend(decoded_groups.into_iter().map(|rendered| SourceCandidate {
+                    rendered,
+                    source: entity_source.clone(),
+                    used: false,
+                }));
+                search_start += entity_len;
+                group_index += decoded_count;
+                continue;
             }
-        },
-        crate::frontmatter::Value::Bool(b) => b.to_string(),
-        crate::frontmatter::Value::Seq(items) => {
-            let inner: Vec<String> = items.iter().map(fm_value_to_compact).collect();
-            format!("[{}]", inner.join(", "))
         }
-        crate::frontmatter::Value::Map(map) => {
-            let pairs: Vec<String> = map
-                .iter()
-                .map(|(k, v)| format!("{}: {}", k, fm_value_to_compact(v)))
-                .collect();
-            format!("{{{}}}", pairs.join(", "))
+        let found = raw_source
+            .get(search_start..)
+            .and_then(|remaining| remaining.find(group))
+            .map(|relative| search_start + relative);
+        let Some(local_start) = found else {
+            if candidates.is_empty() && display_groups(rendered).len() == 1 {
+                candidates.push(SourceCandidate {
+                    rendered: group.clone(),
+                    source: source.clone(),
+                    used: false,
+                });
+            }
+            group_index += 1;
+            continue;
+        };
+        let local_end = local_start + group.len();
+        let mut absolute_start = source.start + local_start;
+        if absolute_start > 0 && text.as_bytes().get(absolute_start - 1) == Some(&b'\\') {
+            absolute_start -= 1;
+        }
+        candidates.push(SourceCandidate {
+            rendered: group.clone(),
+            source: absolute_start..source.start + local_end,
+            used: false,
+        });
+        search_start = local_end;
+        group_index += 1;
+    }
+
+    candidates
+}
+
+fn decoded_entity(raw: &str) -> Option<(usize, Vec<String>)> {
+    if !raw.starts_with('&') {
+        return None;
+    }
+    let end = raw.find(';')?.saturating_add(1);
+    if end > 64 {
+        return None;
+    }
+    let entity = &raw[..end];
+    let decoded = pulldown_cmark::Parser::new(entity)
+        .filter_map(|event| match event {
+            pulldown_cmark::Event::Text(text) => Some(text.into_string()),
+            _ => None,
+        })
+        .collect::<String>();
+    (decoded != entity).then(|| (end, display_groups(&decoded)))
+}
+
+fn display_groups(text: &str) -> Vec<String> {
+    let mut groups: Vec<String> = Vec::new();
+    for character in text.chars() {
+        if character.width().unwrap_or(0) == 0 {
+            if let Some(previous) = groups.last_mut() {
+                previous.push(character);
+            } else {
+                groups.push(character.to_string());
+            }
+        } else {
+            groups.push(character.to_string());
         }
     }
+    groups
+}
+
+fn metadata_border(width: usize, opening: bool) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return if opening { "┌" } else { "└" }.to_string();
+    }
+    let (left, right) = if opening {
+        ('┌', '┐')
+    } else {
+        ('└', '┘')
+    };
+    if !opening || width < 12 {
+        return format!("{left}{}{right}", "─".repeat(width - 2));
+    }
+    let label = "─ metadata ";
+    format!(
+        "{left}{label}{}{right}",
+        "─".repeat(width.saturating_sub(label.chars().count() + 2))
+    )
 }
 
 // ── Re-exports ─────────────────────────────────────────────────────────────
 
-pub use blocks::*;
-pub use table::render_table;
-pub use wrap::{text_width, wrap_lines};
+pub(crate) use blocks::*;
+pub(crate) use wrap::{text_width, wrap_lines, wrap_source_line};
 
 #[cfg(test)]
 mod tests {
@@ -936,7 +1322,7 @@ mod tests {
         let text = "# one\n\n## two\n\n### three\n\n#### four\n\n##### five\n\n###### six\n";
         let model = BlockModel::build(text, None);
         let highlighter = syntax::Highlighter::new(text);
-        let layout = ViewLayout::build(&model, 80, &highlighter);
+        let layout = RenderedLayout::build(&model, 80, &highlighter);
 
         for (label, expected_style) in [
             ("one", SemanticStyle::Heading1),
@@ -966,7 +1352,7 @@ mod tests {
         let text = "## plain *emphasis* `code`\n";
         let model = BlockModel::build(text, None);
         let highlighter = syntax::Highlighter::new(text);
-        let layout = ViewLayout::build(&model, 80, &highlighter);
+        let layout = RenderedLayout::build(&model, 80, &highlighter);
         let heading = layout
             .lines
             .iter()
@@ -1012,7 +1398,7 @@ mod tests {
             .expect("front-matter value should be styled");
 
         assert_eq!(span_text(&row.styled, key_span), "título");
-        assert_eq!(span_text(&row.styled, value_span), "\"café\"");
+        assert_eq!(span_text(&row.styled, value_span), "café");
         assert!(value_span.end_col <= row.styled.text.chars().count());
     }
 
@@ -1033,13 +1419,58 @@ mod tests {
             .expect("front-matter value should be styled");
 
         assert!(row.styled.text.starts_with('│'));
-        assert_eq!(span_text(&row.styled, value_span), "\"value\"");
+        assert_eq!(span_text(&row.styled, value_span), "value");
     }
 
-    fn front_matter_layout(text: &str) -> ViewLayout {
+    #[test]
+    fn unterminated_front_matter_keeps_the_final_metadata_line() {
+        for text in ["---\ntitle: café", "+++\ntitle = \"café\""] {
+            let layout = front_matter_layout(text);
+            let row = layout
+                .lines
+                .iter()
+                .find(|line| line.styled.text.contains("title"))
+                .expect("unterminated final metadata line should be rendered");
+            assert_eq!(row.role, RenderedLineRole::Metadata);
+            assert_eq!(row.source, text.find("title").unwrap()..text.len());
+            let owned_source = row
+                .atoms
+                .iter()
+                .filter_map(|atom| atom.source.as_ref())
+                .map(|source| &text[source.clone()])
+                .collect::<String>();
+            assert!(owned_source.contains("title"));
+            assert!(!layout
+                .lines
+                .iter()
+                .any(|line| line.styled.text.starts_with('└')));
+        }
+    }
+
+    #[test]
+    fn named_and_numeric_entities_own_their_complete_source() {
+        for (text, entity) in [
+            ("A &amp; B\n", "&amp;"),
+            ("A &#38; B\n", "&#38;"),
+            ("A &#x26; B\n", "&#x26;"),
+            ("A &fjlig; B\n", "&fjlig;"),
+        ] {
+            let model = BlockModel::build(text, None);
+            let highlighter = syntax::Highlighter::new(text);
+            let layout = RenderedLayout::build(&model, 80, &highlighter);
+            let entity_start = text.find(entity).unwrap();
+            assert!(layout
+                .lines
+                .iter()
+                .flat_map(|line| &line.atoms)
+                .any(|atom| atom.source == Some(entity_start..entity_start + entity.len())));
+        }
+    }
+
+    fn front_matter_layout(text: &str) -> RenderedLayout {
         let model = BlockModel::build(text, Some(0..text.len()));
         let highlighter = syntax::Highlighter::new(text);
-        ViewLayout::build(&model, 80, &highlighter)
+        RenderedLayout::build(&model, 80, &highlighter)
     }
 
     fn span_text(line: &StyledLine, span: &Span) -> String {
@@ -1050,3 +1481,11 @@ mod tests {
             .collect()
     }
 }
+
+#[cfg(test)]
+#[path = "tests/blocks.rs"]
+mod block_contract_tests;
+
+#[cfg(test)]
+#[path = "tests/goldens.rs"]
+mod golden_contract_tests;

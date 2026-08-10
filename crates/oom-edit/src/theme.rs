@@ -14,6 +14,7 @@
 
 use oom_edit_core::SemanticStyle;
 use ratatui::style::{Color, Modifier, Style};
+use std::fmt;
 
 #[cfg(test)]
 pub(crate) const ZED_UI_TEXT: Color = Color::Rgb(200, 204, 212);
@@ -35,10 +36,8 @@ pub enum UiSlot {
     BadgeNormal,
     /// Insert mode badge.
     BadgeInsert,
-    /// Visual mode badge.
-    BadgeVisual,
-    /// View mode badge.
-    BadgeView,
+    /// Select mode badge.
+    BadgeSelect,
     /// Command mode badge.
     BadgeCommand,
     /// Border / separator.
@@ -61,6 +60,8 @@ pub enum UiSlot {
     GutterCurrent,
     /// Full-width cursor-line chrome in the source editor.
     CursorLine,
+    /// Renderer-owned surface behind YAML/TOML metadata rows.
+    MetadataPanel,
     /// Active tab label.
     TabActive,
     /// Inactive tab label.
@@ -223,6 +224,121 @@ pub enum Tier {
     Monochrome,
 }
 
+/// Resolved light/dark display mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayMode {
+    /// Dark terminal surface.
+    Dark,
+    /// Light terminal surface.
+    Light,
+}
+
+/// Effective palette kind supplied by the active theme at the capability tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaletteKind {
+    /// RGB true-color palette.
+    TrueColor,
+    /// ANSI 16-color palette.
+    Color16,
+    /// Color-free palette.
+    Monochrome,
+}
+
+impl fmt::Display for PaletteKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::TrueColor => "truecolor",
+            Self::Color16 => "color16",
+            Self::Monochrome => "monochrome",
+        })
+    }
+}
+
+/// Winning source for active-theme selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemeSource {
+    /// Explicit `--theme` CLI flag.
+    Cli,
+    /// `OOM_EDIT_THEME` environment override.
+    Environment,
+    /// Dark-mode persisted slot.
+    ConfigDark,
+    /// Light-mode persisted slot.
+    ConfigLight,
+    /// Built-in display-mode fallback.
+    Fallback,
+}
+
+impl fmt::Display for ThemeSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Cli => "--theme",
+            Self::Environment => "environment",
+            Self::ConfigDark => "config.dark",
+            Self::ConfigLight => "config.light",
+            Self::Fallback => "fallback",
+        })
+    }
+}
+
+/// Complete, pure result of startup theme resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedTheme {
+    /// Active built-in theme name.
+    pub name: String,
+    /// Light/dark display mode.
+    pub display_mode: DisplayMode,
+    /// Terminal/environment color capability.
+    pub capability: Tier,
+    /// Palette actually supplied by the active theme.
+    pub palette_kind: PaletteKind,
+    /// Winning selection source.
+    pub source: ThemeSource,
+}
+
+impl ResolvedTheme {
+    /// Whether the resolved display mode is light.
+    pub fn is_light(&self) -> bool {
+        self.display_mode == DisplayMode::Light
+    }
+
+    /// Construct a fully coherent resolved value for injected hosts/tests
+    /// that already chose a built-in name, display mode, and capability.
+    #[cfg(test)]
+    pub(crate) fn injected(name: &str, is_light: bool, capability: Tier) -> Self {
+        let palette_kind = match get_theme(name).palette_for(capability) {
+            Palette::TrueColor { .. } => PaletteKind::TrueColor,
+            Palette::Color16 { .. } => PaletteKind::Color16,
+            Palette::Monochrome { .. } => PaletteKind::Monochrome,
+        };
+        Self {
+            name: name.to_string(),
+            display_mode: if is_light {
+                DisplayMode::Light
+            } else {
+                DisplayMode::Dark
+            },
+            capability,
+            palette_kind,
+            source: ThemeSource::Fallback,
+        }
+    }
+}
+
+impl fmt::Display for ResolvedTheme {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "theme={} palette={} capability={:?} source={} {}",
+            self.name,
+            self.palette_kind,
+            self.capability,
+            self.source,
+            if self.is_light() { "light" } else { "dark" }
+        )
+    }
+}
+
 // ── Selection ladder ────────────────────────────────────────────────────────
 
 /// Environment parts for testing the selection ladder without touching real env vars.
@@ -241,6 +357,21 @@ pub struct EnvParts {
 }
 
 impl EnvParts {
+    /// Determine terminal/environment capability without conflating it with
+    /// the selected theme's effective palette.
+    pub fn capability(&self) -> Tier {
+        if self.no_color || self.term == Some("dumb") {
+            return Tier::Monochrome;
+        }
+        if let Some(colorterm) = self.colorterm {
+            let colorterm = colorterm.to_lowercase();
+            if colorterm.contains("truecolor") || colorterm.contains("24bit") {
+                return Tier::TrueColor;
+            }
+        }
+        Tier::Color16
+    }
+
     /// Determine the effective tier from environment.
     pub fn effective_tier(&self) -> Tier {
         // OOM_EDIT_THEME=accessible forces monochrome (stop here).
@@ -249,24 +380,7 @@ impl EnvParts {
                 return Tier::Monochrome;
             }
         }
-        // NO_COLOR → monochrome.
-        if self.no_color {
-            return Tier::Monochrome;
-        }
-        // TERM=dumb → monochrome.
-        if let Some(term) = self.term {
-            if term == "dumb" {
-                return Tier::Monochrome;
-            }
-        }
-        // COLORTERM truecolor/24bit → TrueColor, else Color16.
-        if let Some(colorterm) = self.colorterm {
-            let ct = colorterm.to_lowercase();
-            if ct.contains("truecolor") || ct.contains("24bit") {
-                return Tier::TrueColor;
-            }
-        }
-        Tier::Color16
+        self.capability()
     }
 
     /// Determine light vs dark mode preference.
@@ -296,17 +410,15 @@ impl EnvParts {
 ///
 /// Priority: `--theme` flag > compatible config dark/light slot > the display
 /// mode's built-in default.
-/// Returns `(theme_name, is_light)`, where `is_light` is the resolved display
-/// mode used to select the corresponding config slot. If the name is unknown,
-/// warns and returns "default-dark".
+/// The returned value is the sole input for startup diagnostics and App theme
+/// construction, so selection provenance cannot drift from presentation.
 pub fn resolve_theme(
     cli_theme: Option<&str>,
     config_mode: Option<&str>,
     config_dark: Option<&str>,
     config_light: Option<&str>,
     env: &EnvParts,
-) -> (String, bool) {
-    let _tier = env.effective_tier();
+) -> ResolvedTheme {
     let is_light = env.is_light(config_mode);
 
     // Determine theme name: CLI flag > config slot > default.
@@ -316,19 +428,47 @@ pub fn resolve_theme(
         "default-dark"
     };
     let configured = if is_light { config_light } else { config_dark };
-    let name: String = match cli_theme {
-        Some(cli) if is_known(cli) => cli.to_string(),
+    let (name, source): (String, ThemeSource) = match cli_theme {
+        Some(cli) if is_known(cli) => (cli.to_string(), ThemeSource::Cli),
         Some(cli) => {
-            eprintln!("oom-edit: unknown theme '{cli}', using default-dark");
-            "default-dark".to_string()
+            eprintln!("oom-edit: unknown theme '{cli}', using {fallback}");
+            (fallback.to_string(), ThemeSource::Fallback)
         }
-        None => configured
-            .filter(|name| is_known(name) && supports_mode(name, is_light))
-            .unwrap_or(fallback)
-            .to_string(),
+        None => match env.oom_edit_theme.filter(|name| is_known(name)) {
+            Some(name) => (name.to_string(), ThemeSource::Environment),
+            None => match configured.filter(|name| is_known(name) && supports_mode(name, is_light))
+            {
+                Some(name) => (
+                    name.to_string(),
+                    if is_light {
+                        ThemeSource::ConfigLight
+                    } else {
+                        ThemeSource::ConfigDark
+                    },
+                ),
+                None => (fallback.to_string(), ThemeSource::Fallback),
+            },
+        },
     };
 
-    (name, is_light)
+    let capability = env.capability();
+    let palette_kind = match get_theme(&name).palette_for(capability) {
+        Palette::TrueColor { .. } => PaletteKind::TrueColor,
+        Palette::Color16 { .. } => PaletteKind::Color16,
+        Palette::Monochrome { .. } => PaletteKind::Monochrome,
+    };
+
+    ResolvedTheme {
+        name,
+        display_mode: if is_light {
+            DisplayMode::Light
+        } else {
+            DisplayMode::Dark
+        },
+        capability,
+        palette_kind,
+        source,
+    }
 }
 
 /// Get the built-in theme by name.
@@ -584,15 +724,9 @@ pub static DEFAULT_DARK: Theme = Theme {
                 Modifier::BOLD,
             ),
             (
-                UiSlot::BadgeVisual,
+                UiSlot::BadgeSelect,
                 Color::Rgb(40, 44, 51),
                 Some(Color::Rgb(180, 119, 207)),
-                Modifier::BOLD,
-            ),
-            (
-                UiSlot::BadgeView,
-                Color::Rgb(40, 44, 51),
-                Some(Color::Rgb(110, 180, 191)),
                 Modifier::BOLD,
             ),
             (
@@ -669,6 +803,12 @@ pub static DEFAULT_DARK: Theme = Theme {
                 Modifier::DIM,
             ),
             (
+                UiSlot::MetadataPanel,
+                Color::Reset,
+                Some(Color::Rgb(47, 52, 62)),
+                Modifier::DIM,
+            ),
+            (
                 UiSlot::TabSeparator,
                 Color::Rgb(47, 52, 62),
                 None,
@@ -737,15 +877,9 @@ pub static DEFAULT_DARK: Theme = Theme {
                 Modifier::BOLD,
             ),
             (
-                UiSlot::BadgeVisual,
+                UiSlot::BadgeSelect,
                 Color::Black,
                 Some(Color::Yellow),
-                Modifier::BOLD,
-            ),
-            (
-                UiSlot::BadgeView,
-                Color::Black,
-                Some(Color::Cyan),
                 Modifier::BOLD,
             ),
             (
@@ -776,6 +910,12 @@ pub static DEFAULT_DARK: Theme = Theme {
             ),
             (UiSlot::TabActive, Color::White, None, Modifier::BOLD),
             (UiSlot::TabInactive, Color::Gray, None, Modifier::DIM),
+            (
+                UiSlot::MetadataPanel,
+                Color::Reset,
+                Some(Color::DarkGray),
+                Modifier::DIM,
+            ),
             (UiSlot::TabSeparator, Color::DarkGray, None, Modifier::DIM),
         ],
     },
@@ -813,15 +953,14 @@ pub static DEFAULT_DARK: Theme = Theme {
             (SemanticStyle::Punct, Modifier::DIM),
             (SemanticStyle::Selection, Modifier::REVERSED),
             (SemanticStyle::Match, Modifier::UNDERLINED),
-            (SemanticStyle::CursorLine, Modifier::REVERSED),
+            (SemanticStyle::CursorLine, Modifier::UNDERLINED),
             (SemanticStyle::Muted, Modifier::DIM),
         ],
         ui: &[
             (UiSlot::StatusBar, Modifier::DIM),
             (UiSlot::BadgeNormal, Modifier::BOLD),
             (UiSlot::BadgeInsert, Modifier::BOLD),
-            (UiSlot::BadgeVisual, Modifier::BOLD),
-            (UiSlot::BadgeView, Modifier::BOLD),
+            (UiSlot::BadgeSelect, Modifier::BOLD),
             (UiSlot::BadgeCommand, Modifier::BOLD),
             (UiSlot::Border, Modifier::DIM),
             (UiSlot::HintKey, Modifier::BOLD),
@@ -832,9 +971,10 @@ pub static DEFAULT_DARK: Theme = Theme {
             (UiSlot::StatusError, Modifier::empty()),
             (UiSlot::Gutter, Modifier::DIM),
             (UiSlot::GutterCurrent, Modifier::BOLD),
-            (UiSlot::CursorLine, Modifier::REVERSED),
+            (UiSlot::CursorLine, Modifier::UNDERLINED),
             (UiSlot::TabActive, Modifier::BOLD),
             (UiSlot::TabInactive, Modifier::DIM),
+            (UiSlot::MetadataPanel, Modifier::DIM),
             (UiSlot::TabSeparator, Modifier::DIM),
         ],
     },
@@ -901,15 +1041,9 @@ pub static DEFAULT_LIGHT: Theme = Theme {
                 Modifier::BOLD,
             ),
             (
-                UiSlot::BadgeVisual,
+                UiSlot::BadgeSelect,
                 Color::Black,
                 Some(Color::Yellow),
-                Modifier::BOLD,
-            ),
-            (
-                UiSlot::BadgeView,
-                Color::Black,
-                Some(Color::Cyan),
                 Modifier::BOLD,
             ),
             (
@@ -940,6 +1074,12 @@ pub static DEFAULT_LIGHT: Theme = Theme {
             ),
             (UiSlot::TabActive, Color::Black, None, Modifier::BOLD),
             (UiSlot::TabInactive, Color::Gray, None, Modifier::DIM),
+            (
+                UiSlot::MetadataPanel,
+                Color::Reset,
+                Some(Color::Gray),
+                Modifier::DIM,
+            ),
             (UiSlot::TabSeparator, Color::Gray, None, Modifier::DIM),
         ],
     },
@@ -1000,15 +1140,9 @@ pub static DEFAULT_LIGHT: Theme = Theme {
                 Modifier::BOLD,
             ),
             (
-                UiSlot::BadgeVisual,
+                UiSlot::BadgeSelect,
                 Color::Black,
                 Some(Color::Yellow),
-                Modifier::BOLD,
-            ),
-            (
-                UiSlot::BadgeView,
-                Color::Black,
-                Some(Color::Cyan),
                 Modifier::BOLD,
             ),
             (
@@ -1039,6 +1173,12 @@ pub static DEFAULT_LIGHT: Theme = Theme {
             ),
             (UiSlot::TabActive, Color::Black, None, Modifier::BOLD),
             (UiSlot::TabInactive, Color::Gray, None, Modifier::DIM),
+            (
+                UiSlot::MetadataPanel,
+                Color::Reset,
+                Some(Color::Gray),
+                Modifier::DIM,
+            ),
             (UiSlot::TabSeparator, Color::Gray, None, Modifier::DIM),
         ],
     },
@@ -1076,15 +1216,14 @@ pub static DEFAULT_LIGHT: Theme = Theme {
             (SemanticStyle::Punct, Modifier::DIM),
             (SemanticStyle::Selection, Modifier::REVERSED),
             (SemanticStyle::Match, Modifier::UNDERLINED),
-            (SemanticStyle::CursorLine, Modifier::REVERSED),
+            (SemanticStyle::CursorLine, Modifier::UNDERLINED),
             (SemanticStyle::Muted, Modifier::DIM),
         ],
         ui: &[
             (UiSlot::StatusBar, Modifier::DIM),
             (UiSlot::BadgeNormal, Modifier::BOLD),
             (UiSlot::BadgeInsert, Modifier::BOLD),
-            (UiSlot::BadgeVisual, Modifier::BOLD),
-            (UiSlot::BadgeView, Modifier::BOLD),
+            (UiSlot::BadgeSelect, Modifier::BOLD),
             (UiSlot::BadgeCommand, Modifier::BOLD),
             (UiSlot::Border, Modifier::DIM),
             (UiSlot::HintKey, Modifier::BOLD),
@@ -1095,9 +1234,10 @@ pub static DEFAULT_LIGHT: Theme = Theme {
             (UiSlot::StatusError, Modifier::empty()),
             (UiSlot::Gutter, Modifier::DIM),
             (UiSlot::GutterCurrent, Modifier::BOLD),
-            (UiSlot::CursorLine, Modifier::REVERSED),
+            (UiSlot::CursorLine, Modifier::UNDERLINED),
             (UiSlot::TabActive, Modifier::BOLD),
             (UiSlot::TabInactive, Modifier::DIM),
+            (UiSlot::MetadataPanel, Modifier::DIM),
             (UiSlot::TabSeparator, Modifier::DIM),
         ],
     },
@@ -1141,15 +1281,14 @@ pub static ACCESSIBLE: Theme = Theme {
             (SemanticStyle::Punct, Modifier::DIM),
             (SemanticStyle::Selection, Modifier::REVERSED),
             (SemanticStyle::Match, Modifier::UNDERLINED),
-            (SemanticStyle::CursorLine, Modifier::REVERSED),
+            (SemanticStyle::CursorLine, Modifier::UNDERLINED),
             (SemanticStyle::Muted, Modifier::DIM),
         ],
         ui: &[
             (UiSlot::StatusBar, Modifier::DIM),
             (UiSlot::BadgeNormal, Modifier::BOLD),
             (UiSlot::BadgeInsert, Modifier::BOLD),
-            (UiSlot::BadgeVisual, Modifier::BOLD),
-            (UiSlot::BadgeView, Modifier::BOLD),
+            (UiSlot::BadgeSelect, Modifier::BOLD),
             (UiSlot::BadgeCommand, Modifier::BOLD),
             (UiSlot::Border, Modifier::DIM),
             (UiSlot::HintKey, Modifier::BOLD),
@@ -1160,9 +1299,10 @@ pub static ACCESSIBLE: Theme = Theme {
             (UiSlot::StatusError, Modifier::empty()),
             (UiSlot::Gutter, Modifier::DIM),
             (UiSlot::GutterCurrent, Modifier::BOLD),
-            (UiSlot::CursorLine, Modifier::REVERSED),
+            (UiSlot::CursorLine, Modifier::UNDERLINED),
             (UiSlot::TabActive, Modifier::BOLD),
             (UiSlot::TabInactive, Modifier::DIM),
+            (UiSlot::MetadataPanel, Modifier::DIM),
             (UiSlot::TabSeparator, Modifier::DIM),
         ],
     },
@@ -1200,15 +1340,14 @@ pub static ACCESSIBLE: Theme = Theme {
             (SemanticStyle::Punct, Modifier::DIM),
             (SemanticStyle::Selection, Modifier::REVERSED),
             (SemanticStyle::Match, Modifier::UNDERLINED),
-            (SemanticStyle::CursorLine, Modifier::REVERSED),
+            (SemanticStyle::CursorLine, Modifier::UNDERLINED),
             (SemanticStyle::Muted, Modifier::DIM),
         ],
         ui: &[
             (UiSlot::StatusBar, Modifier::DIM),
             (UiSlot::BadgeNormal, Modifier::BOLD),
             (UiSlot::BadgeInsert, Modifier::BOLD),
-            (UiSlot::BadgeVisual, Modifier::BOLD),
-            (UiSlot::BadgeView, Modifier::BOLD),
+            (UiSlot::BadgeSelect, Modifier::BOLD),
             (UiSlot::BadgeCommand, Modifier::BOLD),
             (UiSlot::Border, Modifier::DIM),
             (UiSlot::HintKey, Modifier::BOLD),
@@ -1219,9 +1358,10 @@ pub static ACCESSIBLE: Theme = Theme {
             (UiSlot::StatusError, Modifier::empty()),
             (UiSlot::Gutter, Modifier::DIM),
             (UiSlot::GutterCurrent, Modifier::BOLD),
-            (UiSlot::CursorLine, Modifier::REVERSED),
+            (UiSlot::CursorLine, Modifier::UNDERLINED),
             (UiSlot::TabActive, Modifier::BOLD),
             (UiSlot::TabInactive, Modifier::DIM),
+            (UiSlot::MetadataPanel, Modifier::DIM),
             (UiSlot::TabSeparator, Modifier::DIM),
         ],
     },
@@ -1259,15 +1399,14 @@ pub static ACCESSIBLE: Theme = Theme {
             (SemanticStyle::Punct, Modifier::DIM),
             (SemanticStyle::Selection, Modifier::REVERSED),
             (SemanticStyle::Match, Modifier::UNDERLINED),
-            (SemanticStyle::CursorLine, Modifier::REVERSED),
+            (SemanticStyle::CursorLine, Modifier::UNDERLINED),
             (SemanticStyle::Muted, Modifier::DIM),
         ],
         ui: &[
             (UiSlot::StatusBar, Modifier::DIM),
             (UiSlot::BadgeNormal, Modifier::BOLD),
             (UiSlot::BadgeInsert, Modifier::BOLD),
-            (UiSlot::BadgeVisual, Modifier::BOLD),
-            (UiSlot::BadgeView, Modifier::BOLD),
+            (UiSlot::BadgeSelect, Modifier::BOLD),
             (UiSlot::BadgeCommand, Modifier::BOLD),
             (UiSlot::Border, Modifier::DIM),
             (UiSlot::HintKey, Modifier::BOLD),
@@ -1278,9 +1417,10 @@ pub static ACCESSIBLE: Theme = Theme {
             (UiSlot::StatusError, Modifier::empty()),
             (UiSlot::Gutter, Modifier::DIM),
             (UiSlot::GutterCurrent, Modifier::BOLD),
-            (UiSlot::CursorLine, Modifier::REVERSED),
+            (UiSlot::CursorLine, Modifier::UNDERLINED),
             (UiSlot::TabActive, Modifier::BOLD),
             (UiSlot::TabInactive, Modifier::DIM),
+            (UiSlot::MetadataPanel, Modifier::DIM),
             (UiSlot::TabSeparator, Modifier::DIM),
         ],
     },
@@ -1401,6 +1541,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cursor_line_has_a_distinct_non_color_carrier() {
+        for theme in [&DEFAULT_DARK, &DEFAULT_LIGHT, &ACCESSIBLE] {
+            for tier in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
+                let selection = theme.style(tier, SemanticStyle::Selection);
+                let cursor = theme.ui_style(tier, UiSlot::CursorLine);
+                assert_ne!(
+                    cursor.add_modifier, selection.add_modifier,
+                    "Normal cursor and Select rows must differ on {tier:?} in {}",
+                    theme.name
+                );
+                assert!(
+                    cursor
+                        .add_modifier
+                        .intersects(Modifier::DIM | Modifier::UNDERLINED),
+                    "cursor line needs a non-color carrier on {tier:?} in {}",
+                    theme.name
+                );
+            }
+        }
+    }
+
     /// Search matches must remain visible when foreground colors are absent.
     #[test]
     fn search_match_carries_underline() {
@@ -1432,8 +1594,7 @@ mod tests {
             UiSlot::StatusBar,
             UiSlot::BadgeNormal,
             UiSlot::BadgeInsert,
-            UiSlot::BadgeVisual,
-            UiSlot::BadgeView,
+            UiSlot::BadgeSelect,
             UiSlot::BadgeCommand,
             UiSlot::Border,
             UiSlot::HintKey,
@@ -1447,6 +1608,7 @@ mod tests {
             UiSlot::CursorLine,
             UiSlot::TabActive,
             UiSlot::TabInactive,
+            UiSlot::MetadataPanel,
             UiSlot::TabSeparator,
         ];
 
@@ -1571,6 +1733,17 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(env.effective_tier(), Tier::Monochrome);
+        let resolved = resolve_theme(
+            None,
+            None,
+            Some("default-dark"),
+            Some("default-light"),
+            &env,
+        );
+        assert_eq!(resolved.name, "accessible");
+        assert_eq!(resolved.source, ThemeSource::Environment);
+        assert_eq!(resolved.capability, Tier::TrueColor);
+        assert_eq!(resolved.palette_kind, PaletteKind::Monochrome);
     }
 
     #[test]
@@ -1588,40 +1761,83 @@ mod tests {
     #[test]
     fn resolve_cli_theme_takes_priority() {
         let env = EnvParts::default();
-        let (name, _light) = resolve_theme(
+        let resolved = resolve_theme(
             Some("default-light"),
             None,
             Some("default-dark"),
             Some("default-light"),
             &env,
         );
-        assert_eq!(name, "default-light");
+        assert_eq!(resolved.name, "default-light");
+        assert_eq!(resolved.source, ThemeSource::Cli);
     }
 
     #[test]
     fn resolve_unknown_theme_falls_back() {
         let env = EnvParts::default();
-        let (name, _light) = resolve_theme(
+        let resolved = resolve_theme(
             Some("nonexistent"),
             None,
             Some("default-dark"),
             Some("default-light"),
             &env,
         );
-        assert_eq!(name, "default-dark");
+        assert_eq!(resolved.name, "default-dark");
+        assert_eq!(resolved.source, ThemeSource::Fallback);
     }
 
     #[test]
     fn resolve_config_dark_slot() {
         let env = EnvParts::default();
-        let (name, _light) = resolve_theme(
+        let resolved = resolve_theme(
             None,
             None,
             Some("default-dark"),
             Some("default-light"),
             &env,
         );
-        assert_eq!(name, "default-dark");
+        assert_eq!(resolved.name, "default-dark");
+        assert_eq!(resolved.source, ThemeSource::ConfigDark);
+    }
+
+    #[test]
+    fn missing_config_defaults_to_default_dark() {
+        let resolved = resolve_theme(
+            None,
+            None,
+            None,
+            None,
+            &EnvParts {
+                colorterm: Some("truecolor"),
+                ..Default::default()
+            },
+        );
+        assert_eq!(resolved.name, "default-dark");
+        assert_eq!(resolved.source, ThemeSource::Fallback);
+        assert_eq!(resolved.capability, Tier::TrueColor);
+        assert_eq!(resolved.palette_kind, PaletteKind::TrueColor);
+    }
+
+    #[test]
+    fn resolved_theme_reports_config_dark_accessible_as_monochrome() {
+        let resolved = resolve_theme(
+            None,
+            Some("dark"),
+            Some("accessible"),
+            Some("default-light"),
+            &EnvParts {
+                colorterm: Some("truecolor"),
+                ..Default::default()
+            },
+        );
+        assert_eq!(resolved.name, "accessible");
+        assert_eq!(resolved.source, ThemeSource::ConfigDark);
+        assert_eq!(resolved.capability, Tier::TrueColor);
+        assert_eq!(resolved.palette_kind, PaletteKind::Monochrome);
+        assert_eq!(
+            resolved.to_string(),
+            "theme=accessible palette=monochrome capability=TrueColor source=config.dark dark"
+        );
     }
 
     #[test]
@@ -1630,82 +1846,87 @@ mod tests {
             colorfgbg: Some("0;7"), // light
             ..Default::default()
         };
-        let (name, _light) = resolve_theme(
+        let resolved = resolve_theme(
             None,
             None,
             Some("default-dark"),
             Some("default-light"),
             &env,
         );
-        assert_eq!(name, "default-light");
+        assert_eq!(resolved.name, "default-light");
+        assert_eq!(resolved.source, ThemeSource::ConfigLight);
     }
 
     #[test]
     fn resolve_accessible_theme_preserves_light_display_mode() {
         let env = EnvParts::default();
-        let (name, is_light) = resolve_theme(
+        let resolved = resolve_theme(
             None,
             Some("light"),
             Some("default-dark"),
             Some("accessible"),
             &env,
         );
-        assert_eq!(name, "accessible");
-        assert!(is_light);
+        assert_eq!(resolved.name, "accessible");
+        assert!(resolved.is_light());
+        assert_eq!(resolved.palette_kind, PaletteKind::Monochrome);
     }
 
     #[test]
     fn resolve_config_slots_reject_opposite_mode_theme() {
         let env = EnvParts::default();
 
-        let (dark_name, dark_is_light) = resolve_theme(
+        let dark = resolve_theme(
             None,
             Some("dark"),
             Some("default-light"),
             Some("default-light"),
             &env,
         );
-        assert_eq!(dark_name, "default-dark");
-        assert!(!dark_is_light);
+        assert_eq!(dark.name, "default-dark");
+        assert!(!dark.is_light());
 
-        let (light_name, light_is_light) = resolve_theme(
+        let light = resolve_theme(
             None,
             Some("light"),
             Some("default-dark"),
             Some("default-dark"),
             &env,
         );
-        assert_eq!(light_name, "default-light");
-        assert!(light_is_light);
+        assert_eq!(light.name, "default-light");
+        assert!(light.is_light());
 
         for mode in ["dark", "light"] {
-            let (name, _) = resolve_theme(
+            let resolved = resolve_theme(
                 None,
                 Some(mode),
                 Some("accessible"),
                 Some("accessible"),
                 &env,
             );
-            assert_eq!(name, "accessible", "accessible must support {mode} mode");
+            assert_eq!(
+                resolved.name, "accessible",
+                "accessible must support {mode} mode"
+            );
         }
 
-        let (dark_cli_override, _) = resolve_theme(
+        let dark_cli_override = resolve_theme(
             Some("default-light"),
             Some("dark"),
             Some("default-dark"),
             Some("default-light"),
             &env,
         );
-        assert_eq!(dark_cli_override, "default-light");
+        assert_eq!(dark_cli_override.name, "default-light");
 
-        let (light_cli_override, _) = resolve_theme(
+        let light_cli_override = resolve_theme(
             Some("default-dark"),
             Some("light"),
             Some("default-dark"),
             Some("default-light"),
             &env,
         );
-        assert_eq!(light_cli_override, "default-dark");
+        assert_eq!(light_cli_override.name, "default-dark");
     }
 
     // ── Built-in themes ─────────────────────────────────────────────────
@@ -1821,7 +2042,7 @@ mod tests {
             }
         }
         for (slot, foreground, background, _) in *ui {
-            if *slot == UiSlot::CursorLine {
+            if matches!(slot, UiSlot::CursorLine | UiSlot::MetadataPanel) {
                 assert_eq!(
                     *foreground,
                     Color::Reset,
@@ -1867,8 +2088,7 @@ mod tests {
             UiSlot::StatusBar,
             UiSlot::BadgeNormal,
             UiSlot::BadgeInsert,
-            UiSlot::BadgeVisual,
-            UiSlot::BadgeView,
+            UiSlot::BadgeSelect,
             UiSlot::BadgeCommand,
             UiSlot::Border,
             UiSlot::HintKey,
@@ -1882,6 +2102,7 @@ mod tests {
             UiSlot::CursorLine,
             UiSlot::TabActive,
             UiSlot::TabInactive,
+            UiSlot::MetadataPanel,
             UiSlot::TabSeparator,
         ];
 
@@ -1909,6 +2130,22 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn metadata_panel_uses_theme_surface_at_every_tier() {
+        for theme in [&DEFAULT_DARK, &DEFAULT_LIGHT] {
+            for tier in [Tier::TrueColor, Tier::Color16] {
+                let style = theme.ui_style(tier, UiSlot::MetadataPanel);
+                assert!(style.bg.is_some(), "{} {tier:?}", theme.name);
+                assert!(!style.add_modifier.is_empty(), "{} {tier:?}", theme.name);
+            }
+        }
+        for theme in [&DEFAULT_DARK, &DEFAULT_LIGHT, &ACCESSIBLE] {
+            let style = theme.ui_style(Tier::Monochrome, UiSlot::MetadataPanel);
+            assert_eq!(style.fg, Some(Color::Reset));
+            assert!(!style.add_modifier.is_empty(), "{} monochrome", theme.name);
         }
     }
 
@@ -1959,8 +2196,7 @@ mod tests {
         let badge_slots = [
             UiSlot::BadgeNormal,
             UiSlot::BadgeInsert,
-            UiSlot::BadgeVisual,
-            UiSlot::BadgeView,
+            UiSlot::BadgeSelect,
             UiSlot::BadgeCommand,
         ];
 
@@ -2009,8 +2245,7 @@ mod tests {
             UiSlot::StatusBar,
             UiSlot::BadgeNormal,
             UiSlot::BadgeInsert,
-            UiSlot::BadgeVisual,
-            UiSlot::BadgeView,
+            UiSlot::BadgeSelect,
             UiSlot::BadgeCommand,
         ];
 
@@ -2034,8 +2269,7 @@ mod tests {
             UiSlot::StatusBar,
             UiSlot::BadgeNormal,
             UiSlot::BadgeInsert,
-            UiSlot::BadgeVisual,
-            UiSlot::BadgeView,
+            UiSlot::BadgeSelect,
             UiSlot::BadgeCommand,
         ];
 
@@ -2058,6 +2292,7 @@ mod tests {
             UiSlot::CursorLine,
             UiSlot::TabActive,
             UiSlot::TabInactive,
+            UiSlot::MetadataPanel,
             UiSlot::TabSeparator,
         ];
 

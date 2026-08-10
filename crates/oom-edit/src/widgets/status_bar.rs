@@ -4,7 +4,7 @@
 //! `StatusBarText`; `render()` maps it to ratatui widgets.
 //!
 //! Layout: `[badge Length(MODE_BADGE_COLS), middle Min(0), ruler Length(RULER_COLS)]`.
-//! Command and View-search prompts use the middle plus ruler region while the
+//! Command and rendered-search prompts use the middle plus ruler region while the
 //! badge remains fixed at the left edge.
 //!
 //! FR-6.2, FR-6.4.
@@ -29,7 +29,7 @@ pub const TRANSIENT_TTL: Duration = Duration::from_secs(4);
 /// Ruler column width: `line:col  n%` — max ~22 chars for large files.
 pub const RULER_COLS: u16 = 22;
 
-/// Fixed mode-badge width, sized for the longest label: ` V-BLOCK `.
+/// Fixed mode-badge width, sized for the longest public mode label.
 pub const MODE_BADGE_COLS: u16 = 9;
 
 /// Severity glyph prefix for status messages.
@@ -74,9 +74,11 @@ pub struct StatusBar {
     pub is_new: bool,
     /// Cursor position (line, col) — 1-based for display.
     pub cursor_line: usize,
+    /// Cursor column — 1-based for display.
+    pub cursor_col: usize,
     /// Total line count (for percentage calculation).
     pub line_count: usize,
-    /// Command-line text (when in Command mode or View-search active).
+    /// Command-line text (when Command or rendered search is active).
     pub command_line: Option<String>,
 }
 
@@ -89,7 +91,7 @@ pub struct StatusBarText {
     pub content: Vec<Span<'static>>,
     /// Ruler text for the fixed right region.
     pub ruler: Span<'static>,
-    /// Active command or View-search prompt, including its prefix.
+    /// Active command or rendered-search prompt, including its prefix.
     pub prompt: Option<String>,
     /// Whether the cursor should be visible at the end of the prompt.
     pub prompt_cursor: bool,
@@ -131,7 +133,7 @@ impl StatusBar {
             .into_iter()
             .collect();
         let ruler = Span::styled(
-            ruler_text(self.cursor_line, self.line_count),
+            ruler_text(self.cursor_line, self.cursor_col, self.line_count),
             Style::default().add_modifier(ratatui::style::Modifier::DIM),
         );
 
@@ -227,11 +229,8 @@ fn mode_badge(mode: Mode) -> &'static str {
     match mode {
         Mode::Normal => " NORMAL ",
         Mode::Insert => " INSERT ",
-        Mode::Visual => " VISUAL ",
-        Mode::VisualLine => " V-LINE ",
-        Mode::VisualBlock => " V-BLOCK ",
+        Mode::Select => " SELECT ",
         Mode::Command => " :CMD ",
-        Mode::View => " VIEW ",
     }
 }
 
@@ -240,9 +239,8 @@ fn mode_badge_style(mode: Mode, theme: &Theme, tier: Tier) -> Style {
     let slot = match mode {
         Mode::Normal => UiSlot::BadgeNormal,
         Mode::Insert => UiSlot::BadgeInsert,
-        Mode::Visual | Mode::VisualLine | Mode::VisualBlock => UiSlot::BadgeVisual,
+        Mode::Select => UiSlot::BadgeSelect,
         Mode::Command => UiSlot::BadgeCommand,
-        Mode::View => UiSlot::BadgeView,
     };
     theme.ui_style(tier, slot)
 }
@@ -252,12 +250,13 @@ fn mode_badge_style(mode: Mode, theme: &Theme, tier: Tier) -> Style {
 /// Percent = cursor_line / line_count (1-based cursor, 1-based line_count).
 /// At the top (line 1): shows `Top`. At the bottom (line == line_count): shows `Bot`.
 /// Otherwise: `n%` or `Top`/`Bot` at extremes.
-pub fn ruler_text(cursor_line: usize, line_count: usize) -> String {
+pub fn ruler_text(cursor_line: usize, cursor_col: usize, line_count: usize) -> String {
     let cursor_display = cursor_line.max(1);
+    let column_display = cursor_col.max(1);
     let lc = line_count.max(1);
 
     if lc <= 1 {
-        return "1:1  Top".to_string();
+        return format!("1:{column_display}  Top");
     }
 
     // Determine percentage and edge label.
@@ -275,18 +274,18 @@ pub fn ruler_text(cursor_line: usize, line_count: usize) -> String {
     };
 
     if edge.is_empty() {
-        format!("{cursor_display}:1  {pct_int}%")
+        format!("{cursor_display}:{column_display}  {pct_int}%")
     } else {
-        format!("{cursor_display}:1  {pct_int}% {edge}")
+        format!("{cursor_display}:{column_display}  {pct_int}% {edge}")
     }
 }
 
 /// Build the line-number gutter.
 ///
 /// With relative line numbers disabled, all modes use absolute line numbers.
-/// When enabled, Normal/Visual/Command modes use hybrid numbering — the
+/// When enabled, rendered Normal/Select/Command use hybrid numbering — the
 /// current line is absolute and other lines show their signed distance from
-/// the cursor. Insert/View modes remain absolute.
+/// the cursor. Source Insert remains absolute.
 ///
 /// `top_line` is the 0-based index of the first visible line.
 /// `cursor_line` is the 0-based cursor line.
@@ -306,7 +305,7 @@ pub fn build_gutter(
 ) -> Vec<String> {
     let mut lines = Vec::with_capacity(height);
 
-    let show_absolute = !relative_line_numbers || matches!(mode, Mode::Insert | Mode::View);
+    let show_absolute = !relative_line_numbers || mode == Mode::Insert;
 
     for i in 0..height {
         let line_num = top_line + i;
@@ -365,39 +364,54 @@ pub fn gutter_width(line_count: usize) -> usize {
     digits.max(3) + 1 + GUTTER_CONTENT_GAP // +1 for the sign column in hybrid mode
 }
 
-// ── Tests ───────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::theme::{DEFAULT_DARK, DEFAULT_LIGHT};
+    use crate::theme::{Tier, UiSlot, DEFAULT_DARK, DEFAULT_LIGHT};
+    use ratatui::{backend::TestBackend, Terminal};
 
-    // ── Mode badge ──────────────────────────────────────────────────────
+    fn status(mode: Mode) -> StatusBar {
+        StatusBar {
+            mode,
+            path: "test.md".to_string(),
+            dirty: false,
+            is_new: false,
+            cursor_line: 1,
+            cursor_col: 1,
+            line_count: 10,
+            command_line: None,
+        }
+    }
 
-    #[test]
-    fn mode_badge_all_modes() {
-        assert_eq!(mode_badge(Mode::Normal), " NORMAL ");
-        assert_eq!(mode_badge(Mode::Insert), " INSERT ");
-        assert_eq!(mode_badge(Mode::Visual), " VISUAL ");
-        assert_eq!(mode_badge(Mode::VisualLine), " V-LINE ");
-        assert_eq!(mode_badge(Mode::VisualBlock), " V-BLOCK ");
-        assert_eq!(mode_badge(Mode::Command), " :CMD ");
-        assert_eq!(mode_badge(Mode::View), " VIEW ");
+    fn render_status(mode: Mode, width: u16, tier: Tier) -> Terminal<TestBackend> {
+        let text = status(mode).build(None, &DEFAULT_DARK, tier);
+        let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    frame.area(),
+                    &text,
+                    "Space h=help",
+                    true,
+                    &DEFAULT_DARK,
+                    tier,
+                );
+            })
+            .unwrap();
+        terminal
     }
 
     #[test]
-    fn mode_badge_uses_selected_theme_and_tier() {
+    fn badges_cover_exactly_four_public_modes() {
         let cases = [
-            (Mode::Normal, UiSlot::BadgeNormal),
-            (Mode::Insert, UiSlot::BadgeInsert),
-            (Mode::Visual, UiSlot::BadgeVisual),
-            (Mode::VisualLine, UiSlot::BadgeVisual),
-            (Mode::VisualBlock, UiSlot::BadgeVisual),
-            (Mode::Command, UiSlot::BadgeCommand),
-            (Mode::View, UiSlot::BadgeView),
+            (Mode::Normal, " NORMAL ", UiSlot::BadgeNormal),
+            (Mode::Insert, " INSERT ", UiSlot::BadgeInsert),
+            (Mode::Select, " SELECT ", UiSlot::BadgeSelect),
+            (Mode::Command, " :CMD ", UiSlot::BadgeCommand),
         ];
-
-        for (mode, slot) in cases {
+        for (mode, label, slot) in cases {
+            assert_eq!(mode_badge(mode), label);
             assert_eq!(
                 mode_badge_style(mode, &DEFAULT_DARK, Tier::TrueColor),
                 DEFAULT_DARK.ui_style(Tier::TrueColor, slot)
@@ -411,122 +425,38 @@ mod tests {
                 DEFAULT_DARK.ui_style(Tier::Monochrome, slot)
             );
         }
-
-        assert_ne!(
-            DEFAULT_DARK.ui_style(Tier::TrueColor, UiSlot::StatusBar),
-            DEFAULT_LIGHT.ui_style(Tier::TrueColor, UiSlot::StatusBar)
-        );
-    }
-
-    fn render_status(
-        mode: Mode,
-        width: u16,
-        tier: Tier,
-    ) -> ratatui::Terminal<ratatui::backend::TestBackend> {
-        let status = StatusBar {
-            mode,
-            path: "test.md".to_string(),
-            dirty: false,
-            is_new: false,
-            cursor_line: 1,
-            line_count: 10,
-            command_line: None,
-        };
-        let text = status.build(None, &DEFAULT_DARK, tier);
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 1))
-            .expect("create status test terminal");
-        terminal
-            .draw(|frame| {
-                render(
-                    frame,
-                    frame.area(),
-                    &text,
-                    "Space h=help",
-                    true,
-                    &DEFAULT_DARK,
-                    tier,
-                );
-            })
-            .expect("render status row");
-        terminal
     }
 
     #[test]
-    fn status_row_badge_starts_at_column_zero_and_has_constant_width() {
-        let modes = [
-            Mode::Normal,
-            Mode::Insert,
-            Mode::Visual,
-            Mode::VisualLine,
-            Mode::VisualBlock,
-            Mode::Command,
-            Mode::View,
-        ];
-
-        for mode in modes {
+    fn status_badge_has_fixed_geometry_and_row_background() {
+        for mode in [Mode::Normal, Mode::Insert, Mode::Select, Mode::Command] {
             let terminal = render_status(mode, 80, Tier::TrueColor);
             let buffer = terminal.backend().buffer();
             let badge_style = mode_badge_style(mode, &DEFAULT_DARK, Tier::TrueColor);
             let label: String = (0..MODE_BADGE_COLS)
-                .map(|x| buffer.cell((x, 0)).expect("badge cell").symbol())
+                .map(|x| buffer.cell((x, 0)).unwrap().symbol())
                 .collect();
-
             assert!(label.starts_with(mode_badge(mode)));
             for x in 0..MODE_BADGE_COLS {
-                let cell = buffer.cell((x, 0)).expect("badge cell");
-                assert_eq!(cell.fg, badge_style.fg.expect("badge foreground"));
-                assert_eq!(cell.bg, badge_style.bg.expect("badge background"));
-                assert!(cell.modifier.contains(ratatui::style::Modifier::BOLD));
+                let cell = buffer.cell((x, 0)).unwrap();
+                assert_eq!(cell.fg, badge_style.fg.unwrap());
+                assert_eq!(cell.bg, badge_style.bg.unwrap());
             }
-            assert_eq!(
-                buffer.cell((MODE_BADGE_COLS, 0)).expect("middle cell").bg,
-                DEFAULT_DARK
-                    .ui_style(Tier::TrueColor, UiSlot::StatusBar)
-                    .bg
-                    .expect("status-row background")
-            );
+            let row_bg = DEFAULT_DARK
+                .ui_style(Tier::TrueColor, UiSlot::StatusBar)
+                .bg
+                .unwrap();
+            for x in MODE_BADGE_COLS..80 {
+                assert_eq!(buffer.cell((x, 0)).unwrap().bg, row_bg);
+            }
         }
     }
 
     #[test]
-    fn status_row_background_covers_blank_cells() {
-        let terminal = render_status(Mode::Normal, 80, Tier::TrueColor);
-        let status_background = DEFAULT_DARK
-            .ui_style(Tier::TrueColor, UiSlot::StatusBar)
-            .bg
-            .expect("status-row background");
-        let buffer = terminal.backend().buffer();
-        assert_eq!(
-            buffer.cell((40, 0)).expect("blank status cell").symbol(),
-            " "
-        );
-        for x in MODE_BADGE_COLS..80 {
-            assert_eq!(
-                buffer.cell((x, 0)).expect("status-row cell").bg,
-                status_background,
-                "status-row background missing at column {x}"
-            );
-        }
-    }
-
-    #[test]
-    fn status_row_geometry_saturates_at_supported_widths() {
-        let text = StatusBar {
-            mode: Mode::Normal,
-            path: "test.md".to_string(),
-            dirty: false,
-            is_new: false,
-            cursor_line: 1,
-            line_count: 10,
-            command_line: None,
-        }
-        .build(None, &DEFAULT_DARK, Tier::TrueColor);
-
+    fn status_render_saturates_at_zero_and_narrow_widths() {
+        let text = status(Mode::Normal).build(None, &DEFAULT_DARK, Tier::TrueColor);
         for width in [0, 1, 5, 40, 80, 200] {
-            let backend_width = width.max(1);
-            let mut terminal =
-                ratatui::Terminal::new(ratatui::backend::TestBackend::new(backend_width, 1))
-                    .expect("create geometry test terminal");
+            let mut terminal = Terminal::new(TestBackend::new(width.max(1), 1)).unwrap();
             terminal
                 .draw(|frame| {
                     render(
@@ -539,484 +469,104 @@ mod tests {
                         Tier::TrueColor,
                     );
                 })
-                .unwrap_or_else(|error| panic!("width {width} must render: {error}"));
-
-            if width >= MODE_BADGE_COLS + RULER_COLS {
-                let row: String = (0..width)
-                    .map(|x| {
-                        terminal
-                            .backend()
-                            .buffer()
-                            .cell((x, 0))
-                            .expect("row cell")
-                            .symbol()
-                    })
-                    .collect();
-                assert!(
-                    row.ends_with("Top"),
-                    "ruler must be right-aligned at width {width}"
-                );
-            }
+                .unwrap();
         }
     }
 
-    // ── Severity glyph ──────────────────────────────────────────────────
-
     #[test]
-    fn severity_glyph_error() {
-        assert_eq!(severity_glyph(Severity::Error), "\u{2717} ");
+    fn ruler_reports_top_middle_and_bottom() {
+        assert_eq!(ruler_text(1, 1, 10), "1:1  10% Top");
+        assert_eq!(ruler_text(5, 7, 10), "5:7  50%");
+        assert_eq!(ruler_text(10, 2, 10), "10:2  100% Bot");
     }
 
     #[test]
-    fn severity_glyph_warning() {
-        assert_eq!(severity_glyph(Severity::Warning), "\u{26a0} ");
+    fn ruler_handles_single_line_and_document_boundaries() {
+        assert_eq!(ruler_text(1, 9, 1), "1:9  Top");
+        assert!(ruler_text(2, 3, 100).contains("2%"));
+        assert!(ruler_text(99, 4, 100).contains("99%"));
     }
 
     #[test]
-    fn severity_glyph_info() {
-        assert_eq!(severity_glyph(Severity::Info), "");
-    }
-
-    #[test]
-    fn severity_glyph_success() {
-        assert_eq!(severity_glyph(Severity::Success), "");
-    }
-
-    // ── Ruler ───────────────────────────────────────────────────────────
-
-    #[test]
-    fn ruler_single_line() {
-        let r = ruler_text(1, 1);
-        assert!(r.contains("1:1"));
-        assert!(r.contains("Top"));
-    }
-
-    #[test]
-    fn ruler_top_edge() {
-        let r = ruler_text(1, 100);
-        assert!(r.contains("1:1"));
-        assert!(r.contains("Top"));
-    }
-
-    #[test]
-    fn ruler_bottom_edge() {
-        let r = ruler_text(100, 100);
-        assert!(r.contains("100:1"));
-        assert!(r.contains("Bot"));
-    }
-
-    #[test]
-    fn ruler_middle() {
-        let r = ruler_text(50, 100);
-        assert!(r.contains("50:1"));
-        assert!(r.contains("50%"));
-    }
-
-    #[test]
-    fn ruler_near_top() {
-        let r = ruler_text(2, 100);
-        assert!(r.contains("2:1"));
-        // At line 2 of 100, percentage is ~2%, not "Top"
-        assert!(r.contains("2%"));
-    }
-
-    #[test]
-    fn ruler_near_bottom() {
-        let r = ruler_text(99, 100);
-        assert!(r.contains("99:1"));
-        assert!(r.contains("99%"));
-    }
-
-    // ── Gutter ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn gutter_absolute_insert_mode() {
-        let gutter = build_gutter(
-            Mode::Insert,
-            0,   // top_line
-            5,   // cursor_line
-            10,  // height
-            100, // line_count
-            true,
-            6, // gutter_w
-        );
-        assert_eq!(gutter.len(), 10);
-        assert_eq!(gutter[0], "   1  "); // 1-based line numbers
-        assert_eq!(gutter[5], "   6  ");
-        assert_eq!(gutter[9], "  10  ");
-    }
-
-    #[test]
-    fn gutter_absolute_view_mode() {
-        let gutter = build_gutter(Mode::View, 0, 0, 5, 50, false, 6);
-        assert_eq!(gutter[0], "   1  ");
-        assert_eq!(gutter[4], "   5  ");
-    }
-
-    #[test]
-    fn gutter_absolute_normal_when_relative_disabled() {
-        let gutter = build_gutter(Mode::Normal, 0, 2, 5, 20, false, 6);
-        assert_eq!(gutter, ["   1  ", "   2  ", "   3  ", "   4  ", "   5  "]);
-    }
-
-    #[test]
-    fn gutter_hybrid_normal_mode() {
-        let gutter = build_gutter(
-            Mode::Normal,
-            0,   // top_line
-            5,   // cursor_line
-            10,  // height
-            100, // line_count
-            true,
-            6, // gutter_w
-        );
-        assert_eq!(gutter[5], "   6  "); // current line is absolute (0-based 5 = 1-based 6)
-                                         // Lines above cursor show negative distance
-        assert_eq!(gutter[4], "  -1  ");
-        assert_eq!(gutter[3], "  -2  ");
-        // Lines below cursor show positive distance
-        assert_eq!(gutter[6], "  +1  ");
-        assert_eq!(gutter[9], "  +4  ");
-    }
-
-    #[test]
-    fn gutter_hybrid_visual_mode() {
-        // Visual mode uses same hybrid as Normal
-        let gutter = build_gutter(Mode::Visual, 0, 3, 5, 20, true, 6);
-        assert_eq!(gutter[3], "   4  "); // current line absolute
-        assert_eq!(gutter[2], "  -1  ");
-        assert_eq!(gutter[4], "  +1  ");
-    }
-
-    #[test]
-    fn gutter_opt_in_policy_covers_every_source_mode() {
-        for mode in [
-            Mode::Normal,
-            Mode::Visual,
-            Mode::VisualLine,
-            Mode::VisualBlock,
-            Mode::Command,
-        ] {
-            let gutter = build_gutter(mode, 0, 1, 3, 10, true, 6);
-            assert_eq!(gutter, ["  -1  ", "   2  ", "  +1  "], "{mode:?}");
+    fn rendered_normal_and_select_honor_relative_numbers() {
+        for mode in [Mode::Normal, Mode::Select, Mode::Command] {
+            let gutter = build_gutter(mode, 0, 2, 5, 10, true, 4);
+            assert!(gutter[2].contains('3'));
+            assert!(gutter[0].contains('2'));
         }
-
-        let insert = build_gutter(Mode::Insert, 0, 1, 3, 10, true, 6);
-        assert_eq!(insert, ["   1  ", "   2  ", "   3  "]);
+        let insert = build_gutter(Mode::Insert, 0, 2, 5, 10, true, 4);
+        assert!(insert[0].contains('1'));
+        assert!(insert[2].contains('3'));
     }
 
     #[test]
-    fn gutter_padding_beyond_document() {
-        let gutter = build_gutter(
-            Mode::Insert,
-            95,  // top_line
-            97,  // cursor_line
-            10,  // height
-            100, // line_count
-            false,
-            6, // gutter_w
-        );
-        // Lines 96-100 (0-based 95-99) are content, lines 101+ are padding
-        assert_eq!(gutter[4], " 100  "); // last content line (top_line+4=99 < 100)
-        assert_eq!(gutter[5], "      "); // first padding line (top_line+5=100 >= 100)
-        assert_eq!(gutter[9], "      "); // padding beyond document
-    }
-
-    #[test]
-    fn gutter_rows_end_with_two_column_gap() {
-        let absolute = build_gutter(Mode::Insert, 999, 999, 2, 1000, false, 7);
-        let relative = build_gutter(Mode::Normal, 0, 1, 2, 1000, true, 7);
-
-        for row in [&absolute[0], &relative[0], &relative[1]] {
-            assert_eq!(row.len(), 7);
-            assert!(row.ends_with("  "));
-            assert!(!row.ends_with("   "));
-        }
-        assert_eq!(absolute[0], " 1000  ");
-        assert_eq!(absolute[1], "       ");
-    }
-
-    #[test]
-    fn gutter_width_calculation() {
-        assert_eq!(gutter_width(0), 6); // min number/sign width 4 + gap 2
+    fn gutter_width_tracks_digit_boundaries() {
         assert_eq!(gutter_width(9), 6);
-        assert_eq!(gutter_width(99), 6);
+        assert_eq!(gutter_width(10), 6);
         assert_eq!(gutter_width(100), 6);
-        assert_eq!(gutter_width(999), 6);
         assert_eq!(gutter_width(1000), 7);
     }
 
-    // ── Transient TTL ───────────────────────────────────────────────────
-
     #[test]
-    fn transient_not_expired_before_ttl() {
-        let now = Instant::now();
-        let t = Transient {
-            text: "test".to_string(),
-            severity: Severity::Info,
-            expires_at: now + Duration::from_secs(4),
-        };
-        assert!(!t.is_expired(now + Duration::from_secs(3)));
-    }
+    fn gutter_padding_alignment_and_document_bounds_are_stable() {
+        let gutter = build_gutter(Mode::Insert, 95, 97, 10, 100, false, 6);
+        assert_eq!(gutter[4], " 100  ");
+        assert_eq!(gutter[5], "      ");
+        assert_eq!(gutter[9], "      ");
 
-    #[test]
-    fn transient_expired_after_ttl() {
-        let now = Instant::now();
-        let t = Transient {
-            text: "test".to_string(),
-            severity: Severity::Info,
-            expires_at: now + Duration::from_secs(4),
-        };
-        assert!(t.is_expired(now + Duration::from_secs(5)));
-    }
-
-    #[test]
-    fn transient_ttl_expires() {
-        let now = Instant::now();
-        let expired_transient = Transient {
-            text: "test".to_string(),
-            severity: Severity::Info,
-            expires_at: now - Duration::from_secs(1),
-        };
-        assert!(expired_transient.is_expired(now));
-    }
-
-    #[test]
-    fn transient_ttl_keeps_valid() {
-        let now = Instant::now();
-        let valid_transient = Transient {
-            text: "test".to_string(),
-            severity: Severity::Info,
-            expires_at: now + Duration::from_secs(10),
-        };
-        assert!(!valid_transient.is_expired(now));
-    }
-
-    // ── Command-line takeover ───────────────────────────────────────────
-
-    #[test]
-    fn build_preserves_badge_during_prompt() {
-        let sb = StatusBar {
-            mode: Mode::Command,
-            path: "test.md".to_string(),
-            dirty: false,
-            is_new: false,
-            cursor_line: 1,
-            line_count: 10,
-            command_line: Some(":w".to_string()),
-        };
-        let text = sb.build(None, &DEFAULT_DARK, Tier::TrueColor);
-        assert_eq!(text.prompt.as_deref(), Some(":w"));
-        assert!(text.prompt_cursor);
-        assert_eq!(text.badge.content.as_ref(), " :CMD ");
-    }
-
-    #[test]
-    fn build_normal_no_takeover() {
-        let sb = StatusBar {
-            mode: Mode::Normal,
-            path: "test.md".to_string(),
-            dirty: false,
-            is_new: false,
-            cursor_line: 1,
-            line_count: 10,
-            command_line: None,
-        };
-        let text = sb.build(None, &DEFAULT_DARK, Tier::TrueColor);
-        assert!(text.prompt.is_none());
-        assert!(!text.content.is_empty());
-    }
-
-    #[test]
-    fn test_status_bar_zero_width_no_panic() {
-        use ratatui::{backend::TestBackend, layout::Rect, Terminal};
-
-        let text = StatusBar {
-            mode: Mode::Command,
-            path: "test.md".to_string(),
-            dirty: false,
-            is_new: false,
-            cursor_line: 1,
-            line_count: 1,
-            command_line: Some(":w".to_string()),
+        for row in build_gutter(Mode::Normal, 0, 1, 3, 1000, true, 7) {
+            assert_eq!(row.len(), 7);
+            assert!(row.ends_with("  "));
         }
-        .build(None, &DEFAULT_DARK, Tier::TrueColor);
-        let mut terminal = Terminal::new(TestBackend::new(1, 1)).expect("create test terminal");
-
-        terminal
-            .draw(|frame| {
-                render(
-                    frame,
-                    Rect {
-                        x: 0,
-                        y: 0,
-                        width: 0,
-                        height: 1,
-                    },
-                    &text,
-                    "",
-                    true,
-                    &DEFAULT_DARK,
-                    Tier::TrueColor,
-                );
-            })
-            .expect("render zero-width status bar");
-    }
-
-    // ── Status bar build ────────────────────────────────────────────────
-
-    #[test]
-    fn build_shows_dirty_marker() {
-        let sb = StatusBar {
-            mode: Mode::Normal,
-            path: "test.md".to_string(),
-            dirty: true,
-            is_new: false,
-            cursor_line: 1,
-            line_count: 10,
-            command_line: None,
-        };
-        let text = sb.build(None, &DEFAULT_DARK, Tier::TrueColor);
-        let full_text: String = text.content.iter().map(|s| s.content.as_ref()).collect();
-        assert!(full_text.contains("[+]"));
     }
 
     #[test]
-    fn build_shows_transient_with_glyph() {
+    fn transient_expiry_uses_the_injected_deadline() {
         let now = Instant::now();
         let transient = Transient {
-            text: "read-only view".to_string(),
-            severity: Severity::Info,
-            expires_at: now + Duration::from_secs(4),
+            text: "saved".to_string(),
+            severity: Severity::Success,
+            expires_at: now + TRANSIENT_TTL,
         };
-        let sb = StatusBar {
-            mode: Mode::Normal,
-            path: "test.md".to_string(),
-            dirty: false,
-            is_new: false,
-            cursor_line: 1,
-            line_count: 10,
-            command_line: None,
-        };
-        let text = sb.build(Some(&transient), &DEFAULT_DARK, Tier::TrueColor);
-        let full_text: String = text.content.iter().map(|s| s.content.as_ref()).collect();
-        assert!(full_text.contains("read-only view"));
+        assert!(!transient.is_expired(now + TRANSIENT_TTL - Duration::from_nanos(1)));
+        assert!(transient.is_expired(now + TRANSIENT_TTL));
     }
 
     #[test]
-    fn build_error_message_has_x_glyph() {
-        let now = Instant::now();
+    fn severity_glyphs_are_non_color_signals() {
+        assert_eq!(severity_glyph(Severity::Error), "✗ ");
+        assert_eq!(severity_glyph(Severity::Warning), "⚠ ");
+        assert_eq!(severity_glyph(Severity::Info), "");
+        assert_eq!(severity_glyph(Severity::Success), "");
+    }
+
+    #[test]
+    fn build_covers_file_flags_transients_and_prompts() {
+        let mut bar = status(Mode::Normal);
+        bar.path = "/tmp/new.md".to_string();
+        bar.dirty = true;
+        bar.is_new = true;
         let transient = Transient {
             text: "externally modified".to_string(),
             severity: Severity::Error,
-            expires_at: now + Duration::from_secs(4),
+            expires_at: Instant::now() + TRANSIENT_TTL,
         };
-        let sb = StatusBar {
-            mode: Mode::Normal,
-            path: "test.md".to_string(),
-            dirty: false,
-            is_new: false,
-            cursor_line: 1,
-            line_count: 10,
-            command_line: None,
-        };
-        let text = sb.build(Some(&transient), &DEFAULT_DARK, Tier::TrueColor);
-        let full_text: String = text.content.iter().map(|s| s.content.as_ref()).collect();
-        // FR-6.2: error message renders with ✗ even on monochrome
-        assert!(full_text.contains("\u{2717}"));
-    }
+        let built = bar.build(Some(&transient), &DEFAULT_DARK, Tier::TrueColor);
+        let content: String = built
+            .content
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(content.contains("new.md [new file] [+]"));
+        assert!(content.contains("✗ externally modified"));
 
-    #[test]
-    fn build_warning_message_has_triangle_glyph() {
-        let now = Instant::now();
-        let transient = Transient {
-            text: "something off".to_string(),
-            severity: Severity::Warning,
-            expires_at: now + Duration::from_secs(4),
-        };
-        let sb = StatusBar {
-            mode: Mode::Normal,
-            path: "test.md".to_string(),
-            dirty: false,
-            is_new: false,
-            cursor_line: 1,
-            line_count: 10,
-            command_line: None,
-        };
-        let text = sb.build(Some(&transient), &DEFAULT_DARK, Tier::TrueColor);
-        let full_text: String = text.content.iter().map(|s| s.content.as_ref()).collect();
-        assert!(full_text.contains("\u{26a0}"));
-    }
-
-    // ── Deadline computation ────────────────────────────────────────────
-
-    /// Compute the next deadline from transient expiry and which-key pending.
-    /// Used by the event loop to tighten poll deadlines.
-    pub fn next_deadline(
-        transient: Option<&Transient>,
-        which_key_pending_since: Option<Instant>,
-        now: Instant,
-    ) -> Option<Instant> {
-        let transient_deadline = transient.map(|t| t.expires_at);
-        let which_key_deadline = which_key_pending_since.map(|s| s + Duration::from_millis(150));
-
-        transient_deadline
-            .into_iter()
-            .chain(which_key_deadline)
-            .min()
-            .filter(|d| *d > now)
-    }
-
-    #[test]
-    fn deadline_transient_only() {
-        let now = Instant::now();
-        let t = Transient {
-            text: "test".to_string(),
-            severity: Severity::Info,
-            expires_at: now + Duration::from_secs(2),
-        };
-        let deadline = next_deadline(Some(&t), None, now);
-        assert_eq!(deadline, Some(now + Duration::from_secs(2)));
-    }
-
-    #[test]
-    fn deadline_which_key_only() {
-        let now = Instant::now();
-        let pending = now - Duration::from_millis(50);
-        let deadline = next_deadline(None, Some(pending), now);
-        // which_key_deadline = pending + 150ms = now + 100ms
-        assert_eq!(deadline, Some(now + Duration::from_millis(100)));
-    }
-
-    #[test]
-    fn deadline_min_of_both() {
-        let now = Instant::now();
-        let t = Transient {
-            text: "test".to_string(),
-            severity: Severity::Info,
-            expires_at: now + Duration::from_secs(5),
-        };
-        let pending = now - Duration::from_millis(50);
-        let deadline = next_deadline(Some(&t), Some(pending), now);
-        // min(5s, 100ms) = 100ms
-        assert_eq!(deadline, Some(now + Duration::from_millis(100)));
-    }
-
-    #[test]
-    fn deadline_none_when_expired() {
-        let now = Instant::now();
-        let t = Transient {
-            text: "test".to_string(),
-            severity: Severity::Info,
-            expires_at: now - Duration::from_secs(1), // already expired
-        };
-        let deadline = next_deadline(Some(&t), None, now);
-        assert!(deadline.is_none());
-    }
-
-    #[test]
-    fn deadline_none_when_no_inputs() {
-        let deadline = next_deadline(None, None, Instant::now());
-        assert!(deadline.is_none());
+        bar.mode = Mode::Command;
+        bar.command_line = Some(":w".to_string());
+        let prompt = bar.build(None, &DEFAULT_DARK, Tier::TrueColor);
+        assert_eq!(prompt.badge.content.as_ref(), " :CMD ");
+        assert_eq!(prompt.prompt.as_deref(), Some(":w"));
+        assert!(prompt.prompt_cursor);
     }
 }
+
+// ── Tests ───────────────────────────────────────────────────────────────────

@@ -1,12 +1,12 @@
 ┌ Command Palette ─────────────────────┐
 │>                                     │
 │                                      │
-│▸ toggle-view          toggle view    │
-│  help                 help / command │
-│  save                 save           │
-│  quit                 quit           │
-│  cycle-theme          cycle theme    │
-│  next-tab             next tab       │
-│  prev-tab             previous tab   │
-│  jump-to-tab          jump to tab    │
+│▸ select-character     character-wise │
+│  select-line          line-wise selec│
+│  select-block         block-wise sele│
+│  cancel-select        cancel selectio│
+│  select-yank          yank selection │
+│  select-delete        delete selectio│
+│  select-change        change selectio│
+│  select-indent        indent selectio│
 └──────────────────────────────────────┘

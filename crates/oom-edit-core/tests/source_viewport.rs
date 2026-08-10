@@ -2,7 +2,6 @@ use oom_edit_core::session::{
     EditorSession, Effect, KeyCode, KeyCodeKind, KeyInput, Modifiers, Severity, Viewport,
 };
 use oom_edit_core::style::SemanticStyle;
-use oom_edit_core::view::wrap_lines;
 
 fn key(kind: KeyCodeKind) -> KeyInput {
     KeyInput {
@@ -17,6 +16,16 @@ fn feed(session: &mut EditorSession, input: &str) -> Vec<Effect> {
         effects.extend(session.handle_key(key(KeyCodeKind::Char(ch))));
     }
     effects
+}
+
+fn enter_insert(session: &mut EditorSession) {
+    session.handle_key(key(KeyCodeKind::Char('i')));
+}
+
+fn move_right(session: &mut EditorSession, count: usize) {
+    for _ in 0..count {
+        session.handle_key(key(KeyCodeKind::Right));
+    }
 }
 
 fn execute_ex(session: &mut EditorSession, command: &str) -> Vec<Effect> {
@@ -57,7 +66,8 @@ fn render_source_wraps_long_line() {
 #[test]
 fn render_source_wrap_cursor_maps_to_visual_row() {
     let mut session = EditorSession::from_text(&long_line(100));
-    feed(&mut session, "45l");
+    enter_insert(&mut session);
+    move_right(&mut session, 45);
     let frame = session.render_source(viewport(40, 3, true, 0, 0));
     assert_eq!(frame.cursor, (1, 5));
 }
@@ -65,7 +75,8 @@ fn render_source_wrap_cursor_maps_to_visual_row() {
 #[test]
 fn render_source_wrap_cursor_at_wrap_boundary() {
     let mut session = EditorSession::from_text(&long_line(100));
-    feed(&mut session, "40l");
+    enter_insert(&mut session);
+    move_right(&mut session, 40);
     let frame = session.render_source(viewport(40, 3, true, 0, 0));
     assert_eq!(frame.cursor, (1, 0));
 }
@@ -82,7 +93,9 @@ fn render_source_wrap_fills_viewport_height() {
 fn render_source_wrap_multiple_long_lines() {
     let text = format!("{}\n{}", long_line(25), long_line(25));
     let mut session = EditorSession::from_text(&text);
-    feed(&mut session, "j15l");
+    enter_insert(&mut session);
+    session.handle_key(key(KeyCodeKind::Down));
+    move_right(&mut session, 15);
     let frame = session.render_source(viewport(10, 6, true, 0, 0));
     assert_eq!(frame.cursor, (4, 5));
 }
@@ -102,26 +115,22 @@ fn render_source_wrap_preserves_spans_across_break() {
 }
 
 #[test]
-fn render_source_wrap_search_match_on_wrapped_row() {
-    let text = format!("{}needle{}", long_line(45), long_line(10));
-    let mut session = EditorSession::from_text(&text);
-    session.handle_key(key(KeyCodeKind::Char('/')));
-    feed(&mut session, "needle");
-    session.handle_key(key(KeyCodeKind::Enter));
-    let frame = session.render_source(viewport(20, 4, true, 0, 0));
-    assert!(frame.lines[2]
-        .spans
-        .iter()
-        .any(|span| span.style == SemanticStyle::Match));
-}
-
-#[test]
-fn wrap_reuses_view_wrap_lines() {
+fn source_wrap_preserves_exact_wrapped_content() {
     let mut session = EditorSession::from_text(&format!("# {}", long_line(30)));
-    let styled = session.highlighter().highlight_lines(0..1).remove(0);
-    let expected = wrap_lines(&styled, 10, 0);
-    let frame = session.render_source(viewport(10, expected.len() as u16, true, 0, 0));
-    assert_eq!(frame.lines, expected);
+    let frame = session.render_source(viewport(10, 4, true, 0, 0));
+    assert_eq!(
+        frame
+            .lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>(),
+        ["# xxxxxxxx", "xxxxxxxxxx", "xxxxxxxxxx", "xx"]
+    );
+    assert!(frame.lines.iter().all(|line| {
+        line.spans
+            .iter()
+            .any(|span| span.style == SemanticStyle::Heading1)
+    }));
 }
 
 #[test]
@@ -153,7 +162,8 @@ fn render_source_nowrap_span_partially_visible() {
 #[test]
 fn render_source_nowrap_cursor_offset() {
     let mut session = EditorSession::from_text("abcdefghijklmnopqrstuvwxyz");
-    feed(&mut session, "15l");
+    enter_insert(&mut session);
+    move_right(&mut session, 15);
     let frame = session.render_source(viewport(10, 1, false, 10, 0));
     assert_eq!(frame.cursor, (0, 5));
 }
@@ -252,7 +262,8 @@ fn insert_cursor_at_exact_wrap_boundary_uses_blank_continuation() {
 #[test]
 fn render_source_skip_rows_cursor_offset() {
     let mut session = EditorSession::from_text(&long_line(50));
-    feed(&mut session, "35l");
+    enter_insert(&mut session);
+    move_right(&mut session, 35);
     let frame = session.render_source(viewport(10, 3, true, 0, 2));
     assert_eq!(frame.cursor, (1, 5));
 }

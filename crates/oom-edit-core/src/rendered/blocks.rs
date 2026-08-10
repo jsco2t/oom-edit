@@ -5,8 +5,8 @@
 //! source. Front matter (if `fm_span` is `Some`) is emitted as a leading
 //! `Block::FrontMatter` node; the remainder is parsed by pulldown-cmark.
 //!
-//! Inline text is owned (post-unescape). Inline-level spans are NOT required —
-//! VP-1 maps at line granularity via blocks.
+//! Inline text is owned (post-unescape), and every leaf event retains its full
+//! source range so final display atoms can project back to raw Markdown.
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
@@ -17,6 +17,18 @@ use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagE
 pub struct BlockModel {
     /// Top-level blocks, sorted by start byte, non-overlapping.
     pub blocks: Vec<Block>,
+    /// Source-backed rendered text emitted by inline parser events, in source
+    /// order. Layout consumes this sidecar without exposing parser types.
+    pub inline_sources: Vec<InlineSource>,
+}
+
+/// One parser-derived inline leaf and its complete raw-source ownership.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineSource {
+    /// Post-transformation visible text.
+    pub rendered: String,
+    /// Complete UTF-8-safe source range reported by pulldown-cmark.
+    pub source: std::ops::Range<usize>,
 }
 
 // ── Block ──────────────────────────────────────────────────────────────────
@@ -198,7 +210,10 @@ impl BlockModel {
                     kind: BlockKind::FrontMatter,
                 });
             }
-            return Self { blocks };
+            return Self {
+                blocks,
+                inline_sources: Vec::new(),
+            };
         }
 
         // Set up pulldown-cmark with required extensions
@@ -234,7 +249,10 @@ impl BlockModel {
             );
         }
 
-        Self { blocks }
+        Self {
+            blocks,
+            inline_sources: builder.inline_sources,
+        }
     }
 }
 
@@ -260,6 +278,8 @@ struct BlockBuilder {
     stack: Vec<BuildContext>,
     /// Collected top-level blocks.
     blocks: Vec<Block>,
+    /// Full source ranges for leaf inline events.
+    inline_sources: Vec<InlineSource>,
 }
 
 /// Context for a block currently being built on the stack.
@@ -323,11 +343,28 @@ impl BlockBuilder {
             _offset: offset,
             stack: Vec::new(),
             blocks: Vec::new(),
+            inline_sources: Vec::new(),
         }
     }
 
     /// Feed a single event with its global byte range.
     fn feed(&mut self, event: Event<'_>, span: std::ops::Range<usize>) {
+        let rendered_leaf = match &event {
+            Event::Text(text) | Event::Code(text) | Event::Html(text) | Event::InlineHtml(text) => {
+                Some(text.to_string())
+            }
+            Event::SoftBreak => Some(" ".to_string()),
+            Event::HardBreak => Some("  ".to_string()),
+            Event::FootnoteReference(label) => Some(format!("[{label}]")),
+            _ => None,
+        };
+        if let Some(rendered) = rendered_leaf {
+            self.inline_sources.push(InlineSource {
+                rendered,
+                source: span.clone(),
+            });
+        }
+
         match &event {
             // ── Block-level Start events ───────────────────────────────
             Event::Start(Tag::Paragraph) => {

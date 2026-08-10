@@ -24,7 +24,7 @@ use super::registry::{spec_for, Command, CommandSpec, Contexts};
 pub enum KeyTrigger {
     /// A single key event.
     Key(KeyInput),
-    /// A fixed two-key chord (e.g. `Space v`).
+    /// A fixed two-key chord (e.g. `Space h`).
     Chord([KeyInput; 2]),
 }
 
@@ -70,7 +70,8 @@ impl PendingChord {
 /// The keymap: trigger → command pairs, built from a static table.
 ///
 /// Triggers:
-/// - `Space v` → ToggleView
+/// - `v` / `V` / `Ctrl-V` → character / line / block Select
+/// - Select operators/cancel are single-key registry projections
 /// - `Space h` → Help
 /// - `Space w` → Save
 /// - `Space q` → Quit
@@ -92,30 +93,60 @@ fn ch(c: char) -> KeyInput {
     }
 }
 
+fn ctrl(c: char) -> KeyInput {
+    let mut key = ch(c);
+    key.mods.ctrl = true;
+    key
+}
+
 impl Keymap {
     /// Build the default keymap.
     pub fn default() -> Self {
         let space = ch(' ');
 
-        let single: Vec<(KeyInput, Command, Contexts)> = Vec::new();
+        let single: Vec<(KeyInput, Command, Contexts)> = vec![
+            (ch('v'), Command::EnterCharacterSelect, Contexts::NORMAL),
+            (ch('V'), Command::EnterLineSelect, Contexts::NORMAL),
+            (ctrl('v'), Command::EnterBlockSelect, Contexts::NORMAL),
+            (
+                KeyInput {
+                    code: KeyCode {
+                        kind: KeyCodeKind::Esc,
+                    },
+                    mods: oom_edit_core::session::Modifiers::default(),
+                },
+                Command::CancelSelect,
+                Contexts::SELECT,
+            ),
+            (ch('y'), Command::SelectYank, Contexts::SELECT),
+            (ch('d'), Command::SelectDelete, Contexts::SELECT),
+            (ch('x'), Command::SelectDelete, Contexts::SELECT),
+            (ch('c'), Command::SelectChange, Contexts::SELECT),
+            (ch('>'), Command::SelectIndent, Contexts::SELECT),
+            (ch('<'), Command::SelectOutdent, Contexts::SELECT),
+            (ch('o'), Command::SelectSwapAnchor, Contexts::SELECT),
+        ];
 
         let chords: Vec<([KeyInput; 2], Command, Contexts)> = vec![
             (
-                [space, ch('v')],
-                Command::ToggleView,
-                Contexts::NORMAL.or(Contexts::VIEW),
+                [space, ch('h')],
+                Command::Help,
+                Contexts::NORMAL.or(Contexts::SELECT),
             ),
-            ([space, ch('h')], Command::Help, Contexts::ALL),
-            ([space, ch('w')], Command::Save, Contexts::NORMAL),
+            (
+                [space, ch('w')],
+                Command::Save,
+                Contexts::NORMAL.or(Contexts::SELECT),
+            ),
             (
                 [space, ch('q')],
                 Command::Quit,
-                Contexts::NORMAL.or(Contexts::VIEW),
+                Contexts::NORMAL.or(Contexts::SELECT),
             ),
             (
                 [space, ch('t')],
                 Command::CycleTheme,
-                Contexts::NORMAL.or(Contexts::VIEW),
+                Contexts::NORMAL.or(Contexts::SELECT),
             ),
         ];
 
@@ -174,7 +205,7 @@ impl Keymap {
 
     /// Resolve one key event against the app keymap.
     ///
-    /// Space in NORMAL/VIEW starts a pending chord; any non-continuation key
+    /// Space in NORMAL/SELECT starts a pending chord; any non-continuation key
     /// resets and yields `None` (falls through to the engine).
     ///
     /// # Space consumption
@@ -205,9 +236,9 @@ impl Keymap {
             }
         }
 
-        // Check if this key starts a chord (Space in NORMAL/VIEW).
+        // Check if this key starts a chord (Space in NORMAL/SELECT).
         let is_space = is_space_key(ev);
-        let in_chord_context = ctx.contains(Contexts::NORMAL) || ctx.contains(Contexts::VIEW);
+        let in_chord_context = ctx.contains(Contexts::NORMAL) || ctx.contains(Contexts::SELECT);
 
         if is_space && in_chord_context {
             // Start pending chord.
@@ -264,9 +295,10 @@ fn is_space_key(key: &KeyInput) -> bool {
 
 /// Render a key for display.
 fn render_key(key: &KeyInput) -> String {
-    match key.code.kind {
+    let base = match key.code.kind {
         KeyCodeKind::Noop => "Noop".to_string(),
         KeyCodeKind::Char(' ') => "Space".to_string(),
+        KeyCodeKind::Char(c) if key.mods.ctrl => c.to_ascii_uppercase().to_string(),
         KeyCodeKind::Char(c) => c.to_string(),
         KeyCodeKind::F(n) => format!("F{n}"),
         KeyCodeKind::Backspace => "Backspace".to_string(),
@@ -283,6 +315,21 @@ fn render_key(key: &KeyInput) -> String {
         KeyCodeKind::PageDown => "PageDown".to_string(),
         KeyCodeKind::Delete => "Delete".to_string(),
         KeyCodeKind::BackTab => "Shift+Tab".to_string(),
+    };
+    let mut modifiers = Vec::new();
+    if key.mods.ctrl {
+        modifiers.push("Ctrl");
+    }
+    if key.mods.alt {
+        modifiers.push("Alt");
+    }
+    if key.mods.shift {
+        modifiers.push("Shift");
+    }
+    if modifiers.is_empty() {
+        base
+    } else {
+        format!("{}-{base}", modifiers.join("-"))
     }
 }
 
@@ -352,34 +399,29 @@ mod tests {
     }
 
     #[test]
-    fn space_v_resolves_toggle_view() {
+    fn plain_v_resolves_enter_select() {
         let km = Keymap::default();
         let mut pending = PendingChord::default();
-        let space = ch(' ');
         let v = ch('v');
-
-        // Space starts pending.
-        match km.resolve(Contexts::NORMAL, &space, &mut pending) {
-            Resolution::Pending(conts) => {
-                let keys: Vec<char> = conts
-                    .iter()
-                    .filter_map(|(k, _)| match k.code.kind {
-                        KeyCodeKind::Char(c) => Some(c),
-                        _ => None,
-                    })
-                    .collect();
-                assert!(
-                    keys.contains(&'v'),
-                    "Space should offer 'v' as continuation"
-                );
-            }
-            other => panic!("Space should be Pending, got {other:?}"),
-        }
-
-        // v completes the chord.
         match km.resolve(Contexts::NORMAL, &v, &mut pending) {
-            Resolution::Command(Command::ToggleView) => {}
-            other => panic!("Space+v should resolve ToggleView, got {other:?}"),
+            Resolution::Command(Command::EnterCharacterSelect) => {}
+            other => panic!("v should resolve EnterCharacterSelect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn select_shape_bindings_resolve_from_registry_keymap() {
+        let km = Keymap::default();
+        for (input, expected) in [
+            (ch('v'), Command::EnterCharacterSelect),
+            (ch('V'), Command::EnterLineSelect),
+            (ctrl('v'), Command::EnterBlockSelect),
+        ] {
+            let mut pending = PendingChord::default();
+            assert!(matches!(
+                km.resolve(Contexts::NORMAL, &input, &mut pending),
+                Resolution::Command(command) if command == expected
+            ));
         }
     }
 
@@ -532,11 +574,19 @@ mod tests {
     }
 
     #[test]
-    fn rendered_keys_toggle_view() {
+    fn rendered_keys_enter_select() {
         let km = Keymap::default();
         assert_eq!(
-            km.rendered_keys(Command::ToggleView),
-            Some("Space v".to_string())
+            km.rendered_keys(Command::EnterCharacterSelect),
+            Some("v".to_string())
+        );
+        assert_eq!(
+            km.rendered_keys(Command::EnterLineSelect),
+            Some("V".to_string())
+        );
+        assert_eq!(
+            km.rendered_keys(Command::EnterBlockSelect),
+            Some("Ctrl-V".to_string())
         );
     }
 
@@ -551,7 +601,6 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(keys.contains(&'v'));
         assert!(keys.contains(&'h'));
         assert!(keys.contains(&'w'));
         assert!(keys.contains(&'q'));
@@ -567,5 +616,24 @@ mod tests {
             (matches!(r, Resolution::Pending(_)), pending.since.is_some())
         };
         assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn every_binding_uses_its_registry_contexts() {
+        let km = Keymap::default();
+        for (_, command, contexts) in &km.single {
+            assert_eq!(
+                *contexts,
+                spec_for(*command).unwrap().contexts,
+                "single-key context drift for {command:?}"
+            );
+        }
+        for (_, command, contexts) in &km.chords {
+            assert_eq!(
+                *contexts,
+                spec_for(*command).unwrap().contexts,
+                "chord context drift for {command:?}"
+            );
+        }
     }
 }

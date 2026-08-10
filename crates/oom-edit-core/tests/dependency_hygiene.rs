@@ -5,7 +5,15 @@
 //! and checks that the output contains none of the banned crate names.
 //! It must run in `make test` (not `#[ignore]`).
 
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("workspace root should resolve")
+}
 
 /// Run `cargo tree` for oom-edit-core and return stdout as a string.
 fn cargo_tree_output() -> String {
@@ -76,5 +84,73 @@ fn hjkl_types_do_not_leak_public_api() {
     assert!(
         !lib_src.contains("pub use vim::"),
         "lib.rs must not re-export any vim:: types in its public API"
+    );
+}
+
+#[test]
+fn renderer_implementation_module_is_not_public_api() {
+    let lib_src = include_str!("../src/lib.rs");
+    assert!(!lib_src.contains("pub mod rendered;"));
+    assert!(!lib_src.contains("pub use rendered::"));
+}
+
+#[test]
+fn current_surfaces_have_no_legacy_public_modes_or_bindings() {
+    let banned = [
+        concat!("Mode::", "View"),
+        concat!("Mode::", "Visual"),
+        concat!("Contexts::", "VIEW"),
+        concat!("Contexts::", "VISUAL"),
+        concat!("Badge", "View"),
+        concat!("Badge", "Visual"),
+        concat!("toggle", "_view"),
+        concat!("toggle", "-view"),
+        concat!("render", "_view"),
+        concat!("view", "_cursor_line"),
+        concat!(":", "view"),
+        concat!("Space", " v"),
+    ];
+    let mut pending = vec![workspace_root()];
+    let mut violations = Vec::new();
+
+    while let Some(path) = pending.pop() {
+        if path.is_dir() {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            if [".git", "target", "vendor", "patches"].contains(&name) {
+                continue;
+            }
+            for entry in std::fs::read_dir(&path).expect("repository directory should be readable")
+            {
+                pending.push(entry.expect("repository entry should be readable").path());
+            }
+            continue;
+        }
+
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if name == "vim.rs" || name == "CHANGELOG.md" {
+            continue;
+        }
+        let extension = path.extension().and_then(|extension| extension.to_str());
+        if !matches!(extension, Some("rs" | "md" | "txt" | "toml")) {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).expect("audited text file should be UTF-8");
+        for token in banned {
+            if source.contains(token) {
+                violations.push(format!("{} contains {token:?}", path.display()));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "legacy public mode names or bindings remain:\n{}",
+        violations.join("\n")
     );
 }

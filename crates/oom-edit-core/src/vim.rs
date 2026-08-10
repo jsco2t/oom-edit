@@ -59,12 +59,12 @@
 //      as the command. `Esc` exits to Normal; `Enter` commits. We intercept
 //      `Enter` to capture the command before hjkl processes it.
 //
-// Mode mapping (hjkl → oom-edit):
-//   hjkl::VimMode::Normal      → oom_edit::Mode::Normal
-//   hjkl::VimMode::Insert      → oom_edit::Mode::Insert
-//   hjkl::VimMode::Visual      → oom_edit::Mode::Visual
-//   hjkl::VimMode::Replace     → oom_edit::Mode::Insert (replace → insert)
-//   hjkl::VimMode::Command     → oom_edit::Mode::Command
+// Private mode mapping (hjkl → this wrapper only):
+//   hjkl::VimMode::Normal      → vim::Mode::Normal
+//   hjkl::VimMode::Insert      → vim::Mode::Insert
+//   hjkl::VimMode::Visual      → vim::Mode::Visual
+//   hjkl::VimMode::Replace     → vim::Mode::Insert (replace → insert)
+//   hjkl::VimMode::Command     → vim::Mode::Command
 //   (hjkl has no VisualLine/VisualBlock in VimMode — those are in
 //    hjkl_vim::Mode which is internal; we use vim_mode() for the coarse
 //    mode and track visual sub-kinds via the selection highlight checks.)
@@ -73,10 +73,16 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use hjkl_buffer::{ContentEdit, View};
-use hjkl_engine::types::{CursorShape, DefaultHost, Host, Options, Viewport};
+use hjkl_engine::types::{CursorShape, DefaultHost, Host, Options, Query, Viewport};
 use hjkl_engine::{Editor, PlannedInput, SpecialKey, VimMode as HjklVimMode};
-use hjkl_vim::vim::{Operator as HjklOperator, Pending as HjklPending, VimState as HjklVimState};
+use hjkl_vim::vim::{
+    InsertReason as HjklInsertReason, InsertSession as HjklInsertSession, Mode as HjklInternalMode,
+    Operator as HjklOperator, Pending as HjklPending, VimState as HjklVimState,
+};
 use hjkl_vim::{feed_input, install_vim_discipline, VimEditorExt};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+use crate::style::{RenderedSelection, SelectionShape};
 
 // ── vim.rs internal types ──────────────────────────────────────────────────
 
@@ -169,9 +175,26 @@ pub struct TextEdit {
     pub new_text: String,
 }
 
+fn edits_reproduce(before: &str, edits: &[TextEdit], after: &str) -> bool {
+    let mut working = before.to_string();
+    for edit in edits {
+        let start = edit.range.start.min(edit.range.end);
+        let end = edit.range.start.max(edit.range.end);
+        if end > working.len()
+            || !working.is_char_boundary(start)
+            || !working.is_char_boundary(end)
+            || edit.new_text_len != edit.new_text.len()
+        {
+            return false;
+        }
+        working.replace_range(start..end, &edit.new_text);
+    }
+    working == after
+}
+
 // ── Mode ───────────────────────────────────────────────────────────────────
 
-/// Terminal-agnostic mode enum. Mirrors the seven modes from plan §6.1.
+/// Private engine modes; these never escape the wrapper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Mode {
     Normal,
@@ -182,19 +205,33 @@ pub(crate) enum Mode {
     Command,
 }
 
-#[allow(dead_code)]
-impl Mode {
-    /// Check if this mode allows buffer mutations.
-    pub(crate) fn is_editable(self) -> bool {
-        matches!(
-            self,
-            Mode::Normal
-                | Mode::Insert
-                | Mode::Visual
-                | Mode::VisualLine
-                | Mode::VisualBlock
-                | Mode::Command
-        )
+/// Whole-line operator requested by the rendered Select surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RangeOperator {
+    Yank,
+    Delete,
+    Change,
+    Indent,
+    Outdent,
+}
+
+/// Register selected by a rendered operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Register {
+    Unnamed,
+    System,
+    Named(char),
+    BlackHole,
+}
+
+impl Register {
+    pub(crate) fn selector(self) -> Option<char> {
+        match self {
+            Self::Unnamed => None,
+            Self::System => Some('+'),
+            Self::Named(name) => Some(name),
+            Self::BlackHole => Some('_'),
+        }
     }
 }
 
@@ -353,8 +390,11 @@ impl VimCore {
             system_register_selected && (system_yank_pending || Self::is_yank_key(key));
 
         let history_traversal = self.is_history_traversal_key(key);
-        let history_text_before = history_traversal.then(|| self.text());
+        let text_before = self.text();
         let undo_seq_before = history_traversal.then(|| self.editor.buffer().current_undo_seq());
+        if let Some(effects) = self.try_display_block_put(key, &text_before) {
+            return effects;
+        }
         let next_history_prefix = self.mode == Mode::Normal
             && !self.history_prefix_pending
             && matches!(key.code.kind, KeyCodeKind::Char('g'))
@@ -381,11 +421,11 @@ impl VimCore {
 
         // Drain any content edits
         let mut edits = self.drain_content_edits();
-        if self.editor.take_content_reset() {
-            let old_text = history_text_before.as_deref().unwrap_or("");
-            let new_text = self.text();
+        let content_reset = self.editor.take_content_reset();
+        let new_text = self.text();
+        if content_reset || !edits_reproduce(&text_before, &edits, &new_text) {
             edits = vec![TextEdit {
-                range: 0..old_text.len(),
+                range: 0..text_before.len(),
                 new_text_len: new_text.len(),
                 new_text,
             }];
@@ -502,6 +542,133 @@ impl VimCore {
         matches!(self.hjkl_state().pending_register, Some('+') | Some('*'))
     }
 
+    /// Paste renderer-created block registers using display-cell geometry.
+    /// hjkl's stock block paste measures segment width with `chars().count()`,
+    /// which cannot represent rectangles containing a mix of narrow and wide
+    /// atoms. Keep that adaptation private to this engine boundary.
+    fn try_display_block_put(&mut self, key: KeyInput, old_text: &str) -> Option<Vec<VimEffect>> {
+        let before = match key.code.kind {
+            KeyCodeKind::Char('p')
+                if self.mode == Mode::Normal && !key.mods.ctrl && !key.mods.alt =>
+            {
+                false
+            }
+            KeyCodeKind::Char('P')
+                if self.mode == Mode::Normal && !key.mods.ctrl && !key.mods.alt =>
+            {
+                true
+            }
+            _ => return None,
+        };
+        let selector = self.hjkl_state().pending_register;
+        let slot = self.editor.with_registers(|registers| {
+            selector
+                .and_then(|register| registers.read(register))
+                .unwrap_or(&registers.unnamed)
+                .clone()
+        });
+        if !slot.blockwise {
+            return None;
+        }
+        let count = self.hjkl_state().count.max(1);
+        self.hjkl_state_mut().clear_pending_prefix();
+        if slot.text.is_empty() {
+            return Some(Vec::new());
+        }
+
+        let trailing_newline = old_text.ends_with('\n');
+        let mut lines: Vec<String> = old_text.split('\n').map(str::to_string).collect();
+        if trailing_newline {
+            lines.pop();
+        }
+        let (start_row, cursor_col) = self.cursor();
+        let start_line = lines.get(start_row).map_or("", String::as_str);
+        let target_display_col = display_width_through_cursor(start_line, cursor_col, !before);
+        let segments: Vec<&str> = slot.text.split('\n').collect();
+        let mut insertion_columns = Vec::with_capacity(segments.len());
+
+        for (index, segment) in segments.iter().enumerate() {
+            let row = start_row + index;
+            while row >= lines.len() {
+                lines.push(String::new());
+            }
+            let (insert_col, missing_width) =
+                char_index_at_display_column(&lines[row], target_display_col);
+            let characters: Vec<char> = lines[row].chars().collect();
+            let head: String = characters[..insert_col].iter().collect();
+            let tail: String = characters[insert_col..].iter().collect();
+            let virtual_padding = " ".repeat(missing_width);
+            let piece = if tail.is_empty() {
+                segment.repeat(count)
+            } else {
+                let padding = slot
+                    .block_width
+                    .saturating_sub(UnicodeWidthStr::width(*segment));
+                format!("{segment}{}", " ".repeat(padding)).repeat(count)
+            };
+            insertion_columns.push(insert_col + missing_width);
+            lines[row] = format!("{head}{virtual_padding}{piece}{tail}");
+        }
+
+        let mut new_text = lines.join("\n");
+        if trailing_newline {
+            new_text.push('\n');
+        }
+        self.editor.push_undo();
+        self.editor.buffer_mut().replace_all(&new_text);
+        self.editor.mark_content_dirty();
+        let first_insert_col = insertion_columns.first().copied().unwrap_or(cursor_col);
+        let last_insert_col = insertion_columns
+            .last()
+            .copied()
+            .unwrap_or(first_insert_col);
+        self.editor.jump_cursor(start_row, first_insert_col);
+        self.editor.set_mark('[', (start_row, first_insert_col));
+        self.editor.set_mark(
+            ']',
+            (
+                start_row + segments.len().saturating_sub(1),
+                last_insert_col,
+            ),
+        );
+        let _ = self.editor.take_content_edits();
+        let _ = self.editor.take_content_reset();
+        self.modified_since_save = true;
+        Some(vec![
+            VimEffect::Edited {
+                edits: vec![TextEdit {
+                    range: 0..old_text.len(),
+                    new_text_len: new_text.len(),
+                    new_text,
+                }],
+            },
+            VimEffect::CursorMoved,
+        ])
+    }
+
+    /// Enter Insert after a wrapper-owned range change without creating a
+    /// second undo checkpoint. The range deletion already pushed the undo
+    /// snapshot, so the following typed insertion belongs to that same Vim
+    /// change transaction.
+    fn enter_insert_after_change_noundo(&mut self) -> VimEffect {
+        let (row, col) = self.cursor();
+        let before_rope = Query::rope(self.editor.buffer());
+        let state = self.hjkl_state_mut();
+        state.insert_session = Some(HjklInsertSession {
+            count: 1,
+            row_min: row,
+            row_max: row,
+            before_rope,
+            reason: HjklInsertReason::AfterChange,
+            start_row: row,
+            start_col: col,
+        });
+        state.mode = HjklInternalMode::Insert;
+        state.current_mode = HjklVimMode::Insert;
+        self.mode = Mode::Insert;
+        VimEffect::ModeChanged(Mode::Insert)
+    }
+
     fn is_yank_key(key: KeyInput) -> bool {
         match key.code.kind {
             KeyCodeKind::Char('y') => key.mods == Modifiers::default(),
@@ -562,58 +729,6 @@ impl VimCore {
     pub(crate) fn cursor(&self) -> (usize, usize) {
         let pos = self.editor.buffer().cursor();
         (pos.row, pos.col)
-    }
-
-    /// Return visual-mode selection byte ranges. Empty vec when not in
-    /// visual mode.
-    pub(crate) fn selections(&self) -> Vec<Range<usize>> {
-        let _ = self.cursor();
-        let buffer_text = self.text();
-
-        match self.mode {
-            Mode::Visual => {
-                if let Some(((start_row, start_col), (end_row, end_col))) =
-                    self.editor.char_highlight()
-                {
-                    let start_byte = self.row_col_to_byte(start_row, start_col, &buffer_text);
-                    let end_byte = self.row_col_to_byte(end_row, end_col, &buffer_text);
-                    return std::iter::once(start_byte..end_byte).collect();
-                }
-                vec![]
-            }
-            Mode::VisualLine => {
-                if let Some((start_row, end_row)) = self.editor.line_highlight() {
-                    let start_byte = self.row_col_to_byte(start_row, 0, &buffer_text);
-                    // For linewise, include the newline
-                    let end_byte = if end_row + 1 < self.editor.buffer().row_count() {
-                        self.row_col_to_byte(end_row + 1, 0, &buffer_text)
-                    } else {
-                        buffer_text.len()
-                    };
-                    return std::iter::once(start_byte..end_byte).collect();
-                }
-                vec![]
-            }
-            Mode::VisualBlock => {
-                if let Some((top, bot, left, right)) = self.editor.block_highlight() {
-                    let mut ranges = Vec::new();
-                    for r in top..=bot.min(self.editor.buffer().row_count().saturating_sub(1)) {
-                        let line_text = self.line(r).unwrap_or_default();
-                        let start_byte = self.row_col_to_byte(r, left, &buffer_text);
-                        let end_col = left
-                            .min(line_text.chars().count())
-                            .saturating_add(right - left + 1);
-                        let end_byte = self.row_col_to_byte(r, end_col, &buffer_text);
-                        if start_byte < end_byte {
-                            ranges.push(start_byte..end_byte);
-                        }
-                    }
-                    return ranges;
-                }
-                vec![]
-            }
-            _ => vec![],
-        }
     }
 
     /// Return active search-highlight byte ranges for one buffer line.
@@ -697,6 +812,205 @@ impl VimCore {
             ),
         };
         self.editor.buffer_mut().set_cursor(pos);
+    }
+
+    /// Apply a renderer-projected character, line, or block selection.
+    ///
+    /// The projection contains only core-owned display/source types. Exact
+    /// register metadata and all engine mutation stay inside this wrapper.
+    pub(crate) fn apply_selection(
+        &mut self,
+        selection: RenderedSelection,
+        operator: RangeOperator,
+        register: Register,
+    ) -> Vec<VimEffect> {
+        if matches!(operator, RangeOperator::Indent | RangeOperator::Outdent) {
+            let Some(first) = selection.source_ranges.first() else {
+                return Vec::new();
+            };
+            let Some(last) = selection.source_ranges.last() else {
+                return Vec::new();
+            };
+            return self.apply_line_range(first.start..last.end, operator, register);
+        }
+        if selection.source_ranges.is_empty() {
+            return Vec::new();
+        }
+
+        if self.mode != Mode::Normal {
+            let _ = self.handle_key(Self::plain_key(KeyCodeKind::Esc));
+        }
+
+        let old_text = self.text();
+        let target = register.selector();
+        let block_width = selection.block_width.unwrap_or(0);
+        let payload = if selection.shape == SelectionShape::Block {
+            selection
+                .rows
+                .iter()
+                .map(|row| {
+                    let mut text = row
+                        .source_ranges
+                        .iter()
+                        .filter_map(|range| old_text.get(range.clone()))
+                        .collect::<String>();
+                    let selected_width = row.columns.end.saturating_sub(row.columns.start);
+                    let raw_width = UnicodeWidthStr::width(text.as_str());
+                    let padding = block_width.saturating_sub(selected_width.max(raw_width));
+                    text.push_str(&" ".repeat(padding));
+                    text
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            selection
+                .source_ranges
+                .iter()
+                .filter_map(|range| old_text.get(range.clone()))
+                .collect()
+        };
+        match operator {
+            RangeOperator::Yank => {
+                if selection.shape == SelectionShape::Block {
+                    self.editor
+                        .record_yank_block(payload.clone(), block_width, target);
+                } else {
+                    self.editor.record_yank(
+                        payload.clone(),
+                        selection.shape == SelectionShape::Line,
+                        target,
+                    );
+                }
+                let mut effects = vec![VimEffect::CursorMoved];
+                if matches!(register, Register::System) {
+                    effects.push(VimEffect::ClipboardYank(payload));
+                }
+                return effects;
+            }
+            RangeOperator::Delete | RangeOperator::Change => {
+                if selection.shape == SelectionShape::Block {
+                    self.editor
+                        .record_delete_block(payload.clone(), block_width, target);
+                } else {
+                    self.editor.record_delete(
+                        payload.clone(),
+                        selection.shape == SelectionShape::Line,
+                        target,
+                    );
+                }
+            }
+            RangeOperator::Indent | RangeOperator::Outdent => unreachable!(),
+        }
+
+        let earliest = selection.source_ranges[0].start.min(old_text.len());
+        let mut new_text = old_text.clone();
+        let mut ranges = selection.source_ranges;
+        ranges.sort_by_key(|range| (range.start, range.end));
+        for range in ranges.into_iter().rev() {
+            let start = range.start.min(new_text.len());
+            let end = range.end.min(new_text.len());
+            if start < end {
+                new_text.replace_range(start..end, "");
+            }
+        }
+
+        {
+            let _undo_group = self.editor.undo_group();
+            self.editor.push_undo();
+            self.editor.buffer_mut().replace_all(&new_text);
+        }
+        let _ = self.editor.take_content_edits();
+        self.modified_since_save = true;
+        let cursor_offset = earliest.min(new_text.len());
+        let row = new_text[..cursor_offset]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        let line_start = new_text[..cursor_offset]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        let column = new_text[line_start..cursor_offset].chars().count();
+        self.jump_to(row, column);
+
+        let mut effects = vec![
+            VimEffect::Edited {
+                edits: vec![TextEdit {
+                    range: 0..old_text.len(),
+                    new_text_len: new_text.len(),
+                    new_text,
+                }],
+            },
+            VimEffect::CursorMoved,
+        ];
+        if matches!(register, Register::System) {
+            effects.push(VimEffect::ClipboardYank(payload));
+        }
+        if operator == RangeOperator::Change {
+            effects.push(self.enter_insert_after_change_noundo());
+        }
+        effects
+    }
+
+    /// Apply a linewise source range through hjkl's VisualLine machinery.
+    ///
+    /// The caller supplies only core-owned byte coordinates. All engine
+    /// modes, selections, registers, undo state, and edit notifications stay
+    /// confined to this wrapper.
+    pub(crate) fn apply_line_range(
+        &mut self,
+        range: Range<usize>,
+        operator: RangeOperator,
+        register: Register,
+    ) -> Vec<VimEffect> {
+        let text = self.text();
+        let start = range.start.min(text.len());
+        let end = range.end.min(text.len());
+        if start >= end {
+            return Vec::new();
+        }
+
+        if self.mode != Mode::Normal {
+            let _ = self.handle_key(Self::plain_key(KeyCodeKind::Esc));
+        }
+
+        let start_row = text[..start].bytes().filter(|byte| *byte == b'\n').count();
+        let last_byte = end.saturating_sub(1);
+        let end_row = text[..last_byte]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        self.jump_to(start_row, 0);
+
+        let mut effects = self.handle_key(Self::plain_key(KeyCodeKind::Char('V')));
+        for _ in start_row..end_row {
+            effects.extend(self.handle_key(Self::plain_key(KeyCodeKind::Char('j'))));
+        }
+        if let Some(selector) = register.selector() {
+            effects.extend(self.handle_key(Self::plain_key(KeyCodeKind::Char('"'))));
+            effects.extend(self.handle_key(Self::plain_key(KeyCodeKind::Char(selector))));
+        }
+        let operator_key = match operator {
+            RangeOperator::Yank => 'y',
+            RangeOperator::Delete => 'd',
+            RangeOperator::Change => 'c',
+            RangeOperator::Indent => '>',
+            RangeOperator::Outdent => '<',
+        };
+        effects.extend(self.handle_key(Self::plain_key(KeyCodeKind::Char(operator_key))));
+
+        if matches!(operator, RangeOperator::Indent | RangeOperator::Outdent)
+            && self.mode != Mode::Normal
+        {
+            effects.extend(self.handle_key(Self::plain_key(KeyCodeKind::Esc)));
+        }
+        effects
+    }
+
+    fn plain_key(kind: KeyCodeKind) -> KeyInput {
+        KeyInput {
+            code: KeyCode { kind },
+            mods: Modifiers::default(),
+        }
     }
 
     /// Insert text at the current cursor position (for paste operations).
@@ -939,19 +1253,6 @@ impl VimCore {
             .collect()
     }
 
-    /// Convert (row, col) to a byte offset in the document text.
-    fn row_col_to_byte(&self, row: usize, col: usize, text: &str) -> usize {
-        let lines: Vec<&str> = text.split('\n').collect();
-        if row >= lines.len() {
-            return text.len();
-        }
-        let mut offset: usize = lines[..row].iter().map(|l| l.len() + 1).sum(); // +1 for \n
-        let line = lines[row];
-        // col is a character index, not byte index
-        offset += line.chars().take(col).map(|c| c.len_utf8()).sum::<usize>();
-        offset
-    }
-
     /// Handle keys while in Command mode.
     /// Note: hjkl doesn't expose command-line mode through its public API,
     /// so this is a simplified implementation.
@@ -993,6 +1294,38 @@ impl VimCore {
             }
         }
     }
+}
+
+/// Return the display-cell boundary immediately before or after the cursor.
+fn display_width_through_cursor(line: &str, cursor_col: usize, include_cursor: bool) -> usize {
+    let character_count = cursor_col.saturating_add(usize::from(include_cursor));
+    line.chars()
+        .take(character_count)
+        .map(|character| UnicodeWidthChar::width(character).unwrap_or(0))
+        .sum()
+}
+
+/// Locate a display-cell column in a source line.
+///
+/// The returned tuple is `(character_index, virtual_space_padding)`. A target
+/// beyond the line is represented by padding; a target inside a wide glyph is
+/// rounded to the glyph's trailing boundary because a terminal glyph cannot be
+/// split into cells.
+fn char_index_at_display_column(line: &str, target: usize) -> (usize, usize) {
+    let mut display_col = 0;
+    let mut character_count = 0;
+    for (index, character) in line.chars().enumerate() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if display_col == target && character_width > 0 {
+            return (index, 0);
+        }
+        display_col += character_width;
+        character_count = index + 1;
+        if display_col > target {
+            return (character_count, 0);
+        }
+    }
+    (character_count, target.saturating_sub(display_col))
 }
 
 /// Extract one sequential edit's replacement from the engine's final buffer.
@@ -1209,6 +1542,492 @@ mod dirty_tracking_tests {
             vim.is_modified_since(mark),
             "a pruned save-point sequence must not be confused with a later node"
         );
+    }
+}
+
+/// Conformance for the private hjkl wrapper surface retained by plan §6.2.
+///
+/// These tests intentionally live in `vim.rs`: exercising the wrapped
+/// Normal/Visual machinery anywhere else would leak engine concepts across
+/// the single-wrapper boundary.
+#[cfg(test)]
+mod private_conformance_tests {
+    use super::*;
+
+    const REQUIRED_ROWS: &[&str] = &[
+        "V-M1", "V-M2", "V-M3", "V-M4", "V-M5", "V-M6", "V-M7", "V-M8", "V-M9", "V-S1", "V-S2",
+        "V-S3", "V-S4", "V-S5", "V-E1", "V-E2", "V-E3", "V-E4", "V-E5", "V-E6", "V-E7", "V-E8",
+        "V-O1", "V-O2", "V-O3", "V-O4", "V-O5", "V-T1", "V-T2", "V-T3", "V-T4", "V-T5", "V-R1",
+        "V-R2", "V-R3", "V-V1", "V-V2", "V-V3", "V-V4", "V-V5",
+    ];
+
+    type Case = (&'static str, fn());
+    const CASES: &[Case] = &[
+        ("V-M1", v_m1_char_line_and_arrow_motions),
+        ("V-M2", v_m2_word_motions),
+        ("V-M3", v_m3_big_word_motions),
+        ("V-M4", v_m4_line_boundary_motions),
+        ("V-M5", v_m5_file_and_counted_line_motions),
+        ("V-M6", v_m6_half_page_motions),
+        ("V-M7", v_m7_full_page_motions),
+        ("V-M8", v_m8_paragraph_motions),
+        ("V-M9", v_m9_matching_pair_motion),
+        ("V-S1", v_s1_forward_search),
+        ("V-S2", v_s2_backward_search),
+        ("V-S3", v_s3_repeat_search_both_directions),
+        ("V-S4", v_s4_clear_search_highlight),
+        ("V-S5", v_s5_search_operator_target),
+        ("V-E1", v_e1_delete_under_and_before_cursor),
+        ("V-E2", v_e2_replace_character),
+        ("V-E3", v_e3_toggle_case),
+        ("V-E4", v_e4_join_lines),
+        ("V-E5", v_e5_delete_and_change_to_eol),
+        ("V-E6", v_e6_substitute_character_and_line),
+        ("V-E7", v_e7_undo_redo),
+        ("V-E8", v_e8_repeat_change),
+        ("V-O1", v_o1_delete_motion_and_line),
+        ("V-O2", v_o2_change_motion_and_line),
+        ("V-O3", v_o3_yank_motion_and_line),
+        ("V-O4", v_o4_indent_and_outdent),
+        ("V-O5", v_o5_case_operators),
+        ("V-T1", v_t1_word_text_objects),
+        ("V-T2", v_t2_big_word_text_objects),
+        ("V-T3", v_t3_quote_text_objects),
+        ("V-T4", v_t4_pair_text_objects),
+        ("V-T5", v_t5_paragraph_text_objects),
+        ("V-R1", v_r1_put_before_and_after),
+        ("V-R2", v_r2_unnamed_register),
+        ("V-R3", v_r3_system_clipboard_register),
+        ("V-V1", v_v1_visual_motion_extends_selection),
+        ("V-V2", v_v2_visual_operators),
+        ("V-V3", v_v3_visual_line_indent),
+        ("V-V4", v_v4_swap_visual_endpoints),
+        ("V-V5", v_v5_visual_block_insert),
+    ];
+
+    fn key(ch: char) -> KeyInput {
+        KeyInput {
+            code: KeyCode {
+                kind: KeyCodeKind::Char(ch),
+            },
+            mods: Modifiers::default(),
+        }
+    }
+
+    fn special(kind: KeyCodeKind) -> KeyInput {
+        KeyInput {
+            code: KeyCode { kind },
+            mods: Modifiers::default(),
+        }
+    }
+
+    fn ctrl(ch: char) -> KeyInput {
+        KeyInput {
+            code: KeyCode {
+                kind: KeyCodeKind::Char(ch),
+            },
+            mods: Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            },
+        }
+    }
+
+    fn feed(vim: &mut VimCore, keys: &str) -> Vec<VimEffect> {
+        keys.chars()
+            .flat_map(|ch| vim.handle_key(key(ch)))
+            .collect()
+    }
+
+    fn search(vim: &mut VimCore, prefix: char, pattern: &str) -> Vec<VimEffect> {
+        vim.handle_key(key(prefix));
+        feed(vim, pattern);
+        vim.handle_key(special(KeyCodeKind::Enter))
+    }
+
+    #[test]
+    fn private_manifest_covers_every_retained_wrapper_row_exactly_once() {
+        let required: std::collections::BTreeSet<_> = REQUIRED_ROWS.iter().copied().collect();
+        let covered: std::collections::BTreeSet<_> = CASES.iter().map(|(row, _)| *row).collect();
+        assert_eq!(covered, required);
+        assert_eq!(CASES.len(), required.len(), "duplicate private row mapping");
+    }
+
+    #[test]
+    fn v_m1_char_line_and_arrow_motions() {
+        let mut vim = VimCore::new("abcd\nxy\n1234");
+        feed(&mut vim, "lljkh");
+        assert_eq!(vim.cursor(), (0, 1));
+        vim.handle_key(special(KeyCodeKind::Right));
+        vim.handle_key(special(KeyCodeKind::Down));
+        vim.handle_key(special(KeyCodeKind::Up));
+        vim.handle_key(special(KeyCodeKind::Left));
+        assert_eq!(vim.cursor(), (0, 1));
+    }
+
+    #[test]
+    fn v_m2_word_motions() {
+        let mut vim = VimCore::new("one, two three");
+        feed(&mut vim, "we");
+        assert!(vim.cursor().1 >= 4);
+        feed(&mut vim, "b");
+        assert!(vim.cursor().1 < 6);
+    }
+
+    #[test]
+    fn v_m3_big_word_motions() {
+        let mut vim = VimCore::new("one,two three");
+        feed(&mut vim, "W");
+        assert_eq!(vim.cursor().1, 8);
+        feed(&mut vim, "BE");
+        assert_eq!(vim.cursor().1, 6);
+    }
+
+    #[test]
+    fn v_m4_line_boundary_motions() {
+        let mut vim = VimCore::new("  alpha beta");
+        feed(&mut vim, "$0^");
+        assert_eq!(vim.cursor(), (0, 2));
+    }
+
+    #[test]
+    fn v_m5_file_and_counted_line_motions() {
+        let mut vim = VimCore::new("one\ntwo\nthree\nfour");
+        feed(&mut vim, "Ggg3G2gg");
+        assert_eq!(vim.cursor().0, 1);
+    }
+
+    #[test]
+    fn v_m6_half_page_motions() {
+        let mut vim = VimCore::new("1\n2\n3\n4\n5\n6\n7\n8\n9\n10");
+        vim.set_viewport(0, 6);
+        vim.handle_key(ctrl('d'));
+        assert!(vim.cursor().0 > 0);
+        vim.handle_key(ctrl('u'));
+        assert_eq!(vim.cursor().0, 0);
+    }
+
+    #[test]
+    fn v_m7_full_page_motions() {
+        let text = (1..=40)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut vim = VimCore::new(&text);
+        vim.set_viewport(0, 10);
+        vim.handle_key(ctrl('f'));
+        assert_eq!(vim.cursor().0, 8);
+        feed(&mut vim, "G");
+        vim.handle_key(ctrl('b'));
+        assert_eq!(vim.cursor().0, 31);
+    }
+
+    #[test]
+    fn v_m8_paragraph_motions() {
+        let mut vim = VimCore::new("one\n\ntwo\n\nthree");
+        feed(&mut vim, "}}");
+        assert_eq!(vim.cursor().0, 4);
+        feed(&mut vim, "{");
+        assert!(vim.cursor().0 < 4);
+    }
+
+    #[test]
+    fn v_m9_matching_pair_motion() {
+        let mut vim = VimCore::new("(alpha [beta])");
+        feed(&mut vim, "%");
+        assert_eq!(vim.cursor().1, 13);
+        feed(&mut vim, "%");
+        assert_eq!(vim.cursor().1, 0);
+    }
+
+    #[test]
+    fn v_s1_forward_search() {
+        let mut vim = VimCore::new("one target\ntarget");
+        search(&mut vim, '/', "target");
+        assert_eq!(vim.cursor(), (0, 4));
+    }
+
+    #[test]
+    fn v_s2_backward_search() {
+        let mut vim = VimCore::new("one target\ntarget");
+        feed(&mut vim, "G$");
+        search(&mut vim, '?', "target");
+        assert_eq!(vim.cursor(), (1, 0));
+    }
+
+    #[test]
+    fn v_s3_repeat_search_both_directions() {
+        let mut vim = VimCore::new("target x target x target");
+        search(&mut vim, '/', "target");
+        feed(&mut vim, "n");
+        let forward = vim.cursor();
+        feed(&mut vim, "N");
+        assert!(vim.cursor().1 < forward.1);
+    }
+
+    #[test]
+    fn v_s4_clear_search_highlight() {
+        let mut vim = VimCore::new("target target");
+        search(&mut vim, '/', "target");
+        assert!(!vim.search_matches_for_line(0).is_empty());
+        vim.clear_search_highlight();
+        assert!(vim.search_matches_for_line(0).is_empty());
+    }
+
+    #[test]
+    fn v_s5_search_operator_target() {
+        let mut vim = VimCore::new("delete until target remains");
+        feed(&mut vim, "d/target");
+        vim.handle_key(special(KeyCodeKind::Enter));
+        assert_eq!(vim.text(), "target remains");
+    }
+
+    #[test]
+    fn v_e1_delete_under_and_before_cursor() {
+        let mut under = VimCore::new("abc");
+        feed(&mut under, "x");
+        assert_eq!(under.text(), "bc");
+        let mut before = VimCore::new("abc");
+        feed(&mut before, "lX");
+        assert_eq!(before.text(), "bc");
+    }
+
+    #[test]
+    fn v_e2_replace_character() {
+        let mut vim = VimCore::new("abc");
+        feed(&mut vim, "rZ");
+        assert_eq!(vim.text(), "Zbc");
+    }
+
+    #[test]
+    fn v_e3_toggle_case() {
+        let mut vim = VimCore::new("aB");
+        feed(&mut vim, "~~");
+        assert_eq!(vim.text(), "Ab");
+    }
+
+    #[test]
+    fn v_e4_join_lines() {
+        let mut vim = VimCore::new("one\n  two");
+        feed(&mut vim, "J");
+        assert_eq!(vim.text(), "one two");
+    }
+
+    #[test]
+    fn v_e5_delete_and_change_to_eol() {
+        let mut delete = VimCore::new("one two");
+        feed(&mut delete, "wD");
+        assert_eq!(delete.text(), "one ");
+        let mut change = VimCore::new("one two");
+        feed(&mut change, "wCX");
+        change.handle_key(special(KeyCodeKind::Esc));
+        assert_eq!(change.text(), "one X");
+    }
+
+    #[test]
+    fn v_e6_substitute_character_and_line() {
+        let mut character = VimCore::new("one");
+        feed(&mut character, "sX");
+        character.handle_key(special(KeyCodeKind::Esc));
+        assert_eq!(character.text(), "Xne");
+        let mut line = VimCore::new("  one\ntwo");
+        feed(&mut line, "SX");
+        line.handle_key(special(KeyCodeKind::Esc));
+        assert_eq!(line.text(), "  X\ntwo");
+    }
+
+    #[test]
+    fn v_e7_undo_redo() {
+        let mut vim = VimCore::new("abc");
+        feed(&mut vim, "x");
+        assert_eq!(vim.text(), "bc");
+        feed(&mut vim, "u");
+        assert_eq!(vim.text(), "abc");
+        vim.handle_key(ctrl('r'));
+        assert_eq!(vim.text(), "bc");
+    }
+
+    #[test]
+    fn v_e8_repeat_change() {
+        let mut vim = VimCore::new("abcd");
+        feed(&mut vim, "xl.");
+        assert_eq!(vim.text(), "bd");
+    }
+
+    #[test]
+    fn v_o1_delete_motion_and_line() {
+        let mut motion = VimCore::new("one two");
+        feed(&mut motion, "dw");
+        assert_eq!(motion.text(), "two");
+        let mut line = VimCore::new("one\ntwo");
+        feed(&mut line, "dd");
+        assert_eq!(line.text(), "two");
+    }
+
+    #[test]
+    fn v_o2_change_motion_and_line() {
+        let mut motion = VimCore::new("one two");
+        feed(&mut motion, "cwX");
+        motion.handle_key(special(KeyCodeKind::Esc));
+        assert_eq!(motion.text(), "X two");
+        let mut line = VimCore::new("  one\ntwo");
+        feed(&mut line, "ccX");
+        line.handle_key(special(KeyCodeKind::Esc));
+        assert_eq!(line.text(), "  X\ntwo");
+    }
+
+    #[test]
+    fn v_o3_yank_motion_and_line() {
+        let mut motion = VimCore::new("one two");
+        feed(&mut motion, "ywp");
+        assert_eq!(motion.text(), "oone ne two");
+        let mut line = VimCore::new("one\ntwo");
+        feed(&mut line, "yyp");
+        assert_eq!(line.text(), "one\none\ntwo");
+    }
+
+    #[test]
+    fn v_o4_indent_and_outdent() {
+        let mut vim = VimCore::new("one\ntwo");
+        feed(&mut vim, ">>");
+        assert_eq!(vim.text(), "    one\ntwo");
+        feed(&mut vim, "<<");
+        assert_eq!(vim.text(), "one\ntwo");
+    }
+
+    #[test]
+    fn v_o5_case_operators() {
+        let mut lower = VimCore::new("ONE two");
+        feed(&mut lower, "guw");
+        assert_eq!(lower.text(), "one two");
+        let mut upper = VimCore::new("one two");
+        feed(&mut upper, "gUw");
+        assert_eq!(upper.text(), "ONE two");
+    }
+
+    #[test]
+    fn v_t1_word_text_objects() {
+        let mut inner = VimCore::new("one two");
+        feed(&mut inner, "diw");
+        assert_eq!(inner.text(), " two");
+        let mut around = VimCore::new("one two");
+        feed(&mut around, "daw");
+        assert_eq!(around.text(), "two");
+    }
+
+    #[test]
+    fn v_t2_big_word_text_objects() {
+        let mut inner = VimCore::new("one,two three");
+        feed(&mut inner, "diW");
+        assert_eq!(inner.text(), " three");
+        let mut around = VimCore::new("one,two three");
+        feed(&mut around, "daW");
+        assert_eq!(around.text(), "three");
+    }
+
+    #[test]
+    fn v_t3_quote_text_objects() {
+        let mut inner = VimCore::new("say \"hello\" now");
+        feed(&mut inner, "f\"ldi\"");
+        assert_eq!(inner.text(), "say \"\" now");
+        let mut around = VimCore::new("say 'hello' now");
+        feed(&mut around, "f'lda'");
+        assert_eq!(around.text(), "say now");
+    }
+
+    #[test]
+    fn v_t4_pair_text_objects() {
+        let mut paren = VimCore::new("x (alpha) y");
+        feed(&mut paren, "f(di(");
+        assert_eq!(paren.text(), "x () y");
+        let mut bracket = VimCore::new("x [alpha] y");
+        feed(&mut bracket, "f[da[");
+        assert_eq!(bracket.text(), "x  y");
+    }
+
+    #[test]
+    fn v_t5_paragraph_text_objects() {
+        let mut inner = VimCore::new("one\ntwo\n\nthree");
+        feed(&mut inner, "dip");
+        assert!(!inner.text().contains("one"));
+        let mut around = VimCore::new("one\ntwo\n\nthree");
+        feed(&mut around, "dap");
+        assert_eq!(around.text(), "three");
+    }
+
+    #[test]
+    fn v_r1_put_before_and_after() {
+        let mut after = VimCore::new("one\ntwo");
+        feed(&mut after, "yyp");
+        assert_eq!(after.text(), "one\none\ntwo");
+        let mut before = VimCore::new("one\ntwo");
+        feed(&mut before, "yyjP");
+        assert_eq!(before.text(), "one\none\ntwo");
+    }
+
+    #[test]
+    fn v_r2_unnamed_register() {
+        let mut vim = VimCore::new("one\ntwo");
+        feed(&mut vim, "ddp");
+        assert_eq!(vim.text(), "two\none");
+    }
+
+    #[test]
+    fn v_r3_system_clipboard_register() {
+        let mut vim = VimCore::new("one\ntwo");
+        let effects = feed(&mut vim, "\"+yy");
+        assert!(effects
+            .iter()
+            .any(|effect| matches!(effect, VimEffect::ClipboardYank(text) if text == "one\n")));
+    }
+
+    #[test]
+    fn v_v1_visual_motion_extends_selection() {
+        let mut vim = VimCore::new("one two");
+        feed(&mut vim, "vww");
+        assert_eq!(vim.mode(), Mode::Visual);
+        assert!(vim.editor.buffer_selection().is_some());
+    }
+
+    #[test]
+    fn v_v2_visual_operators() {
+        let mut delete = VimCore::new("one two");
+        feed(&mut delete, "vwd");
+        assert_eq!(delete.mode(), Mode::Normal);
+        assert_ne!(delete.text(), "one two");
+        let mut yank = VimCore::new("one two");
+        feed(&mut yank, "vwyP");
+        assert!(yank.text().len() > "one two".len());
+        let mut change = VimCore::new("one two");
+        feed(&mut change, "vwcX");
+        change.handle_key(special(KeyCodeKind::Esc));
+        assert!(change.text().contains('X'));
+    }
+
+    #[test]
+    fn v_v3_visual_line_indent() {
+        let mut vim = VimCore::new("one\ntwo");
+        feed(&mut vim, "Vj>");
+        assert_eq!(vim.text(), "    one\n    two");
+    }
+
+    #[test]
+    fn v_v4_swap_visual_endpoints() {
+        let mut vim = VimCore::new("one two");
+        feed(&mut vim, "vww");
+        let active = vim.cursor();
+        feed(&mut vim, "o");
+        assert_ne!(vim.cursor(), active);
+        assert_eq!(vim.mode(), Mode::Visual);
+    }
+
+    #[test]
+    fn v_v5_visual_block_insert() {
+        let mut vim = VimCore::new("aa\nbb\ncc");
+        vim.handle_key(ctrl('v'));
+        feed(&mut vim, "jjIX");
+        vim.handle_key(special(KeyCodeKind::Esc));
+        assert_eq!(vim.text(), "Xaa\nXbb\nXcc");
     }
 }
 

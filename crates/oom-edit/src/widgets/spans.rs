@@ -1,4 +1,4 @@
-//! Shared span-building utilities for editor and view renderers.
+//! Shared span-building utilities for editor and rendered Markdown renderers.
 
 use oom_edit_core::SemanticStyle;
 use ratatui::style::Style;

@@ -653,7 +653,7 @@ impl Highlighter {
 
 /// Highlight a standalone code snippet with the given language.
 ///
-/// This is used by the View layout renderer for fenced code blocks: each
+/// This is used by the rendered layout renderer for fenced code blocks: each
 /// fence is highlighted as an independent snippet, not as part of the
 /// document's incremental tree (FR-3.5).
 ///
@@ -974,7 +974,7 @@ fn input_edit(old_text: &str, edit: &TextEdit) -> Option<tree_sitter::InputEdit>
     let start_byte = edit.range.start;
     let end_byte = edit.range.end;
     // Normalize backward-range edits (hjkl produces these for operations like
-    // Visual-mode X; the range represents the same character deletion or
+    // Backward engine deletion; the range represents the same character deletion or
     // replacement, just with inverted bounds).
     let (a, b) = if start_byte < end_byte {
         (start_byte, end_byte)

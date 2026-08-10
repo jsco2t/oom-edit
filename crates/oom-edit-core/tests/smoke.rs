@@ -3,45 +3,30 @@
 // These prove the core dependencies work together before any feature code is written.
 
 // ---------------------------------------------------------------------------
-// 1. hjkl_engine_instantiates
+// 1. the public session reaches the private hjkl wrapper
 // ---------------------------------------------------------------------------
 
 #[test]
-fn hjkl_engine_instantiates() {
-    use hjkl_buffer::View;
-    use hjkl_engine::types::{DefaultHost, Options};
-    use hjkl_engine::{Editor, Input, Key};
-    use hjkl_vim::install_vim_discipline;
+fn editor_session_uses_private_hjkl_wrapper() {
+    use oom_edit_core::{EditorSession, KeyCode, KeyCodeKind, KeyInput, Mode, Modifiers};
 
-    // Construct the hjkl editor with the vim discipline over "hello\nworld"
-    let view = View::from_str("hello\nworld");
-    let mut editor = Editor::new(view, DefaultHost::new(), Options::default());
-    install_vim_discipline(&mut editor);
+    let mut session = EditorSession::from_text("# hello\n# world\n");
+    session.render_layout(40);
+    session.handle_key(KeyInput {
+        code: KeyCode {
+            kind: KeyCodeKind::Char('j'),
+        },
+        mods: Modifiers::default(),
+    });
+    session.handle_key(KeyInput {
+        code: KeyCode {
+            kind: KeyCodeKind::Char('i'),
+        },
+        mods: Modifiers::default(),
+    });
 
-    // Feed 'j' (down) — should move cursor from line 0 to line 1
-    let input_j = Input {
-        key: Key::Char('j'),
-        ..Default::default()
-    };
-    hjkl_vim::dispatch_input(&mut editor, input_j);
-
-    // Feed 'l' (right) — should move cursor right on line 1
-    let input_l = Input {
-        key: Key::Char('l'),
-        ..Default::default()
-    };
-    hjkl_vim::dispatch_input(&mut editor, input_l);
-
-    // Cursor should be at (row=1, col=1) — line 1 ("world"), second character
-    let buf = editor.buffer();
-    let pos = buf.cursor();
-    assert_eq!(
-        (pos.row, pos.col),
-        (1, 1),
-        "Expected cursor at (1, 1) after 'jl', got ({}, {})",
-        pos.row,
-        pos.col
-    );
+    assert_eq!(session.mode(), Mode::Insert);
+    assert_eq!(session.document(), "# hello\n# world\n");
 }
 
 // ---------------------------------------------------------------------------

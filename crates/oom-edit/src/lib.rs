@@ -2,7 +2,7 @@
 //!
 //! A `ratatui` + `crossterm` keyboard-driven presentation layer over the
 //! `oom-edit-core` editing engine. All business logic, document model,
-//! syntax highlighting, and View rendering live in `oom-edit-core`;
+//! syntax highlighting, and rendered Markdown live in `oom-edit-core`;
 //! this crate renders and dispatches keys.
 //!
 //! ## Startup ordering (hidlins pattern)
@@ -38,7 +38,7 @@ pub(crate) mod widgets;
 
 pub use args::{Args, ParseOutcome};
 pub use config::{Config, EditorConfig, ThemeConfig};
-pub use theme::{EnvParts, Tier};
+pub use theme::{DisplayMode, EnvParts, PaletteKind, ResolvedTheme, ThemeSource, Tier};
 
 use std::io::stdout;
 
@@ -47,7 +47,23 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::app::App;
+use crate::config::ConfigPresence;
 use crate::terminal_guard::TerminalGuard;
+
+fn resolve_startup_theme(
+    cli_theme: Option<&str>,
+    config: &Config,
+    presence: ConfigPresence,
+    env: &EnvParts,
+) -> ResolvedTheme {
+    theme::resolve_theme(
+        cli_theme,
+        config.theme.mode.as_deref(),
+        presence.dark.then_some(config.theme.dark.as_str()),
+        presence.light.then_some(config.theme.light.as_str()),
+        env,
+    )
+}
 
 /// Top-level entry point invoked by `main.rs`.
 ///
@@ -63,7 +79,7 @@ use crate::terminal_guard::TerminalGuard;
 /// as status messages (the session opens with a new buffer for missing paths).
 pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     // Load config (never fails — warns to stderr on malformed config).
-    let config = Config::load();
+    let (config, config_presence) = Config::load_with_presence();
 
     // Build EnvParts from environment for the selection ladder.
     let env = EnvParts {
@@ -83,22 +99,11 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Resolve theme through the selection ladder.
-    let (theme_name, is_light) = theme::resolve_theme(
-        args.theme.as_deref(),
-        config.theme.mode.as_deref(),
-        Some(&config.theme.dark),
-        Some(&config.theme.light),
-        &env,
-    );
-
-    // Determine tier.
-    let tier = env.effective_tier();
+    let resolved_theme =
+        resolve_startup_theme(args.theme.as_deref(), &config, config_presence, &env);
 
     // Announce theme to stderr before entering alternate screen (hidlins pattern).
-    eprintln!(
-        "oom-edit: theme={theme_name} tier={tier:?}{}",
-        if is_light { " light" } else { " dark" }
-    );
+    eprintln!("oom-edit: {resolved_theme}");
 
     // Build the App (open file) BEFORE touching the terminal.
     let session = match &args.path {
@@ -114,12 +119,11 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let app = App::new(
         session,
-        theme_name,
-        is_light,
-        tier,
+        resolved_theme,
         config.editor.wrap,
         config.relative_line_numbers,
         Box::new(crate::clipboard::Osc52Clipboard::stdout()),
+        Box::new(crate::config::FileConfigStore::production()),
     );
 
     // Enter raw mode + alternate screen + install panic/signal hooks.
@@ -135,4 +139,37 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // Run the event loop.
     event::run_event_loop(app, terminal)
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    #[test]
+    fn production_resolver_reports_partial_config_slot_as_fallback() {
+        let config = Config {
+            editor: EditorConfig { wrap: false },
+            ..Config::default()
+        };
+        let env = EnvParts {
+            term: Some("xterm-256color"),
+            colorterm: Some("truecolor"),
+            ..EnvParts::default()
+        };
+        let fallback = resolve_startup_theme(None, &config, ConfigPresence::default(), &env);
+        assert_eq!(fallback.name, "default-dark");
+        assert_eq!(fallback.source, ThemeSource::Fallback);
+
+        let configured = resolve_startup_theme(
+            None,
+            &config,
+            ConfigPresence {
+                dark: true,
+                light: false,
+            },
+            &env,
+        );
+        assert_eq!(configured.name, "default-dark");
+        assert_eq!(configured.source, ThemeSource::ConfigDark);
+    }
 }

@@ -13,7 +13,7 @@
 //! | `keystroke_to_frame` | NFR-2 | <16 ms typical | `handle_key('x')` + `render_source` |
 //! | `incremental_rehighlight` | NFR-3 | <10 ms each | `apply_edit` single-char + render |
 //! | `injection_heavy_edit` | NFR-3 | <10 ms each | edit/undo with 50 fenced injections |
-//! | `view_build` | NFR-4 | <100 ms | `render_view(80)` cold + rebuild after width change |
+//! | `rendered_build` | NFR-4 | <100 ms | `render_layout(80)` cold + rebuild after width change |
 
 use oom_edit_core::session::{EditorSession, KeyCode, KeyCodeKind, KeyInput, Modifiers, Viewport};
 use std::time::{Duration, Instant};
@@ -186,15 +186,15 @@ fn bench_injection_heavy_edit() {
     );
 }
 
-fn bench_view_build() {
+fn bench_rendered_build() {
     let d = doc();
     let (elapsed, iters) = bench_run(Duration::from_millis(100), || {
         let mut s = EditorSession::from_text(&d);
-        let _ = s.render_view(80);
+        let _ = s.render_layout(80);
     });
     let avg = elapsed / iters as u32;
     println!(
-        "view_build: {} bytes, {} iters, avg {}",
+        "rendered_build: {} bytes, {} iters, avg {}",
         d.len(),
         iters,
         format_duration(avg)
@@ -206,5 +206,5 @@ fn main() {
     bench_keystroke_to_frame();
     bench_incremental_rehighlight();
     bench_injection_heavy_edit();
-    bench_view_build();
+    bench_rendered_build();
 }

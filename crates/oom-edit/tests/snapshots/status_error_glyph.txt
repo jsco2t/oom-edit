@@ -1,24 +1,24 @@
-   1  ---
-   2  title: Kitchen Sink
-   3  author: Test
-   4  ---
-   5
-   6  # Heading One
-   7
-   8  Some **bold** and *italic* text with `inline code` and a
-      [link](https://example.com).
-   9
-  10  > A blockquote with **emphasis** inside.
-  11
-  12  ```rust
-  13  fn main() {
-  14      println!("Hello!");
-  15  }
-  16  ```
-  17
-  18  ---
-  19
+   1  ┌─ metadata ─────────────────────────────────────────────────────────────┐
+   2  │ title: Kitchen Sink                                                    │
+   3  │ author: Test                                                           │
+   4  └────────────────────────────────────────────────────────────────────────┘
+
+   6  █ Heading One
+
+   8  Some bold and italic text with inline code and a link [0].
+
+  10  ┃ A blockquote with emphasis inside.
+
+      ▏ rust
+  13  ▏ fn main() {
+  14  ▏     println!("Hello!");
+  15  ▏ }
+      ▏
+
+  18  ──────────────────────────────────────────────────────────────────────────
+
   20  Another heading.
-  21
+
   22  More text here.
+
  NORMAL  (new) ✗ externally modified                                 1:1  4% Top

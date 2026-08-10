@@ -32,15 +32,15 @@ build: ## Build the workspace
 # ---------------------------------------------------------------------------
 .PHONY: test
 test: ## Run the full test suite
-	cargo test --workspace --offline --locked
+	bash scripts/with-isolated-config.sh cargo test --workspace --offline --locked
 
 .PHONY: test-update-snapshots
 test-update-snapshots: ## Re-run tests with OOM_UPDATE_SNAPSHOTS=1 to (re)write golden files
-	OOM_UPDATE_SNAPSHOTS=1 cargo test --workspace --offline --locked
+	OOM_UPDATE_SNAPSHOTS=1 bash scripts/with-isolated-config.sh cargo test --workspace --offline --locked
 
 .PHONY: test-all
 test-all: ## Tests + example builds
-	cargo test --workspace --offline --locked
+	bash scripts/with-isolated-config.sh cargo test --workspace --offline --locked
 	cargo build --examples --offline --locked
 
 # ---------------------------------------------------------------------------
@@ -101,7 +101,7 @@ check: ## Run fmt-check + lint + build + test + deny + audit (with summary)
 	fi; \
 	echo ""; \
 	echo "test"; \
-	if cargo test --workspace --offline --locked 2>&1; then \
+	if bash scripts/with-isolated-config.sh cargo test --workspace --offline --locked 2>&1; then \
 		echo "[PASS] test"; PASS=$$((PASS + 1)); \
 	else \
 		echo "[FAIL] test"; FAIL=$$((FAIL + 1)); test_ok=false; \
@@ -182,6 +182,10 @@ bench-check: ## Run perf-smoke asserts with relaxed regression thresholds
 .PHONY: run
 run: ## Run the editor (pass ARGS=...)
 	cargo run -p oom-edit --offline --locked -- $(ARGS)
+
+.PHONY: run-isolated
+run-isolated: ## Run with temporary XDG config for manual verification (pass ARGS=...)
+	bash scripts/with-isolated-config.sh cargo run -p oom-edit --offline --locked -- $(ARGS)
 
 # ---------------------------------------------------------------------------
 # Clean

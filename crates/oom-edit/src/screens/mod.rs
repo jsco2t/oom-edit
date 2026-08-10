@@ -1,4 +1,4 @@
-//! Editor and View screens — the rendered views of the document.
+//! Source Insert and rendered Markdown screens.
 
 pub mod editor;
-pub mod view;
+pub mod rendered;

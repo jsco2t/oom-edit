@@ -3,13 +3,16 @@
 This document records direct `oom-edit-core` dependencies, reviewed workspace dependency
 changes, and transitive exceptions, including license, rationale, and hand-roll assessment.
 
+The 0.4.0 rendered Normal/Select migration added no dependency and did not
+change the resolved third-party graph or `vendor/`.
+
 ## Runtime dependencies
 
 | Crate | Exact version | License | Why it's needed | Could we hand-roll this? |
 | --- | --- | --- | --- | --- |
 | `hjkl-engine` | `=0.39.0` | MIT | Core editing engine: document model, undo/redo, search, commands. Provides the `Engine` type that `oom-edit-core` wraps. | No. Deeply complex state machine with undo/redo, search, and command dispatch. Hand-rolling would be thousands of lines. |
 | `hjkl-buffer` | `=0.39.0` | MIT | Rope-based text buffer with cursor/selection model. Required by `hjkl-engine`. | No. Rope data structure with offset tracking is non-trivial. |
-| `hjkl-vim` | `=0.39.0` | MIT | Vim modal editing (Normal/Insert/Visual modes). Provides the Vim state machine. | No. Complete Vim keymap, command parsing, and mode transitions. |
+| `hjkl-vim` | `=0.39.0` | MIT | Private editing mechanics behind the four-mode public session. Its Normal/Insert/Visual states are confined to `vim.rs`; rendered Select translates renderer-neutral character, line, and block projections through that wrapper. | No. Complete Vim keymap, command parsing, and undo/redo transitions. |
 | `tree-sitter` | `=0.26.11` | MIT | Incremental parser runtime. Required by all grammar crates. | No. C FFI bindings to the tree-sitter library. |
 | `tree-sitter-md` | `=0.5.3` | MIT | Markdown grammar for syntax highlighting of fenced blocks and front matter. | No. Hundreds of rules for markdown syntax. |
 | `tree-sitter-rust` | `=0.24.2` | MIT | Rust grammar (for highlighting Rust code blocks). | No. |

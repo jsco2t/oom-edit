@@ -71,7 +71,7 @@ pub enum SemanticStyle {
     Variable,
     /// Punctuation (from code blocks).
     Punct,
-    /// Visual selection highlight.
+    /// Select highlight highlight.
     Selection,
     /// Search match highlight.
     Match,
@@ -95,7 +95,7 @@ pub struct Span {
     pub style: SemanticStyle,
 }
 
-/// A single line of styled text for the source editor view.
+/// A single styled source line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StyledLine {
     /// The line text (no trailing newline).
@@ -105,7 +105,7 @@ pub struct StyledLine {
     pub spans: Vec<Span>,
 }
 
-/// The full rendered source frame for the editor viewport.
+/// The full rendered source frame for the Insert-mode viewport.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceFrame {
     /// Exactly `viewport.height` lines (padded with empty StyledLines if the
@@ -121,14 +121,11 @@ pub struct SourceFrame {
     /// where `row` is 0-based within `lines` and `col` is the character column
     /// within that visual row.
     pub cursor: (u16, u16),
-    /// Visual-mode selection ranges, viewport-relative, expressed as byte
-    /// ranges into the full document text.
-    pub selections: Vec<std::ops::Range<usize>>,
 }
 
-// ── View layout types ──────────────────────────────────────────────────────
+// ── Rendered layout types ──────────────────────────────────────────────────
 
-/// The kind of a rendered view line.
+/// The kind of a rendered Markdown line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineKind {
     /// A line derived from actual document content.
@@ -139,9 +136,19 @@ pub enum LineKind {
     Synthetic,
 }
 
-/// A single rendered line in the View layout.
+/// Renderer-neutral presentation role for a rendered line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RenderedLineRole {
+    /// Ordinary rendered document content.
+    #[default]
+    Document,
+    /// YAML/TOML metadata panel content.
+    Metadata,
+}
+
+/// A single rendered Markdown line.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ViewLine {
+pub struct RenderedLine {
     /// The styled text for this line.
     pub styled: StyledLine,
     /// Source byte range into the original markdown text. For content lines
@@ -150,9 +157,25 @@ pub struct ViewLine {
     pub source: std::ops::Range<usize>,
     /// Whether this line is content or synthetic.
     pub kind: LineKind,
+    /// Renderer-neutral surface identity.
+    pub role: RenderedLineRole,
+    /// Ordered display-cell atoms. Source-derived atoms own exact raw byte
+    /// ranges; generated presentation cells carry `None`.
+    pub atoms: Vec<RenderedSourceAtom>,
+    /// Display columns known to be renderer-generated rather than source text.
+    pub(crate) synthetic_columns: Vec<std::ops::Range<usize>>,
 }
 
-/// The kind of jump target in the View layout.
+/// Smallest selectable rendered unit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedSourceAtom {
+    /// Inclusive/exclusive display-cell columns occupied by the whole atom.
+    pub columns: std::ops::Range<usize>,
+    /// Raw Markdown ownership, or `None` for a synthetic glyph/cell.
+    pub source: Option<std::ops::Range<usize>>,
+}
+
+/// The kind of jump target in the rendered layout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetKind {
     /// A heading jump target, carrying the heading level (1–6).
@@ -163,24 +186,28 @@ pub enum TargetKind {
     Footnote,
 }
 
-/// A jump target within the View layout (for navigation).
+/// A jump target within the rendered layout (for navigation).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JumpTarget {
-    /// 0-based line number in `ViewLayout.lines` where this target begins.
+    /// 0-based line number in `RenderedLayout.lines` where this target begins.
     pub line: usize,
     /// The kind of target.
     pub kind: TargetKind,
 }
 
-/// The full rendered layout for View mode.
+/// The full rendered layout used by Normal and Select.
 ///
-/// Produced by `ViewLayout::build()` from a `BlockModel`, wrap width, and
+/// Produced by `RenderedLayout::build()` from a `BlockModel`, wrap width, and
 /// highlighter. The layout is a sequence of styled, wrapped lines with
 /// source-mapping and jump targets for navigation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ViewLayout {
+pub struct RenderedLayout {
     /// Rendered lines, in display order.
-    pub lines: Vec<ViewLine>,
+    pub lines: Vec<RenderedLine>,
+    /// Optional 1-based source line number for each rendered row. Only the
+    /// first content row for a distinct source line is numbered; wrapped,
+    /// repeated, and synthetic rows are `None`.
+    pub line_numbers: Vec<Option<usize>>,
     /// Jump targets sorted by line number.
     pub jump_targets: Vec<JumpTarget>,
     /// Link destinations: `(marker_index, url)` pairs. Marker `[n]` refers
@@ -188,16 +215,69 @@ pub struct ViewLayout {
     pub link_index: Vec<(usize, String)>,
 }
 
-/// Cursor position in View mode (0-based line number).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ViewCursor {
-    /// 0-based line number in the view layout.
-    pub line: usize,
+/// A point in final rendered display-cell coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, PartialOrd, Ord)]
+pub struct RenderedPoint {
+    /// 0-based rendered row.
+    pub row: usize,
+    /// 0-based display-cell column.
+    pub column: usize,
 }
 
-/// Search state for View mode navigation.
+/// Cursor position in rendered Normal or Select.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct RenderedCursor {
+    /// 0-based line number in the rendered layout.
+    pub line: usize,
+    /// 0-based display-cell column in the rendered row.
+    pub column: usize,
+    /// Preferred display column retained across vertical movement.
+    pub desired_column: usize,
+}
+
+/// Shape of a rendered Select region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SelectionShape {
+    /// Inclusive source-backed atoms between two display points.
+    #[default]
+    Character,
+    /// Exact physical source lines intersected by the endpoints.
+    Line,
+    /// Inclusive display-column rectangle across rendered rows.
+    Block,
+}
+
+/// One selected rendered row, including display geometry and raw-source ranges.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ViewSearch {
+pub struct RenderedSelectionRow {
+    /// 0-based rendered row.
+    pub row: usize,
+    /// Selected display-cell interval for painting.
+    pub columns: std::ops::Range<usize>,
+    /// Ordered raw-source ranges contributed by this row.
+    pub source_ranges: Vec<std::ops::Range<usize>>,
+}
+
+/// Renderer-neutral metadata for a character, line, or block selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedSelection {
+    /// Display point where Select began.
+    pub anchor: RenderedPoint,
+    /// Active display endpoint.
+    pub active: RenderedPoint,
+    /// Active selection shape.
+    pub shape: SelectionShape,
+    /// Ordered, normalized, UTF-8-safe raw-source ranges.
+    pub source_ranges: Vec<std::ops::Range<usize>>,
+    /// Per-row display/source projection used by block edits and overlays.
+    pub rows: Vec<RenderedSelectionRow>,
+    /// Inclusive block rectangle width, only for [`SelectionShape::Block`].
+    pub block_width: Option<usize>,
+}
+
+/// Search state for rendered-mode navigation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedSearch {
     /// The search pattern.
     pub pattern: String,
     /// Whether the pattern is a regex.
@@ -206,7 +286,7 @@ pub struct ViewSearch {
     pub last_direction: SearchDirection,
 }
 
-/// Direction of a search operation in View mode.
+/// Direction of a search operation in rendered mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchDirection {
     /// Search forward (next match).

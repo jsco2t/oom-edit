@@ -41,11 +41,26 @@ fn headless_example_runs_successfully() {
         "headless example should report line count"
     );
     assert!(
-        stdout.contains("Source frame"),
-        "headless example should render source frame"
+        stdout.contains("Mode during selection: Select"),
+        "headless example should exercise Select"
     );
     assert!(
-        stdout.contains("View layout"),
-        "headless example should render view layout"
+        stdout.contains("Character selection: Character")
+            && stdout.contains("Line selection: Line")
+            && stdout.contains("Block selection: Block"),
+        "headless example should expose all three source-mapped shapes"
+    );
+    assert!(
+        stdout.contains("Yank preserved document: true"),
+        "headless example yank should be non-destructive"
+    );
+    assert!(
+        stdout.contains("Mode during source edit: Insert")
+            && stdout.contains("Mode after Insert: Normal"),
+        "headless example should round-trip through Insert"
+    );
+    assert!(
+        stdout.contains("Rendered Normal layout") && stdout.contains("Insert source frame"),
+        "headless example should render both public surfaces"
     );
 }

@@ -1,6 +1,6 @@
 # oom-edit
 
-oom-edit is a console/TUI markdown editor written in Rust: true Vim-style modal editing (Normal/Insert/Visual + a rendered, navigable **View** mode) over tree-sitter-highlighted markdown, including rich highlighting of YAML/TOML front matter and fenced code blocks. The editing core ships as the reusable `oom-edit-core` crate — embeddable in other applications with zero terminal dependencies; the `oom-edit` binary is a thin ratatui shell over it.
+oom-edit is a console/TUI markdown editor written in Rust with exactly four public modes: rendered Normal, source Insert, rendered character/line/block Select, and Command. It includes tree-sitter-highlighted Markdown source, rich YAML/TOML front matter, and fenced code blocks. The editing core ships as the reusable `oom-edit-core` crate — embeddable in other applications with zero terminal dependencies; the `oom-edit` binary is a thin ratatui shell over it.
 
 **License:** MIT
 
@@ -18,14 +18,14 @@ The plan and architecture documents are the source of truth for scope and struct
 
 ## Architecture posture
 
-- **Reusable core, thin UI.** All editing logic, highlighting, markdown modeling, and View rendering live in `oom-edit-core`, which must never depend on ratatui, crossterm, or any terminal/IO-event crate. The TUI is a presentation layer. Anything a second application would want belongs in the core.
+- **Reusable core, thin UI.** All editing logic, highlighting, markdown modeling, and rendered Markdown live in `oom-edit-core`, which must never depend on ratatui, crossterm, or any terminal/IO-event crate. The TUI is a presentation layer. Anything a second application would want belongs in the core.
 - **One wrapper for the engine.** The `hjkl` crates are pinned pre-1.0 and fast-moving; every `hjkl_*` type is confined to `crates/oom-edit-core/src/vim.rs`. No hjkl type appears in any other module or any public signature. Upgrades touch that one file plus the conformance suite.
 - **Renderer-agnostic styling.** The core emits semantic style slots (`SemanticStyle`); colors exist only in the TUI's theme module. No signal is ever color-only — a modifier or text glyph always carries it (accessibility is a requirement, not a theme).
 - **Static everything.** Tree-sitter grammars are statically linked, vendored crates. No runtime grammar loading, no plugins, no network features of any kind.
 
 ## Engineering principles
 
-1. **Test-forward.** Every Must-Have requirement has automated tests; the Vim surface is guaranteed by a conformance suite with meta-tests that make silent coverage loss impossible. Property-based tests for incremental-highlight equivalence and view↔edit position mapping are first-class deliverables, not nice-to-haves.
+1. **Test-forward.** Every Must-Have requirement has automated tests; the modal surface is guaranteed by a conformance suite with meta-tests that make silent coverage loss impossible. Property-based tests for incremental-highlight equivalence and rendered↔source position mapping are first-class deliverables, not nice-to-haves.
 2. **Simplicity over cleverness.** Prefer obvious code, narrow abstractions, and well-trodden patterns. Don't introduce generality for hypothetical future requirements. Three similar lines beats a premature abstraction.
 3. **Limited external dependencies.** Only add external dependencies when it is very clear they solve a major gap in functionality. For minor features it's worth evaluating writing the code directly in the repo (vs adding N more dependencies). Worked examples already decided at planning time: hand-rolled CLI args (no clap), hand-rolled snapshot harness (no insta), hand-rolled OSC 52 + base64 (no clipboard crates), hand-rolled fuzzy matcher.
 4. **Registry as single source of truth (TUI).** App commands are declared once; the hint bar, which-key, command palette, and dispatch are projections of that registry, with drift-prevention meta-tests. Nothing user-facing is hand-maintained in two places.

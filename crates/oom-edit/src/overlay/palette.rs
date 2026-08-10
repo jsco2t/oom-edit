@@ -19,142 +19,18 @@ use crate::theme::{Theme, Tier};
 
 // ── Vim reference table ─────────────────────────────────────────────────────
 
-/// Static Vim reference entries for the palette's non-executable section.
-///
-/// Transcribed from plan §6.2 — every row of every table, exactly.
+/// Static reference entries for the supported four-mode interaction model.
 /// Format: `(keys, description, row-id)`.
 pub static VIM_REFERENCE: &[(&str, &str, &str)] = &[
-    // ── Motions ──────────────────────────────────────────────────────────
-    ("h, ←", "Char/line movement left. No line wrap.", "V-M1"),
-    (
-        "j, ↓",
-        "Line down, preserves desired column on short lines.",
-        "V-M1",
-    ),
-    (
-        "k, ↑",
-        "Line up, preserves desired column on short lines.",
-        "V-M1",
-    ),
-    ("l, →", "Char/line movement right. No line wrap.", "V-M1"),
-    (
-        "w",
-        "Word forward (Vim word rules: punctuation runs are words).",
-        "V-M2",
-    ),
-    ("b", "Word backward.", "V-M2"),
-    ("e", "End of word.", "V-M2"),
-    ("W", "WORD forward (whitespace-delimited).", "V-M3"),
-    ("B", "WORD backward.", "V-M3"),
-    ("E", "End of WORD.", "V-M3"),
-    ("0", "Hard beginning-of-line.", "V-M4"),
-    ("^", "First non-blank character of line.", "V-M4"),
-    ("$", "End-of-line (last character).", "V-M4"),
-    ("gg", "First line of document.", "V-M5"),
-    (
-        "G",
-        "Last line of document; {count}G jumps to line.",
-        "V-M5",
-    ),
-    ("<C-d>", "Half-page down.", "V-M6"),
-    ("<C-u>", "Half-page up.", "V-M6"),
-    ("<C-f>", "Full-page down.", "V-M7"),
-    ("<C-b>", "Full-page up.", "V-M7"),
-    (
-        "{",
-        "Paragraph backward (blank-line-delimited block).",
-        "V-M8",
-    ),
-    ("}", "Paragraph forward.", "V-M8"),
-    ("%", "Jump between matching (){}[] pairs.", "V-M9"),
-    // ── Search ───────────────────────────────────────────────────────────
-    (
-        "/pattern⏎",
-        "Forward search (regex); moves to next match.",
-        "V-S1",
-    ),
-    ("?pattern⏎", "Backward search.", "V-S2"),
-    (
-        "n",
-        "Repeat last search in same direction, with wraparound.",
-        "V-S3",
-    ),
-    ("N", "Repeat last search in opposite direction.", "V-S3"),
-    (":noh", "Clear search-match highlighting.", "V-S4"),
-    // ── Editing ──────────────────────────────────────────────────────────
-    (
-        "x",
-        "Delete char under cursor (into unnamed register).",
-        "V-E1",
-    ),
-    ("X", "Delete char before cursor.", "V-E1"),
-    ("r{char}", "Replace char under cursor.", "V-E2"),
-    ("~", "Toggle case of char under cursor, advance.", "V-E3"),
-    ("J", "Join line below with one space.", "V-E4"),
-    ("D", "Delete to end-of-line.", "V-E5"),
-    ("C", "Change to end-of-line.", "V-E5"),
-    ("s", "Substitute char (delete + Insert).", "V-E6"),
-    ("S", "Change whole line (delete line + Insert).", "V-E6"),
-    (
-        "u",
-        "Undo (one step per Insert session / operator / ex command).",
-        "V-E7",
-    ),
-    ("<C-r>", "Redo.", "V-E7"),
-    (".", "Repeat last change.", "V-E8"),
-    // ── Operators ────────────────────────────────────────────────────────
-    ("d{motion}", "Delete — operator.", "V-O1"),
-    ("dd", "Delete linewise.", "V-O1"),
-    ("c{motion}", "Change (delete + Insert) — operator.", "V-O2"),
-    ("cc", "Change whole line (preserves indent).", "V-O2"),
-    ("y{motion}", "Yank — operator.", "V-O3"),
-    ("yy", "Yank linewise.", "V-O3"),
-    (">{motion}", "Indent by one shift width (4 spaces).", "V-O4"),
-    ("<{motion}", "Dedent by one shift width.", "V-O4"),
-    (">>", "Indent current line.", "V-O4"),
-    ("<<", "Dedent current line.", "V-O4"),
-    ("gu{motion}", "Lowercase.", "V-O5"),
-    ("gU{motion}", "Uppercase.", "V-O5"),
-    // ── Text objects ─────────────────────────────────────────────────────
-    ("iw", "Inner word.", "V-T1"),
-    ("aw", "Around word.", "V-T1"),
-    ("iW", "Inner WORD (whitespace-delimited).", "V-T2"),
-    ("aW", "Around WORD.", "V-T2"),
-    ("i\"/a\"", "Inner / around double-quoted string.", "V-T3"),
-    ("i'/a'", "Inner / around single-quoted string.", "V-T3"),
-    ("i`/a`", "Inner / around backtick-delimited string.", "V-T3"),
-    ("i(/a(", "Inner / around parens (+ ib for braces).", "V-T4"),
-    ("i[/a[", "Inner / around brackets.", "V-T4"),
-    ("i{/a{", "Inner / around braces (+ iB).", "V-T4"),
-    ("i</a<", "Inner / around angle brackets.", "V-T4"),
-    ("ip", "Inner paragraph.", "V-T5"),
-    ("ap", "Around paragraph.", "V-T5"),
-    // ── Registers ────────────────────────────────────────────────────────
-    (
-        "p",
-        "Put after cursor; linewise yanks put linewise.",
-        "V-R1",
-    ),
-    ("P", "Put before cursor.", "V-R1"),
-    (
-        "\"",
-        "Unnamed register — default for all deletes/yanks.",
-        "V-R2",
-    ),
-    ("\"+y", "Yank to system-clipboard register.", "V-R3"),
-    ("\"+p", "Put from system-clipboard register.", "V-R3"),
-    // ── Visual mode ──────────────────────────────────────────────────────
-    ("v", "Characterwise visual mode.", "V-V1"),
-    ("V", "Linewise visual mode.", "V-V1"),
-    ("<C-v>", "Block visual mode.", "V-V1"),
-    (
-        "d/x/c/y",
-        "Apply operator to selection; selection collapses.",
-        "V-V2",
-    ),
-    ("><", "Indent/dedent selection (linewise).", "V-V3"),
-    ("o", "Swap cursor and anchor.", "V-V4"),
-    // ── Ex commands ──────────────────────────────────────────────────────
+    ("j/k, ↑/↓", "Move by rendered row.", "R-N1"),
+    ("gg / G", "Jump to the first / last rendered row.", "R-N2"),
+    ("Tab / S-Tab", "Move between rendered jump targets.", "R-N3"),
+    ("/pattern⏎", "Search rendered text forward.", "R-N4"),
+    ("?pattern⏎", "Search rendered text backward.", "R-N4"),
+    ("n / N", "Repeat the rendered search.", "R-N4"),
+    ("i/a/I/A/o/O", "Enter source Insert mode.", "R-I1"),
+    ("Esc", "Return from Insert to rendered Normal.", "R-I2"),
+    ("u / <C-r>", "Undo / redo.", "R-E1"),
     (":w", "Save (atomic).", "V-X1"),
     (
         ":w {path}",
@@ -181,7 +57,6 @@ pub static VIM_REFERENCE: &[(&str, &str, &str)] = &[
     (":s/pat/rep/g", "Substitute all on current line.", "V-X7"),
     (":%s/pat/rep/g", "Substitute all in document.", "V-X7"),
     (":noh", "Clear search-match highlighting.", "V-X8"),
-    (":view", "Enter View mode.", "V-X8"),
     (":help", "Open help / command palette.", "V-X8"),
 ];
 
@@ -191,18 +66,36 @@ const FLOOR_W: u16 = 40;
 const FLOOR_H: u16 = 12;
 
 /// The command palette state machine.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct PaletteState {
     /// Current filter text (case-insensitive).
     filter: String,
     /// Selected row index within the filtered+sectioned list.
     selected: usize,
+    /// Mode context captured when the palette opened.
+    context: Contexts,
     /// Whether the last Enter was on a Vim reference entry (non-executable).
     #[allow(dead_code)]
     last_was_reference: bool,
 }
 
+impl Default for PaletteState {
+    fn default() -> Self {
+        Self::new(Contexts::NORMAL)
+    }
+}
+
 impl PaletteState {
+    /// Create a palette whose command availability reflects `context`.
+    pub fn new(context: Contexts) -> Self {
+        Self {
+            filter: String::new(),
+            selected: 0,
+            context,
+            last_was_reference: false,
+        }
+    }
+
     /// Get the current filter text (test-only).
     #[cfg(test)]
     pub fn filter_text(&self) -> &str {
@@ -325,7 +218,7 @@ impl PaletteState {
                 return true;
             }
             KeyCodeKind::Down | KeyCodeKind::Tab => {
-                let rows = self.build_rows(Contexts::ALL, &Keymap::default());
+                let rows = self.build_rows(self.context, &Keymap::default());
                 let visible_count = self.filter_rows(&rows).len();
                 if self.selected.saturating_add(1) < visible_count {
                     self.selected += 1;
@@ -375,7 +268,7 @@ impl PaletteState {
 
         // Build rows.
         let km = Keymap::default();
-        let all_rows = self.build_rows(Contexts::ALL, &km);
+        let all_rows = self.build_rows(self.context, &km);
         let visible_indices = self.filter_rows(&all_rows);
 
         // Build display lines.
@@ -434,11 +327,11 @@ impl PaletteState {
     /// Get the command to execute (if the selected row is a Command).
     pub fn selected_command(&self) -> Option<Command> {
         let km = Keymap::default();
-        let all_rows = self.build_rows(Contexts::ALL, &km);
+        let all_rows = self.build_rows(self.context, &km);
         let visible_indices = self.filter_rows(&all_rows);
         if let Some(&row_idx) = visible_indices.get(self.selected) {
-            if let PaletteRow::Command { id, .. } = &all_rows[row_idx] {
-                return Some(*id);
+            if let PaletteRow::Command { id, disabled, .. } = &all_rows[row_idx] {
+                return (!disabled).then_some(*id);
             }
         }
         None
@@ -535,7 +428,7 @@ mod tests {
     #[test]
     fn fuzzy_match_subsequence() {
         assert!(fuzzy_match("hlp", "help"));
-        assert!(fuzzy_match("tgv", "toggle-view"));
+        assert!(fuzzy_match("ers", "enter-select"));
     }
 
     #[test]
@@ -553,7 +446,7 @@ mod tests {
     #[test]
     fn fuzzy_match_rejects_unrelated() {
         assert!(!fuzzy_match("xyz", "help"));
-        assert!(!fuzzy_match("abc", "toggle-view"));
+        assert!(!fuzzy_match("abc", "enter-select"));
     }
 
     #[test]
@@ -655,7 +548,7 @@ mod tests {
     #[test]
     fn test_palette_down_clamps_at_last_row() {
         let mut palette = PaletteState {
-            filter: "V-M2".to_string(),
+            filter: "R-N4".to_string(),
             ..PaletteState::default()
         };
         let rows = palette.build_rows(Contexts::ALL, &Keymap::default());
@@ -675,7 +568,7 @@ mod tests {
     fn test_palette_selected_command_at_boundary() {
         let mut palette = PaletteState {
             filter: "(no binding)".to_string(),
-            ..PaletteState::default()
+            ..PaletteState::new(Contexts::ALL)
         };
         let rows = palette.build_rows(Contexts::ALL, &Keymap::default());
         let visible_rows = palette.filter_rows(&rows);
@@ -697,6 +590,56 @@ mod tests {
         assert_eq!(palette.selected, 5);
 
         assert_eq!(palette.selected_command(), Some(Command::QuitAll));
+    }
+
+    #[test]
+    fn palette_disables_commands_outside_the_opening_context() {
+        let normal = PaletteState::new(Contexts::NORMAL);
+        let normal_rows = normal.build_rows(normal.context, &Keymap::default());
+        assert!(normal_rows.iter().any(|row| matches!(
+            row,
+            PaletteRow::Command {
+                id: Command::EnterCharacterSelect,
+                disabled: false,
+                ..
+            }
+        )));
+        assert!(normal_rows.iter().any(|row| matches!(
+            row,
+            PaletteRow::Command {
+                id: Command::SelectYank,
+                disabled: true,
+                ..
+            }
+        )));
+
+        let select = PaletteState::new(Contexts::SELECT);
+        let select_rows = select.build_rows(select.context, &Keymap::default());
+        assert!(select_rows.iter().any(|row| matches!(
+            row,
+            PaletteRow::Command {
+                id: Command::EnterCharacterSelect,
+                disabled: true,
+                ..
+            }
+        )));
+        assert!(select_rows.iter().any(|row| matches!(
+            row,
+            PaletteRow::Command {
+                id: Command::SelectYank,
+                disabled: false,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn selected_disabled_palette_command_is_not_executable() {
+        let palette = PaletteState {
+            filter: "select-yank".to_string(),
+            ..PaletteState::new(Contexts::NORMAL)
+        };
+        assert_eq!(palette.selected_command(), None);
     }
 
     #[test]
@@ -726,7 +669,7 @@ mod tests {
     #[test]
     fn vim_reference_covers_all_sections() {
         let row_ids: Vec<&str> = VIM_REFERENCE.iter().map(|(_, _, id)| *id).collect();
-        let sections = ["V-M", "V-S", "V-E", "V-O", "V-T", "V-R", "V-V", "V-X"];
+        let sections = ["R-N", "R-I", "R-E", "V-X"];
         for section in sections {
             assert!(
                 row_ids.iter().any(|id| id.starts_with(section)),

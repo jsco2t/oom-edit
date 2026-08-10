@@ -3,7 +3,7 @@
 //! The poll deadline is `min(FRAME_BUDGET, deadline)` where `deadline` is
 //! computed from transient TTL expiry and which-key pending+150ms (T13).
 //! Key events with `kind == Press` only are dispatched; resize events are
-//! forwarded so View-mode layout and cursor state can be remapped.
+//! forwarded so Rendered-mode layout and cursor state can be remapped.
 //!
 //! T16: Bracketed paste is enabled on startup via crossterm.
 
@@ -90,7 +90,7 @@ fn dispatch_event(app: &mut App, ev: Event) {
         Event::Mouse(_) => {
             app.handle_event(&ev);
         }
-        // Resize: forward to app for View-mode cursor remap (FR-3.1).
+        // Resize: forward to app for Rendered-mode cursor remap (FR-3.1).
         Event::Resize(_, _) => {
             app.handle_event(&ev);
         }
@@ -112,32 +112,26 @@ mod tests {
     fn test_app() -> App {
         App::new(
             EditorSession::from_text(RESIZE_DOCUMENT),
-            "default-dark".to_string(),
-            false,
-            Tier::TrueColor,
+            crate::theme::ResolvedTheme::injected("default-dark", false, Tier::TrueColor),
             true,
             false,
             Box::new(RecordingClipboardSink::default()),
+            Box::new(crate::config::DisabledConfigStore),
         )
     }
 
-    fn enter_view(app: &mut App) {
-        dispatch_event(
-            app,
-            Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
-        );
-        dispatch_event(
-            app,
-            Event::Key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE)),
-        );
-        assert_eq!(app.active_mut().unwrap().session_mut().mode(), Mode::View);
+    fn build_initial_rendered_layout(app: &mut App) {
+        dispatch_event(app, Event::Resize(80, 24));
+        assert_eq!(app.active_mut().unwrap().session_mut().mode(), Mode::Normal);
     }
 
     fn current_content_line(app: &mut App) -> usize {
         let session = app.active_mut().unwrap().session_mut();
-        let cursor = session.view_cursor_line();
+        let cursor = session.rendered_cursor_line();
         let text = session.document();
-        let source_start = session.view_layout().unwrap().lines[cursor].source.start;
+        let source_start = session.rendered_layout().unwrap().lines[cursor]
+            .source
+            .start;
         text[..source_start]
             .bytes()
             .filter(|byte| *byte == b'\n')
@@ -147,13 +141,13 @@ mod tests {
     #[test]
     fn test_resize_event_reaches_handler() {
         let mut app = test_app();
-        enter_view(&mut app);
+        build_initial_rendered_layout(&mut app);
 
         let wide_line_count = app
             .active_mut()
             .unwrap()
             .session_mut()
-            .view_layout()
+            .rendered_layout()
             .unwrap()
             .lines
             .len();
@@ -164,20 +158,20 @@ mod tests {
             .active_mut()
             .unwrap()
             .session_mut()
-            .view_layout()
+            .rendered_layout()
             .unwrap()
             .lines
             .len();
         assert!(
             narrow_line_count > wide_line_count,
-            "production dispatch should forward resize and rebuild the narrower View layout"
+            "production dispatch should forward resize and rebuild the narrower rendered layout"
         );
     }
 
     #[test]
-    fn test_view_cursor_stable_after_narrow_resize() {
+    fn test_rendered_cursor_stable_after_narrow_resize() {
         let mut app = test_app();
-        enter_view(&mut app);
+        build_initial_rendered_layout(&mut app);
 
         while current_content_line(&mut app) < 4 {
             dispatch_event(
@@ -190,7 +184,7 @@ mod tests {
             .active_mut()
             .unwrap()
             .session_mut()
-            .view_layout()
+            .rendered_layout()
             .unwrap()
             .lines
             .len();
@@ -201,7 +195,7 @@ mod tests {
             .active_mut()
             .unwrap()
             .session_mut()
-            .view_layout()
+            .rendered_layout()
             .unwrap()
             .lines
             .len();
@@ -212,7 +206,7 @@ mod tests {
         assert_eq!(
             current_content_line(&mut app),
             4,
-            "View cursor should remain on the Target heading's logical source line"
+            "rendered cursor should remain on the Target heading's logical source line"
         );
     }
 }
