@@ -85,9 +85,43 @@ use hjkl_vim::vim::{
 use hjkl_vim::{feed_input, install_vim_discipline, VimEditorExt};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::style::{RenderedSelection, SelectionShape};
+use crate::input::{KeyCode, KeyCodeKind, KeyInput, Modifiers};
 
 // ── vim.rs internal types ──────────────────────────────────────────────────
+
+/// Consumer-owned normalized source request for rendered selection operators.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProjectedSelection {
+    Character {
+        ranges: Vec<Range<usize>>,
+    },
+    Line {
+        ranges: Vec<Range<usize>>,
+    },
+    Block {
+        rows: Vec<ProjectedBlockRow>,
+        width: usize,
+    },
+}
+
+/// One display row retained for block-register padding semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectedBlockRow {
+    pub(crate) ranges: Vec<Range<usize>>,
+    pub(crate) selected_width: usize,
+}
+
+impl ProjectedSelection {
+    fn ranges(&self) -> Vec<Range<usize>> {
+        match self {
+            Self::Character { ranges } | Self::Line { ranges } => ranges.clone(),
+            Self::Block { rows, .. } => rows
+                .iter()
+                .flat_map(|row| row.ranges.iter().cloned())
+                .collect(),
+        }
+    }
+}
 
 /// Host adapter that exposes engine clipboard writes as drainable events.
 struct ClipboardCapturingHost {
@@ -268,72 +302,6 @@ impl Register {
     }
 }
 
-// ── KeyCode / Modifiers / KeyInput ─────────────────────────────────────────
-
-/// Terminal-agnostic key representation (mirrors, but does not expose,
-/// crossterm's model).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct KeyCode {
-    /// The key code kind.
-    pub kind: KeyCodeKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum KeyCodeKind {
-    /// A printable character.
-    Char(char),
-    /// Enter / Return key.
-    Enter,
-    /// Escape key.
-    Esc,
-    /// Backspace key.
-    Backspace,
-    /// Tab key.
-    Tab,
-    /// Shift-Tab key.
-    BackTab,
-    /// Up arrow key.
-    Up,
-    /// Down arrow key.
-    Down,
-    /// Left arrow key.
-    Left,
-    /// Right arrow key.
-    Right,
-    /// Home key.
-    Home,
-    /// End key.
-    End,
-    /// Page Up key.
-    PageUp,
-    /// Page Down key.
-    PageDown,
-    /// Delete key.
-    Delete,
-    /// Function key F1-F24.
-    F(u8),
-}
-
-/// Keyboard modifier bits accompanying every keystroke.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct Modifiers {
-    /// Ctrl modifier pressed.
-    pub ctrl: bool,
-    /// Alt/Option modifier pressed.
-    pub alt: bool,
-    /// Shift modifier pressed.
-    pub shift: bool,
-}
-
-/// A terminal-agnostic key event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct KeyInput {
-    /// The key code.
-    pub code: KeyCode,
-    /// The modifiers.
-    pub mods: Modifiers,
-}
-
 // ── VimCore ────────────────────────────────────────────────────────────────
 
 /// The hjkl wrapper implementing the `VimCore` contract.
@@ -396,6 +364,9 @@ impl VimCore {
 
     /// Handle a key input. Returns zero or more effects.
     pub(crate) fn handle_key(&mut self, key: KeyInput) -> Vec<VimEffect> {
+        if key.code.kind == KeyCodeKind::Noop {
+            return Vec::new();
+        }
         // Normalize: <C-[> (Ctrl+LeftBracket) is ASCII 0x1b, identical to Esc.
         // hjkl-vim only recognizes Key::Esc for exit-insert; it does NOT treat
         // Char('[', ctrl=true) as Esc. Normalize here so callers can use either.
@@ -576,6 +547,10 @@ impl VimCore {
             .as_any()
             .downcast_ref::<HjklVimState>()
             .expect("vim discipline must remain installed")
+    }
+
+    pub(crate) fn has_pending_input(&self) -> bool {
+        self.hjkl_state().pending != HjklPending::None
     }
 
     fn hjkl_state_mut(&mut self) -> &mut HjklVimState {
@@ -929,20 +904,21 @@ impl VimCore {
     /// register metadata and all engine mutation stay inside this wrapper.
     pub(crate) fn apply_selection(
         &mut self,
-        selection: RenderedSelection,
+        selection: ProjectedSelection,
         operator: RangeOperator,
         register: Register,
     ) -> Vec<VimEffect> {
+        let source_ranges = selection.ranges();
         if matches!(operator, RangeOperator::Indent | RangeOperator::Outdent) {
-            let Some(first) = selection.source_ranges.first() else {
+            let Some(first) = source_ranges.first() else {
                 return Vec::new();
             };
-            let Some(last) = selection.source_ranges.last() else {
+            let Some(last) = source_ranges.last() else {
                 return Vec::new();
             };
             return self.apply_line_range(first.start..last.end, operator, register);
         }
-        if selection.source_ranges.is_empty() {
+        if source_ranges.is_empty() {
             return Vec::new();
         }
 
@@ -952,41 +928,42 @@ impl VimCore {
 
         let old_text = self.text();
         let target = register.selector();
-        let block_width = selection.block_width.unwrap_or(0);
-        let payload = if selection.shape == SelectionShape::Block {
-            selection
-                .rows
+        let block_width = match &selection {
+            ProjectedSelection::Block { width, .. } => *width,
+            _ => 0,
+        };
+        let payload = match &selection {
+            ProjectedSelection::Block { rows, .. } => rows
                 .iter()
                 .map(|row| {
                     let mut text = row
-                        .source_ranges
+                        .ranges
                         .iter()
                         .filter_map(|range| old_text.get(range.clone()))
                         .collect::<String>();
-                    let selected_width = row.columns.end.saturating_sub(row.columns.start);
                     let raw_width = UnicodeWidthStr::width(text.as_str());
-                    let padding = block_width.saturating_sub(selected_width.max(raw_width));
+                    let padding = block_width.saturating_sub(row.selected_width.max(raw_width));
                     text.push_str(&" ".repeat(padding));
                     text
                 })
                 .collect::<Vec<_>>()
-                .join("\n")
-        } else {
-            selection
-                .source_ranges
-                .iter()
-                .filter_map(|range| old_text.get(range.clone()))
-                .collect()
+                .join("\n"),
+            ProjectedSelection::Character { ranges } | ProjectedSelection::Line { ranges } => {
+                ranges
+                    .iter()
+                    .filter_map(|range| old_text.get(range.clone()))
+                    .collect()
+            }
         };
         match operator {
             RangeOperator::Yank => {
-                if selection.shape == SelectionShape::Block {
+                if matches!(selection, ProjectedSelection::Block { .. }) {
                     self.editor
                         .record_yank_block(payload.clone(), block_width, target);
                 } else {
                     self.editor.record_yank(
                         payload.clone(),
-                        selection.shape == SelectionShape::Line,
+                        matches!(selection, ProjectedSelection::Line { .. }),
                         target,
                     );
                 }
@@ -997,13 +974,13 @@ impl VimCore {
                 return effects;
             }
             RangeOperator::Delete | RangeOperator::Change => {
-                if selection.shape == SelectionShape::Block {
+                if matches!(selection, ProjectedSelection::Block { .. }) {
                     self.editor
                         .record_delete_block(payload.clone(), block_width, target);
                 } else {
                     self.editor.record_delete(
                         payload.clone(),
-                        selection.shape == SelectionShape::Line,
+                        matches!(selection, ProjectedSelection::Line { .. }),
                         target,
                     );
                 }
@@ -1011,9 +988,9 @@ impl VimCore {
             RangeOperator::Indent | RangeOperator::Outdent => unreachable!(),
         }
 
-        let earliest = selection.source_ranges[0].start.min(old_text.len());
+        let earliest = source_ranges[0].start.min(old_text.len());
         let mut new_text = old_text.clone();
-        let mut ranges = selection.source_ranges;
+        let mut ranges = source_ranges;
         ranges.sort_by_key(|range| (range.start, range.end));
         for range in ranges.into_iter().rev() {
             let start = range.start.min(new_text.len());
@@ -1301,6 +1278,7 @@ impl VimCore {
         };
 
         match code {
+            KeyCodeKind::Noop => unreachable!("Noop is consumed before hjkl conversion"),
             KeyCodeKind::Char(c) => PlannedInput::Char(c, hjkl_mods),
             KeyCodeKind::Enter => PlannedInput::Key(SpecialKey::Enter, hjkl_mods),
             KeyCodeKind::Esc => PlannedInput::Key(SpecialKey::Esc, hjkl_mods),
@@ -1476,6 +1454,172 @@ fn replacement_text_from_final_buffer<'a>(
                 final_text.len()
             )
         })
+}
+
+#[cfg(test)]
+mod projected_selection_tests {
+    use super::*;
+
+    fn clipboard_payload(effects: &[VimEffect]) -> Option<&str> {
+        effects.iter().find_map(|effect| match effect {
+            VimEffect::ClipboardYank(text) => Some(text.as_str()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn vim_core_accepts_canonical_key_input() {
+        let mut vim = VimCore::new("abc");
+        vim.handle_key(crate::input::KeyInput {
+            code: crate::input::KeyCode {
+                kind: crate::input::KeyCodeKind::Char('i'),
+            },
+            mods: crate::input::Modifiers::default(),
+        });
+        vim.handle_key(crate::input::KeyInput {
+            code: crate::input::KeyCode {
+                kind: crate::input::KeyCodeKind::Right,
+            },
+            mods: crate::input::Modifiers {
+                ctrl: false,
+                alt: false,
+                shift: false,
+            },
+        });
+        vim.handle_key(crate::input::KeyInput {
+            code: crate::input::KeyCode {
+                kind: crate::input::KeyCodeKind::Esc,
+            },
+            mods: crate::input::Modifiers::default(),
+        });
+        assert_eq!(vim.mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn projected_character_selection_uses_only_source_ranges() {
+        let mut vim = VimCore::new("alpha **beta** omega");
+        let effects = vim.apply_selection(
+            ProjectedSelection::Character {
+                ranges: std::iter::once(6..14).collect(),
+            },
+            RangeOperator::Yank,
+            Register::System,
+        );
+
+        assert_eq!(clipboard_payload(&effects), Some("**beta**"));
+        assert_eq!(vim.text(), "alpha **beta** omega");
+    }
+
+    #[test]
+    fn projected_line_selection_preserves_linewise_register_semantics() {
+        let mut vim = VimCore::new("one\ntwo\nthree\n");
+        vim.apply_selection(
+            ProjectedSelection::Line {
+                ranges: std::iter::once(4..8).collect(),
+            },
+            RangeOperator::Yank,
+            Register::Unnamed,
+        );
+        vim.jump_to(2, 0);
+        vim.handle_key(VimCore::plain_key(KeyCodeKind::Char('p')));
+
+        assert_eq!(vim.text(), "one\ntwo\nthree\ntwo\n");
+    }
+
+    #[test]
+    fn projected_block_selection_preserves_empty_rows_and_display_padding() {
+        let mut vim = VimCore::new("ab\nx\ncd\n");
+        let effects = vim.apply_selection(
+            ProjectedSelection::Block {
+                width: 3,
+                rows: vec![
+                    ProjectedBlockRow {
+                        ranges: std::iter::once(0..2).collect(),
+                        selected_width: 2,
+                    },
+                    ProjectedBlockRow {
+                        ranges: Vec::new(),
+                        selected_width: 0,
+                    },
+                    ProjectedBlockRow {
+                        ranges: std::iter::once(5..7).collect(),
+                        selected_width: 2,
+                    },
+                ],
+            },
+            RangeOperator::Yank,
+            Register::System,
+        );
+
+        assert_eq!(clipboard_payload(&effects), Some("ab \n   \ncd "));
+    }
+
+    #[test]
+    fn projected_empty_selection_is_a_noop_for_every_variant() {
+        let variants = [
+            ProjectedSelection::Character { ranges: Vec::new() },
+            ProjectedSelection::Line { ranges: Vec::new() },
+            ProjectedSelection::Block {
+                rows: vec![ProjectedBlockRow {
+                    ranges: Vec::new(),
+                    selected_width: 2,
+                }],
+                width: 2,
+            },
+        ];
+        for selection in variants {
+            for operator in [
+                RangeOperator::Yank,
+                RangeOperator::Delete,
+                RangeOperator::Change,
+                RangeOperator::Indent,
+                RangeOperator::Outdent,
+            ] {
+                let mut vim = VimCore::new("unchanged");
+                assert!(vim
+                    .apply_selection(selection.clone(), operator, Register::Unnamed)
+                    .is_empty());
+                assert_eq!(vim.text(), "unchanged");
+                assert_eq!(vim.mode(), Mode::Normal);
+            }
+        }
+    }
+
+    #[test]
+    fn projected_selection_operator_matrix_preserves_yank_delete_change_indent_outdent() {
+        let selection = || ProjectedSelection::Character {
+            ranges: std::iter::once(0..3).collect(),
+        };
+
+        let mut yank = VimCore::new("one two");
+        let effects = yank.apply_selection(selection(), RangeOperator::Yank, Register::System);
+        assert_eq!(clipboard_payload(&effects), Some("one"));
+        assert_eq!(yank.text(), "one two");
+
+        let mut delete = VimCore::new("one two");
+        delete.apply_selection(selection(), RangeOperator::Delete, Register::Unnamed);
+        assert_eq!(delete.text(), " two");
+
+        let mut change = VimCore::new("one two");
+        change.apply_selection(selection(), RangeOperator::Change, Register::Unnamed);
+        assert_eq!(change.text(), " two");
+        assert_eq!(change.mode(), Mode::Insert);
+
+        for (operator, source, expected) in [
+            (RangeOperator::Indent, "one\ntwo", "    one\ntwo"),
+            (RangeOperator::Outdent, "    one\ntwo", "one\ntwo"),
+        ] {
+            let mut vim = VimCore::new(source);
+            vim.apply_selection(
+                ProjectedSelection::Line {
+                    ranges: std::iter::once(0..source.find('\n').unwrap_or(source.len())).collect(),
+                },
+                operator,
+                Register::Unnamed,
+            );
+            assert_eq!(vim.text(), expected);
+        }
+    }
 }
 
 #[cfg(test)]

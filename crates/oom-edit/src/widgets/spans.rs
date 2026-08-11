@@ -9,7 +9,7 @@ use crate::theme::{Theme, Tier};
 /// Build ratatui spans from a styled line's text and semantic spans.
 pub fn build_spans<'a>(
     text: &'a str,
-    spans: &'a [oom_edit_core::style::Span],
+    spans: &'a [oom_edit_core::Span],
     theme: &Theme,
     tier: Tier,
 ) -> Vec<Span<'a>> {

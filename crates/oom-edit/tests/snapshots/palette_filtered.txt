@@ -3,8 +3,8 @@
    3  │ ┌ Command Palette ─────────────────────────────────────────────┐       │
    4  └─│> sav                                                         │───────┘
         │                                                              │
-   6  █ │▸ select-character     character-wise selection       v       │
-        │  save                 save                           Space w │
+   6  █ │▸ save                 save                           Space w │
+        │  g T                  previous tab                        pre│
    8  So│  Tab / S-Tab          Move between rendered jump targets. R-N│
         │  :w                   Save (atomic).                      V-X│
   10  ┃ │  :w {path}            Save a copy to path without retargeting│

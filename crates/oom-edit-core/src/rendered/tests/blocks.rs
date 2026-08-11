@@ -2,7 +2,8 @@
 
 use crate::rendered::{Block, BlockKind, BlockModel, Inline, ListItem};
 use crate::style::{LineKind, SemanticStyle};
-use crate::{Highlighter, RenderedLayout, TargetKind};
+use crate::syntax::Highlighter;
+use crate::{RenderedLayout, TargetKind};
 use std::path::Path;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -22,6 +23,314 @@ fn rendered_layout_at_width(text: &str, width: u16) -> RenderedLayout {
     let model = BlockModel::build(text, None);
     let highlighter = Highlighter::new(text);
     RenderedLayout::build(&model, width, &highlighter)
+}
+
+fn source_backed_ranges(layout: &RenderedLayout, text: &str) -> Vec<std::ops::Range<usize>> {
+    layout
+        .lines
+        .iter()
+        .flat_map(|line| &line.atoms)
+        .filter_map(|atom| atom.source.clone())
+        .filter(|source| !text[source.clone()].chars().all(char::is_whitespace))
+        .collect()
+}
+
+#[test]
+fn repeated_transformed_text_keeps_leaf_local_source_order() {
+    // The removed global candidate queue could consume an identical label
+    // from a different parser leaf. Each displayed group must now remain
+    // inside the exact repeated occurrence that produced it.
+    let text =
+        "same [same](one) ![same *same*](two)\n\n> - same\n\n| a | b |\n|---|---|\n| same | same |";
+    let layout = rendered_layout_at_width(text, 24);
+    let occurrences = text
+        .match_indices("same")
+        .map(|(start, value)| start..start + value.len())
+        .collect::<Vec<_>>();
+    let ranges = source_backed_ranges(&layout, text);
+
+    for occurrence in occurrences {
+        let owned = ranges
+            .iter()
+            .filter(|range| occurrence.start <= range.start && range.end <= occurrence.end)
+            .map(|range| &text[range.clone()])
+            .collect::<String>();
+        assert_eq!(owned, "same", "wrong ownership for {occurrence:?}");
+    }
+}
+
+#[test]
+fn nested_inline_provenance_survives_wrapping_and_prefixes() {
+    // Prefix correction used to happen after wrapping and could accidentally
+    // lend list/quote/image decoration a neighboring leaf's bytes.
+    let text = "> - **alpha [beta](dest) `gamma`** delta";
+    let layout = rendered_layout_at_width(text, 13);
+    assert!(layout.lines.len() > 1);
+    for line in &layout.lines {
+        for atom in &line.atoms {
+            if atom.columns.start < 4 {
+                let visible = line
+                    .styled
+                    .text
+                    .chars()
+                    .nth(atom.columns.start)
+                    .unwrap_or(' ');
+                if matches!(visible, '┃' | '•' | ' ') {
+                    assert_eq!(atom.source, None);
+                }
+            }
+            if let Some(source) = &atom.source {
+                assert!(source.end <= text.len());
+                assert!(text.is_char_boundary(source.start));
+                assert!(text.is_char_boundary(source.end));
+            }
+        }
+    }
+}
+
+#[test]
+fn table_cell_provenance_survives_alignment_padding_and_wrap() {
+    // The old synthetic-column side table corrected padding only after table
+    // layout and could not prove repeated cell ownership was row-local.
+    let long = "東京".repeat(22);
+    let text = format!(
+        "| left | center | right |\n|:---|:---:|---:|\n| same | same | same |\n| {long} |  | same |"
+    );
+    let data_rows = [
+        "| same | same | same |".to_string(),
+        format!("| {long} |  | same |"),
+    ];
+
+    for width in [24, 120] {
+        let layout = rendered_layout_at_width(&text, width);
+        for line in layout
+            .lines
+            .iter()
+            .filter(|line| line.styled.text.contains('│'))
+        {
+            for atom in &line.atoms {
+                if let Some(source) = &atom.source {
+                    assert!(line.source.start <= source.start);
+                    assert!(source.end <= line.source.end);
+                }
+            }
+            for (character, atom) in line.styled.text.chars().zip(&line.atoms) {
+                if matches!(character, '│' | ' ') {
+                    assert_eq!(atom.source, None, "table layout cell was source-backed");
+                }
+            }
+        }
+
+        for row in &data_rows {
+            let row_start = text.find(row).unwrap();
+            let delimiters = row
+                .match_indices('|')
+                .map(|(offset, _)| offset)
+                .collect::<Vec<_>>();
+            for pair in delimiters.windows(2) {
+                let raw_start = pair[0] + 1;
+                let raw_end = pair[1];
+                let raw = &row[raw_start..raw_end];
+                let leading = raw.len() - raw.trim_start().len();
+                let trailing = raw.len() - raw.trim_end().len();
+                let cell = row_start + raw_start + leading..row_start + raw_end - trailing;
+                if cell.is_empty() {
+                    continue;
+                }
+
+                let owned = layout
+                    .lines
+                    .iter()
+                    .flat_map(|line| &line.atoms)
+                    .filter_map(|atom| atom.source.clone())
+                    .filter(|source| cell.start <= source.start && source.end <= cell.end)
+                    .collect::<Vec<_>>();
+                assert!(
+                    !owned.is_empty(),
+                    "cell {cell:?} lost its source at width {width}"
+                );
+                assert_eq!(owned.first().unwrap().start, cell.start);
+                assert_eq!(owned.last().unwrap().end, cell.end);
+                for adjacent in owned.windows(2) {
+                    assert_eq!(
+                        adjacent[0].end, adjacent[1].start,
+                        "cell bytes were duplicated, skipped, or reordered at width {width}"
+                    );
+                }
+                assert_eq!(
+                    owned
+                        .iter()
+                        .map(|source| &text[source.clone()])
+                        .collect::<String>(),
+                    text[cell.clone()],
+                    "cell did not reconstruct from its own bytes at width {width}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn entity_and_escape_atoms_are_constructed_from_complete_tokens() {
+    // Candidate search previously recovered these transforms after rendering;
+    // construction-time atoms must own the complete raw token instead.
+    let text = r"a &amp; b \* c &#x1F642;";
+    let layout = rendered_layout(text);
+    let raw = layout
+        .lines
+        .iter()
+        .flat_map(|line| &line.atoms)
+        .filter_map(|atom| atom.source.as_ref())
+        .map(|source| &text[source.clone()])
+        .collect::<Vec<_>>();
+    assert!(raw.contains(&"&amp;"));
+    assert!(raw.contains(&r"\*"));
+    assert!(raw.contains(&"&#x1F642;"));
+}
+
+#[test]
+fn inline_code_normalization_keeps_each_display_group_on_its_exact_raw_token() {
+    let text = "`alpha\nbeta`\n\n| code |\n|---|\n| `left\\|right` |";
+    let model = BlockModel::build(text, None);
+    let BlockKind::Paragraph { inlines } = &model.blocks[0].kind else {
+        panic!("expected paragraph");
+    };
+    let Inline::Code(code) = &inlines[0] else {
+        panic!("expected code");
+    };
+    assert_eq!(code.text, "alpha beta");
+    assert_eq!(
+        code.atoms
+            .iter()
+            .map(|atom| atom.source.clone())
+            .collect::<Vec<_>>(),
+        (1..6)
+            .map(|start| start..start + 1)
+            .chain(std::iter::once(6..7))
+            .chain((7..11).map(|start| start..start + 1))
+            .collect::<Vec<_>>()
+    );
+    let layout = rendered_layout_at_width(text, 40);
+    let atoms = layout
+        .lines
+        .iter()
+        .flat_map(|line| &line.atoms)
+        .filter_map(|atom| atom.source.clone())
+        .collect::<Vec<_>>();
+
+    let newline = text.find('\n').unwrap();
+    assert!(
+        atoms.contains(&(newline..newline + 1)),
+        "normalized code newline lost its exact source: {atoms:?}"
+    );
+
+    let beta = text.find("beta").unwrap();
+    for offset in 0.."beta".len() {
+        assert!(atoms
+            .iter()
+            .any(|source| { source.start == beta + offset && source.end == beta + offset + 1 }));
+    }
+
+    let escaped_pipe = text.find("\\|").unwrap();
+    assert!(atoms.contains(&(escaped_pipe..escaped_pipe + 2)));
+}
+
+#[test]
+fn ordinary_inline_code_preserves_literal_escaped_pipe_byte_ownership() {
+    let text = "`left\\|right`";
+    let model = BlockModel::build(text, None);
+    let BlockKind::Paragraph { inlines } = &model.blocks[0].kind else {
+        panic!("expected paragraph");
+    };
+    let Inline::Code(code) = &inlines[0] else {
+        panic!("expected code");
+    };
+    assert_eq!(code.text, "left\\|right");
+    assert_eq!(
+        code.atoms
+            .iter()
+            .map(|atom| atom.source.clone())
+            .collect::<Vec<_>>(),
+        (1..12).map(|start| start..start + 1).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        source_backed_ranges(&rendered_layout_at_width(text, 40), text),
+        (1..12).map(|start| start..start + 1).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn prose_non_escape_preserves_backslash_and_following_byte_ownership() {
+    let text = "left\\qright";
+    let model = BlockModel::build(text, None);
+    let BlockKind::Paragraph { inlines } = &model.blocks[0].kind else {
+        panic!("expected paragraph");
+    };
+    let Inline::Text(prose) = &inlines[0] else {
+        panic!("expected prose");
+    };
+    assert_eq!(prose.text, text);
+    let expected = (0..text.len())
+        .map(|start| start..start + 1)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        prose
+            .atoms
+            .iter()
+            .map(|atom| atom.source.clone())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(
+        source_backed_ranges(&rendered_layout_at_width(text, 40), text),
+        expected
+    );
+}
+
+#[test]
+fn rendered_provenance_is_width_invariant() {
+    // Post-hoc recovery depended on final line order. Rewrapping now moves the
+    // same mapped fragments, so non-whitespace ownership is width invariant.
+    let text = r"repeat **repeat** 東京 &amp; \* [repeat](dest) repeat";
+    let baseline = source_backed_ranges(&rendered_layout_at_width(text, 80), text);
+    for width in [7, 11, 19, 37] {
+        assert_eq!(
+            source_backed_ranges(&rendered_layout_at_width(text, width), text),
+            baseline,
+            "source ownership changed at width {width}"
+        );
+    }
+}
+
+#[test]
+fn table_provenance_is_width_invariant() {
+    let text = "| first | second |\n|---|---|\n| same | same |\n| 東京東京東京東京 | same |";
+    let baseline = source_backed_ranges(&rendered_layout_at_width(text, 80), text);
+    for width in [18, 27, 43] {
+        assert_eq!(
+            source_backed_ranges(&rendered_layout_at_width(text, width), text),
+            baseline,
+            "table source ownership changed at width {width}"
+        );
+    }
+}
+
+#[test]
+fn rendered_provenance_pipeline_has_no_posthoc_reconstruction() {
+    // This narrow dependency guard complements the behavioral assertions and
+    // rejects only the removed recovery architecture.
+    let rendered_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/rendered");
+    for file in ["mod.rs", "blocks.rs", "table.rs", "wrap.rs"] {
+        let source = std::fs::read_to_string(rendered_dir.join(file)).unwrap();
+        for removed in [
+            "SourceCandidate",
+            "populate_source_atoms",
+            "inline_sources",
+            "synthetic_columns",
+        ] {
+            assert!(!source.contains(removed), "{file} restored {removed}");
+        }
+    }
 }
 
 #[test]
@@ -200,16 +509,15 @@ fn inline_text(inlines: &[Inline]) -> String {
     for inline in inlines {
         match inline {
             Inline::Text(value) | Inline::Code(value) | Inline::Html(value) => {
-                text.push_str(value);
+                text.push_str(&value.text);
             }
-            Inline::SoftBreak => text.push(' '),
-            Inline::HardBreak => text.push_str("  "),
+            Inline::SoftBreak(value) | Inline::HardBreak(value) => text.push_str(&value.text),
             Inline::Emph(children)
             | Inline::Strong(children)
             | Inline::Strike(children)
             | Inline::Link { text: children, .. } => text.push_str(&inline_text(children)),
-            Inline::Image { alt, .. } => text.push_str(alt),
-            Inline::FootnoteRef(label) => text.push_str(label),
+            Inline::Image { alt, .. } => text.push_str(&inline_text(alt)),
+            Inline::FootnoteRef(label) => text.push_str(&label.text),
         }
     }
     text
@@ -277,7 +585,7 @@ fn test_headings() {
                 assert_eq!(*level as usize, i + 1);
                 assert_eq!(inlines.len(), 1);
                 if let Inline::Text(t) = &inlines[0] {
-                    assert_eq!(*t, format!("H{}", i + 1));
+                    assert_eq!(t.text, format!("H{}", i + 1));
                 } else {
                     panic!("expected Text inline");
                 }
@@ -990,7 +1298,7 @@ fn test_inline_code() {
         BlockKind::Paragraph { inlines } => {
             let has_code = inlines
                 .iter()
-                .any(|i| matches!(i, Inline::Code(c) if c == "cargo build"));
+                .any(|i| matches!(i, Inline::Code(c) if c.text == "cargo build"));
             assert!(has_code, "expected Inline::Code(\"cargo build\")");
         }
         _ => panic!("expected Paragraph, got {:?}", model.blocks[0].kind),

@@ -5,6 +5,8 @@
 //! `Effect`, `Viewport`). It composes `VimCore` (the hjkl wrapper) with the
 //! document model and highlighting pipeline.
 
+mod live_document;
+
 // ── Mode ───────────────────────────────────────────────────────────────────
 
 /// The four user-visible editor modes.
@@ -56,6 +58,18 @@ mod tests {
         }
     }
 
+    fn ctrl(c: char) -> KeyInput {
+        KeyInput {
+            code: KeyCode {
+                kind: KeyCodeKind::Char(c),
+            },
+            mods: Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            },
+        }
+    }
+
     #[test]
     fn session_starts_in_rendered_normal() {
         let mut session = EditorSession::from_text("# Heading\n\nBody\n");
@@ -81,7 +95,7 @@ mod tests {
         let mut session = EditorSession::from_text(&text);
         session.render_layout(80);
         assert_eq!(session.rendered_state.layout_builds, 1);
-        session.vim.reset_work_counters();
+        session.live.reset_work_counters();
 
         for input in [
             key('j'),
@@ -96,12 +110,12 @@ mod tests {
             session.handle_key(input);
             session.render_layout(80);
         }
-        assert_eq!(session.vim.work_counters(), (0, 0));
+        assert_eq!(session.live.work_counters(), (0, 0));
         assert_eq!(session.rendered_state.layout_builds, 1);
 
         session.handle_key(key('i'));
         assert_eq!(session.mode(), Mode::Insert);
-        session.vim.reset_work_counters();
+        session.live.reset_work_counters();
         let line_index_builds = crate::syntax::line_index_build_count();
         for _ in 0..20 {
             session.handle_key(special(KeyCodeKind::Down));
@@ -117,7 +131,7 @@ mod tests {
                 skip_rows: 0,
             });
         }
-        assert_eq!(session.vim.work_counters(), (0, 0));
+        assert_eq!(session.live.work_counters(), (0, 0));
         assert_eq!(crate::syntax::line_index_build_count(), line_index_builds);
 
         session.handle_key(key('x'));
@@ -129,21 +143,21 @@ mod tests {
             left_col: 0,
             skip_rows: 0,
         });
-        assert_eq!(session.vim.work_counters(), (1, 1));
+        assert_eq!(session.live.work_counters(), (2, 1));
         assert_eq!(crate::syntax::line_index_build_count(), line_index_builds);
 
         session.handle_key(esc());
-        session.vim.reset_work_counters();
+        session.live.reset_work_counters();
         session.render_layout(80);
         assert_eq!(session.rendered_state.layout_builds, 2);
-        assert_eq!(session.vim.work_counters(), (1, 0));
+        assert_eq!(session.live.work_counters(), (1, 0));
     }
 
     #[test]
     fn first_actual_width_preserves_source_anchor() {
         let text = "# Heading\n\nA paragraph with enough words to wrap at a narrow width.\n";
         let mut session = EditorSession::from_text(text);
-        session.vim.jump_to(2, 12);
+        session.live.jump_to(2, 12);
         let before = session.cursor();
         session.render_layout(23);
         assert_eq!(session.cursor(), before);
@@ -192,76 +206,435 @@ mod tests {
         assert_eq!(session.mode(), Mode::Normal);
         assert_eq!(session.document(), text);
     }
+
+    #[test]
+    fn interaction_state_select_carries_complete_endpoints() {
+        let mut session = EditorSession::from_text("alpha beta\n");
+        session.render_layout(40);
+        session.handle_key(key('v'));
+        let SessionMode::Select(selection) = &session.session_mode else {
+            panic!("Select mode must carry its state");
+        };
+        assert_eq!(selection.anchor, selection.active);
+        assert_eq!(selection.anchor.point, session.rendered_cursor());
+        assert_eq!(selection.anchor.source, session.cursor());
+        assert!(selection.anchor.atom.is_some());
+        assert!(selection.anchor.line.is_some());
+    }
+
+    #[test]
+    fn selection_state_swap_exchanges_complete_endpoint_identity() {
+        let mut session = EditorSession::from_text("alpha beta gamma\n");
+        session.render_layout(40);
+        session.handle_key(key('v'));
+        session.handle_key(key('w'));
+        let SessionMode::Select(before) = &session.session_mode else {
+            panic!("selection missing");
+        };
+        let before = before.clone();
+        session.handle_key(key('o'));
+        let SessionMode::Select(after) = &session.session_mode else {
+            panic!("selection missing after swap");
+        };
+        assert_eq!(after.anchor, before.active);
+        assert_eq!(after.active, before.anchor);
+        assert_eq!(session.cursor(), after.active.source);
+        assert_eq!(session.rendered_cursor(), after.active.point);
+    }
+
+    #[test]
+    fn selection_state_shape_switch_refreshes_only_shape_specific_projection() {
+        let mut session = EditorSession::from_text("alpha beta\nsecond\n");
+        session.render_layout(40);
+        session.handle_key(key('v'));
+        session.handle_key(key('w'));
+        let SessionMode::Select(before) = &session.session_mode else {
+            panic!("selection missing");
+        };
+        let endpoints = (before.anchor.clone(), before.active.clone());
+        session.handle_key(key('V'));
+        let SessionMode::Select(after) = &session.session_mode else {
+            panic!("selection missing");
+        };
+        assert_eq!((&after.anchor, &after.active), (&endpoints.0, &endpoints.1));
+        assert!(matches!(after.kind, SelectionKind::Line));
+    }
+
+    #[test]
+    fn selection_kind_switch_move_remap_and_return_never_reuses_character_cache() {
+        let mut session = EditorSession::from_text("alpha beta gamma delta\nsecond line\n");
+        session.render_layout(40);
+        session.handle_key(key('v'));
+        session.handle_key(key('w'));
+        if let SessionMode::Select(ActiveSelection {
+            kind: SelectionKind::Character { ranges },
+            ..
+        }) = &mut session.session_mode
+        {
+            *ranges = std::iter::once(usize::MAX - 1..usize::MAX).collect();
+        }
+        session.handle_key(key('V'));
+        session.handle_key(key('j'));
+        session.render_layout(12);
+        session.handle_key(key('v'));
+        let second = session.rendered_selection().unwrap().source_ranges;
+        assert!(!second.iter().any(|range| range.end == usize::MAX));
+        let SessionMode::Select(selection) = &session.session_mode else {
+            panic!("selection missing");
+        };
+        assert!(matches!(selection.kind, SelectionKind::Character { .. }));
+    }
+
+    #[test]
+    fn interaction_state_teardown_is_atomic_for_every_exit() {
+        for exit in [esc(), ctrl('c'), key('v'), key('y')] {
+            let mut session = EditorSession::from_text("alpha beta\n");
+            session.render_layout(40);
+            session.handle_key(key('v'));
+            session.handle_key(exit);
+            assert!(matches!(session.session_mode, SessionMode::CoreDriven));
+            assert_eq!(session.mode(), Mode::Normal);
+            assert!(session.rendered_selection().is_none());
+            assert_eq!(
+                session.rendered_state.register_input,
+                RegisterInput::Default
+            );
+        }
+    }
+
+    #[test]
+    fn core_driven_public_mode_tracks_vim_transitions() {
+        let mut session = EditorSession::from_text("text");
+        session.render_layout(20);
+        session.handle_key(key('i'));
+        assert!(matches!(session.session_mode, SessionMode::CoreDriven));
+        assert_eq!(session.live.mode(), crate::vim::Mode::Insert);
+        assert_eq!(session.mode(), Mode::Insert);
+        session.handle_key(esc());
+        assert_eq!(session.live.mode(), crate::vim::Mode::Normal);
+        assert_eq!(session.mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn register_input_is_consumed_or_cleared_atomically() {
+        let mut session = EditorSession::from_text("alpha beta\n");
+        session.render_layout(40);
+        session.handle_key(key('v'));
+        session.handle_key(key('"'));
+        assert_eq!(
+            session.rendered_state.register_input,
+            RegisterInput::AwaitingName
+        );
+        session.handle_key(key('a'));
+        assert_eq!(
+            session.rendered_state.register_input,
+            RegisterInput::Selected(Register::Named('a'))
+        );
+        session.handle_key(key('y'));
+        assert_eq!(
+            session.rendered_state.register_input,
+            RegisterInput::Default
+        );
+
+        session.handle_key(key('"'));
+        session.handle_key(key('!'));
+        assert_eq!(
+            session.rendered_state.register_input,
+            RegisterInput::Default
+        );
+
+        session.handle_key(key('"'));
+        session.handle_key(ctrl('r'));
+        assert_eq!(
+            session.rendered_state.register_input,
+            RegisterInput::Default
+        );
+    }
+
+    #[test]
+    fn deleting_after_normalized_inline_code_boundary_removes_only_selected_raw_character() {
+        let mut session = EditorSession::from_text("`alpha\nbeta`\n");
+        session.render_layout(40);
+        let beta = session.document().find("beta").unwrap();
+        let point = nav::point_for_source_range(
+            &(beta..beta + 1),
+            session.rendered_state.layout_cache.as_ref().unwrap(),
+        )
+        .expect("beta must have an exact rendered source atom");
+        session.rendered_state.cursor = RenderedCursor::at(point);
+        session.live.jump_to(1, 0);
+
+        session.handle_key(key('v'));
+        session.handle_key(key('d'));
+
+        assert_eq!(session.document(), "`alpha\neta`\n");
+        assert_eq!(session.mode(), Mode::Normal);
+
+        let mut literal = EditorSession::from_text("`left\\|right`\n");
+        literal.render_layout(40);
+        let after_pipe = literal.document().find("right").unwrap();
+        let point = nav::point_for_source_range(
+            &(after_pipe..after_pipe + 1),
+            literal.rendered_state.layout_cache.as_ref().unwrap(),
+        )
+        .expect("character after literal pipe must have an exact source atom");
+        literal.rendered_state.cursor = RenderedCursor::at(point);
+        literal.live.jump_to(0, after_pipe);
+        literal.handle_key(key('v'));
+        literal.handle_key(key('d'));
+        assert_eq!(literal.document(), "`left\\|ight`\n");
+    }
+
+    #[test]
+    fn deleting_after_prose_non_escape_removes_only_selected_raw_character() {
+        let mut session = EditorSession::from_text("left\\qright\n");
+        session.render_layout(40);
+        let after_non_escape = session.document().find("right").unwrap();
+        let point = nav::point_for_source_range(
+            &(after_non_escape..after_non_escape + 1),
+            session.rendered_state.layout_cache.as_ref().unwrap(),
+        )
+        .expect("character after non-escape must have an exact source atom");
+        session.rendered_state.cursor = RenderedCursor::at(point);
+        session.live.jump_to(0, after_non_escape);
+        session.handle_key(key('v'));
+        session.handle_key(key('d'));
+        assert_eq!(session.document(), "left\\qight\n");
+    }
+
+    #[test]
+    fn selection_transition_sequences_preserve_public_invariants() {
+        let mut session = EditorSession::from_text("alpha **beta** gamma\nsecond row\n");
+        for width in [40, 12, 28] {
+            session.render_layout(width);
+            session.handle_key(key('v'));
+            for motion in [key('w'), key('o'), key('V'), key('j'), key('v')] {
+                session.handle_key(motion);
+                if session.mode() == Mode::Select {
+                    let selection = session.rendered_selection().expect("coherent selection");
+                    for range in &selection.source_ranges {
+                        assert!(session.document().is_char_boundary(range.start));
+                        assert!(session.document().is_char_boundary(range.end));
+                    }
+                }
+            }
+            session.handle_key(esc());
+            assert!(session.rendered_selection().is_none());
+        }
+    }
+
+    #[test]
+    fn rendered_search_prompt_carries_draft_and_fixed_origin() {
+        let mut session = EditorSession::from_text("zero\n\nalpha two\n");
+        session.render_layout(40);
+        let origin = session.rendered_state.cursor;
+        session.handle_key(key('/'));
+        session.handle_key(key('a'));
+        let RenderedSearchState::Prompt {
+            draft,
+            origin: stored_origin,
+            ..
+        } = &session.rendered_state.search
+        else {
+            panic!("search prompt missing");
+        };
+        assert_eq!(draft.pattern, "a");
+        assert_eq!(*stored_origin, origin);
+        assert_ne!(session.rendered_state.cursor, origin);
+    }
+
+    #[test]
+    fn rendered_search_submit_cancel_repeat_and_mode_change_are_atomic() {
+        let mut session = EditorSession::from_text("alpha x alpha\n");
+        session.render_layout(40);
+        session.handle_key(key('/'));
+        for c in "alpha".chars() {
+            session.handle_key(key(c));
+        }
+        session.handle_key(special(KeyCodeKind::Enter));
+        assert!(matches!(
+            session.rendered_state.search,
+            RenderedSearchState::Inactive { .. }
+        ));
+        session.handle_key(key('/'));
+        session.handle_key(key('x'));
+        session.handle_key(esc());
+        assert_eq!(session.rendered_search().unwrap().pattern, "alpha");
+        session.handle_key(key('/'));
+        session.enter_insert_from_rendered(RenderedExitAction::Insert);
+        assert!(matches!(
+            session.rendered_state.search,
+            RenderedSearchState::Inactive { .. }
+        ));
+    }
+
+    #[test]
+    fn rendered_search_cancel_preserves_previous_repeat_target() {
+        let mut session = EditorSession::from_text("alpha\n\nbeta\n\nalpha\n\nbeta\n");
+        session.render_layout(40);
+        session.handle_key(key('/'));
+        for c in "alpha".chars() {
+            session.handle_key(key(c));
+        }
+        session.handle_key(special(KeyCodeKind::Enter));
+        session.handle_key(key('/'));
+        for c in "beta".chars() {
+            session.handle_key(key(c));
+        }
+        session.handle_key(esc());
+        assert_eq!(session.rendered_search().unwrap().pattern, "alpha");
+        let before = session.rendered_cursor();
+        session.handle_key(key('n'));
+        assert_ne!(session.rendered_cursor(), before);
+        session.handle_key(key('N'));
+        assert_eq!(session.rendered_search().unwrap().pattern, "alpha");
+    }
+
+    #[test]
+    fn from_text_normalizes_live_text_once() {
+        let session = EditorSession::from_text("one\r\ntwo\rthree\r\n");
+        assert_eq!(session.document(), "one\ntwo\nthree\n");
+        assert_eq!(session.live.highlighter().text(), session.document());
+        assert_eq!(session.line_ending(), LineEnding::CrLf);
+        assert!(session.has_final_newline());
+    }
+
+    #[test]
+    fn session_front_matter_tracks_unsaved_insert_edits() {
+        let mut session = EditorSession::from_text("");
+        session.render_layout(40);
+        session.handle_key(key('i'));
+        session.insert_paste("---\ntitle: live\n---\n");
+        assert!(session.front_matter().is_ok());
+        assert_eq!(
+            session
+                .front_matter()
+                .value()
+                .and_then(|value| value.get("title")),
+            Some(&crate::frontmatter::Value::str("live".to_string()))
+        );
+        assert_eq!(session.live.highlighter().text(), session.document());
+    }
+
+    #[test]
+    fn session_front_matter_tracks_substitute_undo_and_redo() {
+        let mut session = EditorSession::from_text("---\ntitle: old\n---\n\nbody\n");
+        session.render_layout(40);
+        for input in [
+            key(':'),
+            key('%'),
+            key('s'),
+            key('/'),
+            key('o'),
+            key('l'),
+            key('d'),
+            key('/'),
+            key('n'),
+            key('e'),
+            key('w'),
+            key('/'),
+            special(KeyCodeKind::Enter),
+        ] {
+            session.handle_key(input);
+        }
+        assert_eq!(
+            session
+                .front_matter()
+                .value()
+                .and_then(|value| value.get("title")),
+            Some(&crate::frontmatter::Value::str("new".to_string()))
+        );
+        session.handle_key(key('u'));
+        assert_eq!(
+            session
+                .front_matter()
+                .value()
+                .and_then(|value| value.get("title")),
+            Some(&crate::frontmatter::Value::str("old".to_string()))
+        );
+        session.handle_key(ctrl('r'));
+        assert_eq!(
+            session
+                .front_matter()
+                .value()
+                .and_then(|value| value.get("title")),
+            Some(&crate::frontmatter::Value::str("new".to_string()))
+        );
+    }
+
+    #[test]
+    fn all_mutation_entry_points_refresh_derived_state() {
+        let mut session = EditorSession::from_text("alpha\n");
+        session.render_layout(20);
+        session.handle_key(key('i'));
+        session.insert_paste("prefix ");
+        session.handle_key(esc());
+        session.handle_key(key('u'));
+        session.handle_key(ctrl('r'));
+        session.render_layout(20);
+        session.handle_key(key('v'));
+        session.handle_key(key('w'));
+        session.handle_key(key('d'));
+        session.handle_key(key('p'));
+        assert_eq!(session.live.highlighter().text(), session.document());
+        assert_eq!(
+            crate::frontmatter::parse_front_matter(&session.document()),
+            *session.front_matter()
+        );
+        assert!(session.rendered_state.layout_cache.is_none());
+    }
+
+    #[test]
+    fn session_metadata_survives_text_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata.md");
+        std::fs::write(&path, "one\r\ntwo\r\n").unwrap();
+        let mut session = EditorSession::open(&path).unwrap();
+        session.render_layout(20);
+        session.handle_key(key('i'));
+        session.insert_paste("changed ");
+        assert_eq!(session.path(), Some(path.as_path()));
+        assert_eq!(session.line_ending(), LineEnding::CrLf);
+        assert!(session.has_final_newline());
+        assert!(!session.is_new());
+    }
+
+    #[test]
+    fn session_save_uses_authoritative_live_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("saved.md");
+        let mut session = EditorSession::from_text("old\n");
+        session.render_layout(20);
+        session.handle_key(key('i'));
+        session.insert_paste("new ");
+        let expected = session.document();
+        session.save(Some(&path), false).unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), expected);
+    }
+
+    #[test]
+    fn core_gt_and_g_upper_t_emit_typed_tab_effects() {
+        let mut session = EditorSession::from_text("one\n");
+        session.render_layout(20);
+
+        assert!(session.handle_key(key('g')).is_empty());
+        assert_eq!(session.handle_key(key('t')), vec![Effect::TabNext]);
+
+        assert!(session.handle_key(key('g')).is_empty());
+        assert_eq!(session.handle_key(key('T')), vec![Effect::TabPrev]);
+
+        assert!(session.handle_key(key('3')).is_empty());
+        assert!(session.handle_key(key('g')).is_empty());
+        assert_eq!(
+            session.handle_key(key('t')),
+            vec![Effect::TabJump {
+                one_based: std::num::NonZeroUsize::new(3).unwrap(),
+            }]
+        );
+    }
 }
 
-// ── KeyInput / KeyCode / Modifiers ─────────────────────────────────────────
-
-/// Terminal-agnostic key representation (mirrors, but does not expose,
-/// crossterm's model).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct KeyInput {
-    /// The key code.
-    pub code: KeyCode,
-    /// The modifiers.
-    pub mods: Modifiers,
-}
-
-/// A key code — either a printable character or a special key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct KeyCode {
-    /// The key code kind.
-    pub kind: KeyCodeKind,
-}
-
-/// A key code — either a printable character or a special key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum KeyCodeKind {
-    /// An input that is intentionally ignored.
-    Noop,
-    /// A printable character.
-    Char(char),
-    /// Enter / Return key.
-    Enter,
-    /// Escape key.
-    Esc,
-    /// Backspace key.
-    Backspace,
-    /// Tab key.
-    Tab,
-    /// Shift-Tab key.
-    BackTab,
-    /// Up arrow key.
-    Up,
-    /// Down arrow key.
-    Down,
-    /// Left arrow key.
-    Left,
-    /// Right arrow key.
-    Right,
-    /// Home key.
-    Home,
-    /// End key.
-    End,
-    /// Page Up key.
-    PageUp,
-    /// Page Down key.
-    PageDown,
-    /// Delete key.
-    Delete,
-    /// Function key F1-F24.
-    F(u8),
-}
-
-/// Keyboard modifier bits accompanying every keystroke.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct Modifiers {
-    /// Ctrl modifier pressed.
-    pub ctrl: bool,
-    /// Alt/Option modifier pressed.
-    pub alt: bool,
-    /// Shift modifier pressed.
-    pub shift: bool,
-}
+use crate::input::{KeyCode, KeyCodeKind, KeyInput, Modifiers};
 
 // ── Effect ─────────────────────────────────────────────────────────────────
 
@@ -308,13 +681,8 @@ pub enum Effect {
     CursorMoved,
     /// Buffer was edited (dirty may have changed).
     Edited,
-    /// A host-owned boolean option was changed by an ex command.
-    SetOption {
-        /// Stable option key understood by the host.
-        key: String,
-        /// New option value.
-        value: bool,
-    },
+    /// Enable or disable source-line wrapping.
+    SetWrap(bool),
     /// Help was requested through the core command line (`:help`).
     ///
     /// The TUI opens its command palette with the Vim reference section.
@@ -339,7 +707,7 @@ pub enum Effect {
     /// Jump to a specific tab by 1-based index (from `{count}gt`).
     TabJump {
         /// 1-based tab index.
-        index: usize,
+        one_based: std::num::NonZeroUsize,
     },
     /// Quit all tabs (from `:qa` or `:qa!`).
     QuitAllRequested {
@@ -385,19 +753,22 @@ pub struct Viewport {
 
 // ── VimCore re-export (internal) ──────────────────────────────────────────
 
-use crate::vim::{RangeOperator, Register, UndoMark, VimCore, VimEffect};
+use crate::vim::{
+    ProjectedBlockRow, ProjectedSelection, RangeOperator, Register, UndoMark, VimEffect,
+};
 
 // ── Document (internal) ───────────────────────────────────────────────────
 
-use crate::document::Document;
+use crate::document::{Document, LineEnding};
 use crate::error::{OpenError, SaveError};
+use crate::frontmatter::FrontMatter;
 use crate::rendered::nav;
 use crate::rendered::BlockModel;
 use crate::style::{
     RenderedCursor, RenderedLayout, RenderedPoint, RenderedSearch, RenderedSelection,
     SearchDirection, SelectionShape,
 };
-use crate::syntax::Highlighter;
+use live_document::LiveDocument;
 use std::ops::Range;
 
 /// Vim action applied after mapping a rendered cursor to source editing.
@@ -431,7 +802,186 @@ impl RenderedExitAction {
     }
 }
 
+/// Translate renderer-owned selection geometry into the minimal request the
+/// Vim adapter needs. This is the sole boundary between rendered DTOs and the
+/// editor-engine wrapper.
+fn project_selection_for_vim(selection: RenderedSelection) -> ProjectedSelection {
+    match selection.shape {
+        SelectionShape::Character => ProjectedSelection::Character {
+            ranges: selection.source_ranges,
+        },
+        SelectionShape::Line => ProjectedSelection::Line {
+            ranges: selection.source_ranges,
+        },
+        SelectionShape::Block => ProjectedSelection::Block {
+            width: selection.block_width.unwrap_or_default(),
+            rows: selection
+                .rows
+                .into_iter()
+                .map(|row| ProjectedBlockRow {
+                    selected_width: row.columns.end.saturating_sub(row.columns.start),
+                    ranges: row.source_ranges,
+                })
+                .collect(),
+        },
+    }
+}
+
 // ── RenderedState ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectionEndpoint {
+    point: RenderedPoint,
+    source: (usize, usize),
+    atom: Option<Range<usize>>,
+    line: Option<(Range<usize>, usize)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SelectionKind {
+    Character { ranges: Vec<Range<usize>> },
+    Line,
+    Block,
+}
+
+impl SelectionKind {
+    fn shape(&self) -> SelectionShape {
+        match self {
+            Self::Character { .. } => SelectionShape::Character,
+            Self::Line => SelectionShape::Line,
+            Self::Block => SelectionShape::Block,
+        }
+    }
+
+    fn from_shape(shape: SelectionShape) -> Self {
+        match shape {
+            SelectionShape::Character => Self::Character { ranges: Vec::new() },
+            SelectionShape::Line => Self::Line,
+            SelectionShape::Block => Self::Block,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveSelection {
+    anchor: SelectionEndpoint,
+    active: SelectionEndpoint,
+    kind: SelectionKind,
+}
+
+impl ActiveSelection {
+    fn swap_endpoints(&mut self) {
+        std::mem::swap(&mut self.anchor, &mut self.active);
+    }
+
+    fn switch_kind(&mut self, shape: SelectionShape) {
+        self.kind = SelectionKind::from_shape(shape);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionMode {
+    CoreDriven,
+    Select(ActiveSelection),
+    Command,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum RegisterInput {
+    #[default]
+    Default,
+    AwaitingName,
+    Selected(Register),
+}
+
+impl RegisterInput {
+    fn select(&mut self, selector: char) {
+        *self = EditorSession::rendered_register(selector)
+            .map(Self::Selected)
+            .unwrap_or(Self::Default);
+    }
+
+    fn take(&mut self) -> Register {
+        match std::mem::take(self) {
+            Self::Selected(register) => register,
+            Self::Default | Self::AwaitingName => Register::Unnamed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RenderedSearchState {
+    Inactive {
+        last: Option<RenderedSearch>,
+    },
+    Prompt {
+        draft: RenderedSearch,
+        origin: RenderedCursor,
+        last: Option<RenderedSearch>,
+    },
+}
+
+impl Default for RenderedSearchState {
+    fn default() -> Self {
+        Self::Inactive { last: None }
+    }
+}
+
+impl RenderedSearchState {
+    fn current(&self) -> Option<&RenderedSearch> {
+        match self {
+            Self::Inactive { last } => last.as_ref(),
+            Self::Prompt { draft, .. } => Some(draft),
+        }
+    }
+
+    fn prompt(&self) -> Option<(&RenderedSearch, &RenderedCursor)> {
+        match self {
+            Self::Prompt { draft, origin, .. } => Some((draft, origin)),
+            Self::Inactive { .. } => None,
+        }
+    }
+
+    fn begin(&mut self, draft: RenderedSearch, origin: RenderedCursor) {
+        let last = match std::mem::take(self) {
+            Self::Inactive { last } | Self::Prompt { last, .. } => last,
+        };
+        *self = Self::Prompt {
+            draft,
+            origin,
+            last,
+        };
+    }
+
+    fn update_draft(&mut self, update: impl FnOnce(&mut RenderedSearch)) {
+        if let Self::Prompt { draft, .. } = self {
+            update(draft);
+        }
+    }
+
+    fn submit(&mut self) {
+        let replacement = match std::mem::take(self) {
+            Self::Prompt { draft, .. } => Some(draft),
+            Self::Inactive { last } => last,
+        };
+        *self = Self::Inactive { last: replacement };
+    }
+
+    fn cancel(&mut self) {
+        let last = match std::mem::take(self) {
+            Self::Prompt { last, .. } | Self::Inactive { last } => last,
+        };
+        *self = Self::Inactive { last };
+    }
+
+    fn replace_last(&mut self, search: RenderedSearch) {
+        *self = Self::Inactive { last: Some(search) };
+    }
+
+    fn clear(&mut self) {
+        *self = Self::Inactive { last: None };
+    }
+}
 
 /// Persistent state shared by rendered Normal, Select, and Command.
 ///
@@ -444,40 +994,12 @@ struct RenderedState {
     last_width: u16,
     /// Current cursor position in rendered coordinates.
     cursor: RenderedCursor,
-    /// Select anchor display point. Present exactly while public mode is Select.
-    select_anchor: Option<RenderedPoint>,
-    /// Active Select shape.
-    selection_shape: SelectionShape,
-    /// Canonical source position for the Select anchor.
-    ///
-    /// The rendered row is derived from this position whenever wrapping
-    /// changes, so a resize cannot silently move one endpoint of a selection.
-    select_anchor_source: Option<(usize, usize)>,
-    /// Exact source atom under the Select anchor.
-    select_anchor_atom: Option<Range<usize>>,
-    /// Whether the anchor is source-backed rather than synthetic.
-    select_anchor_atom_exact: bool,
-    /// Exact source atom under the active Select endpoint.
-    select_active_atom: Option<Range<usize>>,
-    /// Whether the active endpoint is source-backed rather than synthetic.
-    select_active_atom_exact: bool,
-    /// Source-line identity and wrapped-row ordinal for the Select anchor.
-    select_anchor_line: Option<(Range<usize>, usize)>,
-    /// Source-line identity and wrapped-row ordinal for the active endpoint.
-    select_active_line: Option<(Range<usize>, usize)>,
-    /// Stable character-wise source projection. This is deliberately not
-    /// used for line- or block-wise selection, whose geometry is recomputed.
-    select_character_ranges: Vec<Range<usize>>,
-    /// Explicit register prefix pending in Select.
-    pending_register: Option<Register>,
-    /// Whether Select has received the opening `"` register prefix.
-    register_prefix_pending: bool,
-    /// Active search state (if in search mode).
-    search: Option<RenderedSearch>,
-    /// Whether typed characters are currently extending the search pattern.
-    search_input_active: bool,
-    /// Cursor position captured when the active search prompt was opened.
-    search_origin: Option<RenderedCursor>,
+    /// Mutually exclusive register-prefix input state, shared by Normal put
+    /// and Select operators.
+    register_input: RegisterInput,
+    /// Submitted rendered search or an atomic prompt with fixed origin and
+    /// preserved prior history.
+    search: RenderedSearchState,
     /// Whether the front-matter panel is collapsed.
     fm_collapsed: bool,
     /// Accumulated numeric count for navigation commands.
@@ -497,21 +1019,8 @@ impl RenderedState {
             layout_cache: None,
             last_width: 0,
             cursor: RenderedCursor::new(0),
-            select_anchor: None,
-            selection_shape: SelectionShape::Character,
-            select_anchor_source: None,
-            select_anchor_atom: None,
-            select_anchor_atom_exact: false,
-            select_active_atom: None,
-            select_active_atom_exact: false,
-            select_anchor_line: None,
-            select_active_line: None,
-            select_character_ranges: Vec::new(),
-            pending_register: None,
-            register_prefix_pending: false,
-            search: None,
-            search_input_active: false,
-            search_origin: None,
+            register_input: RegisterInput::Default,
+            search: RenderedSearchState::default(),
             fm_collapsed: false,
             count: 0,
             pending_g: false,
@@ -529,13 +1038,6 @@ impl RenderedState {
     fn invalidate(&mut self) {
         self.layout_cache = None;
     }
-
-    /// Clear search state.
-    fn clear_search(&mut self) {
-        self.search = None;
-        self.search_input_active = false;
-        self.search_origin = None;
-    }
 }
 
 // ── EditorSession ──────────────────────────────────────────────────────────
@@ -545,10 +1047,10 @@ impl RenderedState {
 ///
 /// See architecture §6 for the full API contract.
 pub struct EditorSession {
-    /// The hjkl wrapper — owns the modal editing engine.
-    vim: VimCore,
-    /// The current public mode.
-    mode: Mode,
+    /// Canonical live text plus synchronously-derived caches.
+    live: LiveDocument,
+    /// Session-owned modes; Normal and Insert are always derived from Vim.
+    session_mode: SessionMode,
     /// Dirty generation at last save.
     save_point: UndoMark,
     /// Buffer for ex-command text in Command mode.
@@ -557,8 +1059,6 @@ pub struct EditorSession {
     document: Document,
     /// Persistent rendered navigation and Select state.
     rendered_state: RenderedState,
-    /// Syntax highlighter — kept in sync with buffer edits.
-    highlighter: Highlighter,
 }
 
 impl EditorSession {
@@ -567,23 +1067,23 @@ impl EditorSession {
     /// # Example
     ///
     /// ```
-    /// use oom_edit_core::session::EditorSession;
+    /// use oom_edit_core::EditorSession;
     ///
     /// let session = EditorSession::from_text("# Hello\n\nWorld\n");
-    /// assert_eq!(session.mode(), oom_edit_core::session::Mode::Normal);
+    /// assert_eq!(session.mode(), oom_edit_core::Mode::Normal);
     /// assert_eq!(session.line_count(), 4);
     /// ```
     pub fn from_text(text: &str) -> Self {
-        let mut document = Document::from_text(text);
-        let save_point = document.save_point();
+        let (normalized, document) = Document::from_text(text).into_parts();
+        let mut live = LiveDocument::new(&normalized);
+        let save_point = live.save_point();
         Self {
-            vim: VimCore::new(text),
-            mode: Mode::Normal,
+            live,
+            session_mode: SessionMode::CoreDriven,
             save_point,
             command_buffer: String::new(),
             document,
             rendered_state: RenderedState::new(),
-            highlighter: Highlighter::new(text),
         }
     }
 
@@ -595,17 +1095,16 @@ impl EditorSession {
     /// Per FR-5.1: invalid UTF-8 is refused with the byte offset of the
     /// first bad byte.
     pub fn open(path: &std::path::Path) -> Result<Self, OpenError> {
-        let mut document = Document::open(path)?;
-        let text = document.text().to_string();
-        let save_point = document.save_point();
+        let (text, document) = Document::open(path)?.into_parts();
+        let mut live = LiveDocument::new(&text);
+        let save_point = live.save_point();
         Ok(Self {
-            vim: VimCore::new(&text),
-            mode: Mode::Normal,
+            live,
+            session_mode: SessionMode::CoreDriven,
             save_point,
             command_buffer: String::new(),
             document,
             rendered_state: RenderedState::new(),
-            highlighter: Highlighter::new(&text),
         })
     }
 
@@ -617,17 +1116,13 @@ impl EditorSession {
     /// modified and `force` is `false` (FR-5.7).
     pub fn save(&mut self, path: Option<&std::path::Path>, force: bool) -> Result<(), SaveError> {
         // Get the current text from the vim buffer
-        let text = self.vim.text();
+        let text = self.live.text();
         // Save using the document's I/O logic, passing the vim buffer text
         self.document.save_with_text(&text, path, force)?;
         // The vim engine owns the authoritative dirty generation. Capture it
-        // once after the save succeeds, then keep the session and standalone
-        // document I/O state synchronized to that same mark.
-        let mark = self.vim.save_point();
+        // once after the save succeeds.
+        let mark = self.live.save_point();
         self.save_point = mark;
-        self.document.set_save_point(mark);
-        // Rebuild the highlighter with saved text
-        self.highlighter = Highlighter::new(&text);
         self.rendered_state.invalidate();
         Ok(())
     }
@@ -635,7 +1130,7 @@ impl EditorSession {
     /// Atomically save a copy without retargeting the buffer or clearing its
     /// dirty state (`:w {path}`).
     pub fn save_copy(&self, path: &std::path::Path) -> Result<(), SaveError> {
-        self.document.save_copy_with_text(&self.vim.text(), path)
+        self.document.save_copy_with_text(&self.live.text(), path)
     }
 
     /// Handle a key input. Returns zero or more effects.
@@ -643,7 +1138,7 @@ impl EditorSession {
     /// # Example
     ///
     /// ```
-    /// use oom_edit_core::session::{EditorSession, KeyInput, KeyCode, KeyCodeKind, Modifiers};
+    /// use oom_edit_core::{EditorSession, KeyInput, KeyCode, KeyCodeKind, Modifiers};
     ///
     /// let mut session = EditorSession::from_text("hello");
     /// let key = KeyInput {
@@ -651,8 +1146,8 @@ impl EditorSession {
     ///     mods: Modifiers::default(),
     /// };
     /// let effects = session.handle_key(key);
-    /// assert!(effects.iter().any(|e| matches!(e, oom_edit_core::session::Effect::ModeChanged(_))));
-    /// assert_eq!(session.mode(), oom_edit_core::session::Mode::Insert);
+    /// assert!(effects.iter().any(|e| matches!(e, oom_edit_core::Effect::ModeChanged(_))));
+    /// assert_eq!(session.mode(), oom_edit_core::Mode::Insert);
     /// ```
     pub fn handle_key(&mut self, key: KeyInput) -> Vec<Effect> {
         // Unsupported terminal keys are consumed without reaching any mode
@@ -662,7 +1157,7 @@ impl EditorSession {
             return Vec::new();
         }
 
-        match self.mode {
+        match self.mode() {
             Mode::Normal => self.handle_rendered_normal_key(key),
             Mode::Select => self.handle_rendered_select_key(key),
             Mode::Insert => self.handle_insert_key(key),
@@ -672,32 +1167,57 @@ impl EditorSession {
 
     /// Return the current mode.
     pub fn mode(&self) -> Mode {
-        self.mode
+        match self.session_mode {
+            SessionMode::CoreDriven => {
+                if self.live.mode() == crate::vim::Mode::Insert {
+                    Mode::Insert
+                } else {
+                    Mode::Normal
+                }
+            }
+            SessionMode::Select(_) => Mode::Select,
+            SessionMode::Command => Mode::Command,
+        }
     }
 
     /// Return the full document text.
     pub fn document(&self) -> String {
-        self.vim.text()
+        self.live.text()
     }
 
-    /// Return the syntax highlighter.
-    pub fn highlighter(&self) -> &Highlighter {
-        &self.highlighter
+    /// Return the current file path, if this buffer has one.
+    pub fn path(&self) -> Option<&std::path::Path> {
+        self.document.path()
     }
 
-    /// Return a reference to the document model.
-    pub fn document_ref(&self) -> &Document {
-        &self.document
+    /// Whether this buffer targets a path that has not yet been saved.
+    pub fn is_new(&self) -> bool {
+        self.document.is_new()
+    }
+
+    /// Line-ending policy retained for serialization.
+    pub fn line_ending(&self) -> LineEnding {
+        self.document.line_ending()
+    }
+
+    /// Whether serialization retains a final newline.
+    pub fn has_final_newline(&self) -> bool {
+        self.document.has_final_newline()
+    }
+
+    /// Parsed front matter derived from the current unsaved live text.
+    pub fn front_matter(&self) -> &FrontMatter {
+        self.live.front_matter()
     }
 
     /// Return cursor position as `(line, col)` — 0-based.
     pub fn cursor(&self) -> (usize, usize) {
-        self.vim.cursor()
+        self.live.cursor()
     }
 
     /// Return the unprefixed command-line text, or `None` outside Command mode.
     pub fn command_line(&self) -> Option<String> {
-        (self.mode == Mode::Command).then(|| self.command_buffer.clone())
+        (self.mode() == Mode::Command).then(|| self.command_buffer.clone())
     }
 
     /// Return the active rendered-search prompt, including `/` or `?` prefix.
@@ -705,10 +1225,7 @@ impl EditorSession {
     /// Submitted or cancelled prompts return `None` even though the last
     /// search remains available for `n`/`N`.
     pub fn rendered_search_prompt(&self) -> Option<String> {
-        if !self.rendered_state.search_input_active {
-            return None;
-        }
-        let search = self.rendered_state.search.as_ref()?;
+        let (search, _) = self.rendered_state.search.prompt()?;
         let prefix = match search.last_direction {
             SearchDirection::Forward => '/',
             SearchDirection::Backward => '?',
@@ -733,37 +1250,38 @@ impl EditorSession {
 
     /// Return the retained rendered search state.
     pub fn rendered_search(&self) -> Option<&RenderedSearch> {
-        self.rendered_state.search.as_ref()
+        self.rendered_state.search.current()
     }
 
     /// Return renderer-neutral Select metadata, or `None` outside Select.
     pub fn rendered_selection(&self) -> Option<RenderedSelection> {
-        let anchor = self.rendered_state.select_anchor?;
-        let anchor_source = self.rendered_state.select_anchor_source?;
+        let SessionMode::Select(active) = &self.session_mode else {
+            return None;
+        };
         let layout = self.rendered_state.layout_cache.as_ref()?;
         let mut selection = nav::project_selection_from_source_positions(
-            anchor,
-            self.rendered_state.cursor.point(),
-            self.rendered_state.selection_shape,
-            anchor_source,
-            self.vim.cursor(),
+            active.anchor.point,
+            active.active.point,
+            active.kind.shape(),
+            active.anchor.source,
+            active.active.source,
             layout,
-            &self.vim.text(),
+            &self.live.text(),
         );
-        if selection.shape == SelectionShape::Character {
-            selection.source_ranges = self.rendered_state.select_character_ranges.clone();
+        if let SelectionKind::Character { ranges } = &active.kind {
+            selection.source_ranges = ranges.clone();
         }
         Some(selection)
     }
 
     /// Check if the buffer is dirty (modified since last save).
     pub fn is_dirty(&self) -> bool {
-        self.vim.is_modified_since(self.save_point)
+        self.live.is_modified_since(self.save_point)
     }
 
     /// Take a save point (marks current state as clean).
     pub fn save_point(&mut self) {
-        self.save_point = self.vim.save_point();
+        self.save_point = self.live.save_point();
     }
 
     /// Insert text at the current cursor position as a single paste operation.
@@ -776,28 +1294,25 @@ impl EditorSession {
     /// ignored (not in Insert mode).
     pub fn insert_paste(&mut self, text: &str) -> Vec<Effect> {
         // Only paste in Insert mode (FR-5.5)
-        if self.mode != Mode::Insert {
+        if self.mode() != Mode::Insert {
             return vec![Effect::Message {
                 text: "paste only works in insert mode".to_string(),
                 severity: Severity::Info,
             }];
         }
 
-        let edits = self.vim.insert_text(text);
-        // Apply edits to the highlighter
-        self.highlighter.apply_edit(&edits);
-        self.rendered_state.invalidate();
-        vec![Effect::Edited]
+        let outcome = self.live.insert_text(text);
+        self.translate_vim_effects(outcome)
     }
 
     /// Return the number of lines in the document.
     pub fn line_count(&self) -> usize {
-        self.vim.line_count()
+        self.live.line_count()
     }
 
     /// Return a specific line (0-based), or `None` if out of range.
     pub fn line(&self, idx: usize) -> Option<String> {
-        self.vim.line(idx)
+        self.live.line(idx)
     }
 
     /// Return the cursor's visual row within a document line and that line's
@@ -851,7 +1366,7 @@ impl EditorSession {
     /// # Example
     ///
     /// ```
-    /// use oom_edit_core::session::{EditorSession, Viewport};
+    /// use oom_edit_core::{EditorSession, Viewport};
     ///
     /// let mut session = EditorSession::from_text("# Hello\n\nWorld\n");
     /// let vp = Viewport {
@@ -867,7 +1382,7 @@ impl EditorSession {
     /// assert!(!frame.lines[0].text.is_empty()); // first line has content
     /// ```
     pub fn render_source(&mut self, vp: Viewport) -> crate::style::SourceFrame {
-        self.vim.set_viewport(vp.top_line, vp.height);
+        self.live.set_viewport(vp.top_line, vp.height);
         let line_count = self.line_count();
         let (cursor_line, cursor_col) = self.cursor();
 
@@ -878,9 +1393,12 @@ impl EditorSession {
         // Highlight the visible lines (pad to viewport height)
         let start_line = first_visible.min(line_count);
         let end_line = last_visible.min(line_count);
-        let mut highlighted = self.highlighter.highlight_lines(start_line..end_line);
+        let mut highlighted = self
+            .live
+            .highlighter()
+            .highlight_lines(start_line..end_line);
         for (offset, styled_line) in highlighted.iter_mut().enumerate() {
-            for search_match in self.vim.search_matches_for_line(start_line + offset) {
+            for search_match in self.live.search_matches_for_line(start_line + offset) {
                 Self::overlay_search_match(styled_line, search_match);
             }
         }
@@ -1133,7 +1651,7 @@ impl EditorSession {
     /// # Example
     ///
     /// ```
-    /// use oom_edit_core::session::EditorSession;
+    /// use oom_edit_core::EditorSession;
     ///
     /// let mut session = EditorSession::from_text("# Hello\n\n* item\n");
     /// let layout = session.render_layout(80);
@@ -1141,46 +1659,58 @@ impl EditorSession {
     /// ```
     pub fn render_layout(&mut self, width: u16) -> &crate::style::RenderedLayout {
         if self.rendered_state.needs_layout(width) {
-            let source_anchor = self.vim.cursor();
-            let select_anchor_source = self.rendered_state.select_anchor_source;
-            let select_anchor_atom = self.rendered_state.select_anchor_atom.clone();
-            let select_active_atom = self.rendered_state.select_active_atom.clone();
-            let select_anchor_line = self.rendered_state.select_anchor_line.clone();
-            let select_active_line = self.rendered_state.select_active_line.clone();
-            let character_selection =
-                self.rendered_state.selection_shape == SelectionShape::Character;
-            let block_selection = self.rendered_state.selection_shape == SelectionShape::Block;
+            let source_anchor = self.live.cursor();
+            let selection = match &self.session_mode {
+                SessionMode::Select(selection) => Some(selection.clone()),
+                SessionMode::CoreDriven | SessionMode::Command => None,
+            };
+            let character_selection = selection
+                .as_ref()
+                .is_some_and(|selection| matches!(selection.kind, SelectionKind::Character { .. }));
+            let block_selection = selection
+                .as_ref()
+                .is_some_and(|selection| matches!(selection.kind, SelectionKind::Block));
             let active_atom_remap = character_selection
-                || (block_selection && self.rendered_state.select_active_atom_exact);
+                || (block_selection
+                    && selection
+                        .as_ref()
+                        .is_some_and(|selection| selection.active.atom.is_some()));
             let anchor_atom_remap = character_selection
-                || (block_selection && self.rendered_state.select_anchor_atom_exact);
-            let text = self.vim.text();
+                || (block_selection
+                    && selection
+                        .as_ref()
+                        .is_some_and(|selection| selection.anchor.atom.is_some()));
+            let text = self.live.text();
             let fm_span = crate::frontmatter::front_matter_span(&text);
             let model = BlockModel::build(&text, fm_span);
             let layout = RenderedLayout::build_with_front_matter_state(
                 &model,
                 width,
-                &self.highlighter,
+                self.live.highlighter(),
                 self.rendered_state.fm_collapsed,
             );
             let cursor = active_atom_remap
                 .then(|| {
-                    select_active_atom
+                    selection
                         .as_ref()
+                        .and_then(|selection| selection.active.atom.as_ref())
                         .and_then(|source| nav::point_for_source_range(source, &layout))
                 })
                 .flatten()
                 .or_else(|| {
                     (block_selection && !active_atom_remap)
                         .then(|| {
-                            select_active_line.as_ref().and_then(|(source, ordinal)| {
-                                nav::point_for_line_identity(
-                                    source,
-                                    *ordinal,
-                                    self.rendered_state.cursor.column,
-                                    &layout,
-                                )
-                            })
+                            selection
+                                .as_ref()
+                                .and_then(|selection| selection.active.line.as_ref())
+                                .and_then(|(source, ordinal)| {
+                                    nav::point_for_line_identity(
+                                        source,
+                                        *ordinal,
+                                        self.rendered_state.cursor.column,
+                                        &layout,
+                                    )
+                                })
                         })
                         .flatten()
                 })
@@ -1190,35 +1720,46 @@ impl EditorSession {
                 });
             let select_anchor = anchor_atom_remap
                 .then(|| {
-                    select_anchor_atom
+                    selection
                         .as_ref()
+                        .and_then(|selection| selection.anchor.atom.as_ref())
                         .and_then(|source| nav::point_for_source_range(source, &layout))
                 })
                 .flatten()
                 .or_else(|| {
                     (block_selection && !anchor_atom_remap)
                         .then(|| {
-                            select_anchor_line.as_ref().and_then(|(source, ordinal)| {
-                                nav::point_for_line_identity(
-                                    source,
-                                    *ordinal,
-                                    self.rendered_state
-                                        .select_anchor
-                                        .map_or(0, |point| point.column),
-                                    &layout,
-                                )
-                            })
+                            selection
+                                .as_ref()
+                                .and_then(|selection| selection.anchor.line.as_ref())
+                                .and_then(|(source, ordinal)| {
+                                    nav::point_for_line_identity(
+                                        source,
+                                        *ordinal,
+                                        selection
+                                            .as_ref()
+                                            .map_or(0, |selection| selection.anchor.point.column),
+                                        &layout,
+                                    )
+                                })
                         })
                         .flatten()
                 })
                 .or_else(|| {
-                    select_anchor_source
-                        .map(|(line, col)| nav::enter_rendered(line, col, &layout, &text).point())
+                    selection.as_ref().map(|selection| {
+                        let (line, col) = selection.anchor.source;
+                        nav::enter_rendered(line, col, &layout, &text).point()
+                    })
                 });
             self.rendered_state.layout_cache = Some(layout);
             self.rendered_state.last_width = width;
             self.rendered_state.cursor = cursor;
-            self.rendered_state.select_anchor = select_anchor;
+            if let SessionMode::Select(selection) = &mut self.session_mode {
+                if let Some(select_anchor) = select_anchor {
+                    selection.anchor.point = select_anchor;
+                }
+                selection.active.point = cursor.point();
+            }
             #[cfg(test)]
             {
                 self.rendered_state.layout_builds += 1;
@@ -1247,7 +1788,7 @@ impl EditorSession {
         let Some(layout) = self.rendered_state.layout_cache.as_ref() else {
             return;
         };
-        let text = self.vim.text();
+        let text = self.live.text();
         self.rendered_state.cursor = nav::enter_rendered(edit_line, edit_col, layout, &text);
     }
 
@@ -1260,7 +1801,7 @@ impl EditorSession {
             KeyCodeKind::Esc => {
                 // Cancel command-line and return to Normal
                 self.command_buffer.clear();
-                self.mode = Mode::Normal;
+                self.session_mode = SessionMode::CoreDriven;
                 effects.push(Effect::ModeChanged(Mode::Normal));
             }
             KeyCodeKind::Enter => {
@@ -1270,7 +1811,7 @@ impl EditorSession {
                 effects.extend(self.process_ex_command(&cmd));
                 // Only default to Normal if the ex command didn't already change mode
                 if !effects.iter().any(|e| matches!(e, Effect::ModeChanged(_))) {
-                    self.mode = Mode::Normal;
+                    self.session_mode = SessionMode::CoreDriven;
                     effects.push(Effect::ModeChanged(Mode::Normal));
                 }
             }
@@ -1291,23 +1832,31 @@ impl EditorSession {
     }
 
     fn handle_insert_key(&mut self, key: KeyInput) -> Vec<Effect> {
-        let vim_key = self.key_input_to_vim(key);
-        let vim_effects = self.vim.handle_key(vim_key);
+        let vim_effects = self.live.handle_key(key);
         self.translate_vim_effects(vim_effects)
     }
 
     fn handle_rendered_normal_key(&mut self, key: KeyInput) -> Vec<Effect> {
-        if self.rendered_state.search_input_active {
+        if self.rendered_state.search.prompt().is_some() {
             return self.handle_rendered_search_input(key);
         }
-        if self.rendered_state.register_prefix_pending {
-            self.rendered_state.register_prefix_pending = false;
+        if self.rendered_state.register_input == RegisterInput::AwaitingName {
             if let KeyCodeKind::Char(selector) = key.code.kind {
                 if key.mods == Modifiers::default() {
-                    self.rendered_state.pending_register = Self::rendered_register(selector);
+                    self.rendered_state.register_input.select(selector);
+                    return Vec::new();
                 }
             }
-            return Vec::new();
+            self.rendered_state.register_input = RegisterInput::Default;
+        }
+        if self.live.has_pending_input() {
+            return self.forward_key_to_vim(key);
+        }
+        if let Some(effects) = self.rendered_tab_effect(key) {
+            return effects;
+        }
+        if let Some(effects) = self.forward_pending_native_g(key) {
+            return effects;
         }
         if self.first_rendered_g_is_pending(key) {
             return Vec::new();
@@ -1327,12 +1876,13 @@ impl EditorSession {
                     return self.enter_select(SelectionShape::Line);
                 }
                 KeyCodeKind::Char('"') => {
-                    self.rendered_state.register_prefix_pending = true;
+                    self.rendered_state.register_input = RegisterInput::AwaitingName;
                     return Vec::new();
                 }
                 KeyCodeKind::Char(':') => {
                     self.command_buffer.clear();
-                    self.mode = Mode::Command;
+                    self.rendered_state.search.cancel();
+                    self.session_mode = SessionMode::Command;
                     return vec![Effect::ModeChanged(Mode::Command)];
                 }
                 KeyCodeKind::Char('i') => {
@@ -1356,33 +1906,25 @@ impl EditorSession {
                 KeyCodeKind::Char('p') | KeyCodeKind::Char('P') | KeyCodeKind::Char('u') => {
                     let mut vim_effects = Vec::new();
                     if matches!(key.code.kind, KeyCodeKind::Char('p' | 'P')) {
-                        if let Some(selector) = self
-                            .rendered_state
-                            .pending_register
-                            .take()
-                            .and_then(Register::selector)
+                        if let Some(selector) = self.rendered_state.register_input.take().selector()
                         {
-                            vim_effects.extend(self.vim.handle_key(self.key_input_to_vim(
-                                KeyInput {
-                                    code: KeyCode {
-                                        kind: KeyCodeKind::Char('"'),
-                                    },
-                                    mods: Modifiers::default(),
+                            vim_effects.extend(self.live.handle_key(KeyInput {
+                                code: KeyCode {
+                                    kind: KeyCodeKind::Char('"'),
                                 },
-                            )));
-                            vim_effects.extend(self.vim.handle_key(self.key_input_to_vim(
-                                KeyInput {
-                                    code: KeyCode {
-                                        kind: KeyCodeKind::Char(selector),
-                                    },
-                                    mods: Modifiers::default(),
+                                mods: Modifiers::default(),
+                            }));
+                            vim_effects.extend(self.live.handle_key(KeyInput {
+                                code: KeyCode {
+                                    kind: KeyCodeKind::Char(selector),
                                 },
-                            )));
+                                mods: Modifiers::default(),
+                            }));
                         }
                     }
-                    vim_effects.extend(self.vim.handle_key(self.key_input_to_vim(key)));
+                    vim_effects.extend(self.live.handle_key(key));
                     let mut effects = self.translate_vim_effects(vim_effects);
-                    self.mode = Mode::Normal;
+                    self.session_mode = SessionMode::CoreDriven;
                     effects.retain(|effect| !matches!(effect, Effect::ModeChanged(_)));
                     return effects;
                 }
@@ -1390,9 +1932,9 @@ impl EditorSession {
             }
         }
         if key.mods.ctrl && matches!(key.code.kind, KeyCodeKind::Char('r')) {
-            let vim_effects = self.vim.handle_key(self.key_input_to_vim(key));
+            let vim_effects = self.live.handle_key(key);
             let mut effects = self.translate_vim_effects(vim_effects);
-            self.mode = Mode::Normal;
+            self.session_mode = SessionMode::CoreDriven;
             effects.retain(|effect| !matches!(effect, Effect::ModeChanged(_)));
             return effects;
         }
@@ -1400,17 +1942,20 @@ impl EditorSession {
     }
 
     fn handle_rendered_select_key(&mut self, key: KeyInput) -> Vec<Effect> {
-        if self.rendered_state.search_input_active {
+        if self.rendered_state.search.prompt().is_some() {
             return self.handle_rendered_search_input(key);
         }
-        if self.rendered_state.register_prefix_pending {
-            self.rendered_state.register_prefix_pending = false;
+        if self.rendered_state.register_input == RegisterInput::AwaitingName {
             if let KeyCodeKind::Char(selector) = key.code.kind {
                 if key.mods == Modifiers::default() {
-                    self.rendered_state.pending_register = Self::rendered_register(selector);
+                    self.rendered_state.register_input.select(selector);
+                    return Vec::new();
                 }
             }
-            return Vec::new();
+            self.rendered_state.register_input = RegisterInput::Default;
+        }
+        if let Some(effects) = self.rendered_tab_effect(key) {
+            return effects;
         }
         if self.first_rendered_g_is_pending(key) {
             return Vec::new();
@@ -1434,35 +1979,17 @@ impl EditorSession {
                     return self.switch_or_cancel_selection_shape(SelectionShape::Line)
                 }
                 KeyCodeKind::Char('o') => {
-                    let old_anchor = self
-                        .rendered_state
-                        .select_anchor
-                        .unwrap_or(self.rendered_state.cursor.point());
-                    let old_anchor_source = self
-                        .rendered_state
-                        .select_anchor_source
-                        .unwrap_or(self.vim.cursor());
-                    let old_active_source = self.vim.cursor();
-                    let old_anchor_atom = self.rendered_state.select_anchor_atom.clone();
-                    let old_active_atom = self.rendered_state.select_active_atom.clone();
-                    let old_anchor_atom_exact = self.rendered_state.select_anchor_atom_exact;
-                    let old_active_atom_exact = self.rendered_state.select_active_atom_exact;
-                    let old_anchor_line = self.rendered_state.select_anchor_line.clone();
-                    let old_active_line = self.rendered_state.select_active_line.clone();
-                    self.rendered_state.select_anchor = Some(self.rendered_state.cursor.point());
-                    self.rendered_state.select_anchor_source = Some(old_active_source);
-                    self.rendered_state.select_anchor_atom = old_active_atom;
-                    self.rendered_state.select_active_atom = old_anchor_atom;
-                    self.rendered_state.select_anchor_atom_exact = old_active_atom_exact;
-                    self.rendered_state.select_active_atom_exact = old_anchor_atom_exact;
-                    self.rendered_state.select_anchor_line = old_active_line;
-                    self.rendered_state.select_active_line = old_anchor_line;
-                    self.rendered_state.cursor = RenderedCursor::at(old_anchor);
-                    self.vim.jump_to(old_anchor_source.0, old_anchor_source.1);
+                    let SessionMode::Select(selection) = &mut self.session_mode else {
+                        return Vec::new();
+                    };
+                    selection.swap_endpoints();
+                    let active = selection.active.clone();
+                    self.rendered_state.cursor = RenderedCursor::at(active.point);
+                    self.live.jump_to(active.source.0, active.source.1);
                     return vec![Effect::CursorMoved];
                 }
                 KeyCodeKind::Char('"') => {
-                    self.rendered_state.register_prefix_pending = true;
+                    self.rendered_state.register_input = RegisterInput::AwaitingName;
                     return Vec::new();
                 }
                 KeyCodeKind::Char('y') => return self.apply_select_operator(RangeOperator::Yank),
@@ -1475,8 +2002,7 @@ impl EditorSession {
                     return self.apply_select_operator(RangeOperator::Outdent)
                 }
                 _ => {
-                    self.rendered_state.register_prefix_pending = false;
-                    self.rendered_state.pending_register = None;
+                    self.rendered_state.register_input = RegisterInput::Default;
                 }
             }
         }
@@ -1490,6 +2016,72 @@ impl EditorSession {
             name @ ('a'..='z' | 'A'..='Z' | '0'..='9' | '-') => Some(Register::Named(name)),
             _ => None,
         }
+    }
+
+    fn rendered_tab_effect(&mut self, key: KeyInput) -> Option<Vec<Effect>> {
+        if !self.rendered_state.pending_g || key.mods != Modifiers::default() {
+            return None;
+        }
+        let effect = match key.code.kind {
+            KeyCodeKind::Char('t') => {
+                let count = std::mem::take(&mut self.rendered_state.count);
+                if count == 0 {
+                    Effect::TabNext
+                } else {
+                    Effect::TabJump {
+                        one_based: std::num::NonZeroUsize::new(count)
+                            .expect("positive count is required for counted gt"),
+                    }
+                }
+            }
+            KeyCodeKind::Char('T') => {
+                self.rendered_state.count = 0;
+                Effect::TabPrev
+            }
+            _ => return None,
+        };
+        self.rendered_state.pending_g = false;
+        Some(vec![effect])
+    }
+
+    /// Replay a rendered `g` prefix into Vim when it is not one of the
+    /// renderer-owned `gg`/`gt`/`gT` commands. Counts are replayed too, so the
+    /// native parser receives the exact sequence the host supplied.
+    fn forward_pending_native_g(&mut self, key: KeyInput) -> Option<Vec<Effect>> {
+        if !self.rendered_state.pending_g || key.mods != Modifiers::default() {
+            return None;
+        }
+        if matches!(key.code.kind, KeyCodeKind::Char('g' | 't' | 'T')) {
+            return None;
+        }
+
+        self.rendered_state.pending_g = false;
+        self.commit_rendered_cursor();
+        let count = std::mem::take(&mut self.rendered_state.count);
+        let mut vim_effects = Vec::new();
+        if count > 0 {
+            for digit in count.to_string().chars() {
+                vim_effects.extend(self.live.handle_key(KeyInput {
+                    code: KeyCode {
+                        kind: KeyCodeKind::Char(digit),
+                    },
+                    mods: Modifiers::default(),
+                }));
+            }
+        }
+        vim_effects.extend(self.live.handle_key(KeyInput {
+            code: KeyCode {
+                kind: KeyCodeKind::Char('g'),
+            },
+            mods: Modifiers::default(),
+        }));
+        vim_effects.extend(self.live.handle_key(key));
+        Some(self.translate_vim_effects(vim_effects))
+    }
+
+    fn forward_key_to_vim(&mut self, key: KeyInput) -> Vec<Effect> {
+        let vim_effects = self.live.handle_key(key);
+        self.translate_vim_effects(vim_effects)
     }
 
     /// Hold the first `g` so only the complete rendered `gg` motion jumps.
@@ -1544,9 +2136,9 @@ impl EditorSession {
         let Some(layout) = self.rendered_state.layout_cache.as_ref() else {
             return Vec::new();
         };
-        let text = nav::key_inspects_source(key).then(|| self.vim.text());
+        let text = nav::key_inspects_source(key).then(|| self.live.text());
         let cursor = self.rendered_state.cursor;
-        let search = self.rendered_state.search.clone();
+        let search = self.rendered_state.search.current().cloned();
         let count = std::mem::take(&mut self.rendered_state.count);
         let result = nav::handle_key(
             key,
@@ -1561,12 +2153,13 @@ impl EditorSession {
         let mut effects = Vec::new();
         if result.search_changed {
             if let Some(new_search) = result.new_search {
-                self.rendered_state.search_input_active = new_search.pattern.is_empty();
-                self.rendered_state.search_origin =
-                    self.rendered_state.search_input_active.then_some(cursor);
-                self.rendered_state.search = Some(new_search);
+                if new_search.pattern.is_empty() {
+                    self.rendered_state.search.begin(new_search, cursor);
+                } else {
+                    self.rendered_state.search.replace_last(new_search);
+                }
             } else {
-                self.rendered_state.clear_search();
+                self.rendered_state.search.clear();
             }
         }
         if let Some(new_cursor) = result.new_cursor.filter(|_| result.cursor_moved) {
@@ -1577,9 +2170,10 @@ impl EditorSession {
         }
         let collapse_hides_selection = result.fm_collapsed_toggled
             && !self.rendered_state.fm_collapsed
-            && self.mode == Mode::Select
+            && self.mode() == Mode::Select
             && crate::frontmatter::front_matter_span(
-                text.as_deref().unwrap_or_else(|| self.highlighter.text()),
+                text.as_deref()
+                    .unwrap_or_else(|| self.live.highlighter().text()),
             )
             .is_some_and(|front_matter| {
                 self.rendered_selection().is_some_and(|selection| {
@@ -1610,12 +2204,11 @@ impl EditorSession {
     fn handle_rendered_search_input(&mut self, key: KeyInput) -> Vec<Effect> {
         match key.code.kind {
             KeyCodeKind::Esc => {
-                self.rendered_state.clear_search();
+                self.rendered_state.search.cancel();
                 Vec::new()
             }
             KeyCodeKind::Enter => {
-                self.rendered_state.search_input_active = false;
-                self.rendered_state.search_origin = None;
+                self.rendered_state.search.submit();
                 Vec::new()
             }
             KeyCodeKind::Char(c)
@@ -1624,20 +2217,18 @@ impl EditorSession {
                     && !key.mods.shift
                     && (c.is_ascii_alphanumeric() || c == ' ' || c == '.' || c == '_') =>
             {
-                let cursor = self
-                    .rendered_state
-                    .search_origin
-                    .unwrap_or(self.rendered_state.cursor);
-                let text = self.vim.text();
+                let Some((_, cursor)) = self.rendered_state.search.prompt() else {
+                    return Vec::new();
+                };
+                let cursor = *cursor;
+                let text = self.live.text();
                 let Some(layout) = self.rendered_state.layout_cache.as_ref() else {
                     return Vec::new();
                 };
-                let mut search_state = self
-                    .rendered_state
-                    .search
-                    .as_ref()
-                    .expect("active rendered search input must have search state")
-                    .clone();
+                let Some((search_state, _)) = self.rendered_state.search.prompt() else {
+                    return Vec::new();
+                };
+                let mut search_state = search_state.clone();
                 search_state.pattern.push(c);
                 let match_line = nav::find_next_match(
                     &search_state,
@@ -1646,7 +2237,9 @@ impl EditorSession {
                     &text,
                     search_state.direction(),
                 );
-                self.rendered_state.search = Some(search_state);
+                self.rendered_state
+                    .search
+                    .update_draft(|draft| *draft = search_state);
                 if let Some(match_line) = match_line {
                     self.rendered_state.cursor = nav::cursor_for_row(
                         match_line,
@@ -1666,49 +2259,52 @@ impl EditorSession {
 
     fn enter_insert_from_rendered(&mut self, action: RenderedExitAction) -> Vec<Effect> {
         self.commit_rendered_cursor();
-        self.rendered_state.clear_search();
+        self.rendered_state.search.cancel();
         self.rendered_state.count = 0;
-        let vim_effects = self.vim.handle_key(self.key_input_to_vim(action.key()));
+        let vim_effects = self.live.handle_key(action.key());
         self.translate_vim_effects(vim_effects)
     }
 
     fn enter_select(&mut self, shape: SelectionShape) -> Vec<Effect> {
-        self.rendered_state.select_anchor = Some(self.rendered_state.cursor.point());
-        self.rendered_state.select_anchor_source = Some(self.vim.cursor());
+        let point = self.rendered_state.cursor.point();
+        let source = self.live.cursor();
         let atom = self
             .rendered_state
             .layout_cache
             .as_ref()
-            .and_then(|layout| nav::source_for_point(self.rendered_state.cursor.point(), layout));
-        self.rendered_state.select_anchor_atom = atom.clone();
-        self.rendered_state.select_active_atom = atom;
-        self.rendered_state.select_anchor_atom_exact =
-            self.rendered_state.select_anchor_atom.is_some();
-        self.rendered_state.select_active_atom_exact =
-            self.rendered_state.select_active_atom.is_some();
+            .and_then(|layout| nav::source_for_point(point, layout));
         let line = self
             .rendered_state
             .layout_cache
             .as_ref()
-            .and_then(|layout| {
-                nav::line_identity_for_point(self.rendered_state.cursor.point(), layout)
-            });
-        self.rendered_state.select_anchor_line = line.clone();
-        self.rendered_state.select_active_line = line;
-        self.rendered_state.selection_shape = shape;
-        self.rendered_state.select_character_ranges.clear();
-        self.rendered_state.pending_register = None;
-        self.rendered_state.register_prefix_pending = false;
-        self.mode = Mode::Select;
+            .and_then(|layout| nav::line_identity_for_point(point, layout));
+        let endpoint = SelectionEndpoint {
+            point,
+            source,
+            atom,
+            line,
+        };
+        self.rendered_state.register_input = RegisterInput::Default;
+        self.session_mode = SessionMode::Select(ActiveSelection {
+            anchor: endpoint.clone(),
+            active: endpoint,
+            kind: SelectionKind::from_shape(shape),
+        });
         self.refresh_character_selection();
         vec![Effect::ModeChanged(Mode::Select)]
     }
 
     fn switch_or_cancel_selection_shape(&mut self, shape: SelectionShape) -> Vec<Effect> {
-        if self.rendered_state.selection_shape == shape {
+        let current = match &self.session_mode {
+            SessionMode::Select(selection) => selection.kind.shape(),
+            SessionMode::CoreDriven | SessionMode::Command => return Vec::new(),
+        };
+        if current == shape {
             self.finish_select(Mode::Normal, Vec::new())
         } else {
-            self.rendered_state.selection_shape = shape;
+            if let SessionMode::Select(selection) = &mut self.session_mode {
+                selection.switch_kind(shape);
+            }
             self.refresh_character_selection();
             vec![Effect::CursorMoved]
         }
@@ -1718,32 +2314,27 @@ impl EditorSession {
         let Some(layout) = self.rendered_state.layout_cache.as_ref() else {
             return Vec::new();
         };
-        let anchor = self
-            .rendered_state
-            .select_anchor
-            .unwrap_or(self.rendered_state.cursor.point());
+        let SessionMode::Select(active) = &self.session_mode else {
+            return Vec::new();
+        };
         let mut selection = nav::project_selection_from_source_positions(
-            anchor,
-            self.rendered_state.cursor.point(),
-            self.rendered_state.selection_shape,
-            self.rendered_state
-                .select_anchor_source
-                .unwrap_or(self.vim.cursor()),
-            self.vim.cursor(),
+            active.anchor.point,
+            active.active.point,
+            active.kind.shape(),
+            active.anchor.source,
+            active.active.source,
             layout,
-            &self.vim.text(),
+            &self.live.text(),
         );
-        if selection.shape == SelectionShape::Character {
-            selection.source_ranges = self.rendered_state.select_character_ranges.clone();
+        if let SelectionKind::Character { ranges } = &active.kind {
+            selection.source_ranges = ranges.clone();
         }
         if selection.source_ranges.is_empty() {
             return Vec::new();
         }
-        let register = self
-            .rendered_state
-            .pending_register
-            .unwrap_or(Register::Unnamed);
-        let vim_effects = self.vim.apply_selection(selection, operator, register);
+        let register = self.rendered_state.register_input.take();
+        let projected = project_selection_for_vim(selection);
+        let vim_effects = self.live.apply_selection(projected, operator, register);
         let effects = self.translate_vim_effects(vim_effects);
         self.remap_active_cursor_from_canonical();
         let target_mode = if operator == RangeOperator::Change {
@@ -1755,18 +2346,9 @@ impl EditorSession {
     }
 
     fn finish_select(&mut self, mode: Mode, mut effects: Vec<Effect>) -> Vec<Effect> {
-        self.rendered_state.select_anchor = None;
-        self.rendered_state.select_anchor_source = None;
-        self.rendered_state.select_anchor_atom = None;
-        self.rendered_state.select_anchor_atom_exact = false;
-        self.rendered_state.select_active_atom = None;
-        self.rendered_state.select_active_atom_exact = false;
-        self.rendered_state.select_anchor_line = None;
-        self.rendered_state.select_active_line = None;
-        self.rendered_state.select_character_ranges.clear();
-        self.rendered_state.pending_register = None;
-        self.rendered_state.register_prefix_pending = false;
-        self.mode = mode;
+        self.rendered_state.register_input = RegisterInput::Default;
+        self.rendered_state.search.cancel();
+        self.session_mode = SessionMode::CoreDriven;
         effects.retain(|effect| !matches!(effect, Effect::ModeChanged(_)));
         effects.push(Effect::ModeChanged(mode));
         effects
@@ -1781,13 +2363,13 @@ impl EditorSession {
         let Some(layout) = self.rendered_state.layout_cache.as_ref() else {
             return;
         };
-        let source = self.vim.cursor();
+        let source = self.live.cursor();
         self.rendered_state.cursor = nav::enter_rendered_at_offset(
             source.0,
-            self.vim.cursor_byte_offset(),
+            self.live.cursor_byte_offset(),
             layout,
-            |offset| self.vim.position_for_byte_offset(offset).0,
-            |offset| self.vim.byte_before_is_newline(offset),
+            |offset| self.live.position_for_byte_offset(offset).0,
+            |offset| self.live.byte_before_is_newline(offset),
         );
     }
 
@@ -1797,47 +2379,43 @@ impl EditorSession {
         };
         let source_offset = nav::canonical_source_offset_for_row(
             &self.rendered_state.cursor,
-            self.vim.cursor_byte_offset(),
+            self.live.cursor_byte_offset(),
             layout,
         );
-        let source = self.vim.position_for_byte_offset(source_offset);
-        self.vim.jump_to(source.0, source.1);
+        let source = self.live.position_for_byte_offset(source_offset);
+        self.live.jump_to(source.0, source.1);
     }
 
     fn refresh_character_selection(&mut self) {
-        if self.mode != Mode::Select {
+        let SessionMode::Select(selection) = &mut self.session_mode else {
             return;
-        }
+        };
         let Some(layout) = self.rendered_state.layout_cache.as_ref() else {
             return;
         };
-        if let Some(atom) = nav::source_for_point(self.rendered_state.cursor.point(), layout) {
-            self.rendered_state.select_active_atom = Some(atom);
-            self.rendered_state.select_active_atom_exact = true;
-        } else {
-            self.rendered_state.select_active_atom_exact = false;
-        }
-        self.rendered_state.select_active_line =
-            nav::line_identity_for_point(self.rendered_state.cursor.point(), layout);
-        if self.rendered_state.selection_shape == SelectionShape::Character {
-            let anchor = self
-                .rendered_state
-                .select_anchor
-                .unwrap_or(self.rendered_state.cursor.point());
-            self.rendered_state.select_character_ranges = nav::project_selection(
-                anchor,
-                self.rendered_state.cursor.point(),
+        let point = self.rendered_state.cursor.point();
+        selection.active = SelectionEndpoint {
+            point,
+            source: self.live.cursor(),
+            atom: nav::source_for_point(point, layout),
+            line: nav::line_identity_for_point(point, layout),
+        };
+        if let SelectionKind::Character { ranges } = &mut selection.kind {
+            *ranges = nav::project_selection(
+                selection.anchor.point,
+                selection.active.point,
                 SelectionShape::Character,
                 layout,
-                &self.vim.text(),
+                &self.live.text(),
             )
             .source_ranges;
-        } else {
-            self.rendered_state.select_character_ranges.clear();
         }
     }
 
-    fn translate_vim_effects(&mut self, vim_effects: Vec<VimEffect>) -> Vec<Effect> {
+    fn translate_vim_effects(
+        &mut self,
+        vim_effects: impl IntoIterator<Item = VimEffect>,
+    ) -> Vec<Effect> {
         let mut effects = Vec::new();
         let mut left_insert = false;
         for effect in vim_effects {
@@ -1848,14 +2426,10 @@ impl EditorSession {
                     } else {
                         Mode::Normal
                     };
-                    if mode != self.mode {
-                        left_insert = self.mode == Mode::Insert && mode == Mode::Normal;
-                        self.mode = mode;
-                        effects.push(Effect::ModeChanged(mode));
-                    }
+                    left_insert |= mode == Mode::Normal;
+                    effects.push(Effect::ModeChanged(mode));
                 }
-                VimEffect::Edited { edits } => {
-                    self.highlighter.apply_edit(&edits);
+                VimEffect::Edited { .. } => {
                     self.rendered_state.invalidate();
                     effects.push(Effect::Edited);
                 }
@@ -1892,7 +2466,7 @@ impl EditorSession {
 
         match base {
             "w" | "wq" | "x" => {
-                let force = base != "w" || args.1;
+                let force = args.1;
                 if base == "w" && args.0.is_some() {
                     // :w {path} — save copy without retargeting
                     vec![Effect::SaveRequested {
@@ -1933,7 +2507,7 @@ impl EditorSession {
                     }],
                     Ok(line) => {
                         let row = line.min(self.line_count()) - 1;
-                        self.vim.jump_to(row, 0);
+                        self.live.jump_to(row, 0);
                         self.remap_rendered_cursor(row, 0);
                         vec![Effect::CursorMoved]
                     }
@@ -1955,16 +2529,12 @@ impl EditorSession {
                         severity: Severity::Warning,
                     }];
                 };
-                match self.vim.substitute(substitute_args, start_row, end_row) {
-                    Ok(edits) if edits.is_empty() => vec![Effect::Message {
+                match self.live.substitute(substitute_args, start_row, end_row) {
+                    Ok(outcome) if outcome.effects.is_empty() => vec![Effect::Message {
                         text: "No replacement done".to_string(),
                         severity: Severity::Info,
                     }],
-                    Ok(edits) => {
-                        self.highlighter.apply_edit(&edits);
-                        self.rendered_state.invalidate();
-                        vec![Effect::Edited]
-                    }
+                    Ok(outcome) => self.translate_vim_effects(outcome),
                     Err(_) => vec![Effect::Message {
                         text: "Invalid substitute command".to_string(),
                         severity: Severity::Warning,
@@ -1972,8 +2542,8 @@ impl EditorSession {
                 }
             }
             "noh" => {
-                self.vim.clear_search_highlight();
-                self.rendered_state.clear_search();
+                self.live.clear_search_highlight();
+                self.rendered_state.search.clear();
                 vec![Effect::Message {
                     text: "Search highlighting cleared".to_string(),
                     severity: Severity::Info,
@@ -1981,14 +2551,8 @@ impl EditorSession {
             }
             "help" => vec![Effect::HelpRequested],
             "set" => match args.0 {
-                Some("wrap") => vec![Effect::SetOption {
-                    key: "wrap".to_string(),
-                    value: true,
-                }],
-                Some("nowrap") => vec![Effect::SetOption {
-                    key: "wrap".to_string(),
-                    value: false,
-                }],
+                Some("wrap") => vec![Effect::SetWrap(true)],
+                Some("nowrap") => vec![Effect::SetWrap(false)],
                 Some(unknown) => vec![Effect::Message {
                     text: format!("Unknown option: {unknown}"),
                     severity: Severity::Warning,
@@ -2157,43 +2721,5 @@ impl EditorSession {
         });
         spans.sort_by_key(|span| span.start_col);
         line.spans = spans;
-    }
-
-    /// Translate our KeyInput → VimCore's internal KeyInput.
-    fn key_input_to_vim(&self, key: KeyInput) -> crate::vim::KeyInput {
-        crate::vim::KeyInput {
-            code: crate::vim::KeyCode {
-                kind: self.key_code_kind_to_vim(key.code.kind),
-            },
-            mods: crate::vim::Modifiers {
-                ctrl: key.mods.ctrl,
-                alt: key.mods.alt,
-                shift: key.mods.shift,
-            },
-        }
-    }
-
-    fn key_code_kind_to_vim(&self, kind: KeyCodeKind) -> crate::vim::KeyCodeKind {
-        match kind {
-            KeyCodeKind::Noop => {
-                unreachable!("Noop inputs are ignored before Vim key conversion")
-            }
-            KeyCodeKind::Char(c) => crate::vim::KeyCodeKind::Char(c),
-            KeyCodeKind::Enter => crate::vim::KeyCodeKind::Enter,
-            KeyCodeKind::Esc => crate::vim::KeyCodeKind::Esc,
-            KeyCodeKind::Backspace => crate::vim::KeyCodeKind::Backspace,
-            KeyCodeKind::Tab => crate::vim::KeyCodeKind::Tab,
-            KeyCodeKind::BackTab => crate::vim::KeyCodeKind::BackTab,
-            KeyCodeKind::Up => crate::vim::KeyCodeKind::Up,
-            KeyCodeKind::Down => crate::vim::KeyCodeKind::Down,
-            KeyCodeKind::Left => crate::vim::KeyCodeKind::Left,
-            KeyCodeKind::Right => crate::vim::KeyCodeKind::Right,
-            KeyCodeKind::Home => crate::vim::KeyCodeKind::Home,
-            KeyCodeKind::End => crate::vim::KeyCodeKind::End,
-            KeyCodeKind::PageUp => crate::vim::KeyCodeKind::PageUp,
-            KeyCodeKind::PageDown => crate::vim::KeyCodeKind::PageDown,
-            KeyCodeKind::Delete => crate::vim::KeyCodeKind::Delete,
-            KeyCodeKind::F(n) => crate::vim::KeyCodeKind::F(n),
-        }
     }
 }

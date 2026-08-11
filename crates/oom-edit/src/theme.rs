@@ -342,28 +342,42 @@ impl fmt::Display for ResolvedTheme {
 // ── Selection ladder ────────────────────────────────────────────────────────
 
 /// Environment parts for testing the selection ladder without touching real env vars.
-#[derive(Debug, Clone, Default)]
-pub struct EnvParts {
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct EnvParts {
     /// Value of `OOM_EDIT_THEME`.
-    pub oom_edit_theme: Option<&'static str>,
+    pub(crate) oom_edit_theme: Option<String>,
     /// Value of `NO_COLOR`.
-    pub no_color: bool,
+    pub(crate) no_color: bool,
     /// Value of `TERM`.
-    pub term: Option<&'static str>,
+    pub(crate) term: Option<String>,
     /// Value of `COLORTERM`.
-    pub colorterm: Option<&'static str>,
+    pub(crate) colorterm: Option<String>,
     /// Value of `COLORFGBG` (e.g. "0;7" for light, "7;0" for dark).
-    pub colorfgbg: Option<&'static str>,
+    pub(crate) colorfgbg: Option<String>,
 }
 
 impl EnvParts {
+    pub(crate) fn from_current_process() -> Self {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Self {
+        Self {
+            oom_edit_theme: lookup("OOM_EDIT_THEME"),
+            no_color: lookup("NO_COLOR").is_some(),
+            term: lookup("TERM"),
+            colorterm: lookup("COLORTERM"),
+            colorfgbg: lookup("COLORFGBG"),
+        }
+    }
+
     /// Determine terminal/environment capability without conflating it with
     /// the selected theme's effective palette.
     pub fn capability(&self) -> Tier {
-        if self.no_color || self.term == Some("dumb") {
+        if self.no_color || self.term.as_deref() == Some("dumb") {
             return Tier::Monochrome;
         }
-        if let Some(colorterm) = self.colorterm {
+        if let Some(colorterm) = self.colorterm.as_deref() {
             let colorterm = colorterm.to_lowercase();
             if colorterm.contains("truecolor") || colorterm.contains("24bit") {
                 return Tier::TrueColor;
@@ -373,9 +387,10 @@ impl EnvParts {
     }
 
     /// Determine the effective tier from environment.
+    #[cfg(test)]
     pub fn effective_tier(&self) -> Tier {
         // OOM_EDIT_THEME=accessible forces monochrome (stop here).
-        if let Some(theme) = self.oom_edit_theme {
+        if let Some(theme) = self.oom_edit_theme.as_deref() {
             if theme == "accessible" {
                 return Tier::Monochrome;
             }
@@ -394,7 +409,7 @@ impl EnvParts {
         // COLORFGBG heuristic: "foreground;background".
         // Light theme: bg > fg (e.g. "0;7" = black fg, white bg).
         // Dark theme: fg > bg (e.g. "7;0" = white fg, black bg).
-        if let Some(colorfgbg) = self.colorfgbg {
+        if let Some(colorfgbg) = self.colorfgbg.as_deref() {
             if let Some((fg, bg)) = colorfgbg.split_once(';') {
                 if let (Ok(fg_val), Ok(bg_val)) = (fg.parse::<u32>(), bg.parse::<u32>()) {
                     return bg_val > fg_val;
@@ -434,7 +449,7 @@ pub fn resolve_theme(
             eprintln!("oom-edit: unknown theme '{cli}', using {fallback}");
             (fallback.to_string(), ThemeSource::Fallback)
         }
-        None => match env.oom_edit_theme.filter(|name| is_known(name)) {
+        None => match env.oom_edit_theme.as_deref().filter(|name| is_known(name)) {
             Some(name) => (name.to_string(), ThemeSource::Environment),
             None => match configured.filter(|name| is_known(name) && supports_mode(name, is_light))
             {
@@ -471,50 +486,92 @@ pub fn resolve_theme(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct BuiltinThemeSpec {
+    theme: &'static Theme,
+    compatible_mode: Option<DisplayMode>,
+}
+
+static BUILTIN_THEMES: &[BuiltinThemeSpec] = &[
+    BuiltinThemeSpec {
+        theme: &DEFAULT_DARK,
+        compatible_mode: Some(DisplayMode::Dark),
+    },
+    BuiltinThemeSpec {
+        theme: &DEFAULT_LIGHT,
+        compatible_mode: Some(DisplayMode::Light),
+    },
+    BuiltinThemeSpec {
+        theme: &ACCESSIBLE,
+        compatible_mode: None,
+    },
+];
+
 /// Get the built-in theme by name.
 pub fn get_theme(name: &str) -> &'static Theme {
-    match name {
-        "default-dark" => &DEFAULT_DARK,
-        "default-light" => &DEFAULT_LIGHT,
-        "accessible" => &ACCESSIBLE,
-        _ => &DEFAULT_DARK,
-    }
+    BUILTIN_THEMES
+        .iter()
+        .find(|spec| spec.theme.name == name)
+        .unwrap_or(&BUILTIN_THEMES[0])
+        .theme
 }
 
 /// Get the list of built-in theme names.
-pub fn built_in_themes() -> &'static [&'static str] {
-    &["default-dark", "default-light", "accessible"]
+#[cfg(test)]
+pub fn built_in_themes() -> impl ExactSizeIterator<Item = &'static str> + Clone {
+    BUILTIN_THEMES.iter().map(|spec| spec.theme.name)
 }
 
 fn is_known(name: &str) -> bool {
-    built_in_themes().contains(&name)
+    BUILTIN_THEMES.iter().any(|spec| spec.theme.name == name)
 }
 
 fn supports_mode(name: &str, is_light: bool) -> bool {
-    match name {
-        "default-dark" => !is_light,
-        "default-light" => is_light,
-        "accessible" => true,
-        _ => false,
-    }
-}
-
-fn themes_for_mode(is_light: bool) -> &'static [&'static str] {
-    if is_light {
-        &["default-light", "accessible"]
+    let mode = if is_light {
+        DisplayMode::Light
     } else {
-        &["default-dark", "accessible"]
-    }
+        DisplayMode::Dark
+    };
+    BUILTIN_THEMES.iter().any(|spec| {
+        spec.theme.name == name
+            && spec
+                .compatible_mode
+                .is_none_or(|compatible| compatible == mode)
+    })
 }
 
 /// Cycle to the next built-in theme compatible with the display mode.
 /// Returns the mode's default when `current` is unknown or incompatible.
 pub fn cycle_theme(current: &str, is_light: bool) -> &'static str {
-    let themes = themes_for_mode(is_light);
-    themes
+    let mode = if is_light {
+        DisplayMode::Light
+    } else {
+        DisplayMode::Dark
+    };
+    let compatible = |spec: &&BuiltinThemeSpec| {
+        spec.compatible_mode
+            .is_none_or(|compatible| compatible == mode)
+    };
+    let fallback = BUILTIN_THEMES
         .iter()
-        .position(|&name| name == current)
-        .map_or(themes[0], |idx| themes[(idx + 1) % themes.len()])
+        .find(compatible)
+        .expect("each display mode has a built-in theme")
+        .theme
+        .name;
+    let Some(current_index) = BUILTIN_THEMES
+        .iter()
+        .position(|spec| spec.theme.name == current && compatible(&spec))
+    else {
+        return fallback;
+    };
+    BUILTIN_THEMES
+        .iter()
+        .cycle()
+        .skip(current_index + 1)
+        .find(compatible)
+        .expect("compatible theme cycle is nonempty")
+        .theme
+        .name
 }
 
 // ── Built-in: default-dark ──────────────────────────────────────────────────
@@ -1440,11 +1497,10 @@ mod tests {
     /// of every built-in theme.
     #[test]
     fn all_semantic_styles_resolve() {
-        let themes: [(&str, &Theme); 3] = [
-            ("default-dark", &DEFAULT_DARK),
-            ("default-light", &DEFAULT_LIGHT),
-            ("accessible", &ACCESSIBLE),
-        ];
+        let themes: Vec<_> = BUILTIN_THEMES
+            .iter()
+            .map(|spec| (spec.theme.name, spec.theme))
+            .collect();
 
         let variants = [
             SemanticStyle::Text,
@@ -1501,7 +1557,7 @@ mod tests {
     /// Monochrome palettes must not have any foreground color other than Reset.
     #[test]
     fn monochrome_has_no_fg_colors() {
-        for theme in [&DEFAULT_DARK, &DEFAULT_LIGHT, &ACCESSIBLE] {
+        for theme in BUILTIN_THEMES.iter().map(|spec| spec.theme) {
             let mono = &theme.monochrome;
             if let Palette::Monochrome { semantic, ui } = mono {
                 for (style, _) in semantic.iter() {
@@ -1529,7 +1585,7 @@ mod tests {
     /// Selection style always carries REVERSED on every tier of every theme.
     #[test]
     fn selection_carries_reversed() {
-        for theme in [&DEFAULT_DARK, &DEFAULT_LIGHT, &ACCESSIBLE] {
+        for theme in BUILTIN_THEMES.iter().map(|spec| spec.theme) {
             for tier in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
                 let style = theme.style(tier, SemanticStyle::Selection);
                 assert!(
@@ -1543,7 +1599,7 @@ mod tests {
 
     #[test]
     fn cursor_line_has_a_distinct_non_color_carrier() {
-        for theme in [&DEFAULT_DARK, &DEFAULT_LIGHT, &ACCESSIBLE] {
+        for theme in BUILTIN_THEMES.iter().map(|spec| spec.theme) {
             for tier in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
                 let selection = theme.style(tier, SemanticStyle::Selection);
                 let cursor = theme.ui_style(tier, UiSlot::CursorLine);
@@ -1566,7 +1622,7 @@ mod tests {
     /// Search matches must remain visible when foreground colors are absent.
     #[test]
     fn search_match_carries_underline() {
-        for theme in [&DEFAULT_DARK, &DEFAULT_LIGHT, &ACCESSIBLE] {
+        for theme in BUILTIN_THEMES.iter().map(|spec| spec.theme) {
             for tier in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
                 let style = theme.style(tier, SemanticStyle::Match);
                 assert!(
@@ -1584,11 +1640,10 @@ mod tests {
     /// non-default property on every tier.
     #[test]
     fn every_accessor_nonempty() {
-        let themes: [(&str, &Theme); 3] = [
-            ("default-dark", &DEFAULT_DARK),
-            ("default-light", &DEFAULT_LIGHT),
-            ("accessible", &ACCESSIBLE),
-        ];
+        let themes: Vec<_> = BUILTIN_THEMES
+            .iter()
+            .map(|spec| (spec.theme.name, spec.theme))
+            .collect();
 
         let ui_slots = [
             UiSlot::StatusBar,
@@ -1628,6 +1683,58 @@ mod tests {
     // ── Selection ladder ────────────────────────────────────────────────
 
     #[test]
+    fn env_parts_lookup_maps_exact_environment_names() {
+        let mut queried = Vec::new();
+        let env = EnvParts::from_lookup(|name| {
+            queried.push(name.to_string());
+            match name {
+                "OOM_EDIT_THEME" => Some(["access", "ible"].concat()),
+                "NO_COLOR" => Some(String::new()),
+                "TERM" => Some(["xterm", "-256color"].concat()),
+                "COLORTERM" => Some(["true", "color"].concat()),
+                "COLORFGBG" => Some(format!("{};{}", 0, 7)),
+                _ => None,
+            }
+        });
+
+        assert_eq!(
+            queried,
+            [
+                "OOM_EDIT_THEME",
+                "NO_COLOR",
+                "TERM",
+                "COLORTERM",
+                "COLORFGBG"
+            ]
+        );
+        assert_eq!(env.oom_edit_theme.as_deref(), Some("accessible"));
+        assert!(env.no_color);
+        assert_eq!(env.term.as_deref(), Some("xterm-256color"));
+        assert_eq!(env.colorterm.as_deref(), Some("truecolor"));
+        assert_eq!(env.colorfgbg.as_deref(), Some("0;7"));
+        assert_eq!(env.capability(), Tier::Monochrome);
+        assert!(env.is_light(None));
+        assert_eq!(
+            resolve_theme(
+                None,
+                None,
+                Some("default-dark"),
+                Some("default-light"),
+                &env,
+            )
+            .source,
+            ThemeSource::Environment
+        );
+    }
+
+    #[test]
+    fn startup_environment_snapshot_requires_no_leaks() {
+        let startup = include_str!("lib.rs");
+        assert!(startup.contains("EnvParts::from_current_process()"));
+        assert!(!startup.contains("Box::leak"));
+    }
+
+    #[test]
     fn ladder_no_color_forces_monochrome() {
         let env = EnvParts {
             no_color: true,
@@ -1639,7 +1746,7 @@ mod tests {
     #[test]
     fn ladder_term_dumb_forces_monochrome() {
         let env = EnvParts {
-            term: Some("dumb"),
+            term: Some("dumb".to_string()),
             ..Default::default()
         };
         assert_eq!(env.effective_tier(), Tier::Monochrome);
@@ -1648,8 +1755,8 @@ mod tests {
     #[test]
     fn ladder_oom_edit_theme_accessible_forces_monochrome() {
         let env = EnvParts {
-            oom_edit_theme: Some("accessible"),
-            colorterm: Some("truecolor"),
+            oom_edit_theme: Some("accessible".to_string()),
+            colorterm: Some("truecolor".to_string()),
             ..Default::default()
         };
         assert_eq!(env.effective_tier(), Tier::Monochrome);
@@ -1658,7 +1765,7 @@ mod tests {
     #[test]
     fn ladder_colorterm_truecolor() {
         let env = EnvParts {
-            colorterm: Some("truecolor"),
+            colorterm: Some("truecolor".to_string()),
             ..Default::default()
         };
         assert_eq!(env.effective_tier(), Tier::TrueColor);
@@ -1667,7 +1774,7 @@ mod tests {
     #[test]
     fn ladder_colorterm_24bit() {
         let env = EnvParts {
-            colorterm: Some("24bit"),
+            colorterm: Some("24bit".to_string()),
             ..Default::default()
         };
         assert_eq!(env.effective_tier(), Tier::TrueColor);
@@ -1676,7 +1783,7 @@ mod tests {
     #[test]
     fn ladder_colorterm_default_to_color16() {
         let env = EnvParts {
-            colorterm: Some("basic"),
+            colorterm: Some("basic".to_string()),
             ..Default::default()
         };
         assert_eq!(env.effective_tier(), Tier::Color16);
@@ -1694,7 +1801,7 @@ mod tests {
     #[test]
     fn ladder_colorfgbg_light() {
         let env = EnvParts {
-            colorfgbg: Some("0;7"), // black fg, white bg → light
+            colorfgbg: Some("0;7".to_string()), // black fg, white bg → light
             ..Default::default()
         };
         assert!(env.is_light(None));
@@ -1703,7 +1810,7 @@ mod tests {
     #[test]
     fn ladder_colorfgbg_dark() {
         let env = EnvParts {
-            colorfgbg: Some("7;0"), // white fg, black bg → dark
+            colorfgbg: Some("7;0".to_string()), // white fg, black bg → dark
             ..Default::default()
         };
         assert!(!env.is_light(None));
@@ -1712,7 +1819,7 @@ mod tests {
     #[test]
     fn ladder_config_mode_overrides_colorfgbg() {
         let env = EnvParts {
-            colorfgbg: Some("7;0"), // dark
+            colorfgbg: Some("7;0".to_string()), // dark
             ..Default::default()
         };
         assert!(env.is_light(Some("light")));
@@ -1728,8 +1835,8 @@ mod tests {
     fn ladder_precedence_oom_edit_theme_overrides_colorterm() {
         // OOM_EDIT_THEME=accessible should force monochrome even with truecolor colorterm
         let env = EnvParts {
-            oom_edit_theme: Some("accessible"),
-            colorterm: Some("truecolor"),
+            oom_edit_theme: Some("accessible".to_string()),
+            colorterm: Some("truecolor".to_string()),
             ..Default::default()
         };
         assert_eq!(env.effective_tier(), Tier::Monochrome);
@@ -1750,7 +1857,7 @@ mod tests {
     fn ladder_no_color_overrides_colorterm() {
         let env = EnvParts {
             no_color: true,
-            colorterm: Some("truecolor"),
+            colorterm: Some("truecolor".to_string()),
             ..Default::default()
         };
         assert_eq!(env.effective_tier(), Tier::Monochrome);
@@ -1808,7 +1915,7 @@ mod tests {
             None,
             None,
             &EnvParts {
-                colorterm: Some("truecolor"),
+                colorterm: Some("truecolor".to_string()),
                 ..Default::default()
             },
         );
@@ -1826,7 +1933,7 @@ mod tests {
             Some("accessible"),
             Some("default-light"),
             &EnvParts {
-                colorterm: Some("truecolor"),
+                colorterm: Some("truecolor".to_string()),
                 ..Default::default()
             },
         );
@@ -1843,7 +1950,7 @@ mod tests {
     #[test]
     fn resolve_config_light_slot() {
         let env = EnvParts {
-            colorfgbg: Some("0;7"), // light
+            colorfgbg: Some("0;7".to_string()), // light
             ..Default::default()
         };
         let resolved = resolve_theme(
@@ -1933,11 +2040,72 @@ mod tests {
 
     #[test]
     fn built_in_themes_list() {
-        let themes = built_in_themes();
+        let themes: Vec<_> = built_in_themes().collect();
         assert_eq!(themes.len(), 3);
         assert!(themes.contains(&"default-dark"));
         assert!(themes.contains(&"default-light"));
         assert!(themes.contains(&"accessible"));
+    }
+
+    #[test]
+    fn builtin_theme_registry_has_unique_names_and_mode_defaults() {
+        let mut names = std::collections::HashSet::new();
+        for spec in BUILTIN_THEMES {
+            assert!(names.insert(spec.theme.name));
+        }
+        let first_dark = BUILTIN_THEMES
+            .iter()
+            .find(|spec| {
+                spec.compatible_mode
+                    .is_none_or(|mode| mode == DisplayMode::Dark)
+            })
+            .unwrap();
+        let first_light = BUILTIN_THEMES
+            .iter()
+            .find(|spec| {
+                spec.compatible_mode
+                    .is_none_or(|mode| mode == DisplayMode::Light)
+            })
+            .unwrap();
+        assert_eq!(first_dark.theme.name, "default-dark");
+        assert_eq!(first_light.theme.name, "default-light");
+    }
+
+    #[test]
+    fn builtin_theme_registry_drives_all_projections() {
+        assert_eq!(
+            built_in_themes().collect::<Vec<_>>(),
+            BUILTIN_THEMES
+                .iter()
+                .map(|spec| spec.theme.name)
+                .collect::<Vec<_>>()
+        );
+        for (index, spec) in BUILTIN_THEMES.iter().enumerate() {
+            assert!(std::ptr::eq(get_theme(spec.theme.name), spec.theme));
+            for mode in [DisplayMode::Dark, DisplayMode::Light] {
+                let is_light = mode == DisplayMode::Light;
+                assert_eq!(
+                    supports_mode(spec.theme.name, is_light),
+                    spec.compatible_mode
+                        .is_none_or(|compatible| compatible == mode)
+                );
+                if supports_mode(spec.theme.name, is_light) {
+                    let expected = BUILTIN_THEMES
+                        .iter()
+                        .cycle()
+                        .skip(index + 1)
+                        .find(|candidate| {
+                            candidate
+                                .compatible_mode
+                                .is_none_or(|compatible| compatible == mode)
+                        })
+                        .unwrap()
+                        .theme
+                        .name;
+                    assert_eq!(cycle_theme(spec.theme.name, is_light), expected);
+                }
+            }
+        }
     }
 
     #[test]
@@ -2078,11 +2246,10 @@ mod tests {
     /// Every UiSlot variant is covered in every tier of every built-in theme.
     #[test]
     fn all_ui_slots_covered() {
-        let themes: [(&str, &Theme); 3] = [
-            ("default-dark", &DEFAULT_DARK),
-            ("default-light", &DEFAULT_LIGHT),
-            ("accessible", &ACCESSIBLE),
-        ];
+        let themes: Vec<_> = BUILTIN_THEMES
+            .iter()
+            .map(|spec| (spec.theme.name, spec.theme))
+            .collect();
 
         let slots = [
             UiSlot::StatusBar,
@@ -2142,7 +2309,7 @@ mod tests {
                 assert!(!style.add_modifier.is_empty(), "{} {tier:?}", theme.name);
             }
         }
-        for theme in [&DEFAULT_DARK, &DEFAULT_LIGHT, &ACCESSIBLE] {
+        for theme in BUILTIN_THEMES.iter().map(|spec| spec.theme) {
             let style = theme.ui_style(Tier::Monochrome, UiSlot::MetadataPanel);
             assert_eq!(style.fg, Some(Color::Reset));
             assert!(!style.add_modifier.is_empty(), "{} monochrome", theme.name);
@@ -2249,7 +2416,7 @@ mod tests {
             UiSlot::BadgeCommand,
         ];
 
-        for theme in [&DEFAULT_DARK, &DEFAULT_LIGHT, &ACCESSIBLE] {
+        for theme in BUILTIN_THEMES.iter().map(|spec| spec.theme) {
             for slot in slots {
                 let style = theme.ui_style(Tier::Monochrome, slot);
                 assert_eq!(style.fg, Some(Color::Reset));
@@ -2296,7 +2463,7 @@ mod tests {
             UiSlot::TabSeparator,
         ];
 
-        for theme in [&DEFAULT_DARK, &DEFAULT_LIGHT, &ACCESSIBLE] {
+        for theme in BUILTIN_THEMES.iter().map(|spec| spec.theme) {
             for tier in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
                 for slot in slots {
                     assert!(

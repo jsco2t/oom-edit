@@ -9,8 +9,7 @@
 mod captures;
 mod languages;
 
-pub use captures::capture_to_style;
-pub use languages::{find_by_alias, find_by_name, resolve_language, LangDef, LANGUAGES};
+use languages::LangDef;
 
 use std::{collections::HashMap, ops::Range, sync::Arc};
 
@@ -612,7 +611,7 @@ impl Highlighter {
                 Arc::clone(cached)
             } else {
                 let compiled = Arc::new(
-                    Query::new(&language, meta.language.highlights_query())
+                    Query::new(&language, meta.language.highlights_query)
                         .expect("registered injection highlight query should compile"),
                 );
                 self.query_cache
@@ -716,7 +715,7 @@ pub fn highlight_snippet(lang: &str, text: &str) -> Vec<StyledLine> {
     };
     let lang_obj = (lang_def.language_fn)();
 
-    let query = Query::new(&lang_obj, lang_def.highlights_query()).ok();
+    let query = Query::new(&lang_obj, lang_def.highlights_query).ok();
     let Some(query) = query else {
         return highlight_lines_for_text(text);
     };
@@ -1253,7 +1252,8 @@ fn merge_overlapping_spans(spans: Vec<RankedSpan>) -> Vec<Span> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vim::{KeyCode, KeyCodeKind, KeyInput, Modifiers, VimCore, VimEffect};
+    use crate::input::{KeyCode, KeyCodeKind, KeyInput, Modifiers};
+    use crate::vim::{VimCore, VimEffect};
 
     #[cfg(test)]
     use proptest::prelude::*;

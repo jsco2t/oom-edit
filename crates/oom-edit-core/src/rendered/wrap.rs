@@ -10,7 +10,167 @@
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::style::{Span, StyledLine};
+use std::ops::Range;
+
+use crate::style::{RenderedSourceAtom, SemanticStyle, Span, StyledLine};
+
+/// One owned visible display group. Text, style, and source ownership always
+/// move together through composition and wrapping.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct MappedFragment {
+    pub(super) text: String,
+    pub(super) style: SemanticStyle,
+    pub(super) source: Option<Range<usize>>,
+}
+
+/// A private line of mapped display groups used by the rendered pipeline.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct MappedLine {
+    pub(super) fragments: Vec<MappedFragment>,
+}
+
+impl MappedLine {
+    pub(super) fn push(
+        &mut self,
+        text: String,
+        style: SemanticStyle,
+        source: Option<Range<usize>>,
+    ) {
+        self.fragments.push(MappedFragment {
+            text,
+            style,
+            source,
+        });
+    }
+
+    pub(super) fn push_generated(&mut self, text: &str, style: SemanticStyle) {
+        for group in display_groups(text) {
+            self.push(group, style, None);
+        }
+    }
+
+    pub(super) fn prepend_generated(&mut self, text: &str, style: SemanticStyle) {
+        let mut prefix = MappedLine::default();
+        prefix.push_generated(text, style);
+        prefix.fragments.append(&mut self.fragments);
+        self.fragments = prefix.fragments;
+    }
+
+    pub(super) fn append(&mut self, mut other: MappedLine) {
+        self.fragments.append(&mut other.fragments);
+    }
+
+    #[cfg(test)]
+    pub(super) fn text(&self) -> String {
+        self.fragments
+            .iter()
+            .map(|fragment| fragment.text.as_str())
+            .collect()
+    }
+
+    pub(super) fn width(&self) -> usize {
+        self.fragments
+            .iter()
+            .map(|fragment| fragment.text.width())
+            .sum()
+    }
+
+    pub(super) fn into_parts(self) -> (StyledLine, Vec<RenderedSourceAtom>) {
+        let mut text = String::new();
+        let mut spans: Vec<Span> = Vec::new();
+        let mut atoms = Vec::with_capacity(self.fragments.len());
+        let mut char_column = 0;
+        let mut display_column = 0;
+
+        for fragment in self.fragments {
+            let char_len = fragment.text.chars().count();
+            let display_width = fragment.text.width();
+            text.push_str(&fragment.text);
+
+            let extends_previous = spans.last().is_some_and(|previous| {
+                previous.style == fragment.style && previous.end_col == char_column
+            });
+            if extends_previous {
+                spans
+                    .last_mut()
+                    .expect("the previous span was checked above")
+                    .end_col += char_len;
+            } else if char_len > 0 {
+                spans.push(Span {
+                    start_col: char_column,
+                    end_col: char_column + char_len,
+                    style: fragment.style,
+                });
+            }
+
+            atoms.push(RenderedSourceAtom {
+                columns: display_column..display_column + display_width,
+                source: fragment.source,
+            });
+            char_column += char_len;
+            display_column += display_width;
+        }
+
+        (StyledLine { text, spans }, atoms)
+    }
+}
+
+/// Wrap mapped display groups without separating their source ownership.
+pub(super) fn wrap_mapped_line(
+    input: &MappedLine,
+    width: u16,
+    hanging_indent: u16,
+) -> Vec<MappedLine> {
+    let visual = wrap_lines(&input.clone().into_parts().0, width, hanging_indent);
+    let mut source_index = 0;
+    visual
+        .into_iter()
+        .enumerate()
+        .map(|(line_index, visual_line)| {
+            let mut line = MappedLine::default();
+            let indent = if line_index == 0 {
+                0
+            } else {
+                usize::from(hanging_indent).min(visual_line.text.len())
+            };
+            if indent > 0 {
+                line.push_generated(&" ".repeat(indent), SemanticStyle::Text);
+            }
+
+            let visible = visual_line.text.chars().skip(indent).collect::<String>();
+            for group in display_groups(&visible) {
+                while source_index < input.fragments.len()
+                    && input.fragments[source_index].text != group
+                {
+                    source_index += 1;
+                }
+                if let Some(fragment) = input.fragments.get(source_index).cloned() {
+                    line.fragments.push(fragment);
+                    source_index += 1;
+                } else {
+                    line.push_generated(&group, SemanticStyle::Text);
+                }
+            }
+            line
+        })
+        .collect()
+}
+
+fn display_groups(text: &str) -> Vec<String> {
+    let mut groups: Vec<String> = Vec::new();
+    for character in text.chars() {
+        if character.width().unwrap_or(0) == 0 {
+            if let Some(previous) = groups.last_mut() {
+                previous.push(character);
+            } else {
+                groups.push(character.to_string());
+            }
+        } else {
+            groups.push(character.to_string());
+        }
+    }
+    groups
+}
 
 /// Wrap a styled line into multiple lines that fit within `width` columns.
 ///

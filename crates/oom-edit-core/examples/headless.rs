@@ -6,50 +6,50 @@
 //! This is the reference host application that proves `oom-edit-core` is
 //! embeddable (FR-8.4, SC-4).
 
-use oom_edit_core::session::{EditorSession, KeyCode, KeyCodeKind, KeyInput, Modifiers, Viewport};
+use oom_edit_core::{EditorSession, KeyCode, KeyCodeKind, KeyInput, Modifiers, Viewport};
 
 /// Tiny ANSI escape mapper — local to this example only.
-fn style_to_ansi(style: &oom_edit_core::style::SemanticStyle) -> &'static str {
+fn style_to_ansi(style: &oom_edit_core::SemanticStyle) -> &'static str {
     match style {
-        oom_edit_core::style::SemanticStyle::Heading1
-        | oom_edit_core::style::SemanticStyle::Heading2
-        | oom_edit_core::style::SemanticStyle::Heading3
-        | oom_edit_core::style::SemanticStyle::Heading4
-        | oom_edit_core::style::SemanticStyle::Heading5
-        | oom_edit_core::style::SemanticStyle::Heading6 => "\x1b[1m",
-        oom_edit_core::style::SemanticStyle::Strong => "\x1b[1m",
-        oom_edit_core::style::SemanticStyle::Emphasis => "\x1b[3m",
-        oom_edit_core::style::SemanticStyle::Strikethrough => "\x1b[9m",
-        oom_edit_core::style::SemanticStyle::CodeSpan
-        | oom_edit_core::style::SemanticStyle::CodeBlock => "\x1b[36m",
-        oom_edit_core::style::SemanticStyle::Link
-        | oom_edit_core::style::SemanticStyle::LinkUrl => "\x1b[34m",
-        oom_edit_core::style::SemanticStyle::Comment => "\x1b[2m",
-        oom_edit_core::style::SemanticStyle::ListMarker => "\x1b[33m",
-        oom_edit_core::style::SemanticStyle::Rule => "\x1b[33m",
-        oom_edit_core::style::SemanticStyle::Quote => "\x1b[2m",
-        oom_edit_core::style::SemanticStyle::HtmlRaw => "\x1b[35m",
-        oom_edit_core::style::SemanticStyle::FmDelimiter => "\x1b[2m",
-        oom_edit_core::style::SemanticStyle::FmKey => "\x1b[35m",
-        oom_edit_core::style::SemanticStyle::FmValue => "\x1b[37m",
-        oom_edit_core::style::SemanticStyle::Keyword => "\x1b[31m",
-        oom_edit_core::style::SemanticStyle::Function => "\x1b[32m",
-        oom_edit_core::style::SemanticStyle::TypeName => "\x1b[36m",
-        oom_edit_core::style::SemanticStyle::StringLit => "\x1b[33m",
-        oom_edit_core::style::SemanticStyle::NumberLit => "\x1b[33m",
-        oom_edit_core::style::SemanticStyle::Operator => "\x1b[37m",
-        oom_edit_core::style::SemanticStyle::Variable => "\x1b[37m",
-        oom_edit_core::style::SemanticStyle::Punct => "\x1b[37m",
-        oom_edit_core::style::SemanticStyle::Selection => "\x1b[7m",
-        oom_edit_core::style::SemanticStyle::Match => "\x1b[7m",
-        oom_edit_core::style::SemanticStyle::CursorLine => "\x1b[7m",
-        oom_edit_core::style::SemanticStyle::Text => "",
+        oom_edit_core::SemanticStyle::Heading1
+        | oom_edit_core::SemanticStyle::Heading2
+        | oom_edit_core::SemanticStyle::Heading3
+        | oom_edit_core::SemanticStyle::Heading4
+        | oom_edit_core::SemanticStyle::Heading5
+        | oom_edit_core::SemanticStyle::Heading6 => "\x1b[1m",
+        oom_edit_core::SemanticStyle::Strong => "\x1b[1m",
+        oom_edit_core::SemanticStyle::Emphasis => "\x1b[3m",
+        oom_edit_core::SemanticStyle::Strikethrough => "\x1b[9m",
+        oom_edit_core::SemanticStyle::CodeSpan | oom_edit_core::SemanticStyle::CodeBlock => {
+            "\x1b[36m"
+        }
+        oom_edit_core::SemanticStyle::Link | oom_edit_core::SemanticStyle::LinkUrl => "\x1b[34m",
+        oom_edit_core::SemanticStyle::Comment => "\x1b[2m",
+        oom_edit_core::SemanticStyle::ListMarker => "\x1b[33m",
+        oom_edit_core::SemanticStyle::Rule => "\x1b[33m",
+        oom_edit_core::SemanticStyle::Quote => "\x1b[2m",
+        oom_edit_core::SemanticStyle::HtmlRaw => "\x1b[35m",
+        oom_edit_core::SemanticStyle::FmDelimiter => "\x1b[2m",
+        oom_edit_core::SemanticStyle::FmKey => "\x1b[35m",
+        oom_edit_core::SemanticStyle::FmValue => "\x1b[37m",
+        oom_edit_core::SemanticStyle::Keyword => "\x1b[31m",
+        oom_edit_core::SemanticStyle::Function => "\x1b[32m",
+        oom_edit_core::SemanticStyle::TypeName => "\x1b[36m",
+        oom_edit_core::SemanticStyle::StringLit => "\x1b[33m",
+        oom_edit_core::SemanticStyle::NumberLit => "\x1b[33m",
+        oom_edit_core::SemanticStyle::Operator => "\x1b[37m",
+        oom_edit_core::SemanticStyle::Variable => "\x1b[37m",
+        oom_edit_core::SemanticStyle::Punct => "\x1b[37m",
+        oom_edit_core::SemanticStyle::Selection => "\x1b[7m",
+        oom_edit_core::SemanticStyle::Match => "\x1b[7m",
+        oom_edit_core::SemanticStyle::CursorLine => "\x1b[7m",
+        oom_edit_core::SemanticStyle::Text => "",
         _ => "",
     }
 }
 
-fn print_styled_line(line: &oom_edit_core::style::StyledLine) {
-    let mut last_style: Option<&oom_edit_core::style::SemanticStyle> = None;
+fn print_styled_line(line: &oom_edit_core::StyledLine) {
+    let mut last_style: Option<&oom_edit_core::SemanticStyle> = None;
     let mut ansi_buf = String::new();
     let text_len = line.text.len();
 

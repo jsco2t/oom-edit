@@ -15,8 +15,8 @@ use ratatui::backend::TestBackend;
 use ratatui::style::Modifier;
 use ratatui::Terminal;
 
-use oom_edit_core::clipboard::RecordingClipboardSink;
-use oom_edit_core::session::EditorSession;
+use oom_edit_core::EditorSession;
+use oom_edit_core::RecordingClipboardSink;
 
 use crate::app::App;
 use crate::command::Contexts;
@@ -28,17 +28,17 @@ fn resolve_test_theme_at(name: &str, capability: Tier) -> crate::theme::Resolved
     let config = crate::Config::default();
     let env = match capability {
         Tier::TrueColor => EnvParts {
-            term: Some("xterm-256color"),
-            colorterm: Some("truecolor"),
+            term: Some("xterm-256color".to_string()),
+            colorterm: Some("truecolor".to_string()),
             ..EnvParts::default()
         },
         Tier::Color16 => EnvParts {
-            term: Some("xterm-256color"),
+            term: Some("xterm-256color".to_string()),
             ..EnvParts::default()
         },
         Tier::Monochrome => EnvParts {
             no_color: true,
-            term: Some("dumb"),
+            term: Some("dumb".to_string()),
             ..EnvParts::default()
         },
     };
@@ -75,6 +75,27 @@ fn test_app(text: &str) -> App {
     test_app_with_relative_line_numbers(text, false)
 }
 
+fn confirm_quit_overlay() -> crate::overlay::Overlay {
+    crate::overlay::Overlay::open_confirm_quit(crate::lifecycle::CloseTabRequest {
+        target: 0,
+        force: false,
+        dirty_policy: crate::lifecycle::DirtyClosePolicy::Confirm,
+    })
+}
+
+fn confirm_overwrite_overlay() -> crate::overlay::Overlay {
+    crate::overlay::Overlay::open_confirm_overwrite(
+        crate::lifecycle::SaveRequest {
+            target: 0,
+            path: None,
+            force: false,
+            retarget: true,
+            continuation: crate::lifecycle::SaveContinuation::StayOpen,
+        },
+        PathBuf::from("fixture.md"),
+    )
+}
+
 fn test_app_with_relative_line_numbers(text: &str, relative_line_numbers: bool) -> App {
     let mut session = EditorSession::from_text(text);
     session.render_layout(74);
@@ -85,6 +106,7 @@ fn test_app_with_relative_line_numbers(text: &str, relative_line_numbers: bool) 
         relative_line_numbers,
         Box::new(RecordingClipboardSink::default()),
         Box::new(crate::config::DisabledConfigStore),
+        std::time::Instant::now(),
     )
 }
 
@@ -706,7 +728,7 @@ fn golden_confirm_quit() {
 fn golden_confirm_overwrite() {
     let mut app = test_app(kitchen_sink());
     // Open confirm-overwrite overlay directly.
-    app.set_overlay(crate::overlay::Overlay::open_confirm_overwrite());
+    app.set_overlay(confirm_overwrite_overlay());
     let lines = render_app_lines(80, 24, |frame| {
         app.render(frame);
     });
@@ -734,7 +756,7 @@ fn golden_status_error_glyph() {
     // Set an error transient.
     app.set_transient(
         "externally modified".to_string(),
-        oom_edit_core::session::Severity::Error,
+        oom_edit_core::Severity::Error,
     );
     let lines = render_app_lines(80, 24, |frame| {
         app.render(frame);
@@ -828,6 +850,7 @@ fn default_dark_styles_reach_all_four_modes() {
                     false,
                     Box::new(RecordingClipboardSink::default()),
                     Box::new(crate::config::DisabledConfigStore),
+                    std::time::Instant::now(),
                 );
                 if let Some(key) = mode_key {
                     app.handle_event(&crossterm::event::Event::Key(
@@ -883,6 +906,7 @@ fn accessible_styles_are_color_free_in_all_four_modes() {
                 false,
                 Box::new(RecordingClipboardSink::default()),
                 Box::new(crate::config::DisabledConfigStore),
+                std::time::Instant::now(),
             );
             if let Some(key) = mode_key {
                 app.handle_event(&crossterm::event::Event::Key(
@@ -945,11 +969,8 @@ fn accessible_styles_are_color_free_in_all_four_modes() {
 #[test]
 fn drift_hint_bar_matches_registry() {
     use crate::command::registry::{commands_for, Contexts};
-    use crate::command::Keymap;
-
-    let km = Keymap::default();
     for ctx in Contexts::each_bit() {
-        let cells = crate::widgets::hint_bar::build_hints(ctx, &km);
+        let cells = crate::widgets::hint_bar::build_hints(ctx);
         let commands = commands_for(ctx);
         assert_eq!(
             cells.len(),
@@ -974,13 +995,11 @@ fn drift_hint_bar_matches_registry() {
 /// Palette lists every registered command.
 #[test]
 fn drift_palette_lists_every_command() {
-    use crate::command::registry::{Contexts, COMMANDS};
-    use crate::command::Keymap;
-    use crate::overlay::palette::PaletteState;
+    use crate::command::registry::{BindingRole, Contexts, COMMANDS};
+    use crate::overlay::palette::{PaletteState, VIM_REFERENCE};
 
-    let km = Keymap::default();
     let state = PaletteState::default();
-    let rows = state.build_rows(Contexts::ALL, &km);
+    let rows = state.build_rows(Contexts::ALL);
 
     // Count Command rows.
     let cmd_count = rows
@@ -990,11 +1009,13 @@ fn drift_palette_lists_every_command() {
 
     assert_eq!(
         cmd_count,
-        COMMANDS.len(),
-        "palette must list all {} registered commands (found {})",
-        COMMANDS.len(),
-        cmd_count
+        COMMANDS
+            .iter()
+            .filter(|spec| matches!(spec.binding, BindingRole::AppChord { .. }))
+            .count(),
+        "palette executable rows must exactly match App-owned bindings"
     );
+    assert_eq!(rows.len(), COMMANDS.len() + VIM_REFERENCE.len());
 }
 
 /// Every overlay variant returns a non-empty `hints()` string.
@@ -1133,7 +1154,7 @@ fn drift_render_without_panic_across_sizes() {
         // Editor with confirm-quit overlay.
         {
             let mut app = test_app(kitchen);
-            app.set_overlay(Overlay::open_confirm_quit());
+            app.set_overlay(confirm_quit_overlay());
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _ = render_app_lines(*w, *h, |frame| {
                     app.render(frame);
@@ -1145,7 +1166,7 @@ fn drift_render_without_panic_across_sizes() {
         // Editor with confirm-overwrite overlay.
         {
             let mut app = test_app(kitchen);
-            app.set_overlay(Overlay::open_confirm_overwrite());
+            app.set_overlay(confirm_overwrite_overlay());
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _ = render_app_lines(*w, *h, |frame| {
                     app.render(frame);

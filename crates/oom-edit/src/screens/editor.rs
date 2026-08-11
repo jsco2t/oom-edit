@@ -3,7 +3,7 @@
 //! T11 shipped a minimal body-only layout (status row is a single line).
 //! T13 adds gutter, hint bar, proper status bar, selections, and match rendering.
 
-use oom_edit_core::session::EditorSession;
+use oom_edit_core::EditorSession;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
@@ -11,7 +11,6 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::command::registry::Contexts;
-use crate::command::Keymap;
 use crate::theme::{Theme, Tier};
 use crate::widgets::hint_bar;
 use crate::widgets::spans;
@@ -86,7 +85,7 @@ fn render_body(
     let gutter_w = gutter_w.max(4);
     let gutter_area_width = gutter_w.min(area.width);
 
-    let vp = oom_edit_core::session::Viewport {
+    let vp = oom_edit_core::Viewport {
         top_line: viewport.top_line,
         height: area.height,
         width: area.width.saturating_sub(gutter_area_width),
@@ -156,7 +155,7 @@ fn render_body(
 /// Render the line-number gutter.
 pub(crate) fn render_gutter(
     frame: &mut Frame<'_>,
-    mode: oom_edit_core::session::Mode,
+    mode: oom_edit_core::Mode,
     cursor_line: usize,
     line_numbers: &[Option<usize>],
     relative_line_numbers: bool,
@@ -211,7 +210,6 @@ pub fn render_status_row(
 
     // Build status bar state.
     let path = session
-        .document_ref()
         .path()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| "(new)".to_string());
@@ -228,7 +226,7 @@ pub fn render_status_row(
         mode,
         path,
         dirty,
-        is_new: session.document_ref().is_new(),
+        is_new: session.is_new(),
         cursor_line: cursor.0 + 1, // 1-based for display
         cursor_col: cursor.1 + 1,
         line_count: session.line_count(),
@@ -248,8 +246,7 @@ pub fn render_status_row(
             .width
             .saturating_sub(status_bar::MODE_BADGE_COLS)
             .saturating_sub(status_bar::RULER_COLS);
-        let km = Keymap::default();
-        let cells = hint_bar::build_hints(ctx, &km);
+        let cells = hint_bar::build_hints(ctx);
         hint_bar::format_hints(&cells, flexible_width)
     };
 
@@ -265,12 +262,12 @@ pub fn render_status_row(
 }
 
 /// Convert editor mode to UI context.
-fn mode_to_context(mode: oom_edit_core::session::Mode) -> Contexts {
+fn mode_to_context(mode: oom_edit_core::Mode) -> Contexts {
     match mode {
-        oom_edit_core::session::Mode::Normal => Contexts::NORMAL,
-        oom_edit_core::session::Mode::Insert => Contexts::INSERT,
-        oom_edit_core::session::Mode::Select => Contexts::SELECT,
-        oom_edit_core::session::Mode::Command => Contexts::COMMAND,
+        oom_edit_core::Mode::Normal => Contexts::NORMAL,
+        oom_edit_core::Mode::Insert => Contexts::INSERT,
+        oom_edit_core::Mode::Select => Contexts::SELECT,
+        oom_edit_core::Mode::Command => Contexts::COMMAND,
     }
 }
 
@@ -280,7 +277,7 @@ fn mode_to_context(mode: oom_edit_core::session::Mode) -> Contexts {
 mod tests {
     use super::*;
     use crate::theme::DEFAULT_DARK;
-    use oom_edit_core::session::{KeyCode, KeyCodeKind, KeyInput, Modifiers};
+    use oom_edit_core::{KeyCode, KeyCodeKind, KeyInput, Modifiers};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -685,7 +682,7 @@ mod tests {
     #[test]
     fn mode_to_context_normal() {
         assert_eq!(
-            mode_to_context(oom_edit_core::session::Mode::Normal),
+            mode_to_context(oom_edit_core::Mode::Normal),
             Contexts::NORMAL
         );
     }
@@ -693,7 +690,7 @@ mod tests {
     #[test]
     fn mode_to_context_insert() {
         assert_eq!(
-            mode_to_context(oom_edit_core::session::Mode::Insert),
+            mode_to_context(oom_edit_core::Mode::Insert),
             Contexts::INSERT
         );
     }
@@ -701,7 +698,7 @@ mod tests {
     #[test]
     fn mode_to_context_select() {
         assert_eq!(
-            mode_to_context(oom_edit_core::session::Mode::Select),
+            mode_to_context(oom_edit_core::Mode::Select),
             Contexts::SELECT
         );
     }
@@ -709,7 +706,7 @@ mod tests {
     #[test]
     fn mode_to_context_command() {
         assert_eq!(
-            mode_to_context(oom_edit_core::session::Mode::Command),
+            mode_to_context(oom_edit_core::Mode::Command),
             Contexts::COMMAND
         );
     }

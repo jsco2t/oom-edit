@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (unreleased 0.4.0):** `oom-edit-core` now exposes only its crate-root facade. Implementation modules, highlighter/parser protocols, document metadata, and renderer-to-Vim adapters are private; embedders should import `EditorSession`, terminal-neutral input types, effects, errors, front-matter values, and renderer-neutral output types directly from `oom_edit_core`. Wrap changes now use `Effect::SetWrap(bool)`.
+- Fixed bindings now come from one typed registry, while editor-native `g`/count/tab grammar stays in core. Hosts receive typed `TabNext`, `TabPrev`, and one-based `TabJump` effects, and event time is injected after terminal reads.
 - **Breaking (0.4.0):** `EditorSession::rendered_cursor()` now returns the public two-dimensional `RenderedPoint`; desired-column state and renderer navigation internals are private. `RenderedLine` exposes renderer-neutral metadata roles and source atoms; `RenderedSelection` exposes `SelectionShape`, anchor/active points, per-row display intervals, normalized source ranges, and block width. Both workspace crates and the exact internal dependency are now 0.4.0.
 - Theme resolution now reports the active theme, effective palette, terminal capability, provenance, and display mode as one value. Missing or malformed config falls back to colored `default-dark`/`default-light`; `accessible` remains opt-in and monochrome.
 - **Breaking (0.3.0):** the public mode model is now exactly `Normal`, `Insert`,
@@ -36,6 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Space-q and `:q` now share captured-tab dirty confirmation; save/discard/cancel, external overwrite/reload, and `:wq` continuations act on the original tab. Dirty non-force `:tabclose`, `:e`, and `:qa` consistently refuse with their force remedy, while forced variants affect only their requested target.
+- `gt`, `gT`, counted `gt`, and Space-digit tab switching now use one typed routing path without stealing editor-native `gg`, `gu`, or `gU` prefixes.
 - Rendered and source scrolling now avoid document-sized navigation, edit-validation, and line-index work on each key or frame, restoring responsive Insert edits and keyboard/mouse scrolling near the 1 MB boundary.
 - Rendered Select no longer expands every operation to a whole rendered row; partial, wrapped, Unicode, metadata, and block selections preserve exact UTF-8 source ownership and omit synthetic glyphs.
 - Expanded front matter no longer sorts and compacts parsed values into a pseudo-table, so source order, comments, blank lines, nesting, and scalar spelling remain visible.

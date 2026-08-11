@@ -216,7 +216,7 @@ fn parse_yaml_front_matter(text: &str) -> FrontMatter {
             let value = opt_pod_to_value(parsed.data.as_ref());
             FrontMatter::Yaml(Ok(value))
         }
-        Err(e) => FrontMatter::Yaml(Err(FmError(e))),
+        Err(e) => FrontMatter::Yaml(Err(FmError::from_parser(e))),
     }
 }
 
@@ -232,7 +232,7 @@ fn parse_toml_front_matter(text: &str) -> FrontMatter {
             let value = opt_pod_to_value(parsed.data.as_ref());
             FrontMatter::Toml(Ok(value))
         }
-        Err(e) => FrontMatter::Toml(Err(FmError(e))),
+        Err(e) => FrontMatter::Toml(Err(FmError::from_parser(e))),
     }
 }
 

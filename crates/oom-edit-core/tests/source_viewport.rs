@@ -1,7 +1,7 @@
-use oom_edit_core::session::{
+use oom_edit_core::SemanticStyle;
+use oom_edit_core::{
     EditorSession, Effect, KeyCode, KeyCodeKind, KeyInput, Modifiers, Severity, Viewport,
 };
-use oom_edit_core::style::SemanticStyle;
 
 fn key(kind: KeyCodeKind) -> KeyInput {
     KeyInput {
@@ -347,23 +347,13 @@ fn visual_row_info_empty_line() {
 #[test]
 fn set_wrap_ex_command_emits_effect() {
     let mut session = EditorSession::from_text("");
-    assert!(
-        execute_ex(&mut session, "set wrap").contains(&Effect::SetOption {
-            key: "wrap".to_string(),
-            value: true,
-        })
-    );
+    assert!(execute_ex(&mut session, "set wrap").contains(&Effect::SetWrap(true)));
 }
 
 #[test]
 fn set_nowrap_ex_command_emits_effect() {
     let mut session = EditorSession::from_text("");
-    assert!(
-        execute_ex(&mut session, "set nowrap").contains(&Effect::SetOption {
-            key: "wrap".to_string(),
-            value: false,
-        })
-    );
+    assert!(execute_ex(&mut session, "set nowrap").contains(&Effect::SetWrap(false)));
 }
 
 #[test]

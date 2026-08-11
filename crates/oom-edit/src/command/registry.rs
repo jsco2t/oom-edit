@@ -1,37 +1,13 @@
-//! The command registry — the single source of truth for every user-facing
-//! operation in the app chrome.
-//!
-//! One [`Command`] variant per discrete action; the [`COMMANDS`] table carries
-//! each command's identity (kebab-case `name`, human `desc`), the [`Contexts`]
-//! in which it is available, its hint-bar `order`, and whether it is
-//! `quick_bar`-eligible. Contextual UI projections consume this metadata,
-//! while [`super::Keymap`] owns triggers and `App` owns dispatch.
+//! Static command/binding registry used by dispatch and every UI projection.
 
-// ── Command enum ────────────────────────────────────────────────────────────
-
-/// One enum variant per discrete user-facing action.
-///
-/// A closed enum (design decision D-1): type-safe, exhaustiveness-testable,
-/// and enumerable for the palette/help without a parser.
-macro_rules! command_variants {
-    ($($variant:ident),+ $(,)?) => {
-        #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-        pub enum Command {
-            $($variant),+
-        }
-
-        #[cfg(test)]
-        const ALL_COMMANDS: &'static [Command] = &[
-            $(Command::$variant),+
-        ];
-    };
-}
-
-command_variants! {
+/// Stable metadata-row identity; it is never an executable payload.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum RegistryEntryId {
     EnterCharacterSelect,
     EnterLineSelect,
     EnterBlockSelect,
     CancelSelect,
+    SelectRegister,
     SelectYank,
     SelectDelete,
     SelectChange,
@@ -42,6 +18,7 @@ command_variants! {
     Save,
     Quit,
     CycleTheme,
+    SpaceDigitTab,
     NextTab,
     PrevTab,
     JumpToTab,
@@ -50,328 +27,630 @@ command_variants! {
     QuitAll,
 }
 
-// ── Contexts bitset ─────────────────────────────────────────────────────────
+/// Payload-free actions owned and executed by the TUI.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum AppCommand {
+    Help,
+    Save,
+    Quit,
+    CycleTheme,
+}
 
-/// The set of UI contexts in which a command is available. A hand-rolled bitset
-/// (no `bitflags` dependency — supply-chain rule; ~30 lines).
-///
-/// A "context" is the active mode + overlay the dispatcher is in. A command is
-/// offered (hint bar, palette, dispatch) only where its `contexts` intersect
-/// the current context.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+/// Binding ownership and finite dispatch role.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum BindingRole {
+    AppChord {
+        continuation: char,
+        command: AppCommand,
+    },
+    AppSpaceDigit,
+    CoreKey {
+        display: &'static str,
+    },
+    CoreEx {
+        display: &'static str,
+    },
+}
+
+/// The set of UI contexts in which a registry row is visible.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct Contexts(u8);
 
 impl Contexts {
-    pub const NORMAL: Contexts = Contexts(1 << 0);
-    #[allow(dead_code)]
-    pub const INSERT: Contexts = Contexts(1 << 1);
-    #[allow(dead_code)]
-    pub const SELECT: Contexts = Contexts(1 << 2);
-    #[allow(dead_code)]
-    pub const COMMAND: Contexts = Contexts(1 << 3);
-    #[allow(dead_code)]
-    pub const OVERLAY: Contexts = Contexts(1 << 4);
-
-    /// Bit count — every declared context bit above.
+    pub const NORMAL: Self = Self(1 << 0);
+    pub const INSERT: Self = Self(1 << 1);
+    pub const SELECT: Self = Self(1 << 2);
+    pub const COMMAND: Self = Self(1 << 3);
     #[cfg(test)]
-    const BIT_COUNT: u8 = 5;
-
-    /// Every context — for globally-available commands.
+    pub const OVERLAY: Self = Self(1 << 4);
     #[cfg(test)]
-    pub const ALL: Contexts = Contexts((1 << Self::BIT_COUNT) - 1);
+    pub const ALL: Self = Self((1 << 5) - 1);
 
-    /// Union of two context sets (const so it composes in `static` initialisers).
-    pub const fn or(self, other: Contexts) -> Contexts {
-        Contexts(self.0 | other.0)
+    pub const fn or(self, other: Self) -> Self {
+        Self(self.0 | other.0)
     }
 
-    /// Do these two context sets intersect? Used to test "is this command
-    /// available in `ctx`?" where `ctx` is a single bit.
-    pub const fn contains(self, other: Contexts) -> bool {
+    pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 != 0
     }
 
-    /// Is this the empty set (no contexts)? An empty-context command is
-    /// unreachable dead weight — the registry tests forbid it.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
 
-    /// Iterate the single-bit contexts (one per declared constant). Test-only.
     #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) fn each_bit() -> impl Iterator<Item = Contexts> {
-        (0..Self::BIT_COUNT).map(|i| Contexts(1 << i))
+    pub(crate) fn each_bit() -> impl Iterator<Item = Self> {
+        (0..5).map(|bit| Self(1 << bit))
     }
 }
 
-// ── CommandSpec ─────────────────────────────────────────────────────────────
-
-/// One row of the command registry: a command's static metadata.
-#[derive(Debug)]
+/// One immutable registry row.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct CommandSpec {
-    /// The command this row describes.
-    pub id: Command,
-    /// Kebab-case identifier (for example, `enter-select`).
+    pub id: RegistryEntryId,
     pub name: &'static str,
-    /// Human-readable description for help / hints / palette.
     pub desc: &'static str,
-    /// Contexts in which the command is available.
     pub contexts: Contexts,
-    /// Hint-bar priority; lower renders further left. Gaps of 10 leave room.
-    #[allow(dead_code)]
-    pub order: i16,
-    /// Eligible for the always-visible bottom hint bar.
-    #[allow(dead_code)]
-    pub quick_bar: bool,
+    pub binding: BindingRole,
+    /// Purpose-specific order for the compact hint bar only.
+    pub quick_bar_order: Option<i16>,
 }
 
-// ── COMMANDS table ──────────────────────────────────────────────────────────
+const RENDERED: Contexts = Contexts::NORMAL.or(Contexts::SELECT);
 
-/// The command registry. One row per [`Command`] variant, in help-display order.
-///
-/// App commands (initial registry; `quick_bar` marks hint-bar eligibility):
-///
-/// | Command id   | name         | keys          | contexts            | quick_bar |
-/// |--------------|--------------|---------------|---------------------|-----------|
-/// | `EnterCharacterSelect` | `select-character` | `v` | NORMAL | yes |
-/// | `EnterLineSelect` | `select-line` | `V` | NORMAL | no |
-/// | `EnterBlockSelect` | `select-block` | `Ctrl-V` | NORMAL | no |
-/// | `Help`        | `help`         | `Space h`   | NORMAL, SELECT      | yes       |
-/// | `Save`        | `save`         | `Space w`   | NORMAL, SELECT      | yes       |
-/// | `Quit`        | `quit`         | `Space q`   | NORMAL, SELECT      | yes       |
-/// | `CycleTheme`  | `cycle-theme`  | `Space t`   | NORMAL, SELECT      | no        |
+macro_rules! row {
+    ($id:ident, $name:literal, $desc:literal, $contexts:expr, $binding:expr, $quick:expr) => {
+        CommandSpec {
+            id: RegistryEntryId::$id,
+            name: $name,
+            desc: $desc,
+            contexts: $contexts,
+            binding: $binding,
+            quick_bar_order: $quick,
+        }
+    };
+}
+
+/// Sole fixed-binding and UI-order table.
 pub static COMMANDS: &[CommandSpec] = &[
-    CommandSpec {
-        id: Command::EnterCharacterSelect,
-        name: "select-character",
-        desc: "character-wise selection",
-        contexts: Contexts::NORMAL,
-        order: 0,
-        quick_bar: true,
-    },
-    CommandSpec {
-        id: Command::EnterLineSelect,
-        name: "select-line",
-        desc: "line-wise selection",
-        contexts: Contexts::NORMAL,
-        order: 1,
-        quick_bar: false,
-    },
-    CommandSpec {
-        id: Command::EnterBlockSelect,
-        name: "select-block",
-        desc: "block-wise selection",
-        contexts: Contexts::NORMAL,
-        order: 2,
-        quick_bar: false,
-    },
-    CommandSpec {
-        id: Command::CancelSelect,
-        name: "cancel-select",
-        desc: "cancel selection",
-        contexts: Contexts::SELECT,
-        order: 1,
-        quick_bar: true,
-    },
-    CommandSpec {
-        id: Command::SelectYank,
-        name: "select-yank",
-        desc: "yank selection",
-        contexts: Contexts::SELECT,
-        order: 2,
-        quick_bar: true,
-    },
-    CommandSpec {
-        id: Command::SelectDelete,
-        name: "select-delete",
-        desc: "delete selection",
-        contexts: Contexts::SELECT,
-        order: 3,
-        quick_bar: true,
-    },
-    CommandSpec {
-        id: Command::SelectChange,
-        name: "select-change",
-        desc: "change selection",
-        contexts: Contexts::SELECT,
-        order: 4,
-        quick_bar: false,
-    },
-    CommandSpec {
-        id: Command::SelectIndent,
-        name: "select-indent",
-        desc: "indent selection",
-        contexts: Contexts::SELECT,
-        order: 5,
-        quick_bar: false,
-    },
-    CommandSpec {
-        id: Command::SelectOutdent,
-        name: "select-outdent",
-        desc: "outdent selection",
-        contexts: Contexts::SELECT,
-        order: 6,
-        quick_bar: false,
-    },
-    CommandSpec {
-        id: Command::SelectSwapAnchor,
-        name: "select-swap-anchor",
-        desc: "swap selection endpoint",
-        contexts: Contexts::SELECT,
-        order: 7,
-        quick_bar: false,
-    },
-    CommandSpec {
-        id: Command::Help,
-        name: "help",
-        desc: "help / command palette",
-        contexts: Contexts::NORMAL.or(Contexts::SELECT),
-        order: 10,
-        quick_bar: true,
-    },
-    CommandSpec {
-        id: Command::Save,
-        name: "save",
-        desc: "save",
-        contexts: Contexts::NORMAL.or(Contexts::SELECT),
-        order: 20,
-        quick_bar: true,
-    },
-    CommandSpec {
-        id: Command::Quit,
-        name: "quit",
-        desc: "quit",
-        contexts: Contexts::NORMAL.or(Contexts::SELECT),
-        order: 30,
-        quick_bar: true,
-    },
-    CommandSpec {
-        id: Command::CycleTheme,
-        name: "cycle-theme",
-        desc: "cycle theme",
-        contexts: Contexts::NORMAL.or(Contexts::SELECT),
-        order: 40,
-        quick_bar: false,
-    },
-    CommandSpec {
-        id: Command::NextTab,
-        name: "next-tab",
-        desc: "next tab",
-        contexts: Contexts::NORMAL.or(Contexts::SELECT),
-        order: 50,
-        quick_bar: false,
-    },
-    CommandSpec {
-        id: Command::PrevTab,
-        name: "prev-tab",
-        desc: "previous tab",
-        contexts: Contexts::NORMAL.or(Contexts::SELECT),
-        order: 51,
-        quick_bar: false,
-    },
-    CommandSpec {
-        id: Command::JumpToTab,
-        name: "jump-to-tab",
-        desc: "jump to tab",
-        contexts: Contexts::NORMAL.or(Contexts::SELECT),
-        order: 52,
-        quick_bar: false,
-    },
-    CommandSpec {
-        id: Command::TabNew,
-        name: "tab-new",
-        desc: "new tab",
-        contexts: Contexts::NORMAL.or(Contexts::SELECT),
-        order: 60,
-        quick_bar: false,
-    },
-    CommandSpec {
-        id: Command::TabClose,
-        name: "tab-close",
-        desc: "close tab",
-        contexts: Contexts::NORMAL.or(Contexts::SELECT),
-        order: 61,
-        quick_bar: false,
-    },
-    CommandSpec {
-        id: Command::QuitAll,
-        name: "quit-all",
-        desc: "quit all tabs",
-        contexts: Contexts::COMMAND,
-        order: 70,
-        quick_bar: false,
-    },
+    row!(
+        EnterCharacterSelect,
+        "select-character",
+        "character-wise selection",
+        Contexts::NORMAL,
+        BindingRole::CoreKey { display: "v" },
+        Some(0)
+    ),
+    row!(
+        EnterLineSelect,
+        "select-line",
+        "line-wise selection",
+        Contexts::NORMAL,
+        BindingRole::CoreKey { display: "V" },
+        None
+    ),
+    row!(
+        EnterBlockSelect,
+        "select-block",
+        "block-wise selection",
+        Contexts::NORMAL,
+        BindingRole::CoreKey { display: "Ctrl-V" },
+        None
+    ),
+    row!(
+        CancelSelect,
+        "cancel-select",
+        "cancel selection",
+        Contexts::SELECT,
+        BindingRole::CoreKey {
+            display: "Esc / Ctrl-C"
+        },
+        Some(1)
+    ),
+    row!(
+        SelectRegister,
+        "select-register",
+        "select register",
+        Contexts::SELECT,
+        BindingRole::CoreKey {
+            display: "\"{register}"
+        },
+        None
+    ),
+    row!(
+        SelectYank,
+        "select-yank",
+        "yank selection",
+        Contexts::SELECT,
+        BindingRole::CoreKey { display: "y" },
+        Some(2)
+    ),
+    row!(
+        SelectDelete,
+        "select-delete",
+        "delete selection",
+        Contexts::SELECT,
+        BindingRole::CoreKey { display: "d / x" },
+        Some(3)
+    ),
+    row!(
+        SelectChange,
+        "select-change",
+        "change selection",
+        Contexts::SELECT,
+        BindingRole::CoreKey { display: "c" },
+        None
+    ),
+    row!(
+        SelectIndent,
+        "select-indent",
+        "indent selection",
+        Contexts::SELECT,
+        BindingRole::CoreKey { display: ">" },
+        None
+    ),
+    row!(
+        SelectOutdent,
+        "select-outdent",
+        "outdent selection",
+        Contexts::SELECT,
+        BindingRole::CoreKey { display: "<" },
+        None
+    ),
+    row!(
+        SelectSwapAnchor,
+        "select-swap-anchor",
+        "swap selection endpoint",
+        Contexts::SELECT,
+        BindingRole::CoreKey { display: "o" },
+        None
+    ),
+    row!(
+        Help,
+        "help",
+        "help / command palette",
+        RENDERED,
+        BindingRole::AppChord {
+            continuation: 'h',
+            command: AppCommand::Help
+        },
+        Some(10)
+    ),
+    row!(
+        Save,
+        "save",
+        "save",
+        RENDERED,
+        BindingRole::AppChord {
+            continuation: 'w',
+            command: AppCommand::Save
+        },
+        Some(20)
+    ),
+    row!(
+        Quit,
+        "quit",
+        "quit",
+        RENDERED,
+        BindingRole::AppChord {
+            continuation: 'q',
+            command: AppCommand::Quit
+        },
+        Some(30)
+    ),
+    row!(
+        CycleTheme,
+        "cycle-theme",
+        "cycle theme",
+        RENDERED,
+        BindingRole::AppChord {
+            continuation: 't',
+            command: AppCommand::CycleTheme
+        },
+        None
+    ),
+    row!(
+        SpaceDigitTab,
+        "space-tab",
+        "jump to tab",
+        RENDERED,
+        BindingRole::AppSpaceDigit,
+        None
+    ),
+    row!(
+        NextTab,
+        "next-tab",
+        "next tab",
+        RENDERED,
+        BindingRole::CoreKey { display: "g t" },
+        None
+    ),
+    row!(
+        PrevTab,
+        "prev-tab",
+        "previous tab",
+        RENDERED,
+        BindingRole::CoreKey { display: "g T" },
+        None
+    ),
+    row!(
+        JumpToTab,
+        "jump-to-tab",
+        "jump to numbered tab",
+        RENDERED,
+        BindingRole::CoreKey {
+            display: "{count} g t"
+        },
+        None
+    ),
+    row!(
+        TabNew,
+        "tab-new",
+        "open path in new tab",
+        RENDERED,
+        BindingRole::CoreEx {
+            display: ":tabnew {path}"
+        },
+        None
+    ),
+    row!(
+        TabClose,
+        "tab-close",
+        "close tab",
+        RENDERED,
+        BindingRole::CoreEx {
+            display: ":tabclose"
+        },
+        None
+    ),
+    row!(
+        QuitAll,
+        "quit-all",
+        "quit all tabs",
+        Contexts::COMMAND,
+        BindingRole::CoreEx { display: ":qa" },
+        None
+    ),
 ];
 
-/// The registry row for `id`. Every [`Command`] variant has exactly one row
-/// (guaranteed by `commands_table_is_exhaustive_and_unique`).
-pub fn spec_for(id: Command) -> Option<&'static CommandSpec> {
-    COMMANDS.iter().find(|spec| spec.id == id)
+pub fn rendered_binding(spec: &CommandSpec) -> String {
+    match spec.binding {
+        BindingRole::AppChord { continuation, .. } => format!("Space {continuation}"),
+        BindingRole::AppSpaceDigit => "Space 1-9".to_string(),
+        BindingRole::CoreKey { display } | BindingRole::CoreEx { display } => display.to_string(),
+    }
 }
 
-/// Get quick_bar-eligible commands for a given context, sorted by order.
 pub fn commands_for(ctx: Contexts) -> Vec<&'static CommandSpec> {
-    let mut cmds: Vec<&CommandSpec> = COMMANDS
+    let mut rows: Vec<_> = COMMANDS
         .iter()
-        .filter(|spec| spec.quick_bar && spec.contexts.contains(ctx))
+        .filter(|spec| spec.contexts.contains(ctx) && spec.quick_bar_order.is_some())
         .collect();
-    cmds.sort_by_key(|spec| spec.order);
-    cmds
+    rows.sort_by_key(|spec| spec.quick_bar_order);
+    rows
 }
 
-// ── Meta / drift tests ──────────────────────────────────────────────────────
+pub fn app_chord(ctx: Contexts, continuation: char) -> Option<AppCommand> {
+    COMMANDS.iter().find_map(|spec| {
+        if !spec.contexts.contains(ctx) {
+            return None;
+        }
+        match spec.binding {
+            BindingRole::AppChord {
+                continuation: key,
+                command,
+            } if key == continuation => Some(command),
+            _ => None,
+        }
+    })
+}
+
+pub fn space_continuations(ctx: Contexts) -> Vec<(char, &'static CommandSpec)> {
+    COMMANDS
+        .iter()
+        .filter_map(|spec| match spec.binding {
+            BindingRole::AppChord { continuation, .. } if spec.contexts.contains(ctx) => {
+                Some((continuation, spec))
+            }
+            _ => None,
+        })
+        .collect()
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
-    /// Every `Command` variant appears in `COMMANDS` exactly once.
     #[test]
-    fn commands_table_is_exhaustive_and_unique() {
-        fn assert_registered(c: Command) {
-            let count = COMMANDS.iter().filter(|spec| spec.id == c).count();
-            assert_eq!(count, 1, "{c:?} must appear exactly once in COMMANDS");
+    fn command_registry_is_exhaustive_unique_and_contextual() {
+        let mut ids = HashSet::new();
+        let mut names = HashSet::new();
+        for spec in COMMANDS {
+            assert!(ids.insert(spec.id));
+            assert!(names.insert(spec.name));
+            assert!(!spec.contexts.is_empty());
+            assert!(!rendered_binding(spec).is_empty());
         }
-        for &command in ALL_COMMANDS {
-            assert_registered(command);
-        }
-        assert_eq!(COMMANDS.len(), ALL_COMMANDS.len());
+        assert_eq!(COMMANDS.len(), 22);
     }
 
-    /// Every command has at least one context.
     #[test]
-    fn every_command_has_context() {
-        for spec in COMMANDS {
-            assert!(
-                !spec.contexts.is_empty(),
-                "{:?} has no contexts — unreachable dead weight",
-                spec.id
-            );
-        }
-    }
-
-    /// Command names are unique and kebab-case.
-    #[test]
-    fn command_names_are_unique_kebab_case() {
-        let mut seen = std::collections::HashSet::new();
-        for spec in COMMANDS {
-            assert!(seen.insert(spec.name), "duplicate name {:?}", spec.name);
-            assert!(!spec.name.is_empty(), "empty name for {:?}", spec.id);
-            for ch in spec.name.chars() {
-                assert!(
-                    ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-',
-                    "{:?} name {:?} is not kebab-case (char {ch:?})",
+    fn registry_exactly_matches_fixed_binding_contract() {
+        let expected = [
+            (
+                RegistryEntryId::EnterCharacterSelect,
+                "select-character",
+                "character-wise selection",
+                Contexts::NORMAL,
+                BindingRole::CoreKey { display: "v" },
+                Some(0),
+            ),
+            (
+                RegistryEntryId::EnterLineSelect,
+                "select-line",
+                "line-wise selection",
+                Contexts::NORMAL,
+                BindingRole::CoreKey { display: "V" },
+                None,
+            ),
+            (
+                RegistryEntryId::EnterBlockSelect,
+                "select-block",
+                "block-wise selection",
+                Contexts::NORMAL,
+                BindingRole::CoreKey { display: "Ctrl-V" },
+                None,
+            ),
+            (
+                RegistryEntryId::CancelSelect,
+                "cancel-select",
+                "cancel selection",
+                Contexts::SELECT,
+                BindingRole::CoreKey {
+                    display: "Esc / Ctrl-C",
+                },
+                Some(1),
+            ),
+            (
+                RegistryEntryId::SelectRegister,
+                "select-register",
+                "select register",
+                Contexts::SELECT,
+                BindingRole::CoreKey {
+                    display: "\"{register}",
+                },
+                None,
+            ),
+            (
+                RegistryEntryId::SelectYank,
+                "select-yank",
+                "yank selection",
+                Contexts::SELECT,
+                BindingRole::CoreKey { display: "y" },
+                Some(2),
+            ),
+            (
+                RegistryEntryId::SelectDelete,
+                "select-delete",
+                "delete selection",
+                Contexts::SELECT,
+                BindingRole::CoreKey { display: "d / x" },
+                Some(3),
+            ),
+            (
+                RegistryEntryId::SelectChange,
+                "select-change",
+                "change selection",
+                Contexts::SELECT,
+                BindingRole::CoreKey { display: "c" },
+                None,
+            ),
+            (
+                RegistryEntryId::SelectIndent,
+                "select-indent",
+                "indent selection",
+                Contexts::SELECT,
+                BindingRole::CoreKey { display: ">" },
+                None,
+            ),
+            (
+                RegistryEntryId::SelectOutdent,
+                "select-outdent",
+                "outdent selection",
+                Contexts::SELECT,
+                BindingRole::CoreKey { display: "<" },
+                None,
+            ),
+            (
+                RegistryEntryId::SelectSwapAnchor,
+                "select-swap-anchor",
+                "swap selection endpoint",
+                Contexts::SELECT,
+                BindingRole::CoreKey { display: "o" },
+                None,
+            ),
+            (
+                RegistryEntryId::Help,
+                "help",
+                "help / command palette",
+                RENDERED,
+                BindingRole::AppChord {
+                    continuation: 'h',
+                    command: AppCommand::Help,
+                },
+                Some(10),
+            ),
+            (
+                RegistryEntryId::Save,
+                "save",
+                "save",
+                RENDERED,
+                BindingRole::AppChord {
+                    continuation: 'w',
+                    command: AppCommand::Save,
+                },
+                Some(20),
+            ),
+            (
+                RegistryEntryId::Quit,
+                "quit",
+                "quit",
+                RENDERED,
+                BindingRole::AppChord {
+                    continuation: 'q',
+                    command: AppCommand::Quit,
+                },
+                Some(30),
+            ),
+            (
+                RegistryEntryId::CycleTheme,
+                "cycle-theme",
+                "cycle theme",
+                RENDERED,
+                BindingRole::AppChord {
+                    continuation: 't',
+                    command: AppCommand::CycleTheme,
+                },
+                None,
+            ),
+            (
+                RegistryEntryId::SpaceDigitTab,
+                "space-tab",
+                "jump to tab",
+                RENDERED,
+                BindingRole::AppSpaceDigit,
+                None,
+            ),
+            (
+                RegistryEntryId::NextTab,
+                "next-tab",
+                "next tab",
+                RENDERED,
+                BindingRole::CoreKey { display: "g t" },
+                None,
+            ),
+            (
+                RegistryEntryId::PrevTab,
+                "prev-tab",
+                "previous tab",
+                RENDERED,
+                BindingRole::CoreKey { display: "g T" },
+                None,
+            ),
+            (
+                RegistryEntryId::JumpToTab,
+                "jump-to-tab",
+                "jump to numbered tab",
+                RENDERED,
+                BindingRole::CoreKey {
+                    display: "{count} g t",
+                },
+                None,
+            ),
+            (
+                RegistryEntryId::TabNew,
+                "tab-new",
+                "open path in new tab",
+                RENDERED,
+                BindingRole::CoreEx {
+                    display: ":tabnew {path}",
+                },
+                None,
+            ),
+            (
+                RegistryEntryId::TabClose,
+                "tab-close",
+                "close tab",
+                RENDERED,
+                BindingRole::CoreEx {
+                    display: ":tabclose",
+                },
+                None,
+            ),
+            (
+                RegistryEntryId::QuitAll,
+                "quit-all",
+                "quit all tabs",
+                Contexts::COMMAND,
+                BindingRole::CoreEx { display: ":qa" },
+                None,
+            ),
+        ];
+        let actual = COMMANDS
+            .iter()
+            .map(|spec| {
+                (
                     spec.id,
-                    spec.name
-                );
+                    spec.name,
+                    spec.desc,
+                    spec.contexts,
+                    spec.binding,
+                    spec.quick_bar_order,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+
+        for (index, left) in COMMANDS.iter().enumerate() {
+            for right in &COMMANDS[index + 1..] {
+                let contexts_overlap = left.contexts.0 & right.contexts.0 != 0;
+                if !contexts_overlap {
+                    continue;
+                }
+                if let (
+                    BindingRole::AppChord {
+                        continuation: left_key,
+                        ..
+                    },
+                    BindingRole::AppChord {
+                        continuation: right_key,
+                        ..
+                    },
+                ) = (left.binding, right.binding)
+                {
+                    assert_ne!(
+                        left_key, right_key,
+                        "overlapping App chord for {} and {}",
+                        left.name, right.name
+                    );
+                }
+                if let (Some(left_order), Some(right_order)) =
+                    (left.quick_bar_order, right.quick_bar_order)
+                {
+                    assert_ne!(
+                        left_order, right_order,
+                        "overlapping quick-bar order for {} and {}",
+                        left.name, right.name
+                    );
+                }
             }
+        }
+    }
+
+    #[test]
+    fn core_binding_descriptors_are_visibility_only() {
+        for spec in COMMANDS {
+            if matches!(
+                spec.binding,
+                BindingRole::CoreKey { .. } | BindingRole::CoreEx { .. }
+            ) {
+                assert!(!matches!(spec.binding, BindingRole::AppChord { .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn registry_binding_rendering_is_total() {
+        for spec in COMMANDS {
+            let rendered = rendered_binding(spec);
             assert!(
-                !spec.name.starts_with('-') && !spec.name.ends_with('-'),
-                "{:?} name must not start/end with '-'",
+                !rendered.trim().is_empty(),
+                "missing binding for {:?}",
                 spec.id
             );
+            assert!(!rendered.contains("no binding"));
         }
     }
 }

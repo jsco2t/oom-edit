@@ -35,9 +35,23 @@ pub enum SaveError {
 
 /// Error from parsing front matter.
 ///
-/// Wraps the `gray_matter` parsing error. Parse failures degrade gracefully:
-/// the document still opens, editing is unaffected, and the structural API
-/// returns the error (FR-5.6).
+/// Owns a stable parser-neutral diagnostic. Parse failures degrade
+/// gracefully: the document still opens and editing remains available.
 #[derive(Debug, Error, PartialEq, Eq)]
-#[error("front matter parse error: {0}")]
-pub struct FmError(#[from] pub gray_matter::Error);
+#[error("front matter parse error: {message}")]
+pub struct FmError {
+    message: String,
+}
+
+impl FmError {
+    pub(crate) fn from_parser(error: gray_matter::Error) -> Self {
+        Self {
+            message: error.to_string(),
+        }
+    }
+
+    /// Return the owned parser-neutral diagnostic text.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}

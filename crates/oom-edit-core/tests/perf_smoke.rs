@@ -6,9 +6,7 @@
 mod perf_assertions {
     use std::time::{Duration, Instant};
 
-    use oom_edit_core::session::{
-        EditorSession, KeyCode, KeyCodeKind, KeyInput, Mode, Modifiers, Viewport,
-    };
+    use oom_edit_core::{EditorSession, KeyCode, KeyCodeKind, KeyInput, Mode, Modifiers, Viewport};
 
     const ONE_MIB: usize = 1024 * 1024;
 

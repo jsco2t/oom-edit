@@ -14,35 +14,16 @@
 // ── Language definitions ────────────────────────────────────────────────────
 
 /// A single row in the language registry.
-pub struct LangDef {
+pub(super) struct LangDef {
     /// Canonical name (e.g. `"rust"`, `"python"`).
-    pub name: &'static str,
+    pub(super) name: &'static str,
     /// Info-string aliases — case-insensitive lookup.
     /// `["sh", "shell", "zsh"]` all map to bash.
-    pub aliases: &'static [&'static str],
+    pub(super) aliases: &'static [&'static str],
     /// Returns the tree-sitter `Language` for this grammar.
-    pub language_fn: fn() -> tree_sitter::Language,
-}
-
-impl LangDef {
-    /// Return this registry language's grammar-specific highlight query.
-    pub(crate) fn highlights_query(&self) -> &'static str {
-        match self.name {
-            "markdown" => tree_sitter_md::HIGHLIGHT_QUERY_BLOCK,
-            "markdown_inline" => tree_sitter_md::HIGHLIGHT_QUERY_INLINE,
-            "rust" => tree_sitter_rust::HIGHLIGHTS_QUERY,
-            "python" => tree_sitter_python::HIGHLIGHTS_QUERY,
-            "javascript" => tree_sitter_javascript::HIGHLIGHT_QUERY,
-            "typescript" => tree_sitter_typescript::HIGHLIGHTS_QUERY,
-            "go" => tree_sitter_go::HIGHLIGHTS_QUERY,
-            "bash" => tree_sitter_bash::HIGHLIGHT_QUERY,
-            "json" => tree_sitter_json::HIGHLIGHTS_QUERY,
-            "c" => tree_sitter_c::HIGHLIGHT_QUERY,
-            "yaml" => tree_sitter_yaml::HIGHLIGHTS_QUERY,
-            "toml" => tree_sitter_toml_ng::HIGHLIGHTS_QUERY,
-            name => unreachable!("unregistered language definition: {name}"),
-        }
-    }
+    pub(super) language_fn: fn() -> tree_sitter::Language,
+    /// Grammar-specific tree-sitter highlight query.
+    pub(super) highlights_query: &'static str,
 }
 
 // ── The registry ────────────────────────────────────────────────────────────
@@ -51,66 +32,78 @@ impl LangDef {
 /// and one `Cargo.toml` dependency — no other code changes are required.
 ///
 /// Covers the 10 fence languages (FR-4.3) plus md-block and md-inline.
-pub static LANGUAGES: &[LangDef] = &[
+pub(super) static LANGUAGES: &[LangDef] = &[
     LangDef {
         name: "markdown",
         aliases: &[],
         language_fn: || tree_sitter_md::LANGUAGE.into(),
+        highlights_query: tree_sitter_md::HIGHLIGHT_QUERY_BLOCK,
     },
     LangDef {
         name: "markdown_inline",
         aliases: &[],
         language_fn: || tree_sitter_md::INLINE_LANGUAGE.into(),
+        highlights_query: tree_sitter_md::HIGHLIGHT_QUERY_INLINE,
     },
     LangDef {
         name: "rust",
         aliases: &[],
         language_fn: || tree_sitter_rust::LANGUAGE.into(),
+        highlights_query: tree_sitter_rust::HIGHLIGHTS_QUERY,
     },
     LangDef {
         name: "python",
         aliases: &["py"],
         language_fn: || tree_sitter_python::LANGUAGE.into(),
+        highlights_query: tree_sitter_python::HIGHLIGHTS_QUERY,
     },
     LangDef {
         name: "javascript",
         aliases: &["js", "jsx", "mjs", "cjs"],
         language_fn: || tree_sitter_javascript::LANGUAGE.into(),
+        highlights_query: tree_sitter_javascript::HIGHLIGHT_QUERY,
     },
     LangDef {
         name: "typescript",
         aliases: &["ts", "tsx", "dts"],
         language_fn: || tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        highlights_query: tree_sitter_typescript::HIGHLIGHTS_QUERY,
     },
     LangDef {
         name: "go",
         aliases: &["golang"],
         language_fn: || tree_sitter_go::LANGUAGE.into(),
+        highlights_query: tree_sitter_go::HIGHLIGHTS_QUERY,
     },
     LangDef {
         name: "bash",
         aliases: &["sh", "shell", "zsh", "ksh", "dash"],
         language_fn: || tree_sitter_bash::LANGUAGE.into(),
+        highlights_query: tree_sitter_bash::HIGHLIGHT_QUERY,
     },
     LangDef {
         name: "json",
         aliases: &["jsonc", "json5"],
         language_fn: || tree_sitter_json::LANGUAGE.into(),
+        highlights_query: tree_sitter_json::HIGHLIGHTS_QUERY,
     },
     LangDef {
         name: "c",
         aliases: &["h", "cpp", "cxx", "cc", "c++", "hpp", "hxx"],
         language_fn: || tree_sitter_c::LANGUAGE.into(),
+        highlights_query: tree_sitter_c::HIGHLIGHT_QUERY,
     },
     LangDef {
         name: "yaml",
         aliases: &["yml"],
         language_fn: || tree_sitter_yaml::LANGUAGE.into(),
+        highlights_query: tree_sitter_yaml::HIGHLIGHTS_QUERY,
     },
     LangDef {
         name: "toml",
         aliases: &[],
         language_fn: || tree_sitter_toml_ng::LANGUAGE.into(),
+        highlights_query: tree_sitter_toml_ng::HIGHLIGHTS_QUERY,
     },
 ];
 
@@ -118,7 +111,7 @@ pub static LANGUAGES: &[LangDef] = &[
 
 /// Look up a `LangDef` by canonical name (case-insensitive).
 #[allow(dead_code)]
-pub fn find_by_name(name: &str) -> Option<&'static LangDef> {
+pub(super) fn find_by_name(name: &str) -> Option<&'static LangDef> {
     let name_lower = name.to_lowercase();
     LANGUAGES
         .iter()
@@ -128,7 +121,7 @@ pub fn find_by_name(name: &str) -> Option<&'static LangDef> {
 /// Look up a `LangDef` by info-string alias (case-insensitive).
 /// Returns `None` for unknown languages — the caller should use
 /// `SemanticStyle::CodeBlock` as the fallback style.
-pub fn find_by_alias(alias: &str) -> Option<&'static LangDef> {
+pub(super) fn find_by_alias(alias: &str) -> Option<&'static LangDef> {
     let alias_lower = alias.to_lowercase();
     LANGUAGES
         .iter()
@@ -138,7 +131,7 @@ pub fn find_by_alias(alias: &str) -> Option<&'static LangDef> {
 /// Resolve an info string to a tree-sitter `Language`, or `None` if
 /// the language is unknown.
 #[allow(dead_code)]
-pub fn resolve_language(info_string: &str) -> Option<tree_sitter::Language> {
+pub(super) fn resolve_language(info_string: &str) -> Option<tree_sitter::Language> {
     find_by_alias(info_string).map(|lang| (lang.language_fn)())
 }
 
@@ -184,9 +177,24 @@ mod tests {
     fn all_language_highlight_queries_compile() {
         for lang in LANGUAGES {
             let language = (lang.language_fn)();
-            tree_sitter::Query::new(&language, lang.highlights_query()).unwrap_or_else(|error| {
+            assert!(!lang.highlights_query.trim().is_empty());
+            tree_sitter::Query::new(&language, lang.highlights_query).unwrap_or_else(|error| {
                 panic!("{} highlight query should compile: {error}", lang.name)
             });
+        }
+    }
+
+    #[test]
+    fn registry_names_and_aliases_are_unique_case_insensitively() {
+        let mut identifiers = std::collections::HashSet::new();
+        for language in LANGUAGES {
+            for identifier in std::iter::once(language.name).chain(language.aliases.iter().copied())
+            {
+                assert!(
+                    identifiers.insert(identifier.to_ascii_lowercase()),
+                    "duplicate language name or alias: {identifier}"
+                );
+            }
         }
     }
 

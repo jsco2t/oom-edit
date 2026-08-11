@@ -162,7 +162,7 @@ fn rendered_layout_line_numbers_follow_distinct_content_spans() {
     assert_eq!(layout.lines.len(), layout.line_numbers.len());
     assert_eq!(layout.line_numbers.first(), Some(&Some(1)));
     for (line, number) in layout.lines.iter().zip(&layout.line_numbers) {
-        if line.kind == oom_edit_core::style::LineKind::Synthetic {
+        if line.kind == oom_edit_core::LineKind::Synthetic {
             assert_eq!(*number, None);
         }
     }

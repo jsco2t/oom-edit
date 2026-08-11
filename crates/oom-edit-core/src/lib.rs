@@ -9,41 +9,56 @@
 //!
 //! # Public API
 //!
-//! The public API is re-exported from [`session`] and [`style`]:
-//! - [`session::EditorSession`] — the main editing session type
-//! - [`session::Mode`] — exactly Normal, Insert, Select, and Command
-//! - [`session::Effect`] — effects emitted by session operations
-//! - [`session::Viewport`] — viewport specification for rendering
-//! - [`style::SourceFrame`] — raw-source Insert frame
-//! - [`style::RenderedLayout`] — rendered Normal/Select layout
-//! - [`style::RenderedSelection`] — rendered Select rows and source range
-//! - [`style::SemanticStyle`] — renderer-agnostic style slots
+//! The crate root is the complete supported facade:
+//! - [`EditorSession`] — the main editing session type
+//! - [`Mode`] — exactly Normal, Insert, Select, and Command
+//! - [`Effect`] — typed requests emitted by session operations
+//! - [`KeyInput`] — the shared terminal-neutral input model
+//! - [`Viewport`] and [`SourceFrame`] — raw-source Insert rendering
+//! - [`RenderedLayout`] and [`RenderedSelection`] — rendered Normal/Select output
+//! - [`SemanticStyle`] — renderer-agnostic style slots
 //!
 //! # Example
 //!
 //! ```
-//! use oom_edit_core::session::EditorSession;
+//! use oom_edit_core::EditorSession;
 //!
 //! let mut session = EditorSession::from_text("# Hello\n\nWorld\n");
-//! assert_eq!(session.mode(), oom_edit_core::session::Mode::Normal);
+//! assert_eq!(session.mode(), oom_edit_core::Mode::Normal);
 //! assert_eq!(session.line_count(), 4);
 //!
 //! // Normal is rendered Markdown. Hosts supply the actual text width.
 //! let layout = session.render_layout(80);
 //! assert!(!layout.lines.is_empty());
 //! ```
+//!
+//! Implementation modules are intentionally not part of the facade:
+//!
+//! ```compile_fail
+//! use oom_edit_core::document::Document;
+//! ```
+//! ```compile_fail
+//! use oom_edit_core::session::EditorSession;
+//! ```
+//! ```compile_fail
+//! use oom_edit_core::syntax::LANGUAGES;
+//! ```
+//! ```compile_fail
+//! use oom_edit_core::Highlighter;
+//! ```
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
-pub mod clipboard;
-pub mod document;
-pub mod error;
-pub mod frontmatter;
+mod clipboard;
+mod document;
+mod error;
+mod frontmatter;
+mod input;
 mod rendered;
-pub mod session;
-pub mod style;
-pub mod syntax;
+mod session;
+mod style;
+mod syntax;
 mod vim;
 
 // ── Public re-exports ──────────────────────────────────────────────────────
@@ -54,15 +69,17 @@ mod vim;
 // is exported publicly; this `pub use` list *is* the API contract (FR-8.3).
 
 pub use clipboard::{ClipboardError, ClipboardSink, RecordingClipboardSink};
-pub use error::{OpenError, SaveError};
+pub use document::LineEnding;
+pub use error::{FmError, OpenError, SaveError};
+pub use frontmatter::{FrontMatter, Num, Value};
+pub use input::{KeyCode, KeyCodeKind, KeyInput, Modifiers};
 pub use session::EditorSession;
-pub use session::{Effect, KeyCode, KeyCodeKind, KeyInput, Mode, Modifiers, Severity, Viewport};
+pub use session::{Effect, Mode, Severity, Viewport};
 pub use style::{
     JumpTarget, LineKind, RenderedLayout, RenderedLine, RenderedLineRole, RenderedPoint,
     RenderedSearch, RenderedSelection, RenderedSelectionRow, RenderedSourceAtom, SearchDirection,
     SelectionShape, SemanticStyle, SourceFrame, Span, StyledLine, TargetKind,
 };
-pub use syntax::Highlighter;
 
 #[cfg(test)]
 mod public_api_tests {

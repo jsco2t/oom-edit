@@ -27,6 +27,7 @@ use crate::style::{
     StyledLine, TargetKind,
 };
 use crate::syntax;
+use wrap::{wrap_mapped_line, MappedLine};
 
 // ── Public API ─────────────────────────────────────────────────────────────
 
@@ -115,7 +116,6 @@ impl<'a> RenderedLayoutBuilder<'a> {
             self.append_link_index();
         }
 
-        populate_source_atoms(&mut self.lines, self.model, self.highlighter.text());
         let line_numbers = rendered_line_numbers(&self.lines, self.highlighter.text());
         RenderedLayout {
             lines: self.lines,
@@ -136,7 +136,6 @@ impl<'a> RenderedLayoutBuilder<'a> {
             kind: LineKind::Synthetic,
             role: RenderedLineRole::Document,
             atoms: Vec::new(),
-            synthetic_columns: Vec::new(),
         });
     }
 
@@ -144,28 +143,45 @@ impl<'a> RenderedLayoutBuilder<'a> {
         self.last_content_source = Some(source);
     }
 
-    fn make_content_line(&mut self, styled: StyledLine, source: Range<usize>) {
+    fn make_content_line(&mut self, mapped: MappedLine, source: Range<usize>) {
+        let (styled, atoms) = mapped.into_parts();
         self.lines.push(RenderedLine {
             styled,
             source: source.clone(),
             kind: LineKind::Content,
             role: RenderedLineRole::Document,
-            atoms: Vec::new(),
-            synthetic_columns: Vec::new(),
+            atoms,
         });
         self.set_last_content_source(source);
     }
 
-    fn make_synthetic_line(&mut self, styled: StyledLine, source: Range<usize>) {
+    fn make_synthetic_line(&mut self, mapped: MappedLine, source: Range<usize>) {
         let source = self.last_content_source.clone().unwrap_or(source);
+        let (styled, atoms) = mapped.into_parts();
         self.lines.push(RenderedLine {
             styled,
             source,
             kind: LineKind::Synthetic,
             role: RenderedLineRole::Document,
-            atoms: Vec::new(),
-            synthetic_columns: Vec::new(),
+            atoms,
         });
+    }
+
+    fn make_generated_content_line(&mut self, styled: StyledLine, source: Range<usize>) {
+        self.make_content_line(mapped_from_styled(styled, None), source);
+    }
+
+    fn make_source_content_line(
+        &mut self,
+        styled: StyledLine,
+        source: Range<usize>,
+        visible_start: usize,
+    ) {
+        self.make_content_line(mapped_from_styled(styled, Some(visible_start)), source);
+    }
+
+    fn make_synthetic_styled_line(&mut self, styled: StyledLine, source: Range<usize>) {
+        self.make_synthetic_line(mapped_from_styled(styled, None), source);
     }
 
     fn register_link(&mut self, dest: String) -> usize {
@@ -226,12 +242,25 @@ impl<'a> RenderedLayoutBuilder<'a> {
         let prefix_char_len = prefix.chars().count();
         let prefix_width = text_width(prefix);
         for rendered_line in &mut self.lines[first_child_line..] {
-            for columns in &mut rendered_line.synthetic_columns {
-                columns.start += prefix_width;
-                columns.end += prefix_width;
-            }
-            rendered_line.synthetic_columns.insert(0, 0..prefix_width);
             rendered_line.styled.text.insert_str(0, prefix);
+            for atom in &mut rendered_line.atoms {
+                atom.columns.start += prefix_width;
+                atom.columns.end += prefix_width;
+            }
+            let mut prefix_atoms = display_groups(prefix)
+                .into_iter()
+                .scan(0, |column, group| {
+                    let width = text_width(&group);
+                    let atom = crate::style::RenderedSourceAtom {
+                        columns: *column..*column + width,
+                        source: None,
+                    };
+                    *column += width;
+                    Some(atom)
+                })
+                .collect::<Vec<_>>();
+            prefix_atoms.append(&mut rendered_line.atoms);
+            rendered_line.atoms = prefix_atoms;
             for span in &mut rendered_line.styled.spans {
                 span.start_col += prefix_char_len;
                 span.end_col += prefix_char_len;
@@ -273,43 +302,15 @@ impl<'a> RenderedLayoutBuilder<'a> {
         // Render inline content
         let styled = self.render_inlines(inlines, heading_style);
 
-        // Combine prefix + content
-        let mut combined_text = prefix.to_string();
-        combined_text.push_str(&styled.text);
-
-        let mut combined_spans = styled.spans;
-        // Adjust span offsets by prefix length (in chars, not bytes)
-        let prefix_char_len = prefix.chars().count();
-        for span in &mut combined_spans {
-            span.start_col += prefix_char_len;
-            span.end_col += prefix_char_len;
-        }
-
-        // Apply heading style to prefix
-        combined_spans.push(Span {
-            start_col: 0,
-            end_col: prefix_char_len,
-            style: heading_style,
-        });
-        combined_spans.sort_by_key(|s| s.start_col);
-
-        let combined = StyledLine {
-            text: combined_text,
-            spans: combined_spans,
-        };
+        let mut combined = MappedLine::default();
+        combined.push_generated(&prefix, heading_style);
+        combined.append(styled);
 
         // Wrap the heading
         let jump_line = self.lines.len();
-        let wrapped = wrap_lines(&combined, self.width, 0);
-        for (index, line) in wrapped.into_iter().enumerate() {
+        let wrapped = wrap_mapped_line(&combined, self.width, 0);
+        for line in wrapped {
             self.make_content_line(line, source.clone());
-            if index == 0 {
-                self.lines
-                    .last_mut()
-                    .expect("heading line was just appended")
-                    .synthetic_columns
-                    .push(0..text_width(&prefix));
-            }
         }
 
         // Register heading as jump target
@@ -325,7 +326,7 @@ impl<'a> RenderedLayoutBuilder<'a> {
         let first_line = self.lines.len();
         let first_link = self.link_index.len();
         let styled = self.render_inlines(inlines, SemanticStyle::Text);
-        let wrapped = wrap_lines(&styled, self.width, 0);
+        let wrapped = wrap_mapped_line(&styled, self.width, 0);
         for line in wrapped {
             self.make_content_line(line, source.clone());
         }
@@ -339,75 +340,49 @@ impl<'a> RenderedLayoutBuilder<'a> {
 
     // ── VW-3: Emphasis / VW-4: Inline code ───────────────────────────
 
-    fn render_inlines(&mut self, inlines: &[Inline], default_style: SemanticStyle) -> StyledLine {
-        let mut text = String::new();
-        let mut spans = Vec::new();
-        let mut col_offset: usize = 0;
-
+    fn render_inlines(&mut self, inlines: &[Inline], default_style: SemanticStyle) -> MappedLine {
+        let mut line = MappedLine::default();
         for inline in inlines {
-            let (inline_text, style) = self.inline_to_text_and_style(inline);
-            let style = if style == SemanticStyle::Text {
-                default_style
-            } else {
-                style
-            };
-            let char_len = inline_text.chars().count();
-
-            text.push_str(&inline_text);
-
-            if style != default_style || !inline_text.is_empty() {
-                spans.push(Span {
-                    start_col: col_offset,
-                    end_col: col_offset + char_len,
-                    style,
-                });
-            }
-
-            col_offset += char_len;
+            line.append(self.render_inline(inline, default_style));
         }
-
-        StyledLine { text, spans }
+        line
     }
 
     /// Convert an inline node to (text, SemanticStyle).
     ///
     /// Per the inline styling rule: nested emphasis resolves to the
     /// innermost semantic. `Strong(Emph(..))` → `Strong`, etc.
-    fn inline_to_text_and_style(&mut self, inline: &Inline) -> (String, SemanticStyle) {
+    fn render_inline(&mut self, inline: &Inline, default_style: SemanticStyle) -> MappedLine {
+        let mut line = MappedLine::default();
         match inline {
-            Inline::Text(t) => (t.clone(), SemanticStyle::Text),
-            Inline::Code(c) => (c.clone(), SemanticStyle::CodeSpan),
-            Inline::SoftBreak => (" ".to_string(), SemanticStyle::Text),
-            Inline::HardBreak => ("  ".to_string(), SemanticStyle::Text),
-            Inline::Emph(inner) => {
-                let styled = self.render_inlines(inner, SemanticStyle::Emphasis);
-                (styled.text, SemanticStyle::Emphasis)
+            Inline::Text(leaf) => append_leaf(&mut line, leaf, default_style),
+            Inline::Code(leaf) => append_leaf(&mut line, leaf, SemanticStyle::CodeSpan),
+            Inline::SoftBreak(leaf) | Inline::HardBreak(leaf) => {
+                append_leaf(&mut line, leaf, default_style)
             }
-            Inline::Strong(inner) => {
-                let styled = self.render_inlines(inner, SemanticStyle::Strong);
-                (styled.text, SemanticStyle::Strong)
-            }
+            Inline::Emph(inner) => line.append(self.render_inlines(inner, SemanticStyle::Emphasis)),
+            Inline::Strong(inner) => line.append(self.render_inlines(inner, SemanticStyle::Strong)),
             Inline::Strike(inner) => {
-                let styled = self.render_inlines(inner, SemanticStyle::Strikethrough);
-                (styled.text, SemanticStyle::Strikethrough)
+                line.append(self.render_inlines(inner, SemanticStyle::Strikethrough))
             }
             Inline::Link {
                 text: link_text,
                 dest,
             } => {
                 let marker = self.register_link(dest.clone());
-                let text = self.render_inlines(link_text, SemanticStyle::Link).text;
-                let marker_text = format!("[{}]", marker);
-                (format!("{} {}", text, marker_text), SemanticStyle::Link)
+                line.append(self.render_inlines(link_text, SemanticStyle::Link));
+                line.push_generated(&format!(" [{}]", marker), SemanticStyle::Link);
             }
             Inline::Image { alt, dest } => {
                 let marker = self.register_link(dest.clone());
-                let marker_text = format!("⧉ {} [{}]", alt, marker);
-                (marker_text, SemanticStyle::Link)
+                line.push_generated("⧉ ", SemanticStyle::Link);
+                line.append(self.render_inlines(alt, SemanticStyle::Link));
+                line.push_generated(&format!(" [{}]", marker), SemanticStyle::Link);
             }
-            Inline::FootnoteRef(label) => (format!("[{}]", label), SemanticStyle::Link),
-            Inline::Html(h) => (h.clone(), SemanticStyle::HtmlRaw),
+            Inline::FootnoteRef(leaf) => append_leaf(&mut line, leaf, SemanticStyle::Link),
+            Inline::Html(leaf) => append_leaf(&mut line, leaf, SemanticStyle::HtmlRaw),
         }
+        line
     }
 
     // ── VW-5: Fenced code blocks ─────────────────────────────────────
@@ -451,8 +426,8 @@ impl<'a> RenderedLayoutBuilder<'a> {
 
         // Build gutter lines
         let lang_line_text = format!("{} {}", gutter, lang_tag);
-        self.lines.push(RenderedLine {
-            styled: StyledLine {
+        self.make_synthetic_styled_line(
+            StyledLine {
                 text: lang_line_text.clone(),
                 spans: vec![Span {
                     start_col: 0,
@@ -460,39 +435,23 @@ impl<'a> RenderedLayoutBuilder<'a> {
                     style: SemanticStyle::Muted,
                 }],
             },
-            source: source.start..content_span.start.min(source.end),
-            kind: LineKind::Synthetic,
-            role: RenderedLineRole::Document,
-            atoms: Vec::new(),
-            synthetic_columns: Vec::new(),
-        });
+            source.start..content_span.start.min(source.end),
+        );
 
         let content_lines = source_line_spans(self.highlighter.text(), content_span);
         for (index, line) in highlighted.iter().enumerate() {
-            let text = format!("{} {}", gutter, line.text);
-            let mut spans = line.spans.clone();
-            // Shift spans by gutter width
-            let gutter_width = gutter.chars().count() + 1; // gutter + space
-            for span in &mut spans {
-                span.start_col += gutter_width;
-                span.end_col += gutter_width;
-            }
-            // Add gutter style
-            spans.push(Span {
-                start_col: 0,
-                end_col: gutter.chars().count(),
-                style: SemanticStyle::Muted,
-            });
             let line_source = content_lines
                 .get(index)
                 .cloned()
                 .unwrap_or_else(|| content_span.clone());
-            self.make_content_line(StyledLine { text, spans }, line_source);
+            let mut mapped = mapped_from_styled(line.clone(), Some(line_source.start));
+            mapped.prepend_generated("▏ ", SemanticStyle::Muted);
+            self.make_content_line(mapped, line_source);
         }
 
         // Closing fence
-        self.lines.push(RenderedLine {
-            styled: StyledLine {
+        self.make_synthetic_styled_line(
+            StyledLine {
                 text: gutter.to_string(),
                 spans: vec![Span {
                     start_col: 0,
@@ -500,12 +459,8 @@ impl<'a> RenderedLayoutBuilder<'a> {
                     style: SemanticStyle::Muted,
                 }],
             },
-            source: content_span.end.min(source.end)..source.end,
-            kind: LineKind::Synthetic,
-            role: RenderedLineRole::Document,
-            atoms: Vec::new(),
-            synthetic_columns: Vec::new(),
-        });
+            content_span.end.min(source.end)..source.end,
+        );
     }
 
     fn render_fenced_code_body(
@@ -530,13 +485,11 @@ impl<'a> RenderedLayoutBuilder<'a> {
 
         let source_lines = source_line_spans(self.highlighter.text(), content_span);
         for (index, line) in lines.into_iter().enumerate() {
-            self.make_content_line(
-                line,
-                source_lines
-                    .get(index)
-                    .cloned()
-                    .unwrap_or_else(|| source.clone()),
-            );
+            let source_line = source_lines
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| source.clone());
+            self.make_source_content_line(line, source_line.clone(), source_line.start);
         }
     }
 
@@ -588,7 +541,7 @@ impl<'a> RenderedLayoutBuilder<'a> {
             if let BlockKind::List { ordered, items, .. } = &child.kind {
                 if marker_pending {
                     let marker_start = indent.chars().count();
-                    self.make_content_line(
+                    self.make_generated_content_line(
                         StyledLine {
                             text: format!("{indent}{marker}"),
                             spans: vec![Span {
@@ -630,11 +583,24 @@ impl<'a> RenderedLayoutBuilder<'a> {
                 }
 
                 rendered_line.styled.text.insert_str(0, prefix);
-                for columns in &mut rendered_line.synthetic_columns {
-                    columns.start += prefix_width;
-                    columns.end += prefix_width;
+                for atom in &mut rendered_line.atoms {
+                    atom.columns.start += prefix_width;
+                    atom.columns.end += prefix_width;
                 }
-                rendered_line.synthetic_columns.insert(0, 0..prefix_width);
+                let mut prefix_atoms = display_groups(prefix)
+                    .into_iter()
+                    .scan(0, |column, group| {
+                        let width = text_width(&group);
+                        let atom = crate::style::RenderedSourceAtom {
+                            columns: *column..*column + width,
+                            source: None,
+                        };
+                        *column += width;
+                        Some(atom)
+                    })
+                    .collect::<Vec<_>>();
+                prefix_atoms.append(&mut rendered_line.atoms);
+                rendered_line.atoms = prefix_atoms;
                 for span in &mut rendered_line.styled.spans {
                     span.start_col += prefix_char_len;
                     span.end_col += prefix_char_len;
@@ -697,24 +663,23 @@ impl<'a> RenderedLayoutBuilder<'a> {
                 .get(nearest_row)
                 .cloned()
                 .unwrap_or_else(|| source.clone());
+            let (styled, atoms) = line.into_parts();
             if logical_row.is_some() {
                 self.lines.push(RenderedLine {
-                    styled: line.styled,
+                    styled,
                     source: row_source.clone(),
                     kind: LineKind::Content,
                     role: RenderedLineRole::Document,
-                    atoms: Vec::new(),
-                    synthetic_columns: line.synthetic_columns,
+                    atoms,
                 });
                 self.set_last_content_source(row_source);
             } else {
                 self.lines.push(RenderedLine {
-                    styled: line.styled,
+                    styled,
                     source: row_source,
                     kind: LineKind::Synthetic,
                     role: RenderedLineRole::Document,
-                    atoms: Vec::new(),
-                    synthetic_columns: line.synthetic_columns,
+                    atoms,
                 });
             }
         }
@@ -727,7 +692,7 @@ impl<'a> RenderedLayoutBuilder<'a> {
         let rule_width = self.width as usize;
         let rule_text = "─".repeat(rule_width);
 
-        self.make_content_line(
+        self.make_generated_content_line(
             StyledLine {
                 text: rule_text,
                 spans: vec![Span {
@@ -758,8 +723,13 @@ impl<'a> RenderedLayoutBuilder<'a> {
         };
 
         // Render HTML verbatim in muted monospace style
-        for line in content.lines() {
-            self.make_content_line(
+        let html_lines = source_line_spans(self.highlighter.text(), content_span);
+        for (index, line) in content.lines().enumerate() {
+            let line_source = html_lines
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| source.clone());
+            self.make_source_content_line(
                 StyledLine {
                     text: line.to_string(),
                     spans: vec![Span {
@@ -768,7 +738,8 @@ impl<'a> RenderedLayoutBuilder<'a> {
                         style: SemanticStyle::HtmlRaw,
                     }],
                 },
-                source.clone(),
+                line_source.clone(),
+                line_source.start,
             );
         }
     }
@@ -793,7 +764,7 @@ impl<'a> RenderedLayoutBuilder<'a> {
 
         // Footnotes separator
         let separator = "─ footnotes ─";
-        self.make_synthetic_line(
+        self.make_synthetic_styled_line(
             StyledLine {
                 text: separator.to_string(),
                 spans: vec![Span {
@@ -809,7 +780,7 @@ impl<'a> RenderedLayoutBuilder<'a> {
         for fd in &footnote_defs {
             // Reference marker
             let marker = format!("[{}]: ", fd.label);
-            self.make_content_line(
+            self.make_generated_content_line(
                 StyledLine {
                     text: marker.clone(),
                     spans: vec![Span {
@@ -835,7 +806,7 @@ impl<'a> RenderedLayoutBuilder<'a> {
 
         // Links separator
         let separator = "─ links ─";
-        self.make_synthetic_line(
+        self.make_synthetic_styled_line(
             StyledLine {
                 text: separator.to_string(),
                 spans: vec![Span {
@@ -850,7 +821,7 @@ impl<'a> RenderedLayoutBuilder<'a> {
         let link_index = self.link_index.clone();
         for (marker, dest) in &link_index {
             let line_text = format!("[{}] {}", marker, dest);
-            self.make_synthetic_line(
+            self.make_synthetic_styled_line(
                 StyledLine {
                     text: line_text,
                     spans: vec![Span {
@@ -894,7 +865,7 @@ impl<'a> RenderedLayoutBuilder<'a> {
         if collapsed {
             let mut text = format!("▸ metadata ({key_count} keys)");
             text = text.chars().take(self.width as usize).collect();
-            self.make_metadata_line(
+            self.make_generated_metadata_line(
                 StyledLine {
                     spans: vec![Span {
                         start_col: 0,
@@ -912,7 +883,7 @@ impl<'a> RenderedLayoutBuilder<'a> {
         for (index, line_source) in physical_lines.into_iter().enumerate() {
             if index == 0 || (index == last_index && has_closing_delimiter) {
                 let text = metadata_border(self.width as usize, index == 0);
-                self.make_metadata_line(
+                self.make_generated_metadata_line(
                     StyledLine {
                         spans: vec![Span {
                             start_col: 0,
@@ -945,42 +916,29 @@ impl<'a> RenderedLayoutBuilder<'a> {
         }
     }
 
-    fn make_metadata_line(&mut self, styled: StyledLine, source: Range<usize>) {
+    fn make_metadata_line(&mut self, mapped: MappedLine, source: Range<usize>) {
+        let (styled, atoms) = mapped.into_parts();
         self.lines.push(RenderedLine {
             styled,
             source: source.clone(),
             kind: LineKind::Content,
             role: RenderedLineRole::Metadata,
-            atoms: Vec::new(),
-            synthetic_columns: Vec::new(),
+            atoms,
         });
         self.set_last_content_source(source);
     }
 
+    fn make_generated_metadata_line(&mut self, styled: StyledLine, source: Range<usize>) {
+        self.make_metadata_line(mapped_from_styled(styled, None), source);
+    }
+
     fn render_metadata_body_line(&mut self, styled: StyledLine, source: Range<usize>) {
         let width = self.width as usize;
+        let mapped = mapped_from_styled(styled, Some(source.start));
         if width < 4 {
-            for mut line in wrap_lines(&styled, self.width, 0) {
-                if text_width(&line.text) > width {
-                    let mut used = 0;
-                    line.text = line
-                        .text
-                        .chars()
-                        .take_while(|character| {
-                            let character_width = character.width().unwrap_or(0);
-                            let fits = used + character_width <= width;
-                            if fits {
-                                used += character_width;
-                            }
-                            fits
-                        })
-                        .collect();
-                    let kept = line.text.chars().count();
-                    for span in &mut line.spans {
-                        span.start_col = span.start_col.min(kept);
-                        span.end_col = span.end_col.min(kept);
-                    }
-                    line.spans.retain(|span| span.start_col < span.end_col);
+            for mut line in wrap_mapped_line(&mapped, self.width, 0) {
+                while line.width() > width {
+                    line.fragments.pop();
                 }
                 self.make_metadata_line(line, source.clone());
             }
@@ -988,26 +946,12 @@ impl<'a> RenderedLayoutBuilder<'a> {
         }
 
         let content_width = self.width.saturating_sub(4).max(1);
-        for mut line in wrap_lines(&styled, content_width, 0) {
-            for span in &mut line.spans {
-                span.start_col += 2;
-                span.end_col += 2;
-            }
-            let body_width = text_width(&line.text);
+        for mut line in wrap_mapped_line(&mapped, content_width, 0) {
+            let body_width = line.width();
             let padding = content_width as usize - body_width.min(content_width as usize);
-            line.text = format!("│ {}{} │", line.text, " ".repeat(padding));
-            line.spans.push(Span {
-                start_col: 0,
-                end_col: 2,
-                style: SemanticStyle::FmDelimiter,
-            });
-            let suffix_start = line.text.chars().count().saturating_sub(2);
-            line.spans.push(Span {
-                start_col: suffix_start,
-                end_col: suffix_start + 2,
-                style: SemanticStyle::FmDelimiter,
-            });
-            line.spans.sort_by_key(|span| span.start_col);
+            line.prepend_generated("│ ", SemanticStyle::FmDelimiter);
+            line.push_generated(&" ".repeat(padding), SemanticStyle::Text);
+            line.push_generated(" │", SemanticStyle::FmDelimiter);
             self.make_metadata_line(line, source.clone());
         }
     }
@@ -1089,185 +1033,31 @@ fn source_line_spans(text: &str, source: &Range<usize>) -> Vec<Range<usize>> {
     spans
 }
 
-#[derive(Debug)]
-struct SourceCandidate {
-    rendered: String,
-    source: Range<usize>,
-    used: bool,
-}
-
-fn populate_source_atoms(lines: &mut [RenderedLine], model: &BlockModel, text: &str) {
-    use std::collections::HashMap;
-
-    let mut candidates = Vec::new();
-    for inline in &model.inline_sources {
-        candidates.extend(source_candidates(
-            &inline.rendered,
-            inline.source.clone(),
-            text,
-        ));
-    }
-
-    let mut metadata_sources: Vec<Range<usize>> = lines
-        .iter()
-        .filter(|line| line.role == RenderedLineRole::Metadata)
-        .map(|line| line.source.clone())
-        .collect();
-    metadata_sources.sort_by_key(|source| (source.start, source.end));
-    metadata_sources.dedup();
-    for source in metadata_sources {
-        let raw = text
-            .get(source.clone())
-            .unwrap_or_default()
-            .trim_end_matches(['\r', '\n']);
-        candidates.extend(source_candidates(raw, source, text));
-    }
-    candidates.sort_by_key(|candidate| (candidate.source.start, candidate.source.end));
-    let mut candidate_lookup: HashMap<String, Vec<usize>> = HashMap::new();
-    for (index, candidate) in candidates.iter().enumerate() {
-        candidate_lookup
-            .entry(candidate.rendered.clone())
-            .or_default()
-            .push(index);
-    }
-
-    for line in lines {
-        let groups = display_groups(&line.styled.text);
-        let is_metadata_body = line.role == RenderedLineRole::Metadata
-            && line.styled.text.starts_with("│ ")
-            && line.styled.text.ends_with(" │");
-        let group_count = groups.len();
-        let mut column = 0;
-        line.atoms = groups
-            .into_iter()
-            .enumerate()
-            .map(|(index, group)| {
-                let width = group
-                    .chars()
-                    .map(|character| character.width().unwrap_or(0))
-                    .sum::<usize>();
-                let columns = column..column + width;
-                column += width;
-
-                let generated_prefix_space = index == 1
-                    && line
-                        .styled
-                        .text
-                        .chars()
-                        .next()
-                        .is_some_and(|character| matches!(character, '▏' | '┃' | '│'));
-                let generated_image_prefix = line.styled.text.starts_with("⧉ ") && index < 2;
-                let generated_column = line.synthetic_columns.iter().any(|synthetic| {
-                    columns.end > synthetic.start && columns.start < synthetic.end
-                });
-                let source = if line.kind == LineKind::Synthetic
-                    || (is_metadata_body && (index < 2 || index + 2 >= group_count))
-                    || generated_prefix_space
-                    || generated_image_prefix
-                    || generated_column
-                {
-                    None
-                } else {
-                    candidate_lookup.get(&group).and_then(|indices| {
-                        let first = indices.partition_point(|index| {
-                            candidates[*index].source.start < line.source.start
-                        });
-                        let index = indices[first..]
-                            .iter()
-                            .copied()
-                            .take_while(|index| candidates[*index].source.start < line.source.end)
-                            .find(|index| {
-                                let candidate = &candidates[*index];
-                                candidate.source.end <= line.source.end && !candidate.used
-                            })?;
-                        let candidate = &mut candidates[index];
-                        Some({
-                            candidate.used = true;
-                            candidate.source.clone()
-                        })
-                    })
-                };
-
-                crate::style::RenderedSourceAtom { columns, source }
-            })
-            .collect();
+fn append_leaf(line: &mut MappedLine, leaf: &InlineLeaf, style: SemanticStyle) {
+    for atom in &leaf.atoms {
+        line.push(atom.text.clone(), style, Some(atom.source.clone()));
     }
 }
 
-fn source_candidates(rendered: &str, source: Range<usize>, text: &str) -> Vec<SourceCandidate> {
-    let Some(raw_source) = text.get(source.clone()) else {
-        return Vec::new();
-    };
-    let groups = display_groups(rendered);
-    let mut search_start = 0;
-    let mut candidates = Vec::with_capacity(groups.len());
-
-    let mut group_index = 0;
-    while group_index < groups.len() {
-        let group = &groups[group_index];
-        if let Some((entity_len, decoded_groups)) = decoded_entity(&raw_source[search_start..]) {
-            if groups[group_index..].starts_with(&decoded_groups) {
-                let decoded_count = decoded_groups.len();
-                let entity_source =
-                    source.start + search_start..source.start + search_start + entity_len;
-                candidates.extend(decoded_groups.into_iter().map(|rendered| SourceCandidate {
-                    rendered,
-                    source: entity_source.clone(),
-                    used: false,
-                }));
-                search_start += entity_len;
-                group_index += decoded_count;
-                continue;
-            }
-        }
-        let found = raw_source
-            .get(search_start..)
-            .and_then(|remaining| remaining.find(group))
-            .map(|relative| search_start + relative);
-        let Some(local_start) = found else {
-            if candidates.is_empty() && display_groups(rendered).len() == 1 {
-                candidates.push(SourceCandidate {
-                    rendered: group.clone(),
-                    source: source.clone(),
-                    used: false,
-                });
-            }
-            group_index += 1;
-            continue;
-        };
-        let local_end = local_start + group.len();
-        let mut absolute_start = source.start + local_start;
-        if absolute_start > 0 && text.as_bytes().get(absolute_start - 1) == Some(&b'\\') {
-            absolute_start -= 1;
-        }
-        candidates.push(SourceCandidate {
-            rendered: group.clone(),
-            source: absolute_start..source.start + local_end,
-            used: false,
-        });
-        search_start = local_end;
-        group_index += 1;
+fn mapped_from_styled(styled: StyledLine, visible_start: Option<usize>) -> MappedLine {
+    let mut mapped = MappedLine::default();
+    let mut char_offset = 0;
+    let mut byte_offset = 0;
+    for group in display_groups(&styled.text) {
+        let char_len = group.chars().count();
+        let style = styled
+            .spans
+            .iter()
+            .rev()
+            .find(|span| span.start_col <= char_offset && char_offset < span.end_col)
+            .map_or(SemanticStyle::Text, |span| span.style);
+        let source =
+            visible_start.map(|start| start + byte_offset..start + byte_offset + group.len());
+        byte_offset += group.len();
+        char_offset += char_len;
+        mapped.push(group, style, source);
     }
-
-    candidates
-}
-
-fn decoded_entity(raw: &str) -> Option<(usize, Vec<String>)> {
-    if !raw.starts_with('&') {
-        return None;
-    }
-    let end = raw.find(';')?.saturating_add(1);
-    if end > 64 {
-        return None;
-    }
-    let entity = &raw[..end];
-    let decoded = pulldown_cmark::Parser::new(entity)
-        .filter_map(|event| match event {
-            pulldown_cmark::Event::Text(text) => Some(text.into_string()),
-            _ => None,
-        })
-        .collect::<String>();
-    (decoded != entity).then(|| (end, display_groups(&decoded)))
+    mapped
 }
 
 fn display_groups(text: &str) -> Vec<String> {
@@ -1311,7 +1101,7 @@ fn metadata_border(width: usize, opening: bool) -> String {
 // ── Re-exports ─────────────────────────────────────────────────────────────
 
 pub(crate) use blocks::*;
-pub(crate) use wrap::{text_width, wrap_lines, wrap_source_line};
+pub(crate) use wrap::{text_width, wrap_source_line};
 
 #[cfg(test)]
 mod tests {

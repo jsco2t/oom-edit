@@ -5,9 +5,10 @@
 //!
 //! See VW-9 in plan §6.3.2.
 
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
-use crate::rendered::blocks::{Inline, TableAlignment};
+use crate::rendered::blocks::{Inline, InlineLeaf, TableAlignment};
+use crate::rendered::wrap::MappedLine;
 use crate::style::{SemanticStyle, Span, StyledLine};
 
 /// Maximum display width of a single table cell before wrapping kicks in.
@@ -28,15 +29,45 @@ pub fn render_table(
 ) -> Vec<StyledLine> {
     render_table_with_rows(alignments, header, rows, source_span)
         .into_iter()
-        .map(|line| line.styled)
+        .map(|line| line.into_parts().0)
         .collect()
 }
 
 /// One rendered table line plus its logical Markdown row (header is zero).
 pub(super) struct RenderedTableLine {
-    pub(super) styled: StyledLine,
+    pub(super) mapped: MappedLine,
     pub(super) logical_row: Option<usize>,
-    pub(super) synthetic_columns: Vec<std::ops::Range<usize>>,
+}
+
+impl RenderedTableLine {
+    pub(super) fn into_parts(self) -> (StyledLine, Vec<crate::style::RenderedSourceAtom>) {
+        finalize_table_line(self.mapped, self.logical_row == Some(0))
+    }
+}
+
+fn finalize_table_line(
+    mapped: MappedLine,
+    header: bool,
+) -> (StyledLine, Vec<crate::style::RenderedSourceAtom>) {
+    let (mut styled, atoms) = mapped.into_parts();
+    styled.spans.clear();
+    let char_count = styled.text.chars().count();
+    if char_count > 0 {
+        if header && char_count > 2 {
+            styled.spans.push(Span {
+                start_col: 1,
+                end_col: char_count - 1,
+                style: SemanticStyle::Strong,
+            });
+        } else {
+            styled.spans.push(Span {
+                start_col: 0,
+                end_col: char_count,
+                style: SemanticStyle::Text,
+            });
+        }
+    }
+    (styled, atoms)
 }
 
 /// Render table lines while retaining row identity for source mapping.
@@ -76,9 +107,8 @@ pub(super) fn render_table_with_rows(
 
     // Top border
     lines.push(RenderedTableLine {
-        styled: build_border_row(alignments, &col_widths, true, true, source_span.clone()),
+        mapped: build_border_row(alignments, &col_widths, true, true, source_span.clone()),
         logical_row: None,
-        synthetic_columns: whole_table_row(&col_widths),
     });
 
     // Header row
@@ -86,17 +116,15 @@ pub(super) fn render_table_with_rows(
         build_data_row(&cells[0], alignments, &col_widths, SemanticStyle::Strong)
             .into_iter()
             .map(|line| RenderedTableLine {
-                styled: line.styled,
+                mapped: line,
                 logical_row: Some(0),
-                synthetic_columns: line.synthetic_columns,
             }),
     );
 
     // Separator row
     lines.push(RenderedTableLine {
-        styled: build_separator_row(&col_widths),
+        mapped: build_separator_row(&col_widths),
         logical_row: None,
-        synthetic_columns: whole_table_row(&col_widths),
     });
 
     // Body rows
@@ -110,30 +138,17 @@ pub(super) fn render_table_with_rows(
             )
             .into_iter()
             .map(|line| RenderedTableLine {
-                styled: line.styled,
+                mapped: line,
                 logical_row: Some(row_idx + 1),
-                synthetic_columns: line.synthetic_columns,
             }),
         );
     }
 
     // Bottom border
     lines.push(RenderedTableLine {
-        styled: build_border_row(alignments, &col_widths, false, true, source_span.clone()),
+        mapped: build_border_row(alignments, &col_widths, false, true, source_span.clone()),
         logical_row: None,
-        synthetic_columns: whole_table_row(&col_widths),
     });
-
-    // Assign a default Text span to lines that have no semantic spans.
-    for line in &mut lines {
-        if line.styled.spans.is_empty() && !line.styled.text.is_empty() {
-            line.styled.spans.push(Span {
-                start_col: 0,
-                end_col: line.styled.text.chars().count(),
-                style: SemanticStyle::Text,
-            });
-        }
-    }
 
     lines
 }
@@ -143,15 +158,15 @@ fn compute_cells(row: &[Vec<Inline>], num_cols: usize) -> Vec<Cell> {
     let mut cells = Vec::with_capacity(num_cols);
     for ci in 0..num_cols {
         if ci < row.len() {
-            let inline_text = inline_to_text(&row[ci]);
-            let w = inline_text.width();
+            let mapped = inline_to_mapped(&row[ci], SemanticStyle::Text);
+            let w = mapped.width();
             cells.push(Cell {
-                text: inline_text,
+                mapped,
                 display_width: w,
             });
         } else {
             cells.push(Cell {
-                text: String::new(),
+                mapped: MappedLine::default(),
                 display_width: 0,
             });
         }
@@ -159,36 +174,37 @@ fn compute_cells(row: &[Vec<Inline>], num_cols: usize) -> Vec<Cell> {
     cells
 }
 
-/// Convert a row of inlines to plain text.
-fn inline_to_text(inlines: &[Inline]) -> String {
-    let mut s = String::new();
+/// Convert a row of inlines while retaining each leaf's source ownership.
+fn inline_to_mapped(inlines: &[Inline], style: SemanticStyle) -> MappedLine {
+    let mut line = MappedLine::default();
     for inline in inlines {
         match inline {
-            Inline::Text(t) => s.push_str(t),
-            Inline::Code(c) => s.push_str(c),
-            Inline::SoftBreak => s.push(' '),
-            Inline::HardBreak => s.push_str("  "),
-            Inline::Emph(inner) => s.push_str(&inline_to_text(inner)),
-            Inline::Strong(inner) => s.push_str(&inline_to_text(inner)),
-            Inline::Strike(inner) => s.push_str(&inline_to_text(inner)),
-            Inline::Link { text, .. } => s.push_str(&inline_to_text(text)),
-            Inline::Image { alt, .. } => s.push_str(alt),
-            Inline::FootnoteRef(label) => s.push_str(&format!("[{}]", label)),
-            Inline::Html(h) => s.push_str(h),
+            Inline::Text(leaf)
+            | Inline::Code(leaf)
+            | Inline::SoftBreak(leaf)
+            | Inline::HardBreak(leaf)
+            | Inline::FootnoteRef(leaf)
+            | Inline::Html(leaf) => append_leaf(&mut line, leaf, style),
+            Inline::Emph(inner) | Inline::Strong(inner) | Inline::Strike(inner) => {
+                line.append(inline_to_mapped(inner, style));
+            }
+            Inline::Link { text, .. } => line.append(inline_to_mapped(text, style)),
+            Inline::Image { alt, .. } => line.append(inline_to_mapped(alt, style)),
         }
     }
-    s
+    line
+}
+
+fn append_leaf(line: &mut MappedLine, leaf: &InlineLeaf, style: SemanticStyle) {
+    for atom in &leaf.atoms {
+        line.push(atom.text.clone(), style, Some(atom.source.clone()));
+    }
 }
 
 /// A single table cell with its text and display width.
 struct Cell {
-    text: String,
+    mapped: MappedLine,
     display_width: usize,
-}
-
-struct TableDataLine {
-    styled: StyledLine,
-    synthetic_columns: Vec<std::ops::Range<usize>>,
 }
 
 /// Build a border/separator row.
@@ -198,7 +214,7 @@ fn build_border_row(
     top: bool,
     _bottom: bool,
     _source_span: std::ops::Range<usize>,
-) -> StyledLine {
+) -> MappedLine {
     let start = if top { "┌" } else { "└" };
     let end = if top { "┐" } else { "┘" };
     let mid = if top { "┬" } else { "┴" };
@@ -211,90 +227,57 @@ fn build_border_row(
             text.push(end.chars().next().unwrap());
         }
     }
-    StyledLine {
-        text,
-        spans: Vec::new(),
-    }
+    let mut line = MappedLine::default();
+    line.push_generated(&text, SemanticStyle::Text);
+    line
 }
 
 /// Build a separator row (header/body divider).
-fn build_separator_row(col_widths: &[usize]) -> StyledLine {
+fn build_separator_row(col_widths: &[usize]) -> MappedLine {
     let mut text = String::from("├");
     let last = col_widths.len() - 1;
     for (ci, &w) in col_widths.iter().enumerate() {
         text.push_str(&"─".repeat(w + 2));
         text.push(if ci < last { '┼' } else { '┤' });
     }
-    StyledLine {
-        text,
-        spans: Vec::new(),
-    }
+    let mut line = MappedLine::default();
+    line.push_generated(&text, SemanticStyle::Text);
+    line
 }
 
 /// Split cell text into fixed-width chunks without splitting a character.
-fn split_cell_text(text: &str, max_width: usize) -> Vec<String> {
+fn split_cell_text(line: &MappedLine, max_width: usize) -> Vec<MappedLine> {
     if max_width == 0 {
-        return vec![String::new()];
+        return vec![MappedLine::default()];
     }
 
     let mut lines = Vec::new();
     let mut chunk_start = 0;
-
-    while chunk_start < text.len() {
-        let mut chunk_end = text.len();
-        let mut last_fitting_end = None;
-        let mut last_base_start = chunk_start;
-        let mut consuming_overwide_sequence = false;
-
-        for (relative_start, ch) in text[chunk_start..].char_indices() {
-            let char_start = chunk_start + relative_start;
-            if consuming_overwide_sequence && ch.width().unwrap_or(0) > 0 {
-                chunk_end = char_start;
+    while chunk_start < line.fragments.len() {
+        let mut chunk_end = chunk_start;
+        let mut used = 0;
+        while chunk_end < line.fragments.len() {
+            let width = line.fragments[chunk_end].text.width();
+            if chunk_end > chunk_start && width > 0 && used + width > max_width {
                 break;
             }
-
-            let candidate_end = char_start + ch.len_utf8();
-            let candidate_width = text[chunk_start..candidate_end].width();
-            if candidate_width <= max_width {
-                last_fitting_end = Some(candidate_end);
-                if ch.width().unwrap_or(0) > 0 {
-                    last_base_start = char_start;
-                }
-                continue;
+            used += width;
+            chunk_end += 1;
+            if used >= max_width {
+                break;
             }
-
-            if last_fitting_end.is_none() {
-                // An indivisible wide character must still make progress even
-                // when the requested width is narrower than the character.
-                last_fitting_end = Some(candidate_end);
-                last_base_start = char_start;
-                consuming_overwide_sequence = true;
-                continue;
-            }
-
-            if ch.width().unwrap_or(0) == 0 {
-                // Sequence-aware width can change when a zero-width suffix is
-                // added (for example, U+FE0F emoji presentation). Keep that
-                // suffix with its base instead of leaving it on the next line.
-                if last_base_start > chunk_start {
-                    chunk_end = last_base_start;
-                    break;
-                }
-                last_fitting_end = Some(candidate_end);
-                consuming_overwide_sequence = true;
-                continue;
-            }
-
-            chunk_end = last_fitting_end.expect("a fitting boundary was checked above");
-            break;
         }
-
-        lines.push(text[chunk_start..chunk_end].to_string());
+        if chunk_end == chunk_start {
+            chunk_end += 1;
+        }
+        lines.push(MappedLine {
+            fragments: line.fragments[chunk_start..chunk_end].to_vec(),
+        });
         chunk_start = chunk_end;
     }
 
     if lines.is_empty() {
-        lines.push(String::new());
+        lines.push(MappedLine::default());
     }
     lines
 }
@@ -305,16 +288,16 @@ fn build_data_row(
     alignments: &[TableAlignment],
     col_widths: &[usize],
     header_style: SemanticStyle,
-) -> Vec<TableDataLine> {
-    let wrapped_cells: Vec<Vec<String>> = cells
+) -> Vec<MappedLine> {
+    let wrapped_cells: Vec<Vec<MappedLine>> = cells
         .iter()
         .enumerate()
         .map(|(ci, cell)| {
             let width = col_widths[ci];
             if cell.display_width > width {
-                split_cell_text(&cell.text, width)
+                split_cell_text(&cell.mapped, width)
             } else {
-                vec![cell.text.clone()]
+                vec![cell.mapped.clone()]
             }
         })
         .collect();
@@ -322,106 +305,51 @@ fn build_data_row(
     let mut lines = Vec::with_capacity(max_lines);
 
     for line_index in 0..max_lines {
-        let mut text = String::from("│");
-        let mut synthetic_columns = std::iter::once(0..1).collect();
-        let mut display_column = 1;
+        let mut line = MappedLine::default();
+        line.push_generated("│", SemanticStyle::Text);
         for (ci, cell_lines) in wrapped_cells.iter().enumerate() {
-            let chunk = cell_lines.get(line_index).map_or("", String::as_str);
+            let mut chunk = cell_lines.get(line_index).cloned().unwrap_or_default();
+            for fragment in &mut chunk.fragments {
+                fragment.style = header_style;
+            }
             let width = col_widths[ci];
             let padding = width.saturating_sub(chunk.width());
 
-            push_synthetic_spaces(&mut text, &mut synthetic_columns, &mut display_column, 1);
+            line.push_generated(" ", SemanticStyle::Text);
             if line_index == 0 {
                 match alignments.get(ci) {
                     Some(TableAlignment::Center) => {
                         let left = padding / 2;
                         let right = padding - left;
-                        push_synthetic_spaces(
-                            &mut text,
-                            &mut synthetic_columns,
-                            &mut display_column,
-                            left,
-                        );
-                        text.push_str(chunk);
-                        display_column += chunk.width();
-                        push_synthetic_spaces(
-                            &mut text,
-                            &mut synthetic_columns,
-                            &mut display_column,
-                            right,
-                        );
+                        line.push_generated(&" ".repeat(left), SemanticStyle::Text);
+                        line.append(chunk);
+                        line.push_generated(&" ".repeat(right), SemanticStyle::Text);
                     }
                     Some(TableAlignment::Right) => {
-                        push_synthetic_spaces(
-                            &mut text,
-                            &mut synthetic_columns,
-                            &mut display_column,
-                            padding,
-                        );
-                        text.push_str(chunk);
-                        display_column += chunk.width();
+                        line.push_generated(&" ".repeat(padding), SemanticStyle::Text);
+                        line.append(chunk);
                     }
                     _ => {
-                        text.push_str(chunk);
-                        display_column += chunk.width();
-                        push_synthetic_spaces(
-                            &mut text,
-                            &mut synthetic_columns,
-                            &mut display_column,
-                            padding,
-                        );
+                        line.append(chunk);
+                        line.push_generated(&" ".repeat(padding), SemanticStyle::Text);
                     }
                 }
             } else {
-                text.push_str(chunk);
-                display_column += chunk.width();
-                push_synthetic_spaces(
-                    &mut text,
-                    &mut synthetic_columns,
-                    &mut display_column,
-                    padding,
-                );
+                line.append(chunk);
+                line.push_generated(&" ".repeat(padding), SemanticStyle::Text);
             }
-            push_synthetic_spaces(&mut text, &mut synthetic_columns, &mut display_column, 1);
-            text.push('│');
-            synthetic_columns.push(display_column..display_column + 1);
-            display_column += 1;
+            line.push_generated(" │", SemanticStyle::Text);
         }
-
-        let mut spans = Vec::new();
-        if header_style == SemanticStyle::Strong {
-            let text_len = text.chars().count();
-            spans.push(Span {
-                start_col: 1,
-                end_col: text_len.saturating_sub(1),
-                style: SemanticStyle::Strong,
-            });
+        if header_style == SemanticStyle::Strong && line.fragments.len() > 2 {
+            let last = line.fragments.len() - 1;
+            for fragment in &mut line.fragments[1..last] {
+                fragment.style = SemanticStyle::Strong;
+            }
         }
-        lines.push(TableDataLine {
-            styled: StyledLine { text, spans },
-            synthetic_columns,
-        });
+        lines.push(line);
     }
 
     lines
-}
-
-fn push_synthetic_spaces(
-    text: &mut String,
-    columns: &mut Vec<std::ops::Range<usize>>,
-    display_column: &mut usize,
-    count: usize,
-) {
-    if count == 0 {
-        return;
-    }
-    text.push_str(&" ".repeat(count));
-    columns.push(*display_column..*display_column + count);
-    *display_column += count;
-}
-
-fn whole_table_row(col_widths: &[usize]) -> Vec<std::ops::Range<usize>> {
-    std::iter::once(0..col_widths.iter().sum::<usize>() + 3 * col_widths.len() + 1).collect()
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -430,10 +358,32 @@ fn whole_table_row(col_widths: &[usize]) -> Vec<std::ops::Range<usize>> {
 mod tests {
     use super::*;
 
+    fn make_leaf(text: &str) -> InlineLeaf {
+        let mut mapped = MappedLine::default();
+        mapped.push_generated(text, SemanticStyle::Text);
+        InlineLeaf {
+            text: text.to_string(),
+            atoms: mapped
+                .fragments
+                .into_iter()
+                .map(|fragment| crate::rendered::blocks::InlineAtom {
+                    text: fragment.text,
+                    source: 0..0,
+                })
+                .collect(),
+        }
+    }
+
+    fn make_mapped(text: &str) -> MappedLine {
+        let mut mapped = MappedLine::default();
+        mapped.push_generated(text, SemanticStyle::Text);
+        mapped
+    }
+
     fn make_row(texts: &[&str]) -> Vec<Vec<Inline>> {
         texts
             .iter()
-            .map(|text| vec![Inline::Text((*text).to_string())])
+            .map(|text| vec![Inline::Text(make_leaf(text))])
             .collect()
     }
 
@@ -641,16 +591,22 @@ mod tests {
 
     #[test]
     fn split_cell_text_unit_tests() {
-        assert_eq!(split_cell_text("", 4), vec![""]);
-        assert_eq!(split_cell_text("abc", 4), vec!["abc"]);
-        assert_eq!(split_cell_text("abcd", 4), vec!["abcd"]);
-        assert_eq!(split_cell_text("abcdef", 4), vec!["abcd", "ef"]);
-        assert_eq!(split_cell_text("abc", 0), vec![""]);
-        assert_eq!(split_cell_text("abc", 1), vec!["a", "b", "c"]);
-        assert_eq!(split_cell_text("abc東", 4), vec!["abc", "東"]);
-        assert_eq!(split_cell_text("東西", 1), vec!["東", "西"]);
+        let split = |text: &str, width| {
+            split_cell_text(&make_mapped(text), width)
+                .into_iter()
+                .map(|line| line.text())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(split("", 4), vec![""]);
+        assert_eq!(split("abc", 4), vec!["abc"]);
+        assert_eq!(split("abcd", 4), vec!["abcd"]);
+        assert_eq!(split("abcdef", 4), vec!["abcd", "ef"]);
+        assert_eq!(split("abc", 0), vec![""]);
+        assert_eq!(split("abc", 1), vec!["a", "b", "c"]);
+        assert_eq!(split("abc東", 4), vec!["abc", "東"]);
+        assert_eq!(split("東西", 1), vec!["東", "西"]);
         assert_eq!(
-            split_cell_text(&format!("{}*\u{fe0f}", "a".repeat(39)), 40),
+            split(&format!("{}*\u{fe0f}", "a".repeat(39)), 40),
             vec!["a".repeat(39), "*\u{fe0f}".to_string()]
         );
     }
@@ -805,12 +761,12 @@ mod tests {
             &[cells[0].display_width],
             SemanticStyle::Strong,
         );
-        let line = &lines[0].styled;
+        let line = finalize_table_line(lines[0].clone(), true).0;
         let span = line.spans.first().expect("header row should be styled");
 
         assert_eq!(span.start_col, 1);
         assert_eq!(span.end_col, line.text.chars().count() - 1);
-        assert_eq!(span_text(line, span), " café東京🙂 ");
+        assert_eq!(span_text(&line, span), " café東京🙂 ");
     }
 
     #[test]

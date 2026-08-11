@@ -20,87 +20,143 @@ use ratatui::{
     Frame,
 };
 
-use oom_edit_core::session::KeyInput;
+use oom_edit_core::KeyInput;
+use std::path::PathBuf;
 
-/// A confirm-overlay result.
+use crate::lifecycle::{CloseTabRequest, SaveRequest};
+
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmResult {
-    /// The user confirmed the action (save & quit / overwrite).
     Confirm,
-    /// The user wants to quit without saving.
     Quit,
-    /// The user declined (cancel).
     Cancel,
-    /// The user chose an alternative action (reload for overwrite).
     Reload,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirtyCloseChoice {
+    SaveAndClose,
+    Discard,
+    Cancel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalSaveChoice {
+    Overwrite,
+    Reload,
+    Cancel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfirmationResolution {
+    DirtyClose {
+        action: CloseTabRequest,
+        choice: DirtyCloseChoice,
+    },
+    ExternalSave {
+        request: SaveRequest,
+        disk_path: PathBuf,
+        choice: ExternalSaveChoice,
+    },
 }
 
 /// Confirm quit overlay (dirty buffer).
 ///
 /// Options: `Save and quit` (`y`/`w`) / `Quit without saving` (`n`) / `Cancel` (`Esc`).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ConfirmQuit {
+    action: CloseTabRequest,
     /// Which option is currently highlighted (0=save+quit, 1=quit, 2=cancel).
     selected: usize,
 }
 
 impl ConfirmQuit {
     /// Open a new confirm-quit overlay.
-    #[allow(dead_code)]
-    pub fn new() -> Self {
-        Self { selected: 0 }
+    pub fn for_action(action: CloseTabRequest) -> Self {
+        Self {
+            action,
+            selected: 0,
+        }
     }
 
-    /// Handle a key event. Returns true if consumed.
-    pub fn handle_key(&mut self, key: &KeyInput) -> bool {
-        use oom_edit_core::session::KeyCodeKind;
+    #[cfg(test)]
+    pub fn new() -> Self {
+        Self::for_action(CloseTabRequest {
+            target: 0,
+            force: false,
+            dirty_policy: crate::lifecycle::DirtyClosePolicy::Confirm,
+        })
+    }
 
-        match key.code.kind {
+    /// Handle one exclusive modal key, resolving shortcuts immediately.
+    pub fn resolve_key(&mut self, key: &KeyInput) -> Option<ConfirmationResolution> {
+        use oom_edit_core::KeyCodeKind;
+
+        let choice = match key.code.kind {
             KeyCodeKind::Char('y') if !key.mods.ctrl && !key.mods.alt && !key.mods.shift => {
-                // Save and quit
                 self.selected = 0;
-                return true;
+                Some(DirtyCloseChoice::SaveAndClose)
             }
             KeyCodeKind::Char('w') if !key.mods.ctrl && !key.mods.alt && !key.mods.shift => {
-                // Save and quit (alternative key)
                 self.selected = 0;
-                return true;
+                Some(DirtyCloseChoice::SaveAndClose)
             }
             KeyCodeKind::Char('n') if !key.mods.ctrl && !key.mods.alt && !key.mods.shift => {
-                // Quit without saving
                 self.selected = 1;
-                return true;
+                Some(DirtyCloseChoice::Discard)
             }
             KeyCodeKind::Esc => {
-                // Cancel -- return false so app.rs close-overlay path runs.
                 self.selected = 2;
-                return false;
+                Some(DirtyCloseChoice::Cancel)
             }
             KeyCodeKind::Char('c') if key.mods.ctrl && !key.mods.alt => {
-                // Ctrl-C → Cancel -- return false so app.rs close-overlay path runs.
                 self.selected = 2;
-                return false;
+                Some(DirtyCloseChoice::Cancel)
             }
             KeyCodeKind::Up => {
                 self.selected = self.selected.saturating_sub(1);
-                return true;
+                None
             }
             KeyCodeKind::Down => {
                 self.selected = (self.selected + 1).min(2);
-                return true;
+                None
             }
-            _ => {}
-        }
-
-        false
+            KeyCodeKind::Enter => Some(self.selected_choice()),
+            _ => None,
+        };
+        choice.map(|choice| ConfirmationResolution::DirtyClose {
+            action: self.action,
+            choice,
+        })
     }
 
-    /// Get the user's choice.
+    #[cfg(test)]
+    pub fn handle_key(&mut self, key: &KeyInput) -> bool {
+        let kind = key.code.kind;
+        self.resolve_key(key);
+        matches!(
+            kind,
+            oom_edit_core::KeyCodeKind::Char('y' | 'w' | 'n')
+                | oom_edit_core::KeyCodeKind::Up
+                | oom_edit_core::KeyCodeKind::Down
+        )
+    }
+
+    #[cfg(test)]
     pub fn result(&self) -> ConfirmResult {
+        match self.selected_choice() {
+            DirtyCloseChoice::SaveAndClose => ConfirmResult::Confirm,
+            DirtyCloseChoice::Discard => ConfirmResult::Quit,
+            DirtyCloseChoice::Cancel => ConfirmResult::Cancel,
+        }
+    }
+
+    fn selected_choice(&self) -> DirtyCloseChoice {
         match self.selected {
-            0 => ConfirmResult::Confirm, // Save and quit
-            1 => ConfirmResult::Quit,    // Quit without saving
-            _ => ConfirmResult::Cancel,  // Cancel
+            0 => DirtyCloseChoice::SaveAndClose,
+            1 => DirtyCloseChoice::Discard,
+            _ => DirtyCloseChoice::Cancel,
         }
     }
 
@@ -153,64 +209,103 @@ impl ConfirmQuit {
 /// Confirm overwrite overlay (externally modified file).
 ///
 /// Options: `Overwrite (:w!)` (`o`) / `Reload (:e!)` (`r`) / `Cancel` (`Esc`).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ConfirmOverwrite {
+    request: SaveRequest,
+    disk_path: PathBuf,
     /// Which option is currently highlighted (0=overwrite, 1=reload, 2=cancel).
     selected: usize,
 }
 
 impl ConfirmOverwrite {
     /// Open a new confirm-overwrite overlay.
-    #[allow(dead_code)]
+    pub fn for_request(request: SaveRequest, disk_path: PathBuf) -> Self {
+        Self {
+            request,
+            disk_path,
+            selected: 0,
+        }
+    }
+
+    #[cfg(test)]
     pub fn new() -> Self {
-        Self { selected: 0 }
+        Self::for_request(
+            SaveRequest {
+                target: 0,
+                path: None,
+                force: false,
+                retarget: true,
+                continuation: crate::lifecycle::SaveContinuation::StayOpen,
+            },
+            PathBuf::from("fixture.md"),
+        )
     }
 
     /// Handle a key event. Returns true if consumed.
-    pub fn handle_key(&mut self, key: &KeyInput) -> bool {
-        use oom_edit_core::session::KeyCodeKind;
+    pub fn resolve_key(&mut self, key: &KeyInput) -> Option<ConfirmationResolution> {
+        use oom_edit_core::KeyCodeKind;
 
-        match key.code.kind {
+        let choice = match key.code.kind {
             KeyCodeKind::Char('o') if !key.mods.ctrl && !key.mods.alt && !key.mods.shift => {
-                // Overwrite
                 self.selected = 0;
-                return true;
+                Some(ExternalSaveChoice::Overwrite)
             }
             KeyCodeKind::Char('r') if !key.mods.ctrl && !key.mods.alt && !key.mods.shift => {
-                // Reload
                 self.selected = 1;
-                return true;
+                Some(ExternalSaveChoice::Reload)
             }
             KeyCodeKind::Esc => {
-                // Cancel -- return false so app.rs close-overlay path runs.
                 self.selected = 2;
-                return false;
+                Some(ExternalSaveChoice::Cancel)
             }
             KeyCodeKind::Char('c') if key.mods.ctrl && !key.mods.alt => {
-                // Ctrl-C → Cancel -- return false so app.rs close-overlay path runs.
                 self.selected = 2;
-                return false;
+                Some(ExternalSaveChoice::Cancel)
             }
             KeyCodeKind::Up => {
                 self.selected = self.selected.saturating_sub(1);
-                return true;
+                None
             }
             KeyCodeKind::Down => {
                 self.selected = (self.selected + 1).min(2);
-                return true;
+                None
             }
-            _ => {}
-        }
-
-        false
+            KeyCodeKind::Enter => Some(self.selected_choice()),
+            _ => None,
+        };
+        choice.map(|choice| ConfirmationResolution::ExternalSave {
+            request: self.request.clone(),
+            disk_path: self.disk_path.clone(),
+            choice,
+        })
     }
 
-    /// Get the user's choice.
+    #[cfg(test)]
+    pub fn handle_key(&mut self, key: &KeyInput) -> bool {
+        let kind = key.code.kind;
+        self.resolve_key(key);
+        matches!(
+            kind,
+            oom_edit_core::KeyCodeKind::Char('o' | 'r')
+                | oom_edit_core::KeyCodeKind::Up
+                | oom_edit_core::KeyCodeKind::Down
+        )
+    }
+
+    #[cfg(test)]
     pub fn result(&self) -> ConfirmResult {
+        match self.selected_choice() {
+            ExternalSaveChoice::Overwrite => ConfirmResult::Confirm,
+            ExternalSaveChoice::Reload => ConfirmResult::Reload,
+            ExternalSaveChoice::Cancel => ConfirmResult::Cancel,
+        }
+    }
+
+    fn selected_choice(&self) -> ExternalSaveChoice {
         match self.selected {
-            0 => ConfirmResult::Confirm, // Overwrite
-            1 => ConfirmResult::Reload,  // Reload
-            _ => ConfirmResult::Cancel,  // Cancel
+            0 => ExternalSaveChoice::Overwrite,
+            1 => ExternalSaveChoice::Reload,
+            _ => ExternalSaveChoice::Cancel,
         }
     }
 
@@ -288,28 +383,28 @@ mod tests {
 
     fn char_key(c: char) -> KeyInput {
         KeyInput {
-            code: oom_edit_core::session::KeyCode {
-                kind: oom_edit_core::session::KeyCodeKind::Char(c),
+            code: oom_edit_core::KeyCode {
+                kind: oom_edit_core::KeyCodeKind::Char(c),
             },
-            mods: oom_edit_core::session::Modifiers::default(),
+            mods: oom_edit_core::Modifiers::default(),
         }
     }
 
     fn esc_key() -> KeyInput {
         KeyInput {
-            code: oom_edit_core::session::KeyCode {
-                kind: oom_edit_core::session::KeyCodeKind::Esc,
+            code: oom_edit_core::KeyCode {
+                kind: oom_edit_core::KeyCodeKind::Esc,
             },
-            mods: oom_edit_core::session::Modifiers::default(),
+            mods: oom_edit_core::Modifiers::default(),
         }
     }
 
     fn ctrl_c_key() -> KeyInput {
         KeyInput {
-            code: oom_edit_core::session::KeyCode {
-                kind: oom_edit_core::session::KeyCodeKind::Char('c'),
+            code: oom_edit_core::KeyCode {
+                kind: oom_edit_core::KeyCodeKind::Char('c'),
             },
-            mods: oom_edit_core::session::Modifiers {
+            mods: oom_edit_core::Modifiers {
                 ctrl: true,
                 ..Default::default()
             },
@@ -318,28 +413,28 @@ mod tests {
 
     fn up_key() -> KeyInput {
         KeyInput {
-            code: oom_edit_core::session::KeyCode {
-                kind: oom_edit_core::session::KeyCodeKind::Up,
+            code: oom_edit_core::KeyCode {
+                kind: oom_edit_core::KeyCodeKind::Up,
             },
-            mods: oom_edit_core::session::Modifiers::default(),
+            mods: oom_edit_core::Modifiers::default(),
         }
     }
 
     fn down_key() -> KeyInput {
         KeyInput {
-            code: oom_edit_core::session::KeyCode {
-                kind: oom_edit_core::session::KeyCodeKind::Down,
+            code: oom_edit_core::KeyCode {
+                kind: oom_edit_core::KeyCodeKind::Down,
             },
-            mods: oom_edit_core::session::Modifiers::default(),
+            mods: oom_edit_core::Modifiers::default(),
         }
     }
 
     fn enter_key() -> KeyInput {
         KeyInput {
-            code: oom_edit_core::session::KeyCode {
-                kind: oom_edit_core::session::KeyCodeKind::Enter,
+            code: oom_edit_core::KeyCode {
+                kind: oom_edit_core::KeyCodeKind::Enter,
             },
-            mods: oom_edit_core::session::Modifiers::default(),
+            mods: oom_edit_core::Modifiers::default(),
         }
     }
 

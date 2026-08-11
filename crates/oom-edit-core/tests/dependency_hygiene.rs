@@ -154,3 +154,20 @@ fn current_surfaces_have_no_legacy_public_modes_or_bindings() {
         violations.join("\n")
     );
 }
+
+#[test]
+fn vim_adapter_does_not_depend_on_rendered_selection_dtos() {
+    let vim_src = include_str!("../src/vim.rs");
+    for banned in [
+        concat!("Rendered", "Selection"),
+        concat!("Rendered", "SelectionRow"),
+        concat!("Rendered", "Point"),
+        concat!("Selection", "Shape"),
+        concat!("crate::", "session"),
+    ] {
+        assert!(
+            !vim_src.contains(banned),
+            "vim.rs must own its projected request model and not depend on {banned}"
+        );
+    }
+}

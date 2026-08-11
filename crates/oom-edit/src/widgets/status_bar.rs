@@ -19,7 +19,7 @@ use ratatui::{
     Frame,
 };
 
-use oom_edit_core::session::{Mode, Severity};
+use oom_edit_core::{Mode, Severity};
 
 use crate::theme::{Theme, Tier, UiSlot};
 

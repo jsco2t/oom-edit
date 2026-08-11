@@ -820,10 +820,10 @@ pub struct RenderedKeyResult {
 
 /// Whether a rendered command needs to inspect source characters. Ordinary
 /// row, atom, edge, count, and jump navigation is entirely layout-backed.
-pub(crate) fn key_inspects_source(key: crate::session::KeyInput) -> bool {
+pub(crate) fn key_inspects_source(key: crate::input::KeyInput) -> bool {
     matches!(
         key.code.kind,
-        crate::session::KeyCodeKind::Char('w' | 'W' | 'e' | 'E' | 'b' | 'B' | 'n' | 'N')
+        crate::input::KeyCodeKind::Char('w' | 'W' | 'e' | 'E' | 'b' | 'B' | 'n' | 'N')
     ) && !key.mods.ctrl
         && !key.mods.alt
         && !key.mods.shift
@@ -839,7 +839,7 @@ pub(crate) fn key_inspects_source(key: crate::session::KeyInput) -> bool {
 /// - VN-6: n/N for repeat search
 #[allow(clippy::too_many_arguments)]
 pub fn handle_key(
-    key: crate::session::KeyInput,
+    key: crate::input::KeyInput,
     cursor: &RenderedCursor,
     search: Option<&RenderedSearch>,
     max_rendered_lines: usize,
@@ -853,10 +853,10 @@ pub fn handle_key(
 
     match key.code.kind {
         // Esc: no-op in rendered mode (handled by session layer)
-        crate::session::KeyCodeKind::Esc => {}
+        crate::input::KeyCodeKind::Esc => {}
 
         // j / Down: move down one line
-        crate::session::KeyCodeKind::Char('j') | crate::session::KeyCodeKind::Down
+        crate::input::KeyCodeKind::Char('j') | crate::input::KeyCodeKind::Down
             if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
         {
             let new_line = cursor
@@ -868,7 +868,7 @@ pub fn handle_key(
         }
 
         // k / Up: move up one line
-        crate::session::KeyCodeKind::Char('k') | crate::session::KeyCodeKind::Up
+        crate::input::KeyCodeKind::Char('k') | crate::input::KeyCodeKind::Up
             if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
         {
             let new_line = cursor.line.saturating_sub(step);
@@ -877,7 +877,7 @@ pub fn handle_key(
         }
 
         // h / Left: previous source-backed display atom.
-        crate::session::KeyCodeKind::Char('h') | crate::session::KeyCodeKind::Left
+        crate::input::KeyCodeKind::Char('h') | crate::input::KeyCodeKind::Left
             if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
         {
             if let Some(point) = horizontal_point(cursor, layout, false, step) {
@@ -887,7 +887,7 @@ pub fn handle_key(
         }
 
         // l / Right: next source-backed display atom.
-        crate::session::KeyCodeKind::Char('l') | crate::session::KeyCodeKind::Right
+        crate::input::KeyCodeKind::Char('l') | crate::input::KeyCodeKind::Right
             if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
         {
             if let Some(point) = horizontal_point(cursor, layout, true, step) {
@@ -898,13 +898,13 @@ pub fn handle_key(
 
         // Rendered word motions traverse source-backed display atoms. Hidden
         // Markdown delimiters and synthetic cells are never cursor stops.
-        crate::session::KeyCodeKind::Char('w')
-        | crate::session::KeyCodeKind::Char('W')
-        | crate::session::KeyCodeKind::Char('e')
-        | crate::session::KeyCodeKind::Char('E')
+        crate::input::KeyCodeKind::Char('w')
+        | crate::input::KeyCodeKind::Char('W')
+        | crate::input::KeyCodeKind::Char('e')
+        | crate::input::KeyCodeKind::Char('E')
             if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
         {
-            if let crate::session::KeyCodeKind::Char(motion) = key.code.kind {
+            if let crate::input::KeyCodeKind::Char(motion) = key.code.kind {
                 if let Some(point) = word_point(cursor, layout, text, motion, step) {
                     result.cursor_moved = true;
                     result.new_cursor = Some(RenderedCursor::at(point));
@@ -912,10 +912,10 @@ pub fn handle_key(
             }
         }
 
-        crate::session::KeyCodeKind::Char('b') | crate::session::KeyCodeKind::Char('B')
+        crate::input::KeyCodeKind::Char('b') | crate::input::KeyCodeKind::Char('B')
             if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
         {
-            if let crate::session::KeyCodeKind::Char(motion) = key.code.kind {
+            if let crate::input::KeyCodeKind::Char(motion) = key.code.kind {
                 if let Some(point) = word_point(cursor, layout, text, motion, step) {
                     result.cursor_moved = true;
                     result.new_cursor = Some(RenderedCursor::at(point));
@@ -923,7 +923,7 @@ pub fn handle_key(
             }
         }
 
-        crate::session::KeyCodeKind::Char('0') | crate::session::KeyCodeKind::Char('^')
+        crate::input::KeyCodeKind::Char('0') | crate::input::KeyCodeKind::Char('^')
             if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
         {
             if let Some(point) = edge_point(cursor.line, layout, false) {
@@ -932,7 +932,7 @@ pub fn handle_key(
             }
         }
 
-        crate::session::KeyCodeKind::Char('$')
+        crate::input::KeyCodeKind::Char('$')
             if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
         {
             if let Some(point) = edge_point(cursor.line, layout, true) {
@@ -942,7 +942,7 @@ pub fn handle_key(
         }
 
         // g: go to first line, or the counted rendered line.
-        crate::session::KeyCodeKind::Char('g')
+        crate::input::KeyCodeKind::Char('g')
             if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
         {
             let new_line = count
@@ -953,7 +953,7 @@ pub fn handle_key(
         }
 
         // G: go to last line (or to line N if count > 0)
-        crate::session::KeyCodeKind::Char('G')
+        crate::input::KeyCodeKind::Char('G')
             if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
         {
             if count > 1 {
@@ -973,7 +973,7 @@ pub fn handle_key(
         }
 
         // /: start forward search
-        crate::session::KeyCodeKind::Char('/')
+        crate::input::KeyCodeKind::Char('/')
             if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
         {
             let mut new_search = RenderedSearch::new("");
@@ -983,7 +983,7 @@ pub fn handle_key(
         }
 
         // ?: start backward search
-        crate::session::KeyCodeKind::Char('?')
+        crate::input::KeyCodeKind::Char('?')
             if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
         {
             let mut new_search = RenderedSearch::new("");
@@ -993,7 +993,7 @@ pub fn handle_key(
         }
 
         // Tab: jump to next target
-        crate::session::KeyCodeKind::Tab if !key.mods.ctrl && !key.mods.alt && !key.mods.shift => {
+        crate::input::KeyCodeKind::Tab if !key.mods.ctrl && !key.mods.alt && !key.mods.shift => {
             if let Some(target) = next_jump_target(cursor, jump_targets, false) {
                 result.cursor_moved = true;
                 result.new_cursor = Some(cursor_for_row(target, cursor.desired_column, layout));
@@ -1001,7 +1001,7 @@ pub fn handle_key(
         }
 
         // Shift-Tab: jump to previous target
-        crate::session::KeyCodeKind::BackTab
+        crate::input::KeyCodeKind::BackTab
             if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
         {
             if let Some(target) = next_jump_target(cursor, jump_targets, true) {
@@ -1011,7 +1011,7 @@ pub fn handle_key(
         }
 
         // Ctrl-d: scroll down half viewport
-        crate::session::KeyCodeKind::Char('d') if key.mods.ctrl => {
+        crate::input::KeyCodeKind::Char('d') if key.mods.ctrl => {
             let page = if count > 1 {
                 count
             } else {
@@ -1024,7 +1024,7 @@ pub fn handle_key(
         }
 
         // Ctrl-u: scroll up half viewport
-        crate::session::KeyCodeKind::Char('u') if key.mods.ctrl => {
+        crate::input::KeyCodeKind::Char('u') if key.mods.ctrl => {
             let page = if count > 1 {
                 count
             } else {
@@ -1036,7 +1036,7 @@ pub fn handle_key(
         }
 
         // Ctrl-f: scroll down full viewport
-        crate::session::KeyCodeKind::Char('f') if key.mods.ctrl => {
+        crate::input::KeyCodeKind::Char('f') if key.mods.ctrl => {
             let page = if count > 1 { count } else { max_rendered_lines };
             let new_line =
                 (cursor.line.saturating_add(page)).min(max_rendered_lines.saturating_sub(1));
@@ -1045,7 +1045,7 @@ pub fn handle_key(
         }
 
         // Ctrl-b: scroll up full viewport
-        crate::session::KeyCodeKind::Char('b') if key.mods.ctrl => {
+        crate::input::KeyCodeKind::Char('b') if key.mods.ctrl => {
             let page = if count > 1 { count } else { max_rendered_lines };
             let new_line = cursor.line.saturating_sub(page);
             result.cursor_moved = true;
@@ -1053,7 +1053,7 @@ pub fn handle_key(
         }
 
         // n: repeat search in same direction (with cursor movement)
-        crate::session::KeyCodeKind::Char('n')
+        crate::input::KeyCodeKind::Char('n')
             if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
         {
             if let Some(current_search) = search {
@@ -1088,7 +1088,7 @@ pub fn handle_key(
         }
 
         // N: repeat search in reverse direction (with cursor movement)
-        crate::session::KeyCodeKind::Char('N')
+        crate::input::KeyCodeKind::Char('N')
             if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
         {
             if let Some(current_search) = search {
@@ -1122,7 +1122,7 @@ pub fn handle_key(
         }
 
         // {: jump to previous synthetic boundary line
-        crate::session::KeyCodeKind::Char('{')
+        crate::input::KeyCodeKind::Char('{')
             if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
         {
             if let Some(target) = find_prev_boundary(cursor, layout) {
@@ -1132,7 +1132,7 @@ pub fn handle_key(
         }
 
         // }: jump to next synthetic boundary line
-        crate::session::KeyCodeKind::Char('}')
+        crate::input::KeyCodeKind::Char('}')
             if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
         {
             if let Some(target) = find_next_boundary(cursor, layout) {
@@ -1142,7 +1142,7 @@ pub fn handle_key(
         }
 
         // [[: jump to previous heading
-        crate::session::KeyCodeKind::Char('[')
+        crate::input::KeyCodeKind::Char('[')
             if !key.mods.ctrl && !key.mods.alt && !key.mods.shift && count > 1 =>
         {
             let targets: Vec<&JumpTarget> = layout
@@ -1158,7 +1158,7 @@ pub fn handle_key(
         }
 
         // ]]: jump to next heading
-        crate::session::KeyCodeKind::Char(']')
+        crate::input::KeyCodeKind::Char(']')
             if !key.mods.ctrl && !key.mods.alt && !key.mods.shift && count > 1 =>
         {
             let targets: Vec<&JumpTarget> = layout
@@ -1174,9 +1174,7 @@ pub fn handle_key(
         }
 
         // Enter: on a link-target line, show destination
-        crate::session::KeyCodeKind::Enter
-            if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
-        {
+        crate::input::KeyCodeKind::Enter if !key.mods.ctrl && !key.mods.alt && !key.mods.shift => {
             if let Some(target) = layout.jump_targets.iter().find(|t| t.line == cursor.line) {
                 match &target.kind {
                     TargetKind::Heading(_) => {
@@ -1195,7 +1193,7 @@ pub fn handle_key(
         }
 
         // z: toggle front-matter collapse
-        crate::session::KeyCodeKind::Char('z')
+        crate::input::KeyCodeKind::Char('z')
             if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
         {
             result.layout_dirty = true;
@@ -1204,10 +1202,10 @@ pub fn handle_key(
         }
 
         // Page Up / Page Down: handled by session layer with viewport info
-        crate::session::KeyCodeKind::PageUp | crate::session::KeyCodeKind::PageDown => {}
+        crate::input::KeyCodeKind::PageUp | crate::input::KeyCodeKind::PageDown => {}
 
         // Home: go to first content line
-        crate::session::KeyCodeKind::Home if !key.mods.ctrl && !key.mods.alt && !key.mods.shift => {
+        crate::input::KeyCodeKind::Home if !key.mods.ctrl && !key.mods.alt && !key.mods.shift => {
             if let Some(first_content) = layout
                 .lines
                 .iter()
@@ -1220,7 +1218,7 @@ pub fn handle_key(
         }
 
         // End: go to last content line
-        crate::session::KeyCodeKind::End if !key.mods.ctrl && !key.mods.alt && !key.mods.shift => {
+        crate::input::KeyCodeKind::End if !key.mods.ctrl && !key.mods.alt && !key.mods.shift => {
             let last_content = layout
                 .lines
                 .iter()
@@ -1574,7 +1572,6 @@ mod tests {
             kind,
             role: crate::style::RenderedLineRole::Document,
             atoms: Vec::new(),
-            synthetic_columns: Vec::new(),
         }
     }
 }

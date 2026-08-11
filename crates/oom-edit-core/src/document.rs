@@ -11,8 +11,6 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{OpenError, SaveError};
-use crate::frontmatter::FrontMatter;
-use crate::vim::UndoMark;
 
 trait AtomicSaveOperations {
     type TempFile;
@@ -143,29 +141,74 @@ pub enum LineEnding {
     CrLf,
 }
 
-/// A document — text content plus metadata for I/O and dirty tracking.
-///
-/// The text is always stored internally with LF line endings. On open, the
-/// dominant line ending is detected and recorded; on save, it is restored.
-/// Final-newline presence is similarly preserved (FR-5.2, FR-5.6).
+/// Private file identity and serialization policy for a live session.
 #[derive(Debug)]
 pub struct Document {
     /// The file path, if the document was opened from or saved to a file.
     path: Option<PathBuf>,
-    /// The full text content (always stored with LF line endings).
-    text: String,
     /// The dominant line ending detected on open (restored on save).
     line_ending: LineEnding,
     /// Whether the original file had a final newline.
     has_final_newline: bool,
-    /// Parsed front matter, if any.
-    front_matter: FrontMatter,
-    /// The dirty generation at last save (for dirty tracking).
-    save_point: UndoMark,
     /// Last-known file size in bytes (for external-modification detection).
     last_len: Option<usize>,
     /// Last-known file mtime as system time (for external-modification detection).
     last_mtime: Option<std::time::SystemTime>,
+}
+
+/// One normalized text value paired with its non-text file metadata.
+pub(crate) struct OpenedDocument {
+    text: String,
+    metadata: Document,
+}
+
+impl OpenedDocument {
+    pub(crate) fn into_parts(self) -> (String, Document) {
+        (self.text, self.metadata)
+    }
+}
+
+impl std::ops::Deref for OpenedDocument {
+    type Target = Document;
+
+    fn deref(&self) -> &Self::Target {
+        &self.metadata
+    }
+}
+
+impl std::ops::DerefMut for OpenedDocument {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.metadata
+    }
+}
+
+#[cfg(test)]
+impl OpenedDocument {
+    fn set_text(&mut self, text: &str) {
+        self.text = normalize_lf(text);
+    }
+
+    fn save(&mut self, path: Option<&Path>, force: bool) -> Result<(), SaveError> {
+        let text = self.text.clone();
+        self.metadata.save_with_text(&text, path, force)
+    }
+
+    fn save_copy(&self, path: &Path) -> Result<(), SaveError> {
+        self.metadata.save_copy_with_text(&self.text, path)
+    }
+
+    fn save_copy_using<O: AtomicSaveOperations>(
+        &self,
+        path: &Path,
+        operations: &mut O,
+    ) -> Result<(), SaveError> {
+        self.metadata
+            .save_copy_with_text_using(&self.text, path, operations)
+    }
+
+    fn serialize(&self) -> String {
+        self.metadata.serialize_text(&self.text)
+    }
 }
 
 impl Document {
@@ -179,7 +222,7 @@ impl Document {
     ///
     /// Per FR-5.2: dominant line ending is detected and recorded; final-newline
     /// presence is recorded; in-memory text is normalized to LF.
-    pub fn open(path: &Path) -> Result<Self, OpenError> {
+    pub(crate) fn open(path: &Path) -> Result<OpenedDocument, OpenError> {
         match fs::read(path) {
             Ok(bytes) => {
                 // UTF-8 validation: find the first invalid byte (FR-5.1)
@@ -197,38 +240,33 @@ impl Document {
                 // Normalize to LF in-memory
                 let normalized = normalize_lf(&text);
 
-                // Parse front matter
-                let front_matter = crate::frontmatter::parse_front_matter(&normalized);
-
                 // Get file metadata for external-modification detection
                 let metadata = fs::metadata(path).ok();
                 let last_len = metadata.as_ref().map(|m| m.len() as usize);
                 let last_mtime = metadata.and_then(|m| m.modified().ok());
 
-                let save_point = UndoMark(0);
-
-                Ok(Self {
-                    path: Some(path.to_path_buf()),
+                Ok(OpenedDocument {
                     text: normalized,
-                    line_ending,
-                    has_final_newline,
-                    front_matter,
-                    save_point,
-                    last_len,
-                    last_mtime,
+                    metadata: Self {
+                        path: Some(path.to_path_buf()),
+                        line_ending,
+                        has_final_newline,
+                        last_len,
+                        last_mtime,
+                    },
                 })
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 // New-buffer semantics: empty buffer, path retained, not-dirty
-                Ok(Self {
-                    path: Some(path.to_path_buf()),
+                Ok(OpenedDocument {
                     text: String::new(),
-                    line_ending: LineEnding::Lf,
-                    has_final_newline: false,
-                    front_matter: FrontMatter::None,
-                    save_point: UndoMark(0),
-                    last_len: None,
-                    last_mtime: None,
+                    metadata: Self {
+                        path: Some(path.to_path_buf()),
+                        line_ending: LineEnding::Lf,
+                        has_final_newline: false,
+                        last_len: None,
+                        last_mtime: None,
+                    },
                 })
             }
             Err(e) => Err(OpenError::Io(e)),
@@ -238,35 +276,19 @@ impl Document {
     /// Create a new document from raw text (no file path).
     ///
     /// Used for headless construction and programmatic document creation.
-    pub fn from_text(text: &str) -> Self {
+    pub(crate) fn from_text(text: &str) -> OpenedDocument {
         let (line_ending, has_final_newline) = detect_line_ending(text);
         let normalized = normalize_lf(text);
-        let front_matter = crate::frontmatter::parse_front_matter(&normalized);
-
-        Self {
-            path: None,
+        OpenedDocument {
             text: normalized,
-            line_ending,
-            has_final_newline,
-            front_matter,
-            save_point: UndoMark(0),
-            last_len: None,
-            last_mtime: None,
+            metadata: Self {
+                path: None,
+                line_ending,
+                has_final_newline,
+                last_len: None,
+                last_mtime: None,
+            },
         }
-    }
-
-    /// Save the document to its path (or the given override path).
-    ///
-    /// Uses the document's own text for serialization.
-    ///
-    /// `force: true` bypasses external-modification detection (FR-5.7).
-    ///
-    /// Per FR-5.3: atomic write via temp file + fsync + rename.
-    /// On Unix, permissions are masked to `original & 0o644` (user read/write
-    /// + group/other read); on non-Unix, default permissions are used.
-    pub fn save(&mut self, override_path: Option<&Path>, force: bool) -> Result<(), SaveError> {
-        let text = self.text.clone();
-        self.save_with_text(&text, override_path, force)
     }
 
     /// Save the document using the provided text (e.g., from the vim buffer).
@@ -390,33 +412,12 @@ impl Document {
         // document's save point from the vim engine after a successful save.
         self.record_disk_state(&target_path, serialized.len(), override_path.is_some());
 
-        // Re-parse front matter after save (cheap — always re-parse)
-        self.front_matter = crate::frontmatter::parse_front_matter(text);
-
         Ok(())
-    }
-
-    /// Save a copy of the document to the given path without retargeting
-    /// or clearing dirty (for `:w {path}`).
-    ///
-    /// Uses atomic write (temp file + fsync + rename) to prevent corruption
-    /// on crash or interrupt.
-    pub fn save_copy(&self, path: &Path) -> Result<(), SaveError> {
-        self.save_copy_with_text(&self.text, path)
     }
 
     /// Save supplied live editor text as a copy without retargeting.
     pub(crate) fn save_copy_with_text(&self, text: &str, path: &Path) -> Result<(), SaveError> {
         self.save_copy_with_text_using(text, path, &mut FileSystemAtomicSave)
-    }
-
-    #[cfg(test)]
-    fn save_copy_using<O: AtomicSaveOperations>(
-        &self,
-        path: &Path,
-        operations: &mut O,
-    ) -> Result<(), SaveError> {
-        self.save_copy_with_text_using(&self.text, path, operations)
     }
 
     fn save_copy_with_text_using<O: AtomicSaveOperations>(
@@ -454,29 +455,6 @@ impl Document {
         self.path.as_deref()
     }
 
-    /// Return the document text (always LF-terminated internally).
-    pub fn text(&self) -> &str {
-        &self.text
-    }
-
-    /// Return the front matter, if any.
-    pub fn front_matter(&self) -> &FrontMatter {
-        &self.front_matter
-    }
-
-    /// Set the front matter (called after re-parse on save).
-    pub fn set_front_matter(&mut self, fm: FrontMatter) {
-        self.front_matter = fm;
-    }
-
-    /// Return the line count.
-    pub fn line_count(&self) -> usize {
-        if self.text.is_empty() {
-            return 1;
-        }
-        self.text.matches('\n').count() + 1
-    }
-
     /// Return the line ending style.
     pub fn line_ending(&self) -> LineEnding {
         self.line_ending
@@ -485,32 +463,6 @@ impl Document {
     /// Check if the document has a final newline.
     pub fn has_final_newline(&self) -> bool {
         self.has_final_newline
-    }
-
-    /// Check if the document is dirty (modified since last save).
-    ///
-    /// Per FR-5.4: dirty = buffer has been modified since the save point.
-    /// Undo back to the save point clears dirty.
-    pub fn is_dirty(&self, current_dirty_gen: u64) -> bool {
-        current_dirty_gen != self.save_point.0
-    }
-
-    /// Take a save point (marks current state as clean).
-    pub fn save_point(&mut self) -> UndoMark {
-        // In a real implementation, this would read the current dirty gen
-        // from the vim engine. For the Document type, we just return the
-        // current save point. The session layer updates this after saves.
-        self.save_point
-    }
-
-    /// Set the save point directly.
-    pub fn set_save_point(&mut self, mark: UndoMark) {
-        self.save_point = mark;
-    }
-
-    /// Update the recorded path (for :saveas / retarget).
-    pub fn set_path(&mut self, path: PathBuf) {
-        self.path = Some(path);
     }
 
     /// Check if this document was opened from a nonexistent path (new file).
@@ -523,25 +475,6 @@ impl Document {
         // When opening an existing file, last_len and last_mtime are set.
         // When creating a new buffer, they are None.
         self.path.is_some() && self.last_len.is_none()
-    }
-
-    /// Update the text content. Called after buffer edits.
-    pub fn set_text(&mut self, text: &str) {
-        // Normalize to LF
-        let normalized = normalize_lf(text);
-
-        // Re-parse front matter (cheap — always re-parse)
-        self.front_matter = crate::frontmatter::parse_front_matter(&normalized);
-
-        // Store normalized text
-        self.text = normalized;
-    }
-
-    /// Serialize the document to bytes, restoring the recorded line ending
-    /// and final-newline state.
-    #[cfg(test)]
-    fn serialize(&self) -> String {
-        self.serialize_text(&self.text)
     }
 
     /// Serialize the given text, restoring the recorded line ending

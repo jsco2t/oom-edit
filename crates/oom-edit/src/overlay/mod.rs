@@ -1,18 +1,21 @@
-//! Overlay system — single-slot overlay with take-and-return-bool key protocol.
+//! Overlay system — one exclusive active slot.
 //!
 //! [`Overlay`] is a flat enum with one active slot. Each overlay variant
-//! implements the key protocol: `handle_key(&mut self, key) -> bool` where
-//! `true` means "consumed" and `false` means "pass through".
+//! Palette input uses a consumed/pass-through protocol. Confirmation variants
+//! own their complete lifecycle request and return a semantic resolution.
 //!
 //! `centered()` returns the preferred geometry; `clear()` resets state.
 
 pub mod confirm;
 pub mod palette;
 
-pub use confirm::{ConfirmOverwrite, ConfirmQuit, ConfirmResult};
+pub use confirm::{
+    ConfirmOverwrite, ConfirmQuit, ConfirmationResolution, DirtyCloseChoice, ExternalSaveChoice,
+};
 pub use palette::PaletteState;
 
-use crate::command::{Command, Contexts};
+use crate::command::{AppCommand, Contexts};
+use crate::lifecycle::{CloseTabRequest, SaveRequest};
 use crate::theme::{Theme, Tier};
 
 /// An active overlay slot. Only one overlay can be open at a time.
@@ -48,13 +51,13 @@ impl Overlay {
     }
 
     /// Open the confirm-quit overlay.
-    pub fn open_confirm_quit() -> Self {
-        Overlay::ConfirmQuit(ConfirmQuit::new())
+    pub fn open_confirm_quit(action: CloseTabRequest) -> Self {
+        Overlay::ConfirmQuit(ConfirmQuit::for_action(action))
     }
 
     /// Open the confirm-overwrite overlay.
-    pub fn open_confirm_overwrite() -> Self {
-        Overlay::ConfirmOverwrite(ConfirmOverwrite::new())
+    pub fn open_confirm_overwrite(request: SaveRequest, disk_path: std::path::PathBuf) -> Self {
+        Overlay::ConfirmOverwrite(ConfirmOverwrite::for_request(request, disk_path))
     }
 
     /// Close the current overlay, returning the old value.
@@ -63,11 +66,10 @@ impl Overlay {
     }
 
     /// Handle a key event. Returns `true` if consumed.
-    pub fn handle_key(&mut self, key: &oom_edit_core::session::KeyInput) -> bool {
+    pub fn handle_key(&mut self, key: &oom_edit_core::KeyInput) -> bool {
         match self {
             Overlay::Palette(p) => p.handle_key(key),
-            Overlay::ConfirmQuit(q) => q.handle_key(key),
-            Overlay::ConfirmOverwrite(o) => o.handle_key(key),
+            Overlay::ConfirmQuit(_) | Overlay::ConfirmOverwrite(_) => true,
             Overlay::None => false,
         }
     }
@@ -104,7 +106,7 @@ impl Overlay {
     }
 
     /// Get the command to execute (if the selected row is a Command).
-    pub fn selected_command(&self) -> Option<Command> {
+    pub fn selected_command(&self) -> Option<AppCommand> {
         if let Overlay::Palette(p) = self {
             p.selected_command()
         } else {
@@ -112,11 +114,18 @@ impl Overlay {
         }
     }
 
-    /// Get the confirm result (if a confirm overlay is open).
-    pub fn confirm_result(&self) -> Option<ConfirmResult> {
+    pub fn is_confirmation(&self) -> bool {
+        matches!(self, Overlay::ConfirmQuit(_) | Overlay::ConfirmOverwrite(_))
+    }
+
+    /// Handle confirmation input exclusively and return a semantic resolution.
+    pub fn handle_confirmation_key(
+        &mut self,
+        key: &oom_edit_core::KeyInput,
+    ) -> Option<ConfirmationResolution> {
         match self {
-            Overlay::ConfirmQuit(q) => Some(q.result()),
-            Overlay::ConfirmOverwrite(o) => Some(o.result()),
+            Overlay::ConfirmQuit(q) => q.resolve_key(key),
+            Overlay::ConfirmOverwrite(o) => o.resolve_key(key),
             _ => None,
         }
     }

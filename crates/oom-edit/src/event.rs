@@ -65,46 +65,98 @@ pub fn run_event_loop(
             .unwrap_or(FRAME_BUDGET);
 
         if event::poll(poll_duration)? {
-            let ev = event::read()?;
-            dispatch_event(&mut app, ev);
+            read_sample_and_dispatch(&mut app, event::read, Instant::now)?;
         }
         // No event → loop; the next tick brings the deadline closer.
     }
 }
 
 /// Dispatch one terminal event through the same path used by the event loop.
-fn dispatch_event(app: &mut App, ev: Event) {
+fn dispatch_event_at(app: &mut App, ev: Event, now: Instant) {
     match &ev {
         // Key press events only (ignore release/repeat).
         Event::Key(key) if key.kind == KeyEventKind::Press => {
-            app.handle_event(&ev);
+            app.handle_event_at(&ev, now);
         }
         // T16: Bracketed paste — paste event.
         Event::Paste(_) => {
-            app.handle_event(&ev);
+            app.handle_event_at(&ev, now);
         }
         // Mouse events: absorb (T16 adds wheel scroll).
         Event::Mouse(_) => {
-            app.handle_event(&ev);
+            app.handle_event_at(&ev, now);
         }
         // Resize: forward to app for Rendered-mode cursor remap (FR-3.1).
         Event::Resize(_, _) => {
-            app.handle_event(&ev);
+            app.handle_event_at(&ev, now);
         }
         _ => {}
     }
+}
+
+fn read_then_sample<T, E>(
+    read: impl FnOnce() -> Result<T, E>,
+    sample: impl FnOnce() -> Instant,
+) -> Result<(T, Instant), E> {
+    let event = read()?;
+    let now = sample();
+    Ok((event, now))
+}
+
+fn read_sample_and_dispatch<E>(
+    app: &mut App,
+    read: impl FnOnce() -> Result<Event, E>,
+    sample: impl FnOnce() -> Instant,
+) -> Result<(), E> {
+    let (event, now) = read_then_sample(read, sample)?;
+    dispatch_event_at(app, event, now);
+    Ok(())
+}
+
+#[cfg(test)]
+fn dispatch_event(app: &mut App, ev: Event) {
+    dispatch_event_at(app, ev, Instant::now());
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use oom_edit_core::clipboard::RecordingClipboardSink;
-    use oom_edit_core::session::{EditorSession, Mode};
+    use oom_edit_core::RecordingClipboardSink;
+    use oom_edit_core::{EditorSession, Mode};
 
+    use crate::command::keymap::PendingAppInput;
     use crate::theme::Tier;
 
     const RESIZE_DOCUMENT: &str = "# Intro\n\nThis opening paragraph is deliberately long enough to wrap at forty columns but not at eighty columns.\n\n## Target heading\n\nThis trailing paragraph is also deliberately long enough to make the narrow layout visibly different.\n";
+
+    #[test]
+    fn event_timestamp_is_sampled_after_read_before_dispatch() {
+        use std::cell::RefCell;
+
+        let order = RefCell::new(Vec::new());
+        let sampled = Instant::now();
+        let mut app = test_app();
+        read_sample_and_dispatch(
+            &mut app,
+            || {
+                order.borrow_mut().push("read");
+                Ok::<_, ()>(Event::Key(KeyEvent::new(
+                    KeyCode::Char(' '),
+                    KeyModifiers::NONE,
+                )))
+            },
+            || {
+                order.borrow_mut().push("sample");
+                sampled
+            },
+        )
+        .unwrap();
+        order.borrow_mut().push("dispatch");
+
+        assert_eq!(*order.borrow(), ["read", "sample", "dispatch"]);
+        assert_eq!(app.pending_input, PendingAppInput::Space { since: sampled });
+    }
 
     fn test_app() -> App {
         App::new(
@@ -114,6 +166,7 @@ mod tests {
             false,
             Box::new(RecordingClipboardSink::default()),
             Box::new(crate::config::DisabledConfigStore),
+            std::time::Instant::now(),
         )
     }
 

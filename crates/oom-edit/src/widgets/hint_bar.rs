@@ -9,7 +9,7 @@
 
 use ratatui::text::Line;
 
-use crate::command::{commands_for, keymap::Keymap, registry::Contexts};
+use crate::command::{commands_for, registry::Contexts, rendered_binding};
 
 /// A single hint cell for the hint bar.
 #[derive(Debug, Clone)]
@@ -27,16 +27,14 @@ pub struct HintCell {
 ///
 /// Commands are sorted by registry `order` and use live key rendering from
 /// the keymap. The registry is the only source of hint cells.
-pub fn build_hints(ctx: Contexts, km: &Keymap) -> Vec<HintCell> {
+pub fn build_hints(ctx: Contexts) -> Vec<HintCell> {
     let mut quick_cmds = commands_for(ctx);
-    quick_cmds.sort_by_key(|spec| spec.order);
+    quick_cmds.sort_by_key(|spec| spec.quick_bar_order);
 
     quick_cmds
         .into_iter()
         .map(|spec| {
-            let keys = km
-                .rendered_keys(spec.id)
-                .unwrap_or_else(|| "(no binding)".to_string());
+            let keys = rendered_binding(spec);
             HintCell {
                 text: format!("{keys}={}", spec.desc),
                 disabled: false,
@@ -99,8 +97,7 @@ mod tests {
 
     #[test]
     fn build_hints_contains_each_quick_command_once() {
-        let km = Keymap::default();
-        let cells = build_hints(Contexts::NORMAL, &km);
+        let cells = build_hints(Contexts::NORMAL);
         let expected = commands_for(Contexts::NORMAL);
 
         assert_eq!(cells.len(), expected.len());
@@ -120,8 +117,7 @@ mod tests {
 
     #[test]
     fn build_hints_quick_bar_commands() {
-        let km = Keymap::default();
-        let cells = build_hints(Contexts::NORMAL, &km);
+        let cells = build_hints(Contexts::NORMAL);
         // Normal exposes Select, Help, Save, and Quit in priority order.
         let text: String = cells.iter().map(|c| &c.text).cloned().collect();
         assert!(text.contains("character-wise selection"));
@@ -131,8 +127,7 @@ mod tests {
 
     #[test]
     fn build_hints_empty_for_overlay_context() {
-        let km = Keymap::default();
-        let cells = build_hints(Contexts::OVERLAY, &km);
+        let cells = build_hints(Contexts::OVERLAY);
         assert!(cells.is_empty());
     }
 

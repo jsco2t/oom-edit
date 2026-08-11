@@ -6,7 +6,7 @@
 //!
 //! See plan §6.3, VN-1, VN-3.
 
-use oom_edit_core::session::EditorSession;
+use oom_edit_core::EditorSession;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};

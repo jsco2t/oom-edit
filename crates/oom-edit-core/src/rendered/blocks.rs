@@ -9,6 +9,7 @@
 //! source range so final display atoms can project back to raw Markdown.
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use unicode_width::UnicodeWidthChar;
 
 // ── BlockModel ─────────────────────────────────────────────────────────────
 
@@ -17,18 +18,24 @@ use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagE
 pub struct BlockModel {
     /// Top-level blocks, sorted by start byte, non-overlapping.
     pub blocks: Vec<Block>,
-    /// Source-backed rendered text emitted by inline parser events, in source
-    /// order. Layout consumes this sidecar without exposing parser types.
-    pub inline_sources: Vec<InlineSource>,
 }
 
-/// One parser-derived inline leaf and its complete raw-source ownership.
+/// One visible display group and the parser leaf bytes that produced it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InlineSource {
-    /// Post-transformation visible text.
-    pub rendered: String,
-    /// Complete UTF-8-safe source range reported by pulldown-cmark.
+pub struct InlineAtom {
+    /// Visible base scalar plus any following zero-width suffixes.
+    pub text: String,
+    /// Exact UTF-8-safe raw source ownership.
     pub source: std::ops::Range<usize>,
+}
+
+/// An owned parser leaf whose display groups retain local source ownership.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineLeaf {
+    /// Post-transformation visible text.
+    pub text: String,
+    /// Display groups in visible order.
+    pub atoms: Vec<InlineAtom>,
 }
 
 // ── Block ──────────────────────────────────────────────────────────────────
@@ -151,13 +158,13 @@ pub struct ListItem {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Inline {
     /// Plain text (post-unescape).
-    Text(String),
+    Text(InlineLeaf),
     /// Inline code span (content without backticks).
-    Code(String),
+    Code(InlineLeaf),
     /// Soft line break (two+ spaces at end of line in source).
-    SoftBreak,
+    SoftBreak(InlineLeaf),
     /// Hard line break (backslash at end of line or two+ newlines).
-    HardBreak,
+    HardBreak(InlineLeaf),
     /// Emphasized text.
     Emph(Vec<Inline>),
     /// Strong (bold) text.
@@ -174,14 +181,204 @@ pub enum Inline {
     /// An image with alt text and destination URL.
     Image {
         /// Alternative text.
-        alt: String,
+        alt: Vec<Inline>,
         /// Destination URL.
         dest: String,
     },
     /// A footnote reference.
-    FootnoteRef(String),
+    FootnoteRef(InlineLeaf),
     /// Raw inline HTML.
-    Html(String),
+    Html(InlineLeaf),
+}
+
+fn whole_leaf(rendered: &str, source: std::ops::Range<usize>) -> InlineLeaf {
+    InlineLeaf {
+        text: rendered.to_string(),
+        atoms: display_groups(rendered)
+            .into_iter()
+            .map(|text| InlineAtom {
+                text,
+                source: source.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// Decode one parser leaf while the parser-provided range and raw token are
+/// still adjacent. Alignment is local and monotonic: delimiters may be
+/// skipped, but a visible group can never consume a candidate from another
+/// leaf or from a later repeated occurrence.
+fn mapped_leaf(
+    rendered: &str,
+    source: std::ops::Range<usize>,
+    document: &str,
+    decode_markdown: bool,
+    normalize_code: bool,
+) -> InlineLeaf {
+    let desired = display_groups(rendered);
+    let raw = document.get(source.clone()).unwrap_or_default();
+    let mut atoms = Vec::with_capacity(desired.len());
+    let mut desired_index = 0;
+    let mut offset = 0;
+
+    while offset < raw.len() {
+        if normalize_code {
+            let normalized = if raw[offset..].starts_with("\r\n") {
+                Some((offset + 2, " "))
+            } else if raw.as_bytes().get(offset) == Some(&b'\n')
+                || raw.as_bytes().get(offset) == Some(&b'\r')
+            {
+                Some((offset + 1, " "))
+            } else if raw[offset..].starts_with("\\|")
+                && desired.get(desired_index).is_some_and(|group| group == "|")
+            {
+                Some((offset + 2, "|"))
+            } else {
+                None
+            };
+            if let Some((end, display)) = normalized {
+                append_expected_groups(
+                    &desired,
+                    &mut desired_index,
+                    &mut atoms,
+                    vec![display.to_string()],
+                    source.start + offset..source.start + end,
+                );
+                offset = end;
+                continue;
+            }
+        }
+
+        if decode_markdown && raw.as_bytes().get(offset) == Some(&b'\\') {
+            let escaped_start = offset;
+            offset += 1;
+            if offset < raw.len() {
+                let (end, group) = raw_display_group(raw, offset);
+                if desired
+                    .get(desired_index)
+                    .is_some_and(|desired| desired == &group)
+                {
+                    append_expected_groups(
+                        &desired,
+                        &mut desired_index,
+                        &mut atoms,
+                        vec![group],
+                        source.start + escaped_start..source.start + end,
+                    );
+                    offset = end;
+                    continue;
+                }
+            }
+            offset = escaped_start;
+        }
+
+        if decode_markdown && raw.as_bytes().get(offset) == Some(&b'&') {
+            if let Some(relative_end) = raw[offset..].find(';') {
+                let end = offset + relative_end + 1;
+                if end - offset <= 64 {
+                    let entity = &raw[offset..end];
+                    let decoded = Parser::new(entity)
+                        .filter_map(|event| match event {
+                            Event::Text(text) => Some(text.into_string()),
+                            _ => None,
+                        })
+                        .collect::<String>();
+                    if decoded != entity {
+                        append_expected_groups(
+                            &desired,
+                            &mut desired_index,
+                            &mut atoms,
+                            display_groups(&decoded),
+                            source.start + offset..source.start + end,
+                        );
+                        offset = end;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        let (end, group) = raw_display_group(raw, offset);
+        append_expected_groups(
+            &desired,
+            &mut desired_index,
+            &mut atoms,
+            vec![group],
+            source.start + offset..source.start + end,
+        );
+        offset = end;
+    }
+
+    for text in desired.into_iter().skip(desired_index) {
+        atoms.push(InlineAtom {
+            text,
+            source: source.clone(),
+        });
+    }
+
+    if decode_markdown
+        && source.start > 0
+        && document.as_bytes().get(source.start - 1) == Some(&b'\\')
+    {
+        if let Some(first) = atoms.first_mut() {
+            first.source.start = source.start - 1;
+        }
+    }
+
+    InlineLeaf {
+        text: rendered.to_string(),
+        atoms,
+    }
+}
+
+fn append_expected_groups(
+    desired: &[String],
+    desired_index: &mut usize,
+    atoms: &mut Vec<InlineAtom>,
+    groups: Vec<String>,
+    token_source: std::ops::Range<usize>,
+) {
+    if !desired[*desired_index..].starts_with(&groups) {
+        return;
+    }
+    for text in groups {
+        atoms.push(InlineAtom {
+            text,
+            source: token_source.clone(),
+        });
+        *desired_index += 1;
+    }
+}
+
+fn raw_display_group(raw: &str, start: usize) -> (usize, String) {
+    let mut chars = raw[start..].char_indices();
+    let (_, first) = chars
+        .next()
+        .expect("display-group start must be a character boundary");
+    let mut end = start + first.len_utf8();
+    for (relative, character) in chars {
+        if matches!(character, '\n' | '\r') || character.width().unwrap_or(0) > 0 {
+            break;
+        }
+        end = start + relative + character.len_utf8();
+    }
+    (end, raw[start..end].to_string())
+}
+
+fn display_groups(text: &str) -> Vec<String> {
+    let mut groups: Vec<String> = Vec::new();
+    for character in text.chars() {
+        if character.width().unwrap_or(0) == 0 {
+            if let Some(previous) = groups.last_mut() {
+                previous.push(character);
+            } else {
+                groups.push(character.to_string());
+            }
+        } else {
+            groups.push(character.to_string());
+        }
+    }
+    groups
 }
 
 // ── BlockModel::build ──────────────────────────────────────────────────────
@@ -210,10 +407,7 @@ impl BlockModel {
                     kind: BlockKind::FrontMatter,
                 });
             }
-            return Self {
-                blocks,
-                inline_sources: Vec::new(),
-            };
+            return Self { blocks };
         }
 
         // Set up pulldown-cmark with required extensions
@@ -249,10 +443,7 @@ impl BlockModel {
             );
         }
 
-        Self {
-            blocks,
-            inline_sources: builder.inline_sources,
-        }
+        Self { blocks }
     }
 }
 
@@ -278,8 +469,6 @@ struct BlockBuilder {
     stack: Vec<BuildContext>,
     /// Collected top-level blocks.
     blocks: Vec<Block>,
-    /// Full source ranges for leaf inline events.
-    inline_sources: Vec<InlineSource>,
 }
 
 /// Context for a block currently being built on the stack.
@@ -343,28 +532,11 @@ impl BlockBuilder {
             _offset: offset,
             stack: Vec::new(),
             blocks: Vec::new(),
-            inline_sources: Vec::new(),
         }
     }
 
     /// Feed a single event with its global byte range.
     fn feed(&mut self, event: Event<'_>, span: std::ops::Range<usize>) {
-        let rendered_leaf = match &event {
-            Event::Text(text) | Event::Code(text) | Event::Html(text) | Event::InlineHtml(text) => {
-                Some(text.to_string())
-            }
-            Event::SoftBreak => Some(" ".to_string()),
-            Event::HardBreak => Some("  ".to_string()),
-            Event::FootnoteReference(label) => Some(format!("[{label}]")),
-            _ => None,
-        };
-        if let Some(rendered) = rendered_leaf {
-            self.inline_sources.push(InlineSource {
-                rendered,
-                source: span.clone(),
-            });
-        }
-
         match &event {
             // ── Block-level Start events ───────────────────────────────
             Event::Start(Tag::Paragraph) => {
@@ -822,16 +994,9 @@ impl BlockBuilder {
                 }) = self.stack.pop()
                 {
                     let inlines = std::mem::take(&mut inlines);
-                    let alt = inlines
-                        .into_iter()
-                        .filter_map(|i| match i {
-                            Inline::Text(t) => Some(t),
-                            _ => None,
-                        })
-                        .collect();
                     self.push_inline(
                         Inline::Image {
-                            alt,
+                            alt: inlines,
                             dest: _dest.clone(),
                         },
                         start,
@@ -850,31 +1015,38 @@ impl BlockBuilder {
 
             // ── Inline events ──────────────────────────────────────────
             Event::Text(text) => {
-                self.push_inline(Inline::Text(text.to_string()), span.start);
+                let leaf = mapped_leaf(text, span.clone(), &self.text, true, false);
+                self.push_inline(Inline::Text(leaf), span.start);
             }
 
             Event::Code(code) => {
-                self.push_inline(Inline::Code(code.to_string()), span.start);
+                let leaf = mapped_leaf(code, span.clone(), &self.text, false, true);
+                self.push_inline(Inline::Code(leaf), span.start);
             }
 
             Event::SoftBreak => {
-                self.push_inline(Inline::SoftBreak, span.start);
+                let leaf = whole_leaf(" ", span.clone());
+                self.push_inline(Inline::SoftBreak(leaf), span.start);
             }
 
             Event::HardBreak => {
-                self.push_inline(Inline::HardBreak, span.start);
+                let leaf = whole_leaf("  ", span.clone());
+                self.push_inline(Inline::HardBreak(leaf), span.start);
             }
 
             Event::FootnoteReference(label) => {
-                self.push_inline(Inline::FootnoteRef(label.to_string()), span.start);
+                let leaf = whole_leaf(&format!("[{label}]"), span.clone());
+                self.push_inline(Inline::FootnoteRef(leaf), span.start);
             }
 
             Event::Html(html) => {
-                self.push_inline(Inline::Html(html.to_string()), span.start);
+                let leaf = mapped_leaf(html, span.clone(), &self.text, false, false);
+                self.push_inline(Inline::Html(leaf), span.start);
             }
 
             Event::InlineHtml(html) => {
-                self.push_inline(Inline::Html(html.to_string()), span.start);
+                let leaf = mapped_leaf(html, span.clone(), &self.text, false, false);
+                self.push_inline(Inline::Html(leaf), span.start);
             }
 
             // ── Events we don't need to handle specially ───────────────

@@ -14,7 +14,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::command::{Command, Contexts, Keymap};
+use crate::command::{rendered_binding, AppCommand, BindingRole, Contexts};
 use crate::theme::{Theme, Tier};
 
 // ── Vim reference table ─────────────────────────────────────────────────────
@@ -108,7 +108,7 @@ impl PaletteState {
 pub(crate) enum PaletteRow {
     /// An executable app command.
     Command {
-        id: Command,
+        id: AppCommand,
         name: String,
         desc: String,
         keys: String,
@@ -124,23 +124,31 @@ pub(crate) enum PaletteRow {
 
 impl PaletteState {
     /// Build the full row list from the registry and Vim reference table.
-    pub(crate) fn build_rows(&self, ctx: Contexts, km: &Keymap) -> Vec<PaletteRow> {
+    pub(crate) fn build_rows(&self, ctx: Contexts) -> Vec<PaletteRow> {
         let mut rows = Vec::new();
 
         // App commands section.
         for spec in crate::command::COMMANDS {
             let enabled = spec.contexts.contains(ctx);
-            let keys = km
-                .rendered_keys(spec.id)
-                .unwrap_or_else(|| "(no binding)".to_string());
-
-            rows.push(PaletteRow::Command {
-                id: spec.id,
-                name: spec.name.to_string(),
-                desc: spec.desc.to_string(),
-                keys,
-                disabled: !enabled,
-            });
+            let keys = rendered_binding(spec);
+            match spec.binding {
+                BindingRole::AppChord { command, .. } => rows.push(PaletteRow::Command {
+                    id: command,
+                    name: spec.name.to_string(),
+                    desc: spec.desc.to_string(),
+                    keys,
+                    disabled: !enabled,
+                }),
+                BindingRole::AppSpaceDigit
+                | BindingRole::CoreKey { .. }
+                | BindingRole::CoreEx { .. } => {
+                    rows.push(PaletteRow::Reference {
+                        keys,
+                        desc: spec.desc.to_string(),
+                        row_id: spec.name.to_string(),
+                    });
+                }
+            }
         }
 
         // Vim reference section.
@@ -194,8 +202,8 @@ impl PaletteState {
     }
 
     /// Handle a key event. Returns true if consumed.
-    pub fn handle_key(&mut self, key: &oom_edit_core::session::KeyInput) -> bool {
-        use oom_edit_core::session::KeyCodeKind;
+    pub fn handle_key(&mut self, key: &oom_edit_core::KeyInput) -> bool {
+        use oom_edit_core::KeyCodeKind;
 
         let code = &key.code.kind;
 
@@ -218,7 +226,7 @@ impl PaletteState {
                 return true;
             }
             KeyCodeKind::Down | KeyCodeKind::Tab => {
-                let rows = self.build_rows(self.context, &Keymap::default());
+                let rows = self.build_rows(self.context);
                 let visible_count = self.filter_rows(&rows).len();
                 if self.selected.saturating_add(1) < visible_count {
                     self.selected += 1;
@@ -267,8 +275,7 @@ impl PaletteState {
         frame.render_widget(Paragraph::new(format!("> {}", self.filter)), filter_area);
 
         // Build rows.
-        let km = Keymap::default();
-        let all_rows = self.build_rows(self.context, &km);
+        let all_rows = self.build_rows(self.context);
         let visible_indices = self.filter_rows(&all_rows);
 
         // Build display lines.
@@ -325,9 +332,8 @@ impl PaletteState {
     }
 
     /// Get the command to execute (if the selected row is a Command).
-    pub fn selected_command(&self) -> Option<Command> {
-        let km = Keymap::default();
-        let all_rows = self.build_rows(self.context, &km);
+    pub fn selected_command(&self) -> Option<AppCommand> {
+        let all_rows = self.build_rows(self.context);
         let visible_indices = self.filter_rows(&all_rows);
         if let Some(&row_idx) = visible_indices.get(self.selected) {
             if let PaletteRow::Command { id, disabled, .. } = &all_rows[row_idx] {
@@ -408,7 +414,7 @@ fn viewport_offset(selected: usize, list_height: u16) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oom_edit_core::session::{KeyCode, KeyCodeKind, KeyInput, Modifiers};
+    use oom_edit_core::{KeyCode, KeyCodeKind, KeyInput, Modifiers};
     use ratatui::{backend::TestBackend, Terminal};
 
     use crate::theme::{UiSlot, DEFAULT_DARK};
@@ -551,7 +557,7 @@ mod tests {
             filter: "R-N4".to_string(),
             ..PaletteState::default()
         };
-        let rows = palette.build_rows(Contexts::ALL, &Keymap::default());
+        let rows = palette.build_rows(Contexts::ALL);
         assert_eq!(palette.filter_rows(&rows).len(), 3);
 
         let down = key(KeyCodeKind::Down);
@@ -565,72 +571,57 @@ mod tests {
     }
 
     #[test]
-    fn test_palette_selected_command_at_boundary() {
-        let mut palette = PaletteState {
-            filter: "(no binding)".to_string(),
+    fn palette_selects_an_executable_app_command() {
+        let palette = PaletteState {
+            filter: "help".to_string(),
             ..PaletteState::new(Contexts::ALL)
         };
-        let rows = palette.build_rows(Contexts::ALL, &Keymap::default());
+        let rows = palette.build_rows(Contexts::ALL);
         let visible_rows = palette.filter_rows(&rows);
-        assert_eq!(
-            visible_rows.len(),
-            6,
-            "unexpected filtered rows: {:?}",
-            visible_rows
-                .iter()
-                .map(|&index| &rows[index])
-                .collect::<Vec<_>>()
-        );
-
-        for _ in 0..8 {
-            assert!(palette.handle_key(&key(KeyCodeKind::Down)));
-        }
-        assert_eq!(palette.selected, 5);
-        assert!(palette.handle_key(&key(KeyCodeKind::Tab)));
-        assert_eq!(palette.selected, 5);
-
-        assert_eq!(palette.selected_command(), Some(Command::QuitAll));
+        assert_eq!(visible_rows.len(), 3);
+        assert_eq!(palette.selected_command(), Some(AppCommand::Help));
     }
 
     #[test]
-    fn palette_disables_commands_outside_the_opening_context() {
+    fn palette_keeps_core_bindings_as_non_executable_references() {
         let normal = PaletteState::new(Contexts::NORMAL);
-        let normal_rows = normal.build_rows(normal.context, &Keymap::default());
+        let normal_rows = normal.build_rows(normal.context);
+        assert!(normal_rows.iter().any(|row| matches!(
+            row,
+            PaletteRow::Reference { row_id, .. } if row_id == "select-character"
+        )));
         assert!(normal_rows.iter().any(|row| matches!(
             row,
             PaletteRow::Command {
-                id: Command::EnterCharacterSelect,
+                id: AppCommand::Help,
                 disabled: false,
                 ..
             }
         )));
         assert!(normal_rows.iter().any(|row| matches!(
             row,
-            PaletteRow::Command {
-                id: Command::SelectYank,
-                disabled: true,
-                ..
-            }
+            PaletteRow::Reference { row_id, .. } if row_id == "select-yank"
         )));
+    }
 
-        let select = PaletteState::new(Contexts::SELECT);
-        let select_rows = select.build_rows(select.context, &Keymap::default());
-        assert!(select_rows.iter().any(|row| matches!(
-            row,
-            PaletteRow::Command {
-                id: Command::EnterCharacterSelect,
-                disabled: true,
-                ..
-            }
-        )));
-        assert!(select_rows.iter().any(|row| matches!(
-            row,
-            PaletteRow::Command {
-                id: Command::SelectYank,
-                disabled: false,
-                ..
-            }
-        )));
+    #[test]
+    fn palette_rows_match_registry_commands_and_live_keys() {
+        let palette = PaletteState::new(Contexts::ALL);
+        let rows = palette.build_rows(Contexts::ALL);
+        assert_eq!(
+            rows.len(),
+            crate::command::COMMANDS.len() + VIM_REFERENCE.len()
+        );
+
+        for spec in crate::command::COMMANDS {
+            let binding = rendered_binding(spec);
+            assert!(rows.iter().any(|row| match row {
+                PaletteRow::Command { name, keys, .. } => name == spec.name && keys == &binding,
+                PaletteRow::Reference { row_id, keys, .. } => {
+                    row_id == spec.name && keys == &binding
+                }
+            }));
+        }
     }
 
     #[test]
@@ -648,7 +639,7 @@ mod tests {
             filter: "zzzz-no-visible-row".to_string(),
             ..PaletteState::default()
         };
-        let rows = palette.build_rows(Contexts::ALL, &Keymap::default());
+        let rows = palette.build_rows(Contexts::ALL);
         assert!(palette.filter_rows(&rows).is_empty());
 
         assert!(palette.handle_key(&key(KeyCodeKind::Down)));

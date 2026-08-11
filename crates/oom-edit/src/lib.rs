@@ -28,6 +28,7 @@ pub(crate) mod clipboard;
 pub(crate) mod command;
 pub(crate) mod config;
 pub(crate) mod event;
+pub(crate) mod lifecycle;
 pub(crate) mod overlay;
 pub(crate) mod screens;
 #[cfg(test)]
@@ -37,18 +38,17 @@ pub(crate) mod theme;
 pub(crate) mod widgets;
 
 pub use args::{Args, ParseOutcome};
-pub use config::{Config, EditorConfig, ThemeConfig};
-pub use theme::{DisplayMode, EnvParts, PaletteKind, ResolvedTheme, ThemeSource, Tier};
 
 use std::io::stdout;
 
-use oom_edit_core::session::EditorSession;
+use oom_edit_core::EditorSession;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::app::App;
-use crate::config::ConfigPresence;
+use crate::config::{Config, ConfigPresence};
 use crate::terminal_guard::TerminalGuard;
+use crate::theme::{EnvParts, ResolvedTheme};
 
 fn resolve_startup_theme(
     cli_theme: Option<&str>,
@@ -81,22 +81,7 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     // Load config (never fails — warns to stderr on malformed config).
     let (config, config_presence) = Config::load_with_presence();
 
-    // Build EnvParts from environment for the selection ladder.
-    let env = EnvParts {
-        oom_edit_theme: std::env::var("OOM_EDIT_THEME")
-            .ok()
-            .map(|s| Box::leak(s.into_boxed_str()) as &'static str),
-        no_color: std::env::var("NO_COLOR").is_ok(),
-        term: std::env::var("TERM")
-            .ok()
-            .map(|s| Box::leak(s.into_boxed_str()) as &'static str),
-        colorterm: std::env::var("COLORTERM")
-            .ok()
-            .map(|s| Box::leak(s.into_boxed_str()) as &'static str),
-        colorfgbg: std::env::var("COLORFGBG")
-            .ok()
-            .map(|s| Box::leak(s.into_boxed_str()) as &'static str),
-    };
+    let env = EnvParts::from_current_process();
 
     // Resolve theme through the selection ladder.
     let resolved_theme =
@@ -124,6 +109,7 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         config.relative_line_numbers,
         Box::new(crate::clipboard::Osc52Clipboard::stdout()),
         Box::new(crate::config::FileConfigStore::production()),
+        std::time::Instant::now(),
     );
 
     // Enter raw mode + alternate screen + install panic/signal hooks.
@@ -144,6 +130,8 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod startup_tests {
     use super::*;
+    use crate::config::EditorConfig;
+    use crate::theme::ThemeSource;
 
     #[test]
     fn production_resolver_reports_partial_config_slot_as_fallback() {
@@ -152,8 +140,8 @@ mod startup_tests {
             ..Config::default()
         };
         let env = EnvParts {
-            term: Some("xterm-256color"),
-            colorterm: Some("truecolor"),
+            term: Some("xterm-256color".to_string()),
+            colorterm: Some("truecolor".to_string()),
             ..EnvParts::default()
         };
         let fallback = resolve_startup_theme(None, &config, ConfigPresence::default(), &env);

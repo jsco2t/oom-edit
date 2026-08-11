@@ -12,7 +12,7 @@ use std::io::{self, Write};
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
 
-use oom_edit_core::clipboard::{ClipboardError, ClipboardSink};
+use oom_edit_core::{ClipboardError, ClipboardSink};
 
 /// Maximum payload size for OSC 52 clipboard writes (100 KB).
 const MAX_PAYLOAD: usize = 100 * 1024;

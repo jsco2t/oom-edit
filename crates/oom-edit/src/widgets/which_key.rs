@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::{style::Style, text::Line, widgets::Paragraph, Frame};
 
-use crate::command::{keymap::Keymap, registry::Contexts};
+use crate::command::{keymap::continuations_for, registry::Contexts};
 
 /// Which-key delay: 150ms after Space before the hint bar appears.
 const WHICH_KEY_DELAY: Duration = Duration::from_millis(150);
@@ -28,8 +28,8 @@ pub fn should_show(since: Option<Instant>, now: Instant) -> bool {
 /// Pure build: returns the continuations of Space for the given context,
 /// formatted as a hint string. Returns `None` if there are fewer than 2
 /// continuations (the ≥2 rows rule).
-pub fn build_hint(km: &Keymap, ctx: Contexts) -> Option<String> {
-    let conts = km.continuations_for(ctx);
+pub fn build_hint(ctx: Contexts) -> Option<String> {
+    let conts = continuations_for(ctx);
     if conts.len() < 2 {
         return None;
     }
@@ -37,13 +37,7 @@ pub fn build_hint(km: &Keymap, ctx: Contexts) -> Option<String> {
     // Format: "Space: h=help  w=save  q=quit  t=cycle-theme"
     let parts: Vec<String> = conts
         .iter()
-        .map(|(key, spec)| {
-            let key_str = match key.code.kind {
-                oom_edit_core::session::KeyCodeKind::Char(c) => c.to_string(),
-                _ => format!("{:?}", key.code.kind),
-            };
-            format!("{}={}", key_str, spec.desc)
-        })
+        .map(|(key, spec)| format!("{}={}", key, spec.desc))
         .collect();
 
     Some(format!("Space: {}", parts.join("  ")))
@@ -80,8 +74,15 @@ mod tests {
 
     #[test]
     fn gate_accepts_after_delay() {
-        let past = Instant::now() - Duration::from_millis(200);
-        assert!(should_show(Some(past), Instant::now()));
+        let started = Instant::now();
+        assert!(!should_show(
+            Some(started),
+            started + Duration::from_millis(149)
+        ));
+        assert!(should_show(
+            Some(started),
+            started + Duration::from_millis(150)
+        ));
     }
 
     #[test]
@@ -91,8 +92,7 @@ mod tests {
 
     #[test]
     fn build_hint_returns_some_with_continuations() {
-        let km = Keymap::default();
-        let hint = build_hint(&km, Contexts::NORMAL);
+        let hint = build_hint(Contexts::NORMAL);
         assert!(hint.is_some());
         let hint = hint.unwrap();
         assert!(hint.contains("Space:"));
@@ -101,9 +101,8 @@ mod tests {
 
     #[test]
     fn build_hint_returns_none_when_no_continuations() {
-        let km = Keymap::default();
         // In OVERLAY context, no Space chords are available.
-        let hint = build_hint(&km, Contexts::OVERLAY);
+        let hint = build_hint(Contexts::OVERLAY);
         assert!(hint.is_none());
     }
 }

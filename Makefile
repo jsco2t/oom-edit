@@ -27,6 +27,10 @@ toolchain: ## Install dev toolchain (rustup, cargo-deny, cargo-audit)
 build: ## Build the workspace
 	cargo build --workspace --offline --locked
 
+.PHONY: build-examples
+build-examples: ## Build all examples with locked offline dependencies
+	cargo build --workspace --examples --offline --locked
+
 # ---------------------------------------------------------------------------
 # Test
 # ---------------------------------------------------------------------------

@@ -162,8 +162,6 @@ pub struct RenderedLine {
     /// Ordered display-cell atoms. Source-derived atoms own exact raw byte
     /// ranges; generated presentation cells carry `None`.
     pub atoms: Vec<RenderedSourceAtom>,
-    /// Display columns known to be renderer-generated rather than source text.
-    pub(crate) synthetic_columns: Vec<std::ops::Range<usize>>,
 }
 
 /// Smallest selectable rendered unit.

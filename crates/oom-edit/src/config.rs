@@ -269,13 +269,6 @@ pub(crate) struct ConfigPresence {
 }
 
 impl Config {
-    /// Load configuration from disk, using defaults for missing files or
-    /// malformed TOML. Warns to stderr on errors.
-    pub fn load() -> Self {
-        let path = config_path();
-        Self::load_from_path(&path)
-    }
-
     /// Load production configuration and report whether a valid file won
     /// over the built-in fallback.
     pub(crate) fn load_with_presence() -> (Self, ConfigPresence) {
@@ -318,19 +311,6 @@ impl Config {
                 (Config::default(), ConfigPresence::default())
             }
         }
-    }
-
-    /// Save the configuration atomically (write temp + fsync + rename + dir fsync).
-    ///
-    /// Creates the parent directory if it doesn't exist.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the directory cannot be created or the file
-    /// cannot be written or synced.
-    pub fn save(&self) -> Result<(), String> {
-        let path = config_path();
-        self.save_to_path(&path)
     }
 
     pub(crate) fn save_to_path(&self, path: &Path) -> Result<(), String> {
