@@ -80,11 +80,8 @@ fn dispatch_event(app: &mut App, ev: Event) {
             app.handle_event(&ev);
         }
         // T16: Bracketed paste — paste event.
-        Event::Paste(text) => {
-            if let Some(ref mut entry) = app.active_mut() {
-                entry.session_mut().insert_paste(text);
-            }
-            app.scroll_follow();
+        Event::Paste(_) => {
+            app.handle_event(&ev);
         }
         // Mouse events: absorb (T16 adds wheel scroll).
         Event::Mouse(_) => {
@@ -208,5 +205,24 @@ mod tests {
             4,
             "rendered cursor should remain on the Target heading's logical source line"
         );
+    }
+
+    #[test]
+    fn test_paste_event_reaches_app_handler() {
+        let mut app = test_app();
+        dispatch_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)),
+        );
+        assert_eq!(app.active_mut().unwrap().session_mut().mode(), Mode::Insert);
+
+        dispatch_event(&mut app, Event::Paste("pasted λ".to_string()));
+
+        assert!(app
+            .active_mut()
+            .unwrap()
+            .session_mut()
+            .document()
+            .starts_with("pasted λ"));
     }
 }

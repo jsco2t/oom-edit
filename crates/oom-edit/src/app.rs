@@ -92,6 +92,7 @@ impl TabEntry {
     }
 
     /// Get a mutable reference to the session.
+    #[cfg(test)]
     pub fn session_mut(&mut self) -> &mut EditorSession {
         &mut self.session
     }
@@ -120,6 +121,12 @@ pub struct App {
     viewport_height: usize,
     /// Source text viewport width, excluding the line-number gutter.
     viewport_width: usize,
+    /// Follow requested by a state transition that returns before the normal
+    /// event tail (tab switches and registry-dispatched session commands).
+    pending_scroll_follow: bool,
+    /// Geometry used by the most recent follow, so paint only follows again
+    /// when the body dimensions actually change.
+    last_follow_geometry: Option<(usize, usize)>,
     /// Runtime source-wrap option, initialized from config.
     wrap_enabled: bool,
     /// Whether rendered Normal, Select, and Command use hybrid-relative numbers.
@@ -141,6 +148,8 @@ pub struct App {
     tier: Tier,
     /// Clipboard sink for OSC 52 clipboard writes (T16).
     clipboard_sink: Box<dyn ClipboardSink>,
+    #[cfg(test)]
+    scroll_follow_count: usize,
 }
 
 impl App {
@@ -167,6 +176,8 @@ impl App {
             keymap: Keymap::default(),
             viewport_height: 22,
             viewport_width: 76,
+            pending_scroll_follow: true,
+            last_follow_geometry: None,
             wrap_enabled,
             relative_line_numbers,
             now: Instant::now(),
@@ -176,6 +187,8 @@ impl App {
             config_store,
             tier,
             clipboard_sink,
+            #[cfg(test)]
+            scroll_follow_count: 0,
         }
     }
 
@@ -185,6 +198,7 @@ impl App {
     }
 
     /// Get a mutable reference to the active tab entry.
+    #[cfg(test)]
     pub fn active_mut(&mut self) -> Option<&mut TabEntry> {
         self.tabs.get_mut(self.active_tab)
     }
@@ -201,7 +215,7 @@ impl App {
     }
 
     /// Get a mutable reference to the active session.
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn session_mut(&mut self) -> Option<&mut EditorSession> {
         self.active_mut().map(|t| &mut t.session)
     }
@@ -271,15 +285,22 @@ impl App {
         let status_height: u16 = 1;
         let body_height = body_height(area.height, self.has_multiple_tabs());
 
-        self.viewport_height = body_height as usize;
-        self.viewport_width = self
+        let viewport_height = body_height as usize;
+        let viewport_width = self
             .active()
             .map(|entry| source_text_width(area.width, entry.session.line_count()) as usize)
             .unwrap_or(area.width as usize);
-        // Frame geometry can change before a Resize event is observed (and
-        // Insert edits may have invalidated the rendered cache). Rebuild and
-        // follow using the exact width this frame will render.
-        self.scroll_follow();
+        self.viewport_height = viewport_height;
+        self.viewport_width = viewport_width;
+        let geometry = (viewport_height, viewport_width);
+        if self.last_follow_geometry != Some(geometry) {
+            self.pending_scroll_follow = true;
+            self.last_follow_geometry = Some(geometry);
+        }
+        if self.pending_scroll_follow {
+            self.pending_scroll_follow = false;
+            self.scroll_follow();
+        }
 
         let mut draw_y = area.y;
 
@@ -503,6 +524,7 @@ impl App {
                 .active()
                 .map(|entry| source_text_width(*_width, entry.session.line_count()) as usize)
                 .unwrap_or(*_width as usize);
+            self.last_follow_geometry = Some((self.viewport_height, self.viewport_width));
             if let Some(ref mut entry) = self.tabs.get_mut(self.active_tab) {
                 if entry.session.mode() != oom_edit_core::session::Mode::Insert {
                     let text_width = source_text_width(*_width, entry.session.line_count());
@@ -510,6 +532,20 @@ impl App {
                 }
             }
             self.scroll_follow();
+            self.pending_scroll_follow = false;
+            return;
+        }
+
+        if let Event::Paste(text) = event {
+            let effects = self
+                .tabs
+                .get_mut(self.active_tab)
+                .map(|entry| entry.session.insert_paste(text))
+                .unwrap_or_default();
+            for effect in effects {
+                self.handle_effect(effect);
+            }
+            self.pending_scroll_follow = true;
             return;
         }
 
@@ -670,8 +706,8 @@ impl App {
             self.handle_effect(effect);
         }
 
-        // Scroll-follow: clamp top_line so the cursor is visible.
-        self.scroll_follow();
+        // Coalesce all input received before the next paint into one follow.
+        self.pending_scroll_follow = true;
     }
 
     /// Open a new tab with the given file path.
@@ -681,6 +717,7 @@ impl App {
                 let idx = self.tabs.len();
                 self.tabs.push(TabEntry::new(session));
                 self.active_tab = idx;
+                self.pending_scroll_follow = true;
                 self.set_transient(
                     format!("Opened: {}", path.display()),
                     oom_edit_core::session::Severity::Info,
@@ -727,6 +764,7 @@ impl App {
         if self.tabs.is_empty() {
             self.should_quit = true;
         }
+        self.pending_scroll_follow = true;
     }
 
     /// Switch to tab by 1-based index.
@@ -735,6 +773,7 @@ impl App {
         let idx = index.saturating_sub(1);
         if idx < self.tabs.len() {
             self.active_tab = idx;
+            self.pending_scroll_follow = true;
         }
     }
 
@@ -744,6 +783,7 @@ impl App {
             return;
         }
         self.active_tab = (self.active_tab + 1) % self.tabs.len();
+        self.pending_scroll_follow = true;
     }
 
     /// Previous tab (wrap).
@@ -752,6 +792,7 @@ impl App {
             return;
         }
         self.active_tab = (self.active_tab + self.tabs.len() - 1) % self.tabs.len();
+        self.pending_scroll_follow = true;
     }
 
     /// Quit all tabs.
@@ -959,7 +1000,7 @@ impl App {
         for effect in effects {
             self.handle_effect(effect);
         }
-        self.scroll_follow();
+        self.pending_scroll_follow = true;
     }
 
     /// Handle a single core effect.
@@ -1140,7 +1181,7 @@ impl App {
                         oom_edit_core::session::Severity::Warning,
                     );
                 }
-                self.scroll_follow();
+                self.pending_scroll_follow = true;
             }
             Effect::HelpRequested => {
                 // Open command palette.
@@ -1191,6 +1232,10 @@ impl App {
     /// Scroll-follow: clamp `top_line` so the cursor row is visible with
     /// `SCROLLOFF` lines of context on either rendered or source surfaces.
     pub fn scroll_follow(&mut self) {
+        #[cfg(test)]
+        {
+            self.scroll_follow_count += 1;
+        }
         // Determine the mode first, then apply scroll-follow.
         let is_rendered = self
             .active()
@@ -1557,6 +1602,18 @@ mod tests {
         )
     }
 
+    fn large_source_fixture() -> String {
+        const TARGET: usize = 128 * 1024;
+        const LINE: &str =
+            "paragraph text for source scrolling and incremental editing 0123456789\n\n";
+        let mut text = String::with_capacity(TARGET);
+        while text.len() + LINE.len() <= TARGET {
+            text.push_str(LINE);
+        }
+        text.push_str(&"x".repeat(TARGET - text.len()));
+        text
+    }
+
     fn yank_current_line_to_system_clipboard(app: &mut App) {
         for ch in ['v', '"', '+', 'y'] {
             let key = KeyEvent::new(CrosstermKeyCode::Char(ch), KeyModifiers::NONE);
@@ -1573,6 +1630,8 @@ mod tests {
 
     fn press(app: &mut App, code: CrosstermKeyCode) {
         app.handle_event(&Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+        app.pending_scroll_follow = false;
+        app.scroll_follow();
     }
 
     fn open_palette_with_space_h(app: &mut App) {
@@ -1832,9 +1891,147 @@ mod tests {
         for _ in 0..50 {
             press(&mut app, CrosstermKeyCode::Down);
         }
+        app.scroll_follow();
 
         // Scroll follow should have adjusted top_line
         assert!(app.top_line() > 0, "top_line should have scrolled down");
+    }
+
+    #[test]
+    fn app_navigation_follows_once_per_frame() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+
+        let fixture = large_source_fixture();
+        let mut app = test_app(EditorSession::from_text(&fixture));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12))
+            .expect("test terminal");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("initial frame");
+        app.scroll_follow_count = 0;
+        let started = std::time::Instant::now();
+
+        let before_rendered = app.scroll_follow_count;
+        for code in [
+            CrosstermKeyCode::Char('2'),
+            CrosstermKeyCode::Char('0'),
+            CrosstermKeyCode::Char('j'),
+        ] {
+            app.handle_event(&Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+        }
+        assert_eq!(app.scroll_follow_count, before_rendered);
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("coalesced rendered frame");
+        assert_eq!(app.scroll_follow_count - before_rendered, 1);
+        let entry = &app.tabs[0];
+        let rendered_cursor = entry.session.rendered_cursor_line();
+        assert!(entry.rendered_top > 0);
+        assert!(rendered_cursor >= entry.rendered_top);
+        assert!(rendered_cursor < entry.rendered_top + app.viewport_height);
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("idle rendered frame");
+        assert_eq!(app.scroll_follow_count - before_rendered, 1);
+
+        let before_upward = app.scroll_follow_count;
+        for code in [CrosstermKeyCode::Char('g'), CrosstermKeyCode::Char('g')] {
+            app.handle_event(&Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+        }
+        assert_eq!(app.scroll_follow_count, before_upward);
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("coalesced upward frame");
+        assert_eq!(app.scroll_follow_count - before_upward, 1);
+        assert_eq!(app.tabs[0].rendered_top, 0);
+        assert_eq!(app.tabs[0].session.rendered_cursor_line(), 0);
+
+        let before_source = app.scroll_follow_count;
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('i'),
+            KeyModifiers::NONE,
+        )));
+        for _ in 0..20 {
+            app.handle_event(&Event::Key(KeyEvent::new(
+                CrosstermKeyCode::Down,
+                KeyModifiers::NONE,
+            )));
+        }
+        assert_eq!(app.scroll_follow_count, before_source);
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("coalesced source frame");
+        assert_eq!(app.scroll_follow_count - before_source, 1);
+        assert_eq!(app.session().unwrap().mode(), Mode::Insert);
+        let source_cursor = app.session().unwrap().cursor().0;
+        assert!(app.top_line() > 0);
+        assert!(source_cursor >= app.top_line());
+        assert!(source_cursor < app.top_line() + app.viewport_height);
+
+        let before_paste = app.scroll_follow_count;
+        app.handle_event(&Event::Paste("λ\ninserted".to_string()));
+        assert_eq!(app.scroll_follow_count, before_paste);
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("paste frame");
+        assert_eq!(app.scroll_follow_count - before_paste, 1);
+        let source_cursor = app.session().unwrap().cursor().0;
+        assert!(source_cursor >= app.top_line());
+        assert!(source_cursor < app.top_line() + app.viewport_height);
+
+        let before_mouse = app.scroll_follow_count;
+        app.handle_event(&Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        }));
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("mouse frame");
+        assert_eq!(app.scroll_follow_count - before_mouse, 0);
+
+        app.handle_effect(Effect::SetOption {
+            key: "wrap".to_string(),
+            value: false,
+        });
+        let before_option_frame = app.scroll_follow_count;
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("option frame");
+        assert_eq!(app.scroll_follow_count - before_option_frame, 1);
+        let source_cursor = app.session().unwrap().cursor().0;
+        assert!(source_cursor >= app.top_line());
+        assert!(source_cursor < app.top_line() + app.viewport_height);
+
+        let before_resize = app.scroll_follow_count;
+        app.handle_event(&Event::Resize(80, 10));
+        let mut resized = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 10))
+            .expect("resized terminal");
+        resized
+            .draw(|frame| app.render(frame))
+            .expect("resize frame");
+        assert_eq!(app.scroll_follow_count - before_resize, 1);
+
+        let before_escape = app.scroll_follow_count;
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.scroll_follow_count, before_escape);
+        resized
+            .draw(|frame| app.render(frame))
+            .expect("escape frame");
+        assert_eq!(app.scroll_follow_count - before_escape, 1);
+        assert_eq!(app.session().unwrap().mode(), Mode::Normal);
+        let entry = &app.tabs[0];
+        let rendered_cursor = entry.session.rendered_cursor_line();
+        assert!(rendered_cursor >= entry.rendered_top);
+        assert!(rendered_cursor < entry.rendered_top + app.viewport_height);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "large-fixture production path exceeded relaxed smoke ceiling"
+        );
     }
 
     #[test]
@@ -2009,6 +2206,11 @@ mod tests {
             key: "wrap".to_string(),
             value: false,
         });
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(24, 6))
+            .expect("test terminal");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render pending follow");
         assert!(!app.wrap_enabled);
         assert!(app.left_col() > 0);
         assert_eq!(app.transient.as_ref().unwrap().text, "nowrap");

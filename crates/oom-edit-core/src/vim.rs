@@ -72,6 +72,9 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use hjkl_buffer::{ContentEdit, View};
 use hjkl_engine::types::{CursorShape, DefaultHost, Host, Options, Query, Viewport};
 use hjkl_engine::{Editor, PlannedInput, SpecialKey, VimMode as HjklVimMode};
@@ -175,21 +178,51 @@ pub struct TextEdit {
     pub new_text: String,
 }
 
-fn edits_reproduce(before: &str, edits: &[TextEdit], after: &str) -> bool {
-    let mut working = before.to_string();
-    for edit in edits {
-        let start = edit.range.start.min(edit.range.end);
-        let end = edit.range.start.max(edit.range.end);
-        if end > working.len()
-            || !working.is_char_boundary(start)
-            || !working.is_char_boundary(end)
-            || edit.new_text_len != edit.new_text.len()
-        {
-            return false;
+macro_rules! edits_reproduce {
+    ($before:expr, $edits:expr, $after:expr) => {{
+        let mut working = $before.clone();
+        let mut valid = true;
+        for edit in $edits {
+            let start = edit.range.start.min(edit.range.end);
+            let end = edit.range.start.max(edit.range.end);
+            let (Ok(start_char), Ok(end_char)) = (
+                working.try_byte_to_char(start),
+                working.try_byte_to_char(end),
+            ) else {
+                valid = false;
+                break;
+            };
+            if working.char_to_byte(start_char) != start
+                || working.char_to_byte(end_char) != end
+                || edit.new_text_len != edit.new_text.len()
+            {
+                valid = false;
+                break;
+            }
+            working.remove(start_char..end_char);
+            working.insert(start_char, &edit.new_text);
         }
-        working.replace_range(start..end, &edit.new_text);
+        valid && working == *$after
+    }};
+}
+
+fn validate_content_edits(
+    edits: Vec<TextEdit>,
+    before_len: usize,
+    content_reset: bool,
+    reproduces_after: impl FnOnce(&[TextEdit]) -> bool,
+    fallback_text: impl FnOnce() -> String,
+) -> Vec<TextEdit> {
+    if !content_reset && reproduces_after(&edits) {
+        return edits;
     }
-    working == after
+
+    let new_text = fallback_text();
+    vec![TextEdit {
+        range: 0..before_len,
+        new_text_len: new_text.len(),
+        new_text,
+    }]
 }
 
 // ── Mode ───────────────────────────────────────────────────────────────────
@@ -323,6 +356,12 @@ pub(crate) struct VimCore {
     modified_since_save: bool,
     /// Whether the preceding Normal-mode key was the `g` history prefix.
     history_prefix_pending: bool,
+    /// Whole-document materializations observed by wrapper hot paths.
+    #[cfg(test)]
+    full_materializations: Cell<usize>,
+    /// Edit batches replayed by the correctness validator.
+    #[cfg(test)]
+    edit_replays: Cell<usize>,
 }
 
 impl VimCore {
@@ -348,6 +387,10 @@ impl VimCore {
             save_point_content,
             modified_since_save: false,
             history_prefix_pending: false,
+            #[cfg(test)]
+            full_materializations: Cell::new(0),
+            #[cfg(test)]
+            edit_replays: Cell::new(0),
         }
     }
 
@@ -390,11 +433,12 @@ impl VimCore {
             system_register_selected && (system_yank_pending || Self::is_yank_key(key));
 
         let history_traversal = self.is_history_traversal_key(key);
-        let text_before = self.text();
         let undo_seq_before = history_traversal.then(|| self.editor.buffer().current_undo_seq());
-        if let Some(effects) = self.try_display_block_put(key, &text_before) {
+        if let Some(effects) = self.try_display_block_put(key) {
             return effects;
         }
+        let before = self.editor.buffer().rope();
+        let dirty_gen_before = self.editor.buffer().dirty_gen();
         let next_history_prefix = self.mode == Mode::Normal
             && !self.history_prefix_pending
             && matches!(key.code.kind, KeyCodeKind::Char('g'))
@@ -422,13 +466,17 @@ impl VimCore {
         // Drain any content edits
         let mut edits = self.drain_content_edits();
         let content_reset = self.editor.take_content_reset();
-        let new_text = self.text();
-        if content_reset || !edits_reproduce(&text_before, &edits, &new_text) {
-            edits = vec![TextEdit {
-                range: 0..text_before.len(),
-                new_text_len: new_text.len(),
-                new_text,
-            }];
+        if self.editor.buffer().dirty_gen() != dirty_gen_before {
+            let after = self.editor.buffer().rope();
+            #[cfg(test)]
+            self.edit_replays.set(self.edit_replays.get() + 1);
+            edits = validate_content_edits(
+                edits,
+                before.len_bytes(),
+                content_reset,
+                |candidate| edits_reproduce!(&before, candidate, &after),
+                || self.materialize_text(),
+            );
         }
 
         let history_moved =
@@ -546,7 +594,7 @@ impl VimCore {
     /// hjkl's stock block paste measures segment width with `chars().count()`,
     /// which cannot represent rectangles containing a mix of narrow and wide
     /// atoms. Keep that adaptation private to this engine boundary.
-    fn try_display_block_put(&mut self, key: KeyInput, old_text: &str) -> Option<Vec<VimEffect>> {
+    fn try_display_block_put(&mut self, key: KeyInput) -> Option<Vec<VimEffect>> {
         let before = match key.code.kind {
             KeyCodeKind::Char('p')
                 if self.mode == Mode::Normal && !key.mods.ctrl && !key.mods.alt =>
@@ -576,6 +624,7 @@ impl VimCore {
             return Some(Vec::new());
         }
 
+        let old_text = self.materialize_text();
         let trailing_newline = old_text.ends_with('\n');
         let mut lines: Vec<String> = old_text.split('\n').map(str::to_string).collect();
         if trailing_newline {
@@ -717,7 +766,67 @@ impl VimCore {
 
     /// Return the full buffer text.
     pub(crate) fn text(&self) -> String {
+        self.materialize_text()
+    }
+
+    fn materialize_text(&self) -> String {
+        #[cfg(test)]
+        self.full_materializations
+            .set(self.full_materializations.get() + 1);
         self.editor.buffer().as_string()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_work_counters(&self) {
+        self.full_materializations.set(0);
+        self.edit_replays.set(0);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn work_counters(&self) -> (usize, usize) {
+        (self.full_materializations.get(), self.edit_replays.get())
+    }
+
+    /// Convert a source `(line, character-column)` into a byte offset using
+    /// the buffer rope without materializing the document.
+    pub(crate) fn byte_offset_for_position(&self, line: usize, column: usize) -> usize {
+        let rope = self.editor.buffer().rope();
+        let line = line.min(rope.len_lines().saturating_sub(1));
+        let line_start_char = rope.line_to_char(line);
+        let rope_line = rope.line(line);
+        let mut content_chars = rope_line.len_chars();
+        if content_chars > 0 && rope_line.char(content_chars - 1) == '\n' {
+            content_chars -= 1;
+            if content_chars > 0 && rope_line.char(content_chars - 1) == '\r' {
+                content_chars -= 1;
+            }
+        }
+        rope.char_to_byte(line_start_char + column.min(content_chars))
+    }
+
+    /// Convert a source byte offset into `(line, character-column)` using
+    /// the buffer rope without materializing the document.
+    pub(crate) fn position_for_byte_offset(&self, offset: usize) -> (usize, usize) {
+        let rope = self.editor.buffer().rope();
+        let offset = offset.min(rope.len_bytes());
+        let line = rope.byte_to_line(offset);
+        let line_start = rope.line_to_byte(line);
+        let column = rope.byte_to_char(offset) - rope.byte_to_char(line_start);
+        (line, column)
+    }
+
+    pub(crate) fn cursor_byte_offset(&self) -> usize {
+        let (line, column) = self.cursor();
+        self.byte_offset_for_position(line, column)
+    }
+
+    pub(crate) fn byte_before_is_newline(&self, offset: usize) -> bool {
+        let rope = self.editor.buffer().rope();
+        offset > 0 && offset <= rope.len_bytes() && rope.byte(offset - 1) == b'\n'
+    }
+
+    pub(crate) fn line_count(&self) -> usize {
+        self.editor.buffer().rope().len_lines()
     }
 
     /// Return line `idx` (0-based), or `None` if out of range.
@@ -1235,7 +1344,10 @@ impl VimCore {
     /// Drain content edits from the editor and convert to our TextEdit shape.
     fn drain_content_edits(&mut self) -> Vec<TextEdit> {
         let hjkl_edits = self.editor.take_content_edits();
-        let text = self.editor.buffer().as_string();
+        if hjkl_edits.is_empty() {
+            return Vec::new();
+        }
+        let text = self.materialize_text();
         hjkl_edits
             .iter()
             .enumerate()
@@ -1424,6 +1536,120 @@ mod dirty_tracking_tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn vim_cursor_keys_do_not_materialize_or_validate_content() {
+        let text = "αβγ line\n".repeat(20_000);
+        let mut vim = VimCore::new(&text);
+        vim.handle_key(key('i'));
+        vim.full_materializations.set(0);
+        vim.edit_replays.set(0);
+
+        for kind in [KeyCodeKind::Down, KeyCodeKind::Up, KeyCodeKind::Esc] {
+            vim.handle_key(special_key(kind));
+        }
+
+        assert_eq!(vim.full_materializations.get(), 0);
+        assert_eq!(vim.edit_replays.get(), 0);
+        assert_eq!(vim.text(), text);
+    }
+
+    #[test]
+    fn vim_edit_validation_falls_back_only_on_reset_or_invalid_batch() {
+        let before = View::from_str("aé\nz").rope();
+        let valid = vec![
+            TextEdit {
+                range: 1..3,
+                new_text_len: 1,
+                new_text: "x".to_string(),
+            },
+            TextEdit {
+                range: 2..2,
+                new_text_len: 4,
+                new_text: "🙂".to_string(),
+            },
+        ];
+        let after = View::from_str("ax🙂\nz").rope();
+        let fallback_calls = Cell::new(0);
+        let validated = validate_content_edits(
+            valid.clone(),
+            before.len_bytes(),
+            false,
+            |candidate| edits_reproduce!(&before, candidate, &after),
+            || {
+                fallback_calls.set(fallback_calls.get() + 1);
+                "fallback".to_string()
+            },
+        );
+        assert_eq!(validated, valid);
+        assert_eq!(fallback_calls.get(), 0);
+
+        let malformed_boundary = vec![TextEdit {
+            range: 2..3,
+            new_text_len: 2,
+            new_text: "é".to_string(),
+        }];
+        let rounded_after = View::from_str("aé\nz").rope();
+        assert!(!edits_reproduce!(
+            &before,
+            &malformed_boundary,
+            &rounded_after
+        ));
+        let wrong_length = vec![TextEdit {
+            range: 0..1,
+            new_text_len: 9,
+            new_text: "x".to_string(),
+        }];
+        for invalid in [malformed_boundary, wrong_length] {
+            let validated = validate_content_edits(
+                invalid,
+                before.len_bytes(),
+                false,
+                |candidate| edits_reproduce!(&before, candidate, &after),
+                || {
+                    fallback_calls.set(fallback_calls.get() + 1);
+                    "fallback".to_string()
+                },
+            );
+            assert_eq!(
+                validated,
+                [TextEdit {
+                    range: 0..before.len_bytes(),
+                    new_text_len: 8,
+                    new_text: "fallback".to_string(),
+                }]
+            );
+        }
+
+        let reset = validate_content_edits(
+            valid,
+            before.len_bytes(),
+            true,
+            |_| panic!("reset must not replay the incremental batch"),
+            || {
+                fallback_calls.set(fallback_calls.get() + 1);
+                "reset text".to_string()
+            },
+        );
+        assert_eq!(
+            reset,
+            [TextEdit {
+                range: 0..before.len_bytes(),
+                new_text_len: 10,
+                new_text: "reset text".to_string(),
+            }]
+        );
+        assert_eq!(fallback_calls.get(), 3);
+    }
+
+    #[test]
+    fn rope_coordinates_round_trip_unicode_and_line_boundaries() {
+        let vim = VimCore::new("aé🙂\r\ncombining e\u{301}\nlast");
+        for position in [(0, 0), (0, 1), (0, 2), (0, 3), (1, 11), (2, 4)] {
+            let offset = vim.byte_offset_for_position(position.0, position.1);
+            assert_eq!(vim.position_for_byte_offset(offset), position);
+        }
     }
 
     #[test]

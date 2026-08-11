@@ -36,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Rendered and source scrolling now avoid document-sized navigation, edit-validation, and line-index work on each key or frame, restoring responsive Insert edits and keyboard/mouse scrolling near the 1 MB boundary.
 - Rendered Select no longer expands every operation to a whole rendered row; partial, wrapped, Unicode, metadata, and block selections preserve exact UTF-8 source ownership and omit synthetic glyphs.
 - Expanded front matter no longer sorts and compacts parsed values into a pseudo-table, so source order, comments, blank lines, nesting, and scalar spelling remain visible.
 - Rendered Markdown now preserves nested-list source order and renders depth-specific bullets, declared ordered-list numbers, nested task markers, and aligned continuations.

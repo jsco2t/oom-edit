@@ -49,6 +49,13 @@ mod tests {
         }
     }
 
+    fn special(kind: KeyCodeKind) -> KeyInput {
+        KeyInput {
+            code: KeyCode { kind },
+            mods: Modifiers::default(),
+        }
+    }
+
     #[test]
     fn session_starts_in_rendered_normal() {
         let mut session = EditorSession::from_text("# Heading\n\nBody\n");
@@ -66,6 +73,70 @@ mod tests {
         assert_eq!(session.cursor(), (0, 0));
         session.handle_key(key('j'));
         assert_eq!(session.cursor().0, 2);
+    }
+
+    #[test]
+    fn navigation_and_frames_reuse_materialization_layout_and_line_index_work() {
+        let text = "plain paragraph content for cached work counters\n\n".repeat(500);
+        let mut session = EditorSession::from_text(&text);
+        session.render_layout(80);
+        assert_eq!(session.rendered_state.layout_builds, 1);
+        session.vim.reset_work_counters();
+
+        for input in [
+            key('j'),
+            key('k'),
+            key('2'),
+            key('0'),
+            key('j'),
+            key('G'),
+            key('g'),
+            key('g'),
+        ] {
+            session.handle_key(input);
+            session.render_layout(80);
+        }
+        assert_eq!(session.vim.work_counters(), (0, 0));
+        assert_eq!(session.rendered_state.layout_builds, 1);
+
+        session.handle_key(key('i'));
+        assert_eq!(session.mode(), Mode::Insert);
+        session.vim.reset_work_counters();
+        let line_index_builds = crate::syntax::line_index_build_count();
+        for _ in 0..20 {
+            session.handle_key(special(KeyCodeKind::Down));
+        }
+        let top_line = session.cursor().0.saturating_sub(5);
+        for _ in 0..3 {
+            let _ = session.render_source(Viewport {
+                top_line,
+                height: 10,
+                width: 80,
+                wrap: true,
+                left_col: 0,
+                skip_rows: 0,
+            });
+        }
+        assert_eq!(session.vim.work_counters(), (0, 0));
+        assert_eq!(crate::syntax::line_index_build_count(), line_index_builds);
+
+        session.handle_key(key('x'));
+        let _ = session.render_source(Viewport {
+            top_line,
+            height: 10,
+            width: 80,
+            wrap: true,
+            left_col: 0,
+            skip_rows: 0,
+        });
+        assert_eq!(session.vim.work_counters(), (1, 1));
+        assert_eq!(crate::syntax::line_index_build_count(), line_index_builds);
+
+        session.handle_key(esc());
+        session.vim.reset_work_counters();
+        session.render_layout(80);
+        assert_eq!(session.rendered_state.layout_builds, 2);
+        assert_eq!(session.vim.work_counters(), (1, 0));
     }
 
     #[test]
@@ -415,6 +486,9 @@ struct RenderedState {
     pending_g: bool,
     /// First bracket of a rendered `[[` or `]]` heading motion.
     pending_heading_bracket: Option<char>,
+    /// Actual rendered layout builds, exposed only to regression tests.
+    #[cfg(test)]
+    layout_builds: usize,
 }
 
 impl RenderedState {
@@ -442,6 +516,8 @@ impl RenderedState {
             count: 0,
             pending_g: false,
             pending_heading_bracket: None,
+            #[cfg(test)]
+            layout_builds: 0,
         }
     }
 
@@ -716,12 +792,7 @@ impl EditorSession {
 
     /// Return the number of lines in the document.
     pub fn line_count(&self) -> usize {
-        // Count newlines + 1 (at least one line)
-        let text = self.vim.text();
-        if text.is_empty() {
-            return 1;
-        }
-        text.matches('\n').count() + 1
+        self.vim.line_count()
     }
 
     /// Return a specific line (0-based), or `None` if out of range.
@@ -1148,6 +1219,10 @@ impl EditorSession {
             self.rendered_state.last_width = width;
             self.rendered_state.cursor = cursor;
             self.rendered_state.select_anchor = select_anchor;
+            #[cfg(test)]
+            {
+                self.rendered_state.layout_builds += 1;
+            }
         }
         self.rendered_state
             .layout_cache
@@ -1469,7 +1544,7 @@ impl EditorSession {
         let Some(layout) = self.rendered_state.layout_cache.as_ref() else {
             return Vec::new();
         };
-        let text = self.vim.text();
+        let text = nav::key_inspects_source(key).then(|| self.vim.text());
         let cursor = self.rendered_state.cursor;
         let search = self.rendered_state.search.clone();
         let count = std::mem::take(&mut self.rendered_state.count);
@@ -1481,7 +1556,7 @@ impl EditorSession {
             &layout.jump_targets,
             layout,
             count,
-            &text,
+            text.as_deref().unwrap_or_default(),
         );
         let mut effects = Vec::new();
         if result.search_changed {
@@ -1503,7 +1578,10 @@ impl EditorSession {
         let collapse_hides_selection = result.fm_collapsed_toggled
             && !self.rendered_state.fm_collapsed
             && self.mode == Mode::Select
-            && crate::frontmatter::front_matter_span(&text).is_some_and(|front_matter| {
+            && crate::frontmatter::front_matter_span(
+                text.as_deref().unwrap_or_else(|| self.highlighter.text()),
+            )
+            .is_some_and(|front_matter| {
                 self.rendered_selection().is_some_and(|selection| {
                     selection.source_ranges.iter().any(|source| {
                         source.start < front_matter.end && front_matter.start < source.end
@@ -1704,21 +1782,25 @@ impl EditorSession {
             return;
         };
         let source = self.vim.cursor();
-        let text = self.vim.text();
-        self.rendered_state.cursor = nav::enter_rendered(source.0, source.1, layout, &text);
+        self.rendered_state.cursor = nav::enter_rendered_at_offset(
+            source.0,
+            self.vim.cursor_byte_offset(),
+            layout,
+            |offset| self.vim.position_for_byte_offset(offset).0,
+            |offset| self.vim.byte_before_is_newline(offset),
+        );
     }
 
     fn commit_rendered_cursor(&mut self) {
         let Some(layout) = self.rendered_state.layout_cache.as_ref() else {
             return;
         };
-        let text = self.vim.text();
-        let source = nav::canonical_position_for_row(
+        let source_offset = nav::canonical_source_offset_for_row(
             &self.rendered_state.cursor,
-            self.vim.cursor(),
+            self.vim.cursor_byte_offset(),
             layout,
-            &text,
         );
+        let source = self.vim.position_for_byte_offset(source_offset);
         self.vim.jump_to(source.0, source.1);
     }
 

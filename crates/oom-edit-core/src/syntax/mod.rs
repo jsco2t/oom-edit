@@ -14,6 +14,9 @@ pub use languages::{find_by_alias, find_by_name, resolve_language, LangDef, LANG
 
 use std::{collections::HashMap, ops::Range, sync::Arc};
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use tree_sitter::{Parser, Point, Query, QueryCursor, StreamingIterator, Tree};
 
 use crate::style::{SemanticStyle, Span, StyledLine};
@@ -129,6 +132,7 @@ enum InjectionKind {
 enum ParsePath {
     Full,
     Incremental,
+    BlockNeutral,
     Skipped,
 }
 
@@ -145,6 +149,8 @@ enum ParsePath {
 pub struct Highlighter {
     /// The full document text.
     text: String,
+    /// Byte offset of each physical line start, maintained with edits.
+    line_starts: Vec<usize>,
     /// The main markdown block parse tree.
     md_tree: Tree,
     /// Markdown block highlight query.
@@ -160,6 +166,9 @@ pub struct Highlighter {
     /// Most recent parser route, exposed only to regression tests.
     #[cfg(test)]
     last_parse_path: ParsePath,
+    /// Full Markdown block parses; ordinary inline edits must not increase it.
+    #[cfg(test)]
+    block_parse_count: Cell<usize>,
 }
 
 impl Highlighter {
@@ -188,6 +197,7 @@ impl Highlighter {
 
         let mut highlighter = Self {
             text: text.to_string(),
+            line_starts: line_start_indices(text),
             md_tree: tree,
             md_query: query,
             md_inline_query: inline_query,
@@ -196,6 +206,8 @@ impl Highlighter {
             query_cache: HashMap::new(),
             #[cfg(test)]
             last_parse_path: ParsePath::Full,
+            #[cfg(test)]
+            block_parse_count: Cell::new(1),
         };
 
         // Discover injection regions
@@ -209,10 +221,12 @@ impl Highlighter {
         &self.text
     }
 
-    /// Apply a batch of text edits and incrementally re-parse.
+    /// Apply a batch of text edits and update the retained parse tree.
     ///
-    /// This is the FR-4.4 incremental highlighting path: only the affected
-    /// trees are re-parsed, keeping keystroke latency within NFR-3 budget.
+    /// This is the FR-4.4 incremental highlighting path: affected trees are
+    /// re-parsed unless every edit is proven to be an ASCII word-only change
+    /// that cannot alter Markdown block structure. That narrow exception uses
+    /// `Tree::edit` for coordinates and the live inline parse for styling.
     ///
     /// Edits are applied in their incoming sequential order and injection
     /// regions are re-resolved after the batch.
@@ -226,37 +240,50 @@ impl Highlighter {
             self.last_parse_path = ParsePath::Skipped;
         }
 
-        let mut working_text = self.text.clone();
-
+        let mut rediscover_injections = !self.injections.is_empty();
         let mut tree_was_edited = false;
+        let mut block_reparse_required = false;
         for edit in edits {
             // Every coordinate is relative to the document produced by the
             // preceding entry, so compute and apply the tree edit before
             // applying the identical replacement to the working text.
-            if let Some(tree_edit) = input_edit(&working_text, edit) {
+            rediscover_injections |= edit_may_create_injection(&self.text, edit);
+            block_reparse_required |= !edit_is_provably_block_neutral(&self.text, edit);
+            if let Some(tree_edit) = input_edit_indexed(&self.line_starts, edit) {
                 self.md_tree.edit(&tree_edit);
                 tree_was_edited = true;
             }
-            apply_edit_to_string(&mut working_text, edit);
+            apply_edit_to_line_starts(&mut self.line_starts, edit);
+            apply_edit_to_string(&mut self.text, edit);
         }
-        self.text = working_text;
 
         if !tree_was_edited {
             return;
         }
 
-        let old_tree = Some(&self.md_tree);
-        self.md_tree = self
-            .md_parser
-            .parse(&self.text, old_tree)
-            .expect("re-parse should succeed");
-        #[cfg(test)]
-        {
-            self.last_parse_path = ParsePath::Incremental;
+        if block_reparse_required {
+            let old_tree = Some(&self.md_tree);
+            self.md_tree = self
+                .md_parser
+                .parse(&self.text, old_tree)
+                .expect("re-parse should succeed");
+            #[cfg(test)]
+            self.block_parse_count
+                .set(self.block_parse_count.get().saturating_add(1));
+            #[cfg(test)]
+            {
+                self.last_parse_path = ParsePath::Incremental;
+            }
+        } else {
+            #[cfg(test)]
+            {
+                self.last_parse_path = ParsePath::BlockNeutral;
+            }
         }
 
-        // Re-discover injections
-        self.discover_injections();
+        if rediscover_injections {
+            self.discover_injections();
+        }
     }
 
     /// Highlight the given line range and return styled lines.
@@ -272,7 +299,7 @@ impl Highlighter {
         }
 
         let text = &self.text;
-        let line_starts = line_start_indices(text);
+        let line_starts = &self.line_starts;
 
         // Number of actual lines: if text ends with newline, last element is
         // the position after the final newline (not a real line start).
@@ -382,6 +409,7 @@ impl Highlighter {
 
         // Run the markdown highlight query on the subtree
         let mut cursor = QueryCursor::new();
+        cursor.set_byte_range(range.clone());
         let mut matches = cursor.matches(&self.md_query, subtree, text_bytes);
 
         while let Some(m) = matches.next() {
@@ -500,7 +528,13 @@ impl Highlighter {
 
             // For inline nodes, parse with the inline grammar
             if kind == "inline" {
-                let inline_text = &text[child.start_byte()..child.end_byte()];
+                // Inline constructs can cross physical-line and viewport
+                // boundaries. Parse the complete containing node for grammar
+                // context, then constrain query work and emitted captures to
+                // the requested viewport.
+                let inline_start = child.start_byte();
+                let inline_end = child.end_byte();
+                let inline_text = &text[inline_start..inline_end];
                 let inline_bytes = inline_text.as_bytes();
 
                 let mut inline_parser = Parser::new();
@@ -508,13 +542,20 @@ impl Highlighter {
                 if inline_parser.set_language(&inline_language).is_ok() {
                     if let Some(inline_tree) = inline_parser.parse(inline_bytes, None) {
                         let mut inline_cursor = QueryCursor::new();
+                        inline_cursor.set_byte_range(
+                            range.start.saturating_sub(inline_start)
+                                ..range
+                                    .end
+                                    .saturating_sub(inline_start)
+                                    .min(inline_bytes.len()),
+                        );
                         let mut matches = inline_cursor.matches(
                             &self.md_inline_query,
                             inline_tree.root_node(),
                             inline_bytes,
                         );
 
-                        let base_offset = child.start_byte();
+                        let base_offset = inline_start;
                         while let Some(m) = matches.next() {
                             for capture in m.captures {
                                 let capture_name =
@@ -525,7 +566,10 @@ impl Highlighter {
                                 let abs_start = base_offset + inline_node.start_byte();
                                 let abs_end = base_offset + inline_node.end_byte();
 
-                                if abs_start < abs_end {
+                                if abs_start < abs_end
+                                    && abs_end > range.start
+                                    && abs_start < range.end
+                                {
                                     spans.push(ByteSpan {
                                         start_byte: abs_start,
                                         end_byte: abs_end,
@@ -964,7 +1008,7 @@ fn byte_offset_to_char_index(text: &str, byte_offset: usize) -> usize {
 }
 
 /// Construct a tree-sitter edit from a replacement against `old_text`.
-fn input_edit(old_text: &str, edit: &TextEdit) -> Option<tree_sitter::InputEdit> {
+fn input_edit_indexed(line_starts: &[usize], edit: &TextEdit) -> Option<tree_sitter::InputEdit> {
     // Skip true no-ops while allowing insertions through to the incremental
     // parse path.
     if edit.range.start == edit.range.end && edit.new_text_len == 0 {
@@ -982,34 +1026,31 @@ fn input_edit(old_text: &str, edit: &TextEdit) -> Option<tree_sitter::InputEdit>
         (end_byte, start_byte)
     };
     let new_end_byte = a + edit.new_text_len;
-    let start_position = byte_to_point(old_text, a);
+    let start_position = byte_to_point_indexed(line_starts, a);
 
     Some(tree_sitter::InputEdit {
         start_byte: a,
         old_end_byte: b,
         new_end_byte,
         start_position,
-        old_end_position: byte_to_point(old_text, b),
+        old_end_position: byte_to_point_indexed(line_starts, b),
         new_end_position: compute_new_end_point(start_position, &edit.new_text),
     })
 }
 
-/// Convert a byte offset in `text` to a `(row, col)` point.
-fn byte_to_point(text: &str, byte: usize) -> Point {
-    let mut row = 0usize;
-    let mut col = 0usize;
-    for (i, c) in text.char_indices() {
-        if i >= byte {
-            break;
-        }
-        if c == '\n' {
-            row += 1;
-            col = 0;
-        } else {
-            col += c.len_utf8();
-        }
-    }
-    Point::new(row, col)
+#[cfg(test)]
+fn input_edit(old_text: &str, edit: &TextEdit) -> Option<tree_sitter::InputEdit> {
+    input_edit_indexed(&line_start_indices(old_text), edit)
+}
+
+/// Convert a byte offset to a tree-sitter point through cached physical-line
+/// starts. Tree-sitter columns are UTF-8 byte columns, so no prefix scan is
+/// required after locating the line.
+fn byte_to_point_indexed(line_starts: &[usize], byte: usize) -> Point {
+    let row = line_starts
+        .partition_point(|line_start| *line_start <= byte)
+        .saturating_sub(1);
+    Point::new(row, byte.saturating_sub(line_starts[row]))
 }
 
 /// Compute the `Point` where replacement text ends, given the `Point`
@@ -1033,6 +1074,8 @@ fn compute_new_end_point(start: Point, new_text: &str) -> Point {
 /// Return a vector where `result[i]` is the byte offset of the first
 /// character of line `i` (0-based).
 fn line_start_indices(text: &str) -> Vec<usize> {
+    #[cfg(test)]
+    LINE_INDEX_BUILDS.with(|count| count.set(count.get().saturating_add(1)));
     let mut starts = Vec::new();
     starts.push(0);
     for (i, c) in text.char_indices() {
@@ -1042,6 +1085,96 @@ fn line_start_indices(text: &str) -> Vec<usize> {
         }
     }
     starts
+}
+
+#[cfg(test)]
+thread_local! {
+    static LINE_INDEX_BUILDS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn line_index_build_count() -> usize {
+    LINE_INDEX_BUILDS.with(Cell::get)
+}
+
+/// A document with no existing injections only needs rediscovery when an
+/// edit can form a fenced-code or front-matter delimiter in its local lines.
+fn edit_may_create_injection(text: &str, edit: &TextEdit) -> bool {
+    let start = edit.range.start.min(edit.range.end);
+    let end = edit.range.start.max(edit.range.end);
+    let window_start = text[..start].rfind('\n').map_or(0, |newline| newline + 1);
+    let window_end = text[end..]
+        .find('\n')
+        .map_or(text.len(), |newline| end + newline + 1);
+    let mut window = text[window_start..start].to_string();
+    window.push_str(&edit.new_text);
+    window.push_str(&text[end..window_end]);
+    window.contains("```")
+        || window.contains("~~~")
+        || window.lines().any(|line| {
+            line.trim_end_matches('\r') == "---" || line.trim_end_matches('\r') == "+++"
+        })
+}
+
+/// Prove the narrow case where a block reparse cannot change Markdown block
+/// structure: an ASCII word-character edit within a non-indented line that
+/// begins with an ASCII letter. Everything else takes the canonical
+/// Tree-sitter incremental parse path. `Tree::edit` keeps byte coordinates
+/// current, and inline syntax is parsed from live viewport text.
+fn edit_is_provably_block_neutral(text: &str, edit: &TextEdit) -> bool {
+    let start = edit.range.start.min(edit.range.end);
+    let end = edit.range.start.max(edit.range.end);
+    let removed = &text[start..end];
+    if removed.contains(['\r', '\n']) || edit.new_text.contains(['\r', '\n']) {
+        return false;
+    }
+    if !removed.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        || !edit
+            .new_text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric())
+    {
+        return false;
+    }
+    let line_start = text[..start].rfind('\n').map_or(0, |newline| newline + 1);
+    let line_end = text[end..]
+        .find('\n')
+        .map_or(text.len(), |newline| end + newline);
+    let old_line = &text[line_start..line_end];
+    let mut new_line = text[line_start..start].to_string();
+    new_line.push_str(&edit.new_text);
+    new_line.push_str(&text[end..line_end]);
+    old_line
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphabetic)
+        && new_line
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphabetic)
+}
+
+/// Update cached line starts for one sequential byte-range replacement.
+fn apply_edit_to_line_starts(line_starts: &mut Vec<usize>, edit: &TextEdit) {
+    let start = edit.range.start.min(edit.range.end);
+    let end = edit.range.start.max(edit.range.end);
+    let first_removed = line_starts.partition_point(|offset| *offset <= start);
+    let first_after = line_starts.partition_point(|offset| *offset <= end);
+    let inserted_starts: Vec<_> = edit
+        .new_text
+        .char_indices()
+        .filter_map(|(offset, character)| (character == '\n').then_some(start + offset + 1))
+        .collect();
+    let shifted_from = first_removed + inserted_starts.len();
+    line_starts.splice(first_removed..first_after, inserted_starts);
+
+    let removed_len = end - start;
+    let inserted_len = edit.new_text.len();
+    let delta = inserted_len as i128 - removed_len as i128;
+    for offset in &mut line_starts[shifted_from..] {
+        *offset = usize::try_from(*offset as i128 + delta)
+            .expect("line start must remain non-negative after a valid edit");
+    }
 }
 
 // ── Helper: apply edits to a string ─────────────────────────────────────────
@@ -1791,6 +1924,161 @@ mod tests {
     }
 
     #[test]
+    fn highlighter_line_index_tracks_sequential_edits() {
+        let mut highlighter = Highlighter::new("α\nbeta\n🙂 end\n");
+        let assert_index = |highlighter: &Highlighter| {
+            assert_eq!(
+                highlighter.line_starts,
+                line_start_indices(highlighter.text()),
+                "cached starts must equal a full rebuild"
+            );
+        };
+        assert_index(&highlighter);
+
+        highlighter.apply_edit(&[TextEdit {
+            range: 0..0,
+            new_text_len: 6,
+            new_text: "start\n".to_string(),
+        }]);
+        assert_index(&highlighter);
+
+        let beta = highlighter.text().find("beta").unwrap();
+        highlighter.apply_edit(&[TextEdit {
+            range: beta..beta + 4,
+            new_text_len: 0,
+            new_text: String::new(),
+        }]);
+        assert_index(&highlighter);
+
+        let emoji = highlighter.text().find('🙂').unwrap();
+        highlighter.apply_edit(&[TextEdit {
+            range: emoji..emoji + '🙂'.len_utf8(),
+            new_text_len: "界\nnew".len(),
+            new_text: "界\nnew".to_string(),
+        }]);
+        assert_index(&highlighter);
+
+        // Both coordinates are sequential: the second edit sees the prefix
+        // inserted by the first edit in this same engine fan-out batch.
+        highlighter.apply_edit(&[
+            TextEdit {
+                range: 0..0,
+                new_text_len: 2,
+                new_text: "p\n".to_string(),
+            },
+            TextEdit {
+                range: 2..7,
+                new_text_len: 7,
+                new_text: "renamed".to_string(),
+            },
+        ]);
+        assert_index(&highlighter);
+
+        let before_rebuilds = line_index_build_count();
+        for start in 0..highlighter.line_starts.len().min(20) {
+            let _ = highlighter.highlight_lines(start..start + 3);
+        }
+        assert_eq!(line_index_build_count(), before_rebuilds);
+    }
+
+    #[test]
+    fn block_parser_skips_inline_edits_but_reparses_block_transitions() {
+        let mut highlighter = Highlighter::new("# Heading\n\nordinary paragraph\n");
+        assert_eq!(highlighter.block_parse_count.get(), 1);
+        assert_eq!(highlighter.last_parse_path, ParsePath::Full);
+
+        let paragraph = highlighter.text().find("ordinary").unwrap();
+        highlighter.apply_edit(&[TextEdit {
+            range: paragraph..paragraph + 1,
+            new_text_len: 1,
+            new_text: "O".to_string(),
+        }]);
+        assert_eq!(highlighter.block_parse_count.get(), 1);
+        assert_eq!(highlighter.last_parse_path, ParsePath::BlockNeutral);
+        assert_eq!(
+            highlighter.highlight_lines(0..3),
+            Highlighter::new(highlighter.text()).highlight_lines(0..3)
+        );
+
+        highlighter.apply_edit(&[TextEdit {
+            range: 0..1,
+            new_text_len: 1,
+            new_text: "x".to_string(),
+        }]);
+        assert_eq!(highlighter.block_parse_count.get(), 2);
+        assert_eq!(
+            highlighter.highlight_lines(0..3),
+            Highlighter::new(highlighter.text()).highlight_lines(0..3)
+        );
+    }
+
+    #[test]
+    fn block_parser_reparses_same_marker_class_when_structure_can_change() {
+        let mut highlighter = Highlighter::new("Title\n---\n");
+        highlighter.apply_edit(&[TextEdit {
+            range: 6..9,
+            new_text_len: 3,
+            new_text: "***".to_string(),
+        }]);
+
+        assert_eq!(highlighter.block_parse_count.get(), 2);
+        assert_eq!(
+            highlighter.highlight_lines(0..2),
+            Highlighter::new("Title\n***\n").highlight_lines(0..2)
+        );
+    }
+
+    #[test]
+    fn inline_highlighting_keeps_context_across_viewport_boundary() {
+        let text = "*hello\nworld* after\n";
+        let highlighter = Highlighter::new(text);
+        let full = highlighter.highlight_lines(0..2);
+        let partial = highlighter.highlight_lines(1..2);
+
+        assert_eq!(partial, full[1..2]);
+        assert!(partial[0]
+            .spans
+            .iter()
+            .any(|span| span.style == SemanticStyle::Emphasis));
+    }
+
+    #[test]
+    fn completing_frontmatter_closer_discovers_injection() {
+        let initial = "---\ntitle: Hello\n";
+        let mut highlighter = Highlighter::new(initial);
+        assert!(highlighter.injections.is_empty());
+
+        highlighter.apply_edit(&[TextEdit {
+            range: initial.len()..initial.len(),
+            new_text_len: 4,
+            new_text: "---\n".to_string(),
+        }]);
+
+        assert!(!highlighter.injections.is_empty());
+        assert!(highlighter.highlight_lines(1..2)[0]
+            .spans
+            .iter()
+            .any(|span| span.style == SemanticStyle::FmKey));
+    }
+
+    #[test]
+    fn pasting_complete_frontmatter_discovers_injection() {
+        let mut highlighter = Highlighter::new("");
+        let pasted = "---\ntitle: X\n---\n";
+        highlighter.apply_edit(&[TextEdit {
+            range: 0..0,
+            new_text_len: pasted.len(),
+            new_text: pasted.to_string(),
+        }]);
+
+        assert!(!highlighter.injections.is_empty());
+        assert!(highlighter.highlight_lines(1..2)[0]
+            .spans
+            .iter()
+            .any(|span| span.style == SemanticStyle::FmKey));
+    }
+
+    #[test]
     fn highlighter_unterminated_fence_no_panic() {
         let text = "```rust\nno closing fence\n";
         let h = Highlighter::new(text);
@@ -2394,6 +2682,11 @@ mod tests {
                     current_text.replace_range(normalized_start..normalized_end, &new_text);
 
                     prop_assert_eq!(highlighter.text(), &current_text);
+                    prop_assert_eq!(
+                        &highlighter.line_starts,
+                        &line_start_indices(&current_text),
+                        "cached line starts diverged after generated sequential edit"
+                    );
 
                     let incremental = highlighter.highlight_lines(0..1000);
                     let fresh = Highlighter::new(&current_text).highlight_lines(0..1000);
@@ -2779,7 +3072,10 @@ mod tests {
         highlighter.apply_edit(&[edit]);
 
         assert_eq!(highlighter.text(), expected_text);
-        assert_eq!(highlighter.last_parse_path, ParsePath::Incremental);
+        assert!(matches!(
+            highlighter.last_parse_path,
+            ParsePath::Incremental | ParsePath::BlockNeutral
+        ));
         let incremental = highlighter.highlight_lines(0..1000);
         let fresh = Highlighter::new(&expected_text).highlight_lines(0..1000);
         assert_eq!(incremental, fresh);
@@ -2835,7 +3131,10 @@ mod tests {
     fn assert_vim_highlighting_matches_fresh(vim: &VimCore, highlighter: &Highlighter) {
         let expected = vim.text();
         assert_eq!(highlighter.text(), expected);
-        assert_eq!(highlighter.last_parse_path, ParsePath::Incremental);
+        assert!(matches!(
+            highlighter.last_parse_path,
+            ParsePath::Incremental | ParsePath::BlockNeutral
+        ));
         assert_eq!(
             highlighter.highlight_lines(0..1000),
             Highlighter::new(&expected).highlight_lines(0..1000)

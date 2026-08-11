@@ -1,7 +1,7 @@
 //! Rendered navigation, source mapping, search, and Select range handling.
 //!
 //! This module implements rendered navigation: position mapping between
-//! source and rendered coordinates (`enter_rendered` / `leave_rendered`), scroll-top
+//! source and rendered coordinates (`enter_rendered` / canonical source offsets), scroll-top
 //! calculation (`rendered_scroll_top`), and Rendered-mode key handling
 //! (`handle_key`). Together they satisfy VN-1 through VN-6 and VP-1 through
 //! VP-4.
@@ -125,7 +125,35 @@ pub fn enter_rendered(
     }
 
     let edit_offset = doc_position_to_byte_offset(edit_line, edit_col, text);
+    enter_rendered_at_offset(
+        edit_line,
+        edit_offset,
+        layout,
+        |offset| {
+            text[..offset.min(text.len())]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count()
+        },
+        |offset| {
+            offset
+                .checked_sub(1)
+                .and_then(|previous| text.as_bytes().get(previous))
+                .is_some_and(|byte| *byte == b'\n')
+        },
+    )
+}
 
+/// Map a canonical source byte offset to the nearest source-backed rendered
+/// atom. The caller owns byte/line conversion so ordinary remaps can stay
+/// rope-backed without allocating the complete document.
+pub(crate) fn enter_rendered_at_offset(
+    edit_line: usize,
+    edit_offset: usize,
+    layout: &RenderedLayout,
+    source_line_for_offset: impl Fn(usize) -> usize,
+    byte_before_is_newline: impl Fn(usize) -> bool,
+) -> RenderedCursor {
     if let Some((row, atom)) = layout
         .lines
         .iter()
@@ -159,12 +187,7 @@ pub fn enter_rendered(
     if let Some(idx) = layout.lines.iter().position(|rendered_line| {
         rendered_line.kind == LineKind::Content
             && rendered_line.source.end == edit_offset
-            && rendered_line
-                .source
-                .end
-                .checked_sub(1)
-                .and_then(|end| text.as_bytes().get(end))
-                .is_some_and(|byte| *byte != b'\n')
+            && !byte_before_is_newline(rendered_line.source.end)
     }) {
         return cursor_for_row(idx, 0, layout);
     }
@@ -178,7 +201,7 @@ pub fn enter_rendered(
                 return None;
             }
 
-            let source_line = source_to_doc_line(&rendered_line.source, text);
+            let source_line = source_line_for_offset(rendered_line.source.start);
             (source_line > edit_line
                 || (source_line == edit_line && rendered_line.source.start >= edit_offset))
                 .then_some((idx, rendered_line.source.start))
@@ -197,95 +220,40 @@ pub fn enter_rendered(
     }
 }
 
-// ── VP-1 / VP-2 / VP-3: leave_rendered — rendered → source mapping ───────────
-
-/// Map a rendered cursor line back to an edit cursor (line, col).
-///
-/// VP-1: Synthetic rendered rows map to the source span of the nearest
-/// preceding content line.
-///
-/// VP-2: The edit cursor column is set to 0 (start of line).
-///
-/// VP-3: If the rendered cursor is beyond the last content line, it clamps
-/// to the last document line.
-///
-/// `text` is the full document text, needed to convert source byte offsets
-/// to document line numbers.
-pub fn leave_rendered(
-    rendered_cursor: &RenderedCursor,
-    layout: &RenderedLayout,
-    text: &str,
-) -> (usize, usize) {
-    for (rendered_line_idx, rendered_line) in layout.lines.iter().enumerate() {
-        if rendered_line_idx == rendered_cursor.line {
-            if let Some(source) = rendered_line
-                .atoms
-                .iter()
-                .find(|atom| atom.columns.contains(&rendered_cursor.column))
-                .and_then(|atom| atom.source.as_ref())
-                .or_else(|| {
-                    rendered_line
-                        .atoms
-                        .iter()
-                        .filter_map(|atom| atom.source.as_ref())
-                        .min_by_key(|source| source.start)
-                })
-            {
-                return byte_offset_to_doc_position(source.start, text);
-            }
-            return (source_to_doc_line(&rendered_line.source, text), 0);
-        }
-    }
-
-    // Beyond last rendered row: clamp to last doc line
-    let last_content_source = layout.lines.iter().rev().find_map(|l| {
-        if l.kind == LineKind::Content {
-            Some(&l.source)
-        } else {
-            None
-        }
-    });
-
-    match last_content_source {
-        Some(source) => (source_to_doc_line(source, text), 0),
-        None => (0, 0),
-    }
-}
-
-/// Map a rendered point to its canonical source position while preserving the
-/// current source column only when it already belongs to that exact atom.
-pub fn canonical_position_for_row(
+/// Return the canonical source byte offset for a rendered cursor. Preserve
+/// the current offset when it still belongs to the cursor's exact atom;
+/// otherwise snap to that atom (or the row's nearest source span).
+pub(crate) fn canonical_source_offset_for_row(
     cursor: &RenderedCursor,
-    current: (usize, usize),
+    current_offset: usize,
     layout: &RenderedLayout,
-    text: &str,
-) -> (usize, usize) {
-    let current_offset = doc_position_to_byte_offset(current.0, current.1, text);
+) -> usize {
     let Some(line) = layout.lines.get(cursor.line) else {
-        return leave_rendered(cursor, layout, text);
+        return layout
+            .lines
+            .iter()
+            .rev()
+            .find(|line| line.kind == LineKind::Content)
+            .map_or(0, |line| line.source.start);
     };
-    if line
+    let selected_source = line
         .atoms
         .iter()
         .find(|atom| atom.columns.contains(&cursor.column) || atom.columns.start == cursor.column)
         .and_then(|atom| atom.source.as_ref())
-        .is_some_and(|source| source.contains(&current_offset) || source.start == current_offset)
-    {
-        current
-    } else {
-        leave_rendered(cursor, layout, text)
-    }
-}
-
-fn byte_offset_to_doc_position(offset: usize, text: &str) -> (usize, usize) {
-    let offset = offset.min(text.len());
-    let line_start = text[..offset].rfind('\n').map_or(0, |newline| newline + 1);
-    let line = text[..line_start]
-        .bytes()
-        .filter(|byte| *byte == b'\n')
-        .count();
-    let column = text[line_start..offset].chars().count();
-    (line, column)
+        .or_else(|| {
+            line.atoms
+                .iter()
+                .filter_map(|atom| atom.source.as_ref())
+                .min_by_key(|source| source.start)
+        });
+    selected_source.map_or(line.source.start, |source| {
+        if source.contains(&current_offset) || source.start == current_offset {
+            current_offset
+        } else {
+            source.start
+        }
+    })
 }
 
 pub(crate) fn cursor_for_row(
@@ -809,12 +777,6 @@ fn normalize_ranges(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
     normalized
 }
 
-/// Convert a source byte range to a 0-based document line number.
-fn source_to_doc_line(source: &Range<usize>, text: &str) -> usize {
-    let start = source.start.min(text.len());
-    text[..start].chars().filter(|&c| c == '\n').count()
-}
-
 /// Convert a 0-based document position to a byte offset, clamping positions
 /// beyond the line or document to the nearest valid offset.
 pub(crate) fn doc_position_to_byte_offset(line: usize, col: usize, text: &str) -> usize {
@@ -854,6 +816,17 @@ pub struct RenderedKeyResult {
     pub fm_collapsed_toggled: bool,
     /// Status message to display (e.g. "Search wrapped", "FM collapsed").
     pub message: Option<String>,
+}
+
+/// Whether a rendered command needs to inspect source characters. Ordinary
+/// row, atom, edge, count, and jump navigation is entirely layout-backed.
+pub(crate) fn key_inspects_source(key: crate::session::KeyInput) -> bool {
+    matches!(
+        key.code.kind,
+        crate::session::KeyCodeKind::Char('w' | 'W' | 'e' | 'E' | 'b' | 'B' | 'n' | 'N')
+    ) && !key.mods.ctrl
+        && !key.mods.alt
+        && !key.mods.shift
 }
 
 /// Handle a key in rendered mode. Returns the effect of the keypress.
