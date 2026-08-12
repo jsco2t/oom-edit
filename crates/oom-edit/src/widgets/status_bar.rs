@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::{
     layout::{Alignment, Position, Rect},
-    style::Style,
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Paragraph},
     Frame,
@@ -173,7 +173,10 @@ pub fn render(
 
     let badge_width = MODE_BADGE_COLS.min(area.width);
     let badge_area = Rect::new(area.x, area.y, badge_width, 1.min(area.height));
-    frame.render_widget(Block::default().style(text.badge.style), badge_area);
+    // The badge is composited over the dimmed status row. Explicitly remove
+    // DIM so the mode label retains the intended black, bold contrast.
+    let badge_style = text.badge.style.remove_modifier(Modifier::DIM);
+    frame.render_widget(Block::default().style(badge_style), badge_area);
     frame.render_widget(Paragraph::new(Line::from(text.badge.clone())), badge_area);
 
     let gap_width = MODE_BADGE_GAP_COLS.min(area.width.saturating_sub(badge_width));
@@ -457,12 +460,15 @@ mod tests {
                 let cell = buffer.cell((x, 0)).unwrap();
                 assert_eq!(cell.fg, crate::theme::TEST_EXACT_BLACK);
                 assert_eq!(cell.bg, badge_style.bg.unwrap());
+                assert!(cell.modifier.contains(ratatui::style::Modifier::BOLD));
+                assert!(!cell.modifier.contains(ratatui::style::Modifier::DIM));
             }
             let row_style = DEFAULT_DARK.ui_style(Tier::TrueColor, UiSlot::StatusBar);
             let gap = buffer.cell((MODE_BADGE_COLS, 0)).unwrap();
             assert_eq!(gap.symbol(), " ");
             assert_eq!(gap.fg, row_style.fg.unwrap());
             assert_eq!(gap.bg, row_style.bg.unwrap());
+            assert!(gap.modifier.contains(ratatui::style::Modifier::DIM));
             assert_eq!(
                 buffer.cell((STATUS_CONTENT_OFFSET, 0)).unwrap().symbol(),
                 "S"

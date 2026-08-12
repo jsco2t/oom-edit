@@ -883,6 +883,8 @@ fn default_dark_styles_reach_all_four_modes() {
                     assert_eq!(cell.symbol(), expected.to_string());
                     assert_eq!(cell.fg, badge_style.fg.unwrap_or_default());
                     assert_eq!(cell.bg, badge_style.bg.unwrap_or_default());
+                    assert!(cell.modifier.contains(Modifier::BOLD));
+                    assert!(!cell.modifier.contains(Modifier::DIM));
                     if theme_name == "default-dark" && capability == Tier::TrueColor {
                         assert_eq!(cell.fg, crate::theme::TEST_EXACT_BLACK);
                     }
@@ -894,6 +896,7 @@ fn default_dark_styles_reach_all_four_modes() {
                 assert_eq!(gap.symbol(), " ");
                 assert_eq!(gap.fg, status_style.fg.unwrap_or_default());
                 assert_eq!(gap.bg, status_style.bg.unwrap_or_default());
+                assert!(gap.modifier.contains(status_style.add_modifier));
             }
         }
     }
