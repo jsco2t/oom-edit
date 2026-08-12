@@ -244,7 +244,7 @@ pub fn render_status_row(
     } else {
         let flexible_width = area
             .width
-            .saturating_sub(status_bar::MODE_BADGE_COLS)
+            .saturating_sub(status_bar::STATUS_CONTENT_OFFSET)
             .saturating_sub(status_bar::RULER_COLS);
         let cells = hint_bar::build_hints(ctx);
         hint_bar::format_hints(&cells, flexible_width)
@@ -329,15 +329,25 @@ mod tests {
     }
 
     #[test]
-    fn prompt_cursor_is_offset_after_badge() {
+    fn prompt_cursor_is_offset_after_badge_gap() {
+        let row_style = DEFAULT_DARK.ui_style(Tier::TrueColor, crate::theme::UiSlot::StatusBar);
+
         let mut command = EditorSession::from_text("hello");
         feed(&mut command, ":w");
         let command_terminal = render_session_status(&command, 80);
         assert_eq!(
             command_terminal.backend().cursor_position(),
-            ratatui::layout::Position::new(status_bar::MODE_BADGE_COLS + 2, 0)
+            ratatui::layout::Position::new(status_bar::STATUS_CONTENT_OFFSET + 2, 0)
         );
         assert!(buffer_row(&command_terminal, 0, 80).starts_with(" :CMD    :w"));
+        let command_gap = command_terminal
+            .backend()
+            .buffer()
+            .cell((status_bar::MODE_BADGE_COLS, 0))
+            .unwrap();
+        assert_eq!(command_gap.symbol(), " ");
+        assert_eq!(command_gap.fg, row_style.fg.unwrap());
+        assert_eq!(command_gap.bg, row_style.bg.unwrap());
 
         let mut rendered_search = EditorSession::from_text("# heading");
         rendered_search.render_layout(76);
@@ -345,9 +355,30 @@ mod tests {
         let view_terminal = render_session_status(&rendered_search, 80);
         assert_eq!(
             view_terminal.backend().cursor_position(),
-            ratatui::layout::Position::new(status_bar::MODE_BADGE_COLS + 5, 0)
+            ratatui::layout::Position::new(status_bar::STATUS_CONTENT_OFFSET + 5, 0)
         );
         assert!(buffer_row(&view_terminal, 0, 80).starts_with(" NORMAL  /head"));
+        let search_gap = view_terminal
+            .backend()
+            .buffer()
+            .cell((status_bar::MODE_BADGE_COLS, 0))
+            .unwrap();
+        assert_eq!(search_gap.symbol(), " ");
+        assert_eq!(search_gap.fg, row_style.fg.unwrap());
+        assert_eq!(search_gap.bg, row_style.bg.unwrap());
+    }
+
+    #[test]
+    fn hint_fitting_reserves_badge_gap() {
+        let session = EditorSession::from_text("hello");
+        let terminal = render_session_status(&session, 70);
+        let row = buffer_row(&terminal, 0, 70);
+        let middle_start = status_bar::STATUS_CONTENT_OFFSET as usize;
+        let middle_end = 70 - status_bar::RULER_COLS as usize;
+        let middle = &row[middle_start..middle_end];
+
+        assert_eq!(middle.trim_end(), "v=character-wise selection");
+        assert!(!middle.contains("Space w"));
     }
 
     #[test]

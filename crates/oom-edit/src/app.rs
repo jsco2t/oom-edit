@@ -434,11 +434,12 @@ impl App {
 
         let ctx = self.mode_context();
         if let Some(text) = which_key::build_hint(ctx) {
-            let badge_width = crate::widgets::status_bar::MODE_BADGE_COLS.min(status_area.width);
+            let content_offset =
+                crate::widgets::status_bar::STATUS_CONTENT_OFFSET.min(status_area.width);
             let flexible_area = ratatui::layout::Rect::new(
-                status_area.x.saturating_add(badge_width),
+                status_area.x.saturating_add(content_offset),
                 status_area.y,
-                status_area.width.saturating_sub(badge_width),
+                status_area.width.saturating_sub(content_offset),
                 status_area.height,
             );
             which_key::render(frame, flexible_area, &text);
@@ -2771,6 +2772,43 @@ mod tests {
 
         // should_show should return true at 200ms delay.
         assert!(crate::widgets::which_key::should_show(Some(instant), later));
+    }
+
+    #[test]
+    fn app_which_key_preserves_mode_badge_gap() {
+        let session = EditorSession::from_text("hello");
+        let mut app = test_app(session);
+        let space = KeyEvent::new(CrosstermKeyCode::Char(' '), KeyModifiers::NONE);
+        app.handle_event(&Event::Key(space));
+        let PendingAppInput::Space { since } = app.pending_input else {
+            panic!("Space must establish pending App input");
+        };
+        app.tick(since + std::time::Duration::from_millis(200));
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(70, 10)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let status_y = 9;
+        let row_style = theme::DEFAULT_DARK.ui_style(Tier::TrueColor, theme::UiSlot::StatusBar);
+        let gap = buffer
+            .cell((crate::widgets::status_bar::MODE_BADGE_COLS, status_y))
+            .unwrap();
+        assert_eq!(gap.symbol(), " ");
+        assert_eq!(gap.fg, row_style.fg.unwrap());
+        assert_eq!(gap.bg, row_style.bg.unwrap());
+
+        let row: String = (0..70)
+            .map(|x| buffer.cell((x, status_y)).unwrap().symbol())
+            .collect();
+        let which_key_x = row
+            .find("Space:")
+            .expect("delayed which-key text must render") as u16;
+        assert_eq!(
+            which_key_x,
+            crate::widgets::status_bar::STATUS_CONTENT_OFFSET
+        );
     }
 
     /// T12: Routing order — overlay takes precedence over keymap.

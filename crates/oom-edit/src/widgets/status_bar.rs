@@ -3,9 +3,10 @@
 //! Pure build + thin render: `build_status()` returns a ready-to-render
 //! `StatusBarText`; `render()` maps it to ratatui widgets.
 //!
-//! Layout: `[badge Length(MODE_BADGE_COLS), middle Min(0), ruler Length(RULER_COLS)]`.
-//! Command and rendered-search prompts use the middle plus ruler region while the
-//! badge remains fixed at the left edge.
+//! Layout: `[badge Length(MODE_BADGE_COLS), gap Length(MODE_BADGE_GAP_COLS),
+//! middle Min(0), ruler Length(RULER_COLS)]`. Command and rendered-search prompts
+//! use the middle plus ruler region while the badge and gap remain fixed at the
+//! left edge.
 //!
 //! FR-6.2, FR-6.4.
 
@@ -30,7 +31,13 @@ pub const TRANSIENT_TTL: Duration = Duration::from_secs(4);
 pub const RULER_COLS: u16 = 22;
 
 /// Fixed mode-badge width, sized for the longest public mode label.
-pub const MODE_BADGE_COLS: u16 = 9;
+pub const MODE_BADGE_COLS: u16 = 8;
+
+/// Blank status-row-colored gap after the mode badge.
+pub const MODE_BADGE_GAP_COLS: u16 = 1;
+
+/// Fixed offset where flexible status content begins.
+pub const STATUS_CONTENT_OFFSET: u16 = MODE_BADGE_COLS + MODE_BADGE_GAP_COLS;
 
 /// Severity glyph prefix for status messages.
 fn severity_glyph(severity: Severity) -> &'static str {
@@ -169,8 +176,10 @@ pub fn render(
     frame.render_widget(Block::default().style(text.badge.style), badge_area);
     frame.render_widget(Paragraph::new(Line::from(text.badge.clone())), badge_area);
 
-    let flexible_x = area.x.saturating_add(badge_width);
-    let flexible_width = area.width.saturating_sub(badge_width);
+    let gap_width = MODE_BADGE_GAP_COLS.min(area.width.saturating_sub(badge_width));
+    let content_offset = badge_width.saturating_add(gap_width);
+    let flexible_x = area.x.saturating_add(content_offset);
+    let flexible_width = area.width.saturating_sub(content_offset);
     if flexible_width == 0 {
         return;
     }
@@ -428,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn status_badge_has_fixed_geometry_and_row_background() {
+    fn status_badge_has_fixed_geometry_dark_text_and_visual_gap() {
         for mode in [Mode::Normal, Mode::Insert, Mode::Select, Mode::Command] {
             let terminal = render_status(mode, 80, Tier::TrueColor);
             let buffer = terminal.backend().buffer();
@@ -436,26 +445,37 @@ mod tests {
             let label: String = (0..MODE_BADGE_COLS)
                 .map(|x| buffer.cell((x, 0)).unwrap().symbol())
                 .collect();
-            assert!(label.starts_with(mode_badge(mode)));
+            assert_eq!(
+                label,
+                format!(
+                    "{:<width$}",
+                    mode_badge(mode),
+                    width = MODE_BADGE_COLS as usize
+                )
+            );
             for x in 0..MODE_BADGE_COLS {
                 let cell = buffer.cell((x, 0)).unwrap();
-                assert_eq!(cell.fg, badge_style.fg.unwrap());
+                assert_eq!(cell.fg, crate::theme::TEST_EXACT_BLACK);
                 assert_eq!(cell.bg, badge_style.bg.unwrap());
             }
-            let row_bg = DEFAULT_DARK
-                .ui_style(Tier::TrueColor, UiSlot::StatusBar)
-                .bg
-                .unwrap();
-            for x in MODE_BADGE_COLS..80 {
-                assert_eq!(buffer.cell((x, 0)).unwrap().bg, row_bg);
-            }
+            let row_style = DEFAULT_DARK.ui_style(Tier::TrueColor, UiSlot::StatusBar);
+            let gap = buffer.cell((MODE_BADGE_COLS, 0)).unwrap();
+            assert_eq!(gap.symbol(), " ");
+            assert_eq!(gap.fg, row_style.fg.unwrap());
+            assert_eq!(gap.bg, row_style.bg.unwrap());
+            assert_eq!(
+                buffer.cell((STATUS_CONTENT_OFFSET, 0)).unwrap().symbol(),
+                "S"
+            );
         }
     }
 
     #[test]
-    fn status_render_saturates_at_zero_and_narrow_widths() {
+    fn status_render_saturates_at_badge_gap_boundaries() {
         let text = status(Mode::Normal).build(None, &DEFAULT_DARK, Tier::TrueColor);
-        for width in [0, 1, 5, 40, 80, 200] {
+        let badge_style = mode_badge_style(Mode::Normal, &DEFAULT_DARK, Tier::TrueColor);
+        let row_style = DEFAULT_DARK.ui_style(Tier::TrueColor, UiSlot::StatusBar);
+        for width in [0, 1, 7, 8, 9, 10, 40, 80, 200] {
             let mut terminal = Terminal::new(TestBackend::new(width.max(1), 1)).unwrap();
             terminal
                 .draw(|frame| {
@@ -464,12 +484,34 @@ mod tests {
                         Rect::new(0, 0, width, 1),
                         &text,
                         "Space h=help",
-                        true,
+                        false,
                         &DEFAULT_DARK,
                         Tier::TrueColor,
                     );
                 })
                 .unwrap();
+
+            if width == 0 {
+                continue;
+            }
+            let buffer = terminal.backend().buffer();
+            for x in 0..MODE_BADGE_COLS.min(width) {
+                let cell = buffer.cell((x, 0)).unwrap();
+                assert_eq!(cell.fg, badge_style.fg.unwrap());
+                assert_eq!(cell.bg, badge_style.bg.unwrap());
+            }
+            if width > MODE_BADGE_COLS {
+                let gap = buffer.cell((MODE_BADGE_COLS, 0)).unwrap();
+                assert_eq!(gap.symbol(), " ");
+                assert_eq!(gap.fg, row_style.fg.unwrap());
+                assert_eq!(gap.bg, row_style.bg.unwrap());
+            }
+            if width > STATUS_CONTENT_OFFSET {
+                let first_content = buffer.cell((STATUS_CONTENT_OFFSET, 0)).unwrap();
+                assert_eq!(first_content.symbol(), "S");
+                assert_eq!(first_content.fg, row_style.fg.unwrap());
+                assert_eq!(first_content.bg, row_style.bg.unwrap());
+            }
         }
     }
 

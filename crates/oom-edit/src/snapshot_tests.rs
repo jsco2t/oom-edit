@@ -873,12 +873,27 @@ fn default_dark_styles_reach_all_four_modes() {
                     assert!(cell.modifier.contains(heading_style.add_modifier));
                 }
                 let badge_style = get_theme(theme_name).ui_style(capability, slot);
-                for (x, expected) in badge.chars().enumerate() {
+                let expected_badge = format!(
+                    "{:<width$}",
+                    badge,
+                    width = crate::widgets::status_bar::MODE_BADGE_COLS as usize
+                );
+                for (x, expected) in expected_badge.chars().enumerate() {
                     let cell = buffer.cell((x as u16, 7)).unwrap();
                     assert_eq!(cell.symbol(), expected.to_string());
                     assert_eq!(cell.fg, badge_style.fg.unwrap_or_default());
                     assert_eq!(cell.bg, badge_style.bg.unwrap_or_default());
+                    if theme_name == "default-dark" && capability == Tier::TrueColor {
+                        assert_eq!(cell.fg, crate::theme::TEST_EXACT_BLACK);
+                    }
                 }
+                let status_style = get_theme(theme_name).ui_style(capability, UiSlot::StatusBar);
+                let gap = buffer
+                    .cell((crate::widgets::status_bar::MODE_BADGE_COLS, 7))
+                    .unwrap();
+                assert_eq!(gap.symbol(), " ");
+                assert_eq!(gap.fg, status_style.fg.unwrap_or_default());
+                assert_eq!(gap.bg, status_style.bg.unwrap_or_default());
             }
         }
     }

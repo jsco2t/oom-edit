@@ -38,6 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Mode badges now use crisp black text and leave a one-cell status-row-colored gap before adjacent status content.
 - Space-q and `:q` now share captured-tab dirty confirmation; save/discard/cancel, external overwrite/reload, and `:wq` continuations act on the original tab. Dirty non-force `:tabclose`, `:e`, and `:qa` consistently refuse with their force remedy, while forced variants affect only their requested target.
 - `gt`, `gT`, counted `gt`, and Space-digit tab switching now use one typed routing path without stealing editor-native `gg`, `gu`, or `gU` prefixes.
 - Rendered and source scrolling now avoid document-sized navigation, edit-validation, and line-index work on each key or frame, restoring responsive Insert edits and keyboard/mouse scrolling near the 1 MB boundary.

@@ -22,6 +22,8 @@ pub(crate) const ZED_UI_TEXT: Color = Color::Rgb(200, 204, 212);
 pub(crate) const ZED_CYAN: Color = Color::Rgb(110, 180, 191);
 #[cfg(test)]
 pub(crate) const ZED_ORANGE: Color = Color::Rgb(191, 149, 106);
+#[cfg(test)]
+pub(crate) const TEST_EXACT_BLACK: Color = Color::Rgb(0, 0, 0);
 
 // ── UI Slots ────────────────────────────────────────────────────────────────
 
@@ -770,25 +772,25 @@ pub static DEFAULT_DARK: Theme = Theme {
             ),
             (
                 UiSlot::BadgeNormal,
-                Color::Rgb(40, 44, 51),
+                Color::Rgb(0, 0, 0),
                 Some(Color::Rgb(115, 173, 233)),
                 Modifier::BOLD,
             ),
             (
                 UiSlot::BadgeInsert,
-                Color::Rgb(40, 44, 51),
+                Color::Rgb(0, 0, 0),
                 Some(Color::Rgb(161, 193, 129)),
                 Modifier::BOLD,
             ),
             (
                 UiSlot::BadgeSelect,
-                Color::Rgb(40, 44, 51),
+                Color::Rgb(0, 0, 0),
                 Some(Color::Rgb(180, 119, 207)),
                 Modifier::BOLD,
             ),
             (
                 UiSlot::BadgeCommand,
-                Color::Rgb(40, 44, 51),
+                Color::Rgb(0, 0, 0),
                 Some(Color::Rgb(223, 193, 132)),
                 Modifier::BOLD,
             ),
@@ -2159,7 +2161,6 @@ mod tests {
 
         let expected_ui = [
             (UiSlot::StatusBar, Color::Rgb(200, 204, 212)),
-            (UiSlot::BadgeNormal, Color::Rgb(40, 44, 51)),
             (UiSlot::Border, Color::Rgb(47, 52, 62)),
             (UiSlot::HintKey, Color::Rgb(223, 193, 132)),
             (UiSlot::StatusError, Color::Rgb(208, 114, 119)),
@@ -2171,6 +2172,18 @@ mod tests {
                 DEFAULT_DARK.ui_style(Tier::TrueColor, slot).fg,
                 Some(expected),
                 "unexpected Zed foreground for {slot:?}"
+            );
+        }
+        for slot in [
+            UiSlot::BadgeNormal,
+            UiSlot::BadgeInsert,
+            UiSlot::BadgeSelect,
+            UiSlot::BadgeCommand,
+        ] {
+            assert_eq!(
+                DEFAULT_DARK.ui_style(Tier::TrueColor, slot).fg,
+                Some(Color::Rgb(0, 0, 0)),
+                "{slot:?} must use deterministic black independently of the Zed palette"
             );
         }
         assert_eq!(
@@ -2378,7 +2391,7 @@ mod tests {
                     let style = theme.ui_style(tier, slot);
                     let expected_black = if theme.name == "default-dark" && tier == Tier::TrueColor
                     {
-                        Color::Rgb(40, 44, 51)
+                        Color::Rgb(0, 0, 0)
                     } else {
                         Color::Black
                     };
