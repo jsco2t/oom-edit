@@ -18,6 +18,7 @@ fn public_facade_types_are_available_at_crate_root() {
     let _: RenderedPoint = session.rendered_cursor();
     let _: &RenderedLayout = session.render_layout(20);
     let _: Option<RenderedSelection> = session.rendered_selection();
+    let _: RenderedLineRole = RenderedLineRole::CodeFence;
     let _: SourceFrame = session.render_source(Viewport {
         top_line: 0,
         height: 2,

@@ -400,6 +400,8 @@ impl<'a> RenderedLayoutBuilder<'a> {
             return;
         }
 
+        let first_fence_line = self.lines.len();
+
         // Fenced code block with gutter
         let gutter = "▏";
         let lang_tag = lang.as_deref().unwrap_or("");
@@ -461,6 +463,10 @@ impl<'a> RenderedLayoutBuilder<'a> {
             },
             content_span.end.min(source.end)..source.end,
         );
+
+        for line in &mut self.lines[first_fence_line..] {
+            line.role = RenderedLineRole::CodeFence;
+        }
     }
 
     fn render_fenced_code_body(

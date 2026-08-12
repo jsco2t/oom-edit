@@ -144,6 +144,8 @@ pub enum RenderedLineRole {
     Document,
     /// YAML/TOML metadata panel content.
     Metadata,
+    /// Rendered fenced-code surface, including header, body, and closing rows.
+    CodeFence,
 }
 
 /// A single rendered Markdown line.

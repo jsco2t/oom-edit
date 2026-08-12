@@ -62,6 +62,8 @@ pub enum UiSlot {
     GutterCurrent,
     /// Full-width cursor-line chrome in the source editor.
     CursorLine,
+    /// Renderer-owned surface behind fenced-code rows.
+    CodeFence,
     /// Renderer-owned surface behind YAML/TOML metadata rows.
     MetadataPanel,
     /// Active tab label.
@@ -850,6 +852,12 @@ pub static DEFAULT_DARK: Theme = Theme {
                 Modifier::DIM,
             ),
             (
+                UiSlot::CodeFence,
+                Color::Reset,
+                Some(Color::Rgb(44, 48, 56)),
+                Modifier::empty(),
+            ),
+            (
                 UiSlot::TabActive,
                 Color::Rgb(200, 204, 212),
                 None,
@@ -967,6 +975,12 @@ pub static DEFAULT_DARK: Theme = Theme {
                 Some(Color::DarkGray),
                 Modifier::DIM,
             ),
+            (
+                UiSlot::CodeFence,
+                Color::Reset,
+                Some(Color::DarkGray),
+                Modifier::empty(),
+            ),
             (UiSlot::TabActive, Color::White, None, Modifier::BOLD),
             (UiSlot::TabInactive, Color::Gray, None, Modifier::DIM),
             (
@@ -1031,6 +1045,7 @@ pub static DEFAULT_DARK: Theme = Theme {
             (UiSlot::Gutter, Modifier::DIM),
             (UiSlot::GutterCurrent, Modifier::BOLD),
             (UiSlot::CursorLine, Modifier::UNDERLINED),
+            (UiSlot::CodeFence, Modifier::empty()),
             (UiSlot::TabActive, Modifier::BOLD),
             (UiSlot::TabInactive, Modifier::DIM),
             (UiSlot::MetadataPanel, Modifier::DIM),
@@ -1131,6 +1146,12 @@ pub static DEFAULT_LIGHT: Theme = Theme {
                 Some(Color::Gray),
                 Modifier::DIM,
             ),
+            (
+                UiSlot::CodeFence,
+                Color::Reset,
+                Some(Color::Rgb(245, 246, 248)),
+                Modifier::empty(),
+            ),
             (UiSlot::TabActive, Color::Black, None, Modifier::BOLD),
             (UiSlot::TabInactive, Color::Gray, None, Modifier::DIM),
             (
@@ -1230,6 +1251,12 @@ pub static DEFAULT_LIGHT: Theme = Theme {
                 Some(Color::Gray),
                 Modifier::DIM,
             ),
+            (
+                UiSlot::CodeFence,
+                Color::Reset,
+                Some(Color::Gray),
+                Modifier::empty(),
+            ),
             (UiSlot::TabActive, Color::Black, None, Modifier::BOLD),
             (UiSlot::TabInactive, Color::Gray, None, Modifier::DIM),
             (
@@ -1294,6 +1321,7 @@ pub static DEFAULT_LIGHT: Theme = Theme {
             (UiSlot::Gutter, Modifier::DIM),
             (UiSlot::GutterCurrent, Modifier::BOLD),
             (UiSlot::CursorLine, Modifier::UNDERLINED),
+            (UiSlot::CodeFence, Modifier::empty()),
             (UiSlot::TabActive, Modifier::BOLD),
             (UiSlot::TabInactive, Modifier::DIM),
             (UiSlot::MetadataPanel, Modifier::DIM),
@@ -1359,6 +1387,7 @@ pub static ACCESSIBLE: Theme = Theme {
             (UiSlot::Gutter, Modifier::DIM),
             (UiSlot::GutterCurrent, Modifier::BOLD),
             (UiSlot::CursorLine, Modifier::UNDERLINED),
+            (UiSlot::CodeFence, Modifier::empty()),
             (UiSlot::TabActive, Modifier::BOLD),
             (UiSlot::TabInactive, Modifier::DIM),
             (UiSlot::MetadataPanel, Modifier::DIM),
@@ -1418,6 +1447,7 @@ pub static ACCESSIBLE: Theme = Theme {
             (UiSlot::Gutter, Modifier::DIM),
             (UiSlot::GutterCurrent, Modifier::BOLD),
             (UiSlot::CursorLine, Modifier::UNDERLINED),
+            (UiSlot::CodeFence, Modifier::empty()),
             (UiSlot::TabActive, Modifier::BOLD),
             (UiSlot::TabInactive, Modifier::DIM),
             (UiSlot::MetadataPanel, Modifier::DIM),
@@ -1477,6 +1507,7 @@ pub static ACCESSIBLE: Theme = Theme {
             (UiSlot::Gutter, Modifier::DIM),
             (UiSlot::GutterCurrent, Modifier::BOLD),
             (UiSlot::CursorLine, Modifier::UNDERLINED),
+            (UiSlot::CodeFence, Modifier::empty()),
             (UiSlot::TabActive, Modifier::BOLD),
             (UiSlot::TabInactive, Modifier::DIM),
             (UiSlot::MetadataPanel, Modifier::DIM),
@@ -1663,6 +1694,7 @@ mod tests {
             UiSlot::Gutter,
             UiSlot::GutterCurrent,
             UiSlot::CursorLine,
+            UiSlot::CodeFence,
             UiSlot::TabActive,
             UiSlot::TabInactive,
             UiSlot::MetadataPanel,
@@ -2223,7 +2255,10 @@ mod tests {
             }
         }
         for (slot, foreground, background, _) in *ui {
-            if matches!(slot, UiSlot::CursorLine | UiSlot::MetadataPanel) {
+            if matches!(
+                slot,
+                UiSlot::CursorLine | UiSlot::CodeFence | UiSlot::MetadataPanel
+            ) {
                 assert_eq!(
                     *foreground,
                     Color::Reset,
@@ -2280,6 +2315,7 @@ mod tests {
             UiSlot::Gutter,
             UiSlot::GutterCurrent,
             UiSlot::CursorLine,
+            UiSlot::CodeFence,
             UiSlot::TabActive,
             UiSlot::TabInactive,
             UiSlot::MetadataPanel,
@@ -2326,6 +2362,66 @@ mod tests {
             let style = theme.ui_style(Tier::Monochrome, UiSlot::MetadataPanel);
             assert_eq!(style.fg, Some(Color::Reset));
             assert!(!style.add_modifier.is_empty(), "{} monochrome", theme.name);
+        }
+    }
+
+    #[test]
+    fn code_fence_surface_is_subtle_and_theme_appropriate() {
+        for (theme, tier, expected_background) in [
+            (&DEFAULT_DARK, Tier::TrueColor, Color::Rgb(44, 48, 56)),
+            (&DEFAULT_DARK, Tier::Color16, Color::DarkGray),
+            (&DEFAULT_LIGHT, Tier::TrueColor, Color::Rgb(245, 246, 248)),
+            (&DEFAULT_LIGHT, Tier::Color16, Color::Gray),
+        ] {
+            let palette = theme.palette_for(tier);
+            let raw_foreground = match palette {
+                Palette::TrueColor { ui, .. } | Palette::Color16 { ui, .. } => ui
+                    .iter()
+                    .find(|(slot, ..)| *slot == UiSlot::CodeFence)
+                    .map(|(_, foreground, _, _)| *foreground)
+                    .expect("code-fence slot must exist"),
+                Palette::Monochrome { .. } => panic!("expected a color palette"),
+            };
+            assert_eq!(raw_foreground, Color::Reset);
+
+            let style = theme.ui_style(tier, UiSlot::CodeFence);
+            assert_eq!(style.fg, None, "{} {tier:?}", theme.name);
+            assert_eq!(
+                style.bg,
+                Some(expected_background),
+                "{} {tier:?}",
+                theme.name
+            );
+            assert!(style.add_modifier.is_empty(), "{} {tier:?}", theme.name);
+        }
+
+        for theme in [&DEFAULT_DARK, &DEFAULT_LIGHT] {
+            let fence = theme.ui_style(Tier::TrueColor, UiSlot::CodeFence);
+            assert_ne!(
+                fence.bg,
+                theme.ui_style(Tier::TrueColor, UiSlot::MetadataPanel).bg,
+                "{} fence surface must be subtler than metadata",
+                theme.name
+            );
+            assert_ne!(
+                fence.bg,
+                theme.ui_style(Tier::TrueColor, UiSlot::CursorLine).bg,
+                "{} fence surface must be subtler than the cursor",
+                theme.name
+            );
+        }
+
+        for theme in BUILTIN_THEMES.iter().map(|spec| spec.theme) {
+            let style = theme.ui_style(Tier::Monochrome, UiSlot::CodeFence);
+            assert_eq!(style.fg, Some(Color::Reset), "{} monochrome", theme.name);
+            assert_eq!(style.bg, None, "{} monochrome", theme.name);
+            assert!(style.add_modifier.is_empty(), "{} monochrome", theme.name);
+        }
+        for tier in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
+            let style = ACCESSIBLE.ui_style(tier, UiSlot::CodeFence);
+            assert_eq!(style.fg, Some(Color::Reset), "accessible {tier:?}");
+            assert_eq!(style.bg, None, "accessible {tier:?}");
+            assert!(style.add_modifier.is_empty(), "accessible {tier:?}");
         }
     }
 

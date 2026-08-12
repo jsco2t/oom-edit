@@ -1,7 +1,7 @@
 //! Tests for the rendered block model and layout.
 
 use crate::rendered::{Block, BlockKind, BlockModel, Inline, ListItem};
-use crate::style::{LineKind, SemanticStyle};
+use crate::style::{LineKind, RenderedLineRole, SemanticStyle};
 use crate::syntax::Highlighter;
 use crate::{RenderedLayout, TargetKind};
 use std::path::Path;
@@ -686,6 +686,173 @@ fn test_fenced_code_blocks() {
             assert!(!content_span.is_empty());
         }
         _ => panic!("expected CodeFence, got {:?}", model.blocks[1].kind),
+    }
+}
+
+#[test]
+fn fenced_layout_marks_complete_surface_role() {
+    let text = "```rust\nfn main() {}\n\nlet value = \"ok\";\n```\n```mystery\nopaque\n```\n```\n```\n\n    indented\n";
+    let layout = rendered_layout(text);
+    let rendered = layout
+        .lines
+        .iter()
+        .map(|line| line.styled.text.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        rendered,
+        [
+            "▏ rust",
+            "▏ fn main() {}",
+            "▏ ",
+            "▏ let value = \"ok\";",
+            "▏",
+            "",
+            "▏ mystery",
+            "▏ opaque",
+            "▏",
+            "",
+            "▏ ",
+            "▏ ",
+            "▏",
+            "",
+            "indented",
+        ]
+    );
+
+    let expected_roles = [
+        RenderedLineRole::CodeFence,
+        RenderedLineRole::CodeFence,
+        RenderedLineRole::CodeFence,
+        RenderedLineRole::CodeFence,
+        RenderedLineRole::CodeFence,
+        RenderedLineRole::Document,
+        RenderedLineRole::CodeFence,
+        RenderedLineRole::CodeFence,
+        RenderedLineRole::CodeFence,
+        RenderedLineRole::Document,
+        RenderedLineRole::CodeFence,
+        RenderedLineRole::CodeFence,
+        RenderedLineRole::CodeFence,
+        RenderedLineRole::Document,
+        RenderedLineRole::Document,
+    ];
+    let expected_kinds = [
+        LineKind::Synthetic,
+        LineKind::Content,
+        LineKind::Content,
+        LineKind::Content,
+        LineKind::Synthetic,
+        LineKind::Synthetic,
+        LineKind::Synthetic,
+        LineKind::Content,
+        LineKind::Synthetic,
+        LineKind::Synthetic,
+        LineKind::Synthetic,
+        LineKind::Content,
+        LineKind::Synthetic,
+        LineKind::Synthetic,
+        LineKind::Content,
+    ];
+    assert_eq!(
+        layout
+            .lines
+            .iter()
+            .map(|line| line.role)
+            .collect::<Vec<_>>(),
+        expected_roles
+    );
+    assert_eq!(
+        layout
+            .lines
+            .iter()
+            .map(|line| line.kind)
+            .collect::<Vec<_>>(),
+        expected_kinds
+    );
+
+    let known_body = &layout.lines[1];
+    assert!(known_body
+        .styled
+        .spans
+        .iter()
+        .any(|span| span.style == SemanticStyle::Keyword));
+    let unknown_body = &layout.lines[7];
+    assert_eq!(
+        unknown_body
+            .styled
+            .spans
+            .iter()
+            .map(|span| span.style)
+            .collect::<Vec<_>>(),
+        [SemanticStyle::Muted, SemanticStyle::Text],
+        "unknown-language content must retain its existing plain-text foreground"
+    );
+    assert_eq!(&text[known_body.source.clone()], "fn main() {}\n");
+    assert_eq!(&text[unknown_body.source.clone()], "opaque");
+    assert_eq!(&text[layout.lines[14].source.clone()], "indented");
+
+    for line in &layout.lines {
+        assert!(line.source.end <= text.len());
+        assert!(text.is_char_boundary(line.source.start));
+        assert!(text.is_char_boundary(line.source.end));
+        let mut previous_end = 0;
+        for atom in &line.atoms {
+            assert!(atom.columns.start >= previous_end);
+            assert!(atom.columns.start <= atom.columns.end);
+            previous_end = atom.columns.end;
+            if let Some(source) = &atom.source {
+                assert!(source.end <= text.len());
+                assert!(text.is_char_boundary(source.start));
+                assert!(text.is_char_boundary(source.end));
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_fence_surface_role_survives_container_prefixes() {
+    let text = "- Before fence\n  ```rust\n  let value = 1;\n  ```\n  After fence\n\n> Before quote fence\n> ```text\n> quoted code\n> ```\n> After quote fence";
+    let layout = rendered_layout(text);
+
+    let fence_rows = layout
+        .lines
+        .iter()
+        .filter(|line| line.styled.text.contains('▏'))
+        .collect::<Vec<_>>();
+    assert_eq!(fence_rows.len(), 8);
+    assert!(fence_rows
+        .iter()
+        .all(|line| line.role == RenderedLineRole::CodeFence));
+    assert!(fence_rows
+        .iter()
+        .any(|line| line.styled.text.starts_with("  ▏ rust")));
+    assert!(fence_rows
+        .iter()
+        .any(|line| line.styled.text.starts_with("┃ ▏ text")));
+
+    for label in [
+        "Before fence",
+        "After fence",
+        "Before quote fence",
+        "After quote fence",
+    ] {
+        let line = layout
+            .lines
+            .iter()
+            .find(|line| line.styled.text.contains(label))
+            .unwrap_or_else(|| panic!("missing neighboring prose {label:?}"));
+        assert_eq!(line.role, RenderedLineRole::Document);
+    }
+
+    for line in &layout.lines {
+        for atom in &line.atoms {
+            if let Some(source) = &atom.source {
+                assert!(source.end <= text.len());
+                assert!(text.is_char_boundary(source.start));
+                assert!(text.is_char_boundary(source.end));
+            }
+        }
     }
 }
 

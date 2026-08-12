@@ -6,7 +6,8 @@
 //!
 //! See plan §6.3, VN-1, VN-3.
 
-use oom_edit_core::EditorSession;
+use oom_edit_core::{EditorSession, RenderedLineRole};
+use ratatui::buffer::CellWidth;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -16,6 +17,14 @@ use ratatui::Frame;
 use crate::theme::{Theme, Tier, UiSlot};
 use crate::widgets::spans;
 use crate::widgets::status_bar;
+
+fn line_surface(theme: &Theme, tier: Tier, role: RenderedLineRole) -> Option<Style> {
+    match role {
+        RenderedLineRole::Document => None,
+        RenderedLineRole::Metadata => Some(theme.ui_style(tier, UiSlot::MetadataPanel)),
+        RenderedLineRole::CodeFence => Some(theme.ui_style(tier, UiSlot::CodeFence)),
+    }
+}
 
 /// Render Normal, Select, or Command into the body area.
 pub fn render_rendered(
@@ -79,13 +88,9 @@ pub fn render_rendered(
             theme,
             tier,
         );
-        if rendered_line.role == oom_edit_core::RenderedLineRole::Metadata {
-            spans = build_highlighted_line(
-                spans,
-                text_width,
-                theme.ui_style(tier, UiSlot::MetadataPanel),
-            )
-            .spans;
+        let base_surface = line_surface(theme, tier, rendered_line.role);
+        if let Some(style) = base_surface {
+            spans = build_highlighted_line(spans, text_width, style).spans;
         }
 
         let selected = selection
@@ -95,7 +100,7 @@ pub fn render_rendered(
             .filter(|columns| columns.start < columns.end);
         if let Some(columns) = selected {
             let mut style = theme.style(tier, oom_edit_core::SemanticStyle::Selection);
-            if rendered_line.role == oom_edit_core::RenderedLineRole::Metadata {
+            if base_surface.is_some() {
                 style.bg = None;
             }
             lines.push(build_interval_highlighted_line(spans, columns, style));
@@ -178,7 +183,11 @@ fn build_interval_highlighted_line<'a>(
 
 /// Overlay a full-row carrier without replacing semantic foreground styles.
 fn build_highlighted_line<'a>(mut spans: Vec<Span<'a>>, width: u16, style: Style) -> Line<'a> {
-    let text_width = spans.iter().map(Span::width).sum::<usize>();
+    let text_width = spans
+        .iter()
+        .flat_map(|span| span.styled_graphemes(Style::default()))
+        .map(|grapheme| usize::from(grapheme.symbol.cell_width()))
+        .sum::<usize>();
 
     for span in &mut spans {
         span.style = span.style.add_modifier(style.add_modifier);
@@ -198,7 +207,7 @@ fn build_highlighted_line<'a>(mut spans: Vec<Span<'a>>, width: u16, style: Style
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::theme::{Tier, DEFAULT_DARK};
+    use crate::theme::{Tier, DEFAULT_DARK, DEFAULT_LIGHT};
     use oom_edit_core::{KeyCode, KeyCodeKind, KeyInput, Modifiers, SemanticStyle};
     use ratatui::backend::TestBackend;
     use ratatui::style::Modifier;
@@ -567,6 +576,238 @@ mod tests {
         assert_eq!(non_cursor_opening.fg, opening.fg);
         assert_eq!(Some(non_cursor_opening.bg), panel.bg);
         assert!(!non_cursor_opening.modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn code_fence_surface_fills_width_and_preserves_syntax() {
+        let text = "Before\n\n```rust\nlet message = \"hi\";\n\n\tnext();\n```\n\nAfter\n";
+
+        for theme in [&DEFAULT_DARK, &DEFAULT_LIGHT] {
+            let terminal_width = 36;
+            let terminal_height = 10;
+            let mut session = EditorSession::from_text(text);
+            let gutter = status_bar::gutter_width(session.line_count()) as u16;
+            let text_width = terminal_width - gutter;
+            let (fence_rows, body_row, keyword_column, string_column, document_rows) = {
+                let layout = session.render_layout(text_width);
+                let fence_rows = layout
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, line)| line.role == RenderedLineRole::CodeFence)
+                    .map(|(row, _)| row)
+                    .collect::<Vec<_>>();
+                let (body_row, body) = layout
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .find(|(_, line)| line.styled.text.contains("let message"))
+                    .expect("rendered Rust body");
+                let keyword_column = body.styled.text.find("let").unwrap();
+                let string_column = body.styled.text.find("\"hi\"").unwrap();
+                let document_rows = layout
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, line)| line.role == RenderedLineRole::Document)
+                    .map(|(row, _)| row)
+                    .collect::<Vec<_>>();
+                (
+                    fence_rows,
+                    body_row,
+                    keyword_column,
+                    string_column,
+                    document_rows,
+                )
+            };
+
+            assert_eq!(fence_rows.len(), 5, "{} fence boundary", theme.name);
+            let mut terminal =
+                Terminal::new(TestBackend::new(terminal_width, terminal_height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_rendered(
+                        frame,
+                        &mut session,
+                        0,
+                        false,
+                        frame.area(),
+                        theme,
+                        Tier::TrueColor,
+                    );
+                })
+                .unwrap();
+
+            let buffer = terminal.backend().buffer();
+            let fence_background = theme
+                .ui_style(Tier::TrueColor, UiSlot::CodeFence)
+                .bg
+                .unwrap();
+            for row in fence_rows {
+                for column in 0..text_width {
+                    assert_eq!(
+                        buffer.cell((gutter + column, row as u16)).unwrap().bg,
+                        fence_background,
+                        "{} fence row {row}, column {column}",
+                        theme.name
+                    );
+                }
+            }
+
+            assert_eq!(
+                Some(
+                    buffer
+                        .cell((gutter + keyword_column as u16, body_row as u16))
+                        .unwrap()
+                        .fg
+                ),
+                theme.style(Tier::TrueColor, SemanticStyle::Keyword).fg
+            );
+            assert_eq!(
+                Some(
+                    buffer
+                        .cell((gutter + string_column as u16, body_row as u16))
+                        .unwrap()
+                        .fg
+                ),
+                theme.style(Tier::TrueColor, SemanticStyle::StringLit).fg
+            );
+            for row in document_rows {
+                assert_ne!(
+                    buffer.cell((gutter, row as u16)).unwrap().bg,
+                    fence_background,
+                    "{} document row {row}",
+                    theme.name
+                );
+                assert_ne!(
+                    buffer
+                        .cell((gutter + text_width - 1, row as u16))
+                        .unwrap()
+                        .bg,
+                    fence_background,
+                    "{} document padding row {row}",
+                    theme.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn code_fence_surface_composes_selection_and_cursor() {
+        let text = "Before\n\n```rust\nlet value = \"ok\";\nnext();\n```\n\nAfter\n";
+        let terminal_width = 40;
+        let terminal_height = 10;
+        let mut session = EditorSession::from_text(text);
+        let gutter = status_bar::gutter_width(session.line_count()) as u16;
+        let text_width = terminal_width - gutter;
+        let (first_body_row, passive_fence_row, layout_len) = {
+            let layout = session.render_layout(text_width);
+            let first_body_row = layout
+                .lines
+                .iter()
+                .position(|line| line.styled.text.contains("let value"))
+                .unwrap();
+            let passive_fence_row = layout
+                .lines
+                .iter()
+                .position(|line| {
+                    line.role == RenderedLineRole::CodeFence
+                        && line.styled.text.starts_with("▏ rust")
+                })
+                .unwrap();
+            (first_body_row, passive_fence_row, layout.lines.len())
+        };
+
+        for _ in 0..layout_len {
+            if session.rendered_cursor_line() == first_body_row {
+                break;
+            }
+            session.handle_key(key('j'));
+        }
+        assert_eq!(session.rendered_cursor_line(), first_body_row);
+        session.handle_key(key('v'));
+        session.handle_key(key('l'));
+        session.handle_key(key('j'));
+        let cursor_row = session.rendered_cursor_line();
+        assert_ne!(cursor_row, first_body_row);
+        let selected = session
+            .rendered_selection()
+            .unwrap()
+            .rows
+            .iter()
+            .find(|row| row.row == first_body_row)
+            .expect("first code row remains selected")
+            .clone();
+
+        let mut select_terminal =
+            Terminal::new(TestBackend::new(terminal_width, terminal_height)).unwrap();
+        select_terminal
+            .draw(|frame| {
+                render_rendered(
+                    frame,
+                    &mut session,
+                    0,
+                    false,
+                    frame.area(),
+                    &DEFAULT_DARK,
+                    Tier::TrueColor,
+                );
+            })
+            .unwrap();
+        let selected_cell = select_terminal
+            .backend()
+            .buffer()
+            .cell((
+                gutter + selected.columns.start as u16,
+                first_body_row as u16,
+            ))
+            .unwrap();
+        assert_eq!(
+            selected_cell.bg,
+            DEFAULT_DARK
+                .ui_style(Tier::TrueColor, UiSlot::CodeFence)
+                .bg
+                .unwrap()
+        );
+        assert!(selected_cell.modifier.contains(Modifier::REVERSED));
+
+        session.handle_key(KeyInput {
+            code: KeyCode {
+                kind: KeyCodeKind::Esc,
+            },
+            mods: Modifiers::default(),
+        });
+        let active_row = session.rendered_cursor_line();
+        let mut normal_terminal =
+            Terminal::new(TestBackend::new(terminal_width, terminal_height)).unwrap();
+        normal_terminal
+            .draw(|frame| {
+                render_rendered(
+                    frame,
+                    &mut session,
+                    0,
+                    false,
+                    frame.area(),
+                    &DEFAULT_DARK,
+                    Tier::TrueColor,
+                );
+            })
+            .unwrap();
+        let buffer = normal_terminal.backend().buffer();
+        assert_eq!(
+            buffer.cell((gutter, active_row as u16)).unwrap().bg,
+            DEFAULT_DARK
+                .ui_style(Tier::TrueColor, UiSlot::CursorLine)
+                .bg
+                .unwrap()
+        );
+        assert_eq!(
+            buffer.cell((gutter, passive_fence_row as u16)).unwrap().bg,
+            DEFAULT_DARK
+                .ui_style(Tier::TrueColor, UiSlot::CodeFence)
+                .bg
+                .unwrap()
+        );
     }
 
     #[test]
