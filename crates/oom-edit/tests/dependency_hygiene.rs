@@ -2,7 +2,7 @@
 //!
 //! The reusable core has its own dependency-boundary checks. These tests cover
 //! the workspace policy that belongs to the terminal crate: one crossterm
-//! lineage and warning-fatal cargo-deny entry points.
+//! lineage and warning-fatal dependency-check entry points.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -98,6 +98,42 @@ fn make_deny_and_check_promote_warnings() {
         assert!(
             stdout.contains("cargo deny __DENY_FLAGS_SENTINEL__"),
             "make --dry-run {target} should consume the shared DENY_FLAGS variable:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn make_audit_and_check_promote_warnings() {
+    let root = workspace_root();
+
+    for target in ["audit", "check"] {
+        let output = Command::new("make")
+            .args(["--dry-run", target])
+            .current_dir(&root)
+            .output()
+            .unwrap_or_else(|error| panic!("make --dry-run {target} should run: {error}"));
+        let stdout = checked_stdout(output, &format!("make --dry-run {target}"));
+
+        assert!(
+            stdout.contains("cargo audit -D warnings"),
+            "make --dry-run {target} should expand the shared warning-fatal policy:\n{stdout}"
+        );
+
+        let output = Command::new("make")
+            .args(["--dry-run", target, "AUDIT_FLAGS=__AUDIT_FLAGS_SENTINEL__"])
+            .current_dir(&root)
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("make --dry-run {target} with an AUDIT_FLAGS override should run: {error}")
+            });
+        let stdout = checked_stdout(
+            output,
+            &format!("make --dry-run {target} AUDIT_FLAGS=__AUDIT_FLAGS_SENTINEL__"),
+        );
+
+        assert!(
+            stdout.contains("cargo audit __AUDIT_FLAGS_SENTINEL__"),
+            "make --dry-run {target} should consume the shared AUDIT_FLAGS variable:\n{stdout}"
         );
     }
 }

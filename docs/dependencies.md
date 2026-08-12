@@ -105,6 +105,26 @@ fork is introduced.
 
 - **`hjkl` ecosystem**: `hjkl-engine` → `hjkl-bonsai` → `hjkl-xdg` → `dirs` → `dirs-sys` (patched). The `hjkl` crates are pinned pre-1.0 and fast-moving.
 
+### LRU 0.18.2 soundness remediation
+
+The transitive `lru` dependency was updated from 0.18.1 to 0.18.2 after
+`RUSTSEC-2026-0253` identified a panic-safety use-after-free in `LruCache::pop`. Ratatui-core
+owns the dependency and accepts the patched release through its existing `lru = "0.18"`
+requirement, so no direct dependency or application API changed.
+
+- **License:** MIT; unchanged from 0.18.1 and already permitted by `deny.toml`.
+- **Maintenance signal:** the patched 0.18.2 release directly addresses the upstream soundness
+  advisory affecting the locked version.
+- **Popularity baseline:** unchanged. This remains the established cache implementation selected
+  by Ratatui-core rather than a newly introduced package or direct dependency.
+- **Vendored diff review:** limited to the upstream panic-safety correction and crate metadata for
+  the 0.18.2 patch release; the obsolete 0.18.1 vendored source is removed.
+- **Hand-roll assessment:** rejected. Ratatui-core owns the cache usage, and replacing its
+  transitive implementation locally would create an unnecessary maintained fork.
+
+`make audit` and the audit step inside `make check` use `-D warnings`, ensuring future
+informational soundness advisories fail the gate instead of appearing beneath a successful exit.
+
 ### Duplicate lineages eliminated
 
 - Direct `crossterm 0.28.1` was aligned with Ratatui's `crossterm 0.29.0` backend.

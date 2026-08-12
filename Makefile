@@ -5,6 +5,7 @@
 
 SHELL := /bin/bash
 DENY_FLAGS := check -D warnings
+AUDIT_FLAGS := -D warnings
 
 .PHONY: help
 help: ## Show this help (default)
@@ -119,7 +120,7 @@ check: ## Run fmt-check + lint + build + test + deny + audit (with summary)
 	fi; \
 	echo ""; \
 	echo "audit"; \
-	if cargo audit 2>&1; then \
+	if cargo audit $(AUDIT_FLAGS) 2>&1; then \
 		echo "[PASS] audit"; PASS=$$((PASS + 1)); \
 	else \
 		echo "[FAIL] audit"; FAIL=$$((FAIL + 1)); audit_ok=false; \
@@ -153,7 +154,7 @@ deny: ## License/ban/advisory checks (CI gate)
 
 .PHONY: audit
 audit: ## RustSec advisory checks (CI gate)
-	cargo audit
+	cargo audit $(AUDIT_FLAGS)
 
 # ---------------------------------------------------------------------------
 # Documentation

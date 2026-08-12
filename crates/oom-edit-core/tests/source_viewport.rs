@@ -73,6 +73,23 @@ fn render_source_wrap_cursor_maps_to_visual_row() {
 }
 
 #[test]
+fn insert_column_zero_remains_stable_while_scrolling() {
+    let mut session = EditorSession::from_text("abcdef\nx\n\nabcdef");
+    enter_insert(&mut session);
+    move_right(&mut session, 3);
+    session.handle_key(key(KeyCodeKind::Down));
+    session.handle_key(key(KeyCodeKind::Home));
+
+    session.handle_key(key(KeyCodeKind::Down));
+    assert_eq!(session.cursor(), (2, 0));
+    session.handle_key(key(KeyCodeKind::Down));
+    assert_eq!(session.cursor(), (3, 0));
+
+    let frame = session.render_source(viewport(8, 4, true, 0, 0));
+    assert_eq!(frame.cursor.1, 0);
+}
+
+#[test]
 fn render_source_wrap_cursor_at_wrap_boundary() {
     let mut session = EditorSession::from_text(&long_line(100));
     enter_insert(&mut session);

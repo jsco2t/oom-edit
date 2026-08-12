@@ -380,6 +380,7 @@ impl VimCore {
             return self.handle_command_mode_key(hjkl_input, key);
         }
 
+        let mode_before = self.mode;
         let cursor_before = self.cursor();
         let repeat_search_wrapped = if self.mode == Mode::Normal
             && key.mods == Modifiers::default()
@@ -437,7 +438,8 @@ impl VimCore {
         // Drain any content edits
         let mut edits = self.drain_content_edits();
         let content_reset = self.editor.take_content_reset();
-        if self.editor.buffer().dirty_gen() != dirty_gen_before {
+        let content_changed = self.editor.buffer().dirty_gen() != dirty_gen_before;
+        if content_changed {
             let after = self.editor.buffer().rope();
             #[cfg(test)]
             self.edit_replays.set(self.edit_replays.get() + 1);
@@ -460,6 +462,18 @@ impl VimCore {
 
         // Check for mode change
         let current_mode = self.compute_mode();
+        let cursor_after = self.cursor();
+        if Self::insert_action_reanchors_sticky_column(
+            mode_before,
+            current_mode,
+            key,
+            consumed,
+            cursor_before,
+            cursor_after,
+            content_changed,
+        ) {
+            self.editor.set_sticky_col(Some(cursor_after.1));
+        }
         let mut effects = Vec::new();
         if current_mode != self.mode {
             effects.push(VimEffect::ModeChanged(current_mode));
@@ -488,6 +502,30 @@ impl VimCore {
         }
 
         effects
+    }
+
+    /// Whether a consumed Insert action makes the resulting cursor column the
+    /// new target for later vertical movement.
+    fn insert_action_reanchors_sticky_column(
+        mode_before: Mode,
+        mode_after: Mode,
+        key: KeyInput,
+        consumed: bool,
+        cursor_before: (usize, usize),
+        cursor_after: (usize, usize),
+        content_changed: bool,
+    ) -> bool {
+        if !consumed || mode_before != Mode::Insert || mode_after != Mode::Insert {
+            return false;
+        }
+
+        let explicit_horizontal = matches!(
+            key.code.kind,
+            KeyCodeKind::Left | KeyCodeKind::Right | KeyCodeKind::Home | KeyCodeKind::End
+        );
+        let vertical = matches!(key.code.kind, KeyCodeKind::Up | KeyCodeKind::Down);
+
+        !vertical && (explicit_horizontal || content_changed || cursor_after != cursor_before)
     }
 
     fn clipboard_effects(&self, writes: Vec<String>, system_yank_step: bool) -> Vec<VimEffect> {
@@ -885,17 +923,13 @@ impl VimCore {
 
     /// Move the cursor to the given (row, col) position.
     pub(crate) fn jump_to(&mut self, row: usize, col: usize) {
-        use hjkl_buffer::Position;
-        let pos = Position {
-            row,
-            col: col.min(
-                self.editor
-                    .line(row)
-                    .map(|l| l.chars().count())
-                    .unwrap_or(0),
-            ),
-        };
-        self.editor.buffer_mut().set_cursor(pos);
+        let col = col.min(
+            self.editor
+                .line(row)
+                .map(|line| line.chars().count())
+                .unwrap_or(0),
+        );
+        self.editor.jump_cursor(row, col);
     }
 
     /// Apply a renderer-projected character, line, or block selection.
@@ -1139,14 +1173,12 @@ impl VimCore {
         buffer.replace_all(&new_text);
 
         // Move cursor forward by the inserted text length (in chars)
-        let char_len = text.chars().count();
-        let new_line = if text.contains('\n') {
-            // If multi-line, cursor goes to the end of the last line of pasted text
-            let new_lines: Vec<&str> = new_text.split('\n').collect();
-            let last_line_idx = new_lines.len().saturating_sub(1).min(new_lines.len() - 1);
-            // Cursor at end of the last line of pasted text
-            let last_line = new_lines[last_line_idx];
-            (last_line_idx, last_line.chars().count())
+        let new_line = if let Some((_, final_inserted_line)) = text.rsplit_once('\n') {
+            let inserted_line_count = text.bytes().filter(|byte| *byte == b'\n').count();
+            (
+                line + inserted_line_count,
+                final_inserted_line.chars().count(),
+            )
         } else {
             // Single line: advance col within the same line
             let max_col = new_text
@@ -1154,13 +1186,14 @@ impl VimCore {
                 .nth(line)
                 .map(|l| l.chars().count())
                 .unwrap_or(0);
-            (line, (col + char_len).min(max_col))
+            (line, (col + text.chars().count()).min(max_col))
         };
 
         buffer.set_cursor(hjkl_buffer::Position {
             row: new_line.0,
             col: new_line.1,
         });
+        self.editor.set_sticky_col(Some(new_line.1));
 
         // Collect the content edits for the highlighter
         let edits = self.drain_content_edits();
@@ -1619,6 +1652,119 @@ mod projected_selection_tests {
             );
             assert_eq!(vim.text(), expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod insert_column_tests {
+    use super::*;
+
+    fn special(kind: KeyCodeKind) -> KeyInput {
+        VimCore::plain_key(kind)
+    }
+
+    fn enter_insert_at_column(vim: &mut VimCore, column: usize) {
+        vim.handle_key(VimCore::plain_key(KeyCodeKind::Char('i')));
+        for _ in 0..column {
+            vim.handle_key(special(KeyCodeKind::Right));
+        }
+    }
+
+    fn move_down(vim: &mut VimCore) {
+        vim.handle_key(special(KeyCodeKind::Down));
+    }
+
+    #[test]
+    fn insert_horizontal_positioning_reanchors_sticky_column() {
+        let mut left = VimCore::new("abcdef\nxyz\nabcdef");
+        enter_insert_at_column(&mut left, 3);
+        move_down(&mut left);
+        assert_eq!(left.cursor(), (1, 2));
+        left.handle_key(special(KeyCodeKind::Left));
+        move_down(&mut left);
+        assert_eq!(left.cursor(), (2, 1));
+
+        let mut right = VimCore::new("abcdef\nx\nabcdef");
+        enter_insert_at_column(&mut right, 3);
+        move_down(&mut right);
+        assert_eq!(right.cursor(), (1, 0));
+        right.handle_key(special(KeyCodeKind::Right));
+        move_down(&mut right);
+        assert_eq!(right.cursor(), (2, 1));
+
+        let mut home = VimCore::new("abcdef\nx\n\nabcdef");
+        enter_insert_at_column(&mut home, 3);
+        move_down(&mut home);
+        home.handle_key(special(KeyCodeKind::Home));
+        move_down(&mut home);
+        move_down(&mut home);
+        assert_eq!(home.cursor(), (3, 0));
+
+        let mut end = VimCore::new("abcdef\nxyz\nabcdef");
+        enter_insert_at_column(&mut end, 1);
+        move_down(&mut end);
+        end.handle_key(special(KeyCodeKind::End));
+        move_down(&mut end);
+        assert_eq!(end.cursor(), (2, 2));
+    }
+
+    #[test]
+    fn insert_edits_and_paste_reanchor_sticky_column() {
+        let mut typed = VimCore::new("abcdef\nx\nabcdef");
+        enter_insert_at_column(&mut typed, 3);
+        move_down(&mut typed);
+        typed.handle_key(VimCore::plain_key(KeyCodeKind::Char('z')));
+        move_down(&mut typed);
+        assert_eq!(typed.cursor(), (2, 1));
+
+        let mut backspace = VimCore::new("abcdef\nxyz\nabcdef");
+        enter_insert_at_column(&mut backspace, 3);
+        move_down(&mut backspace);
+        backspace.handle_key(special(KeyCodeKind::Backspace));
+        move_down(&mut backspace);
+        assert_eq!(backspace.cursor(), (2, 1));
+
+        let mut paste = VimCore::new("abcdef\nx\nabcdef");
+        enter_insert_at_column(&mut paste, 3);
+        move_down(&mut paste);
+        paste.insert_text("zz");
+        move_down(&mut paste);
+        assert_eq!(paste.cursor(), (2, 2));
+
+        let mut multiline_paste = VimCore::new("abcdef\nx\nabcdef");
+        enter_insert_at_column(&mut multiline_paste, 3);
+        move_down(&mut multiline_paste);
+        multiline_paste.insert_text("a\nbc");
+        assert_eq!(multiline_paste.cursor(), (2, 2));
+        move_down(&mut multiline_paste);
+        assert_eq!(multiline_paste.cursor(), (3, 2));
+    }
+
+    #[test]
+    fn programmatic_jump_reanchors_sticky_column() {
+        let mut vim = VimCore::new("abcdef\nx\nabcdef");
+        enter_insert_at_column(&mut vim, 3);
+        move_down(&mut vim);
+        assert_eq!(vim.cursor(), (1, 0));
+
+        vim.jump_to(1, 0);
+        move_down(&mut vim);
+
+        assert_eq!(vim.cursor(), (2, 0));
+    }
+
+    #[test]
+    fn insert_vertical_motion_restores_desired_column_across_short_lines() {
+        let mut vim = VimCore::new("abcdef\nx\n\nabcdef");
+        enter_insert_at_column(&mut vim, 3);
+
+        move_down(&mut vim);
+        assert_eq!(vim.cursor(), (1, 0));
+        move_down(&mut vim);
+        assert_eq!(vim.cursor(), (2, 0));
+        move_down(&mut vim);
+
+        assert_eq!(vim.cursor(), (3, 3));
     }
 }
 
