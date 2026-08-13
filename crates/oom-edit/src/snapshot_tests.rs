@@ -1197,23 +1197,36 @@ fn drift_palette_lists_every_command() {
 /// Every overlay variant returns a non-empty `hints()` string.
 #[test]
 fn drift_overlay_hints_nonempty() {
-    let palette = crate::overlay::PaletteState::default();
-    assert!(
-        !palette.hints().is_empty(),
-        "Palette hints must be non-empty"
-    );
+    use crate::command::Contexts;
+    use crate::overlay::Overlay;
 
-    let quit = crate::overlay::ConfirmQuit::new();
-    assert!(
-        !quit.hints().is_empty(),
-        "ConfirmQuit hints must be non-empty"
-    );
+    let overlays = [
+        Overlay::None,
+        Overlay::open_palette(Contexts::NORMAL),
+        confirm_quit_overlay(),
+        confirm_overwrite_overlay(),
+    ];
+    assert_eq!(overlays.len(), 4, "current Overlay variant list is stale");
 
-    let overwrite = crate::overlay::ConfirmOverwrite::new();
-    assert!(
-        !overwrite.hints().is_empty(),
-        "ConfirmOverwrite hints must be non-empty"
-    );
+    for overlay in overlays {
+        match &overlay {
+            Overlay::None
+            | Overlay::Palette(_)
+            | Overlay::ConfirmQuit(_)
+            | Overlay::ConfirmOverwrite(_) => {}
+        }
+        let _ = overlay.geometry();
+        let _ = overlay.selected_command();
+        let _ = overlay.is_confirmation();
+        if overlay.is_some() {
+            assert!(
+                !overlay.hints().is_empty(),
+                "every active overlay must provide non-empty hints: {overlay:?}"
+            );
+        } else {
+            assert!(overlay.hints().is_empty());
+        }
+    }
 }
 
 /// Every `SemanticStyle` variant maps to a non-empty style on every tier
@@ -1272,6 +1285,42 @@ fn drift_all_semantic_styles_mapped_per_theme() {
         let theme = get_theme(theme_name);
         for tier in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
             for variant in &variants {
+                match variant {
+                    SemanticStyle::Text
+                    | SemanticStyle::Heading1
+                    | SemanticStyle::Heading2
+                    | SemanticStyle::Heading3
+                    | SemanticStyle::Heading4
+                    | SemanticStyle::Heading5
+                    | SemanticStyle::Heading6
+                    | SemanticStyle::Emphasis
+                    | SemanticStyle::Strong
+                    | SemanticStyle::Strikethrough
+                    | SemanticStyle::CodeSpan
+                    | SemanticStyle::CodeBlock
+                    | SemanticStyle::Quote
+                    | SemanticStyle::ListMarker
+                    | SemanticStyle::Link
+                    | SemanticStyle::LinkUrl
+                    | SemanticStyle::Rule
+                    | SemanticStyle::HtmlRaw
+                    | SemanticStyle::FmDelimiter
+                    | SemanticStyle::FmKey
+                    | SemanticStyle::FmValue
+                    | SemanticStyle::Keyword
+                    | SemanticStyle::Function
+                    | SemanticStyle::TypeName
+                    | SemanticStyle::StringLit
+                    | SemanticStyle::NumberLit
+                    | SemanticStyle::Comment
+                    | SemanticStyle::Operator
+                    | SemanticStyle::Variable
+                    | SemanticStyle::Punct
+                    | SemanticStyle::Selection
+                    | SemanticStyle::Match
+                    | SemanticStyle::CursorLine
+                    | SemanticStyle::Muted => {}
+                }
                 let style = theme.style(tier, *variant);
                 assert!(
                     style.fg.is_some()

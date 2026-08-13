@@ -8,6 +8,50 @@ use oom_edit_core::{
     SearchDirection, SelectionShape, SemanticStyle, Severity, SourceFrame, Span, StyledLine,
     TargetKind, Value, Viewport,
 };
+use std::path::Path;
+
+fn public_use_declarations(source: &str) -> Vec<String> {
+    let mut declarations = Vec::new();
+    let mut current = String::new();
+
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if current.is_empty() {
+            if !trimmed.starts_with("pub use ") {
+                continue;
+            }
+            current.push_str(trimmed);
+        } else {
+            current.push(' ');
+            current.push_str(trimmed);
+        }
+
+        if trimmed.ends_with(';') {
+            declarations.push(std::mem::take(&mut current));
+        }
+    }
+
+    assert!(current.is_empty(), "unterminated pub use declaration");
+    declarations
+}
+
+fn assert_no_exported_macros(path: &Path) {
+    for entry in std::fs::read_dir(path).expect("core source directory should be readable") {
+        let path = entry.expect("core source entry should be readable").path();
+        if path.is_dir() {
+            assert_no_exported_macros(&path);
+        } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+            let source =
+                std::fs::read_to_string(&path).expect("core Rust source should be readable");
+            let compact_source: String = source.split_whitespace().collect();
+            assert!(
+                !compact_source.contains("#[macro_export"),
+                "exported macro bypasses the curated crate-root facade: {}",
+                path.display()
+            );
+        }
+    }
+}
 
 #[test]
 fn public_facade_types_are_available_at_crate_root() {
@@ -58,6 +102,36 @@ fn public_facade_types_are_available_at_crate_root() {
         TargetKind,
         Value,
     )>();
+}
+
+#[test]
+fn public_facade_is_exactly_the_curated_pre_spell_surface() {
+    let source = include_str!("../src/lib.rs");
+    let declarations = public_use_declarations(source);
+    assert_eq!(
+        declarations,
+        [
+            "pub use clipboard::{ClipboardError, ClipboardSink, RecordingClipboardSink};",
+            "pub use document::LineEnding;",
+            "pub use error::{FmError, OpenError, SaveError};",
+            "pub use frontmatter::{FrontMatter, Num, Value};",
+            "pub use input::{KeyCode, KeyCodeKind, KeyInput, Modifiers};",
+            "pub use session::EditorSession;",
+            "pub use session::{Effect, Mode, Severity, Viewport};",
+            "pub use style::{ JumpTarget, LineKind, RenderedLayout, RenderedLine, RenderedLineRole, RenderedPoint, RenderedSearch, RenderedSelection, RenderedSelectionRow, RenderedSourceAtom, SearchDirection, SelectionShape, SemanticStyle, SourceFrame, Span, StyledLine, TargetKind, };",
+        ],
+        "crate-root facade changed; update the API contract and this guard together"
+    );
+
+    let unexpected_public_items: Vec<_> = source
+        .lines()
+        .filter(|line| line.starts_with("pub ") && !line.starts_with("pub use "))
+        .collect();
+    assert!(
+        unexpected_public_items.is_empty(),
+        "crate-root facade must consist only of the curated re-exports: {unexpected_public_items:?}"
+    );
+    assert_no_exported_macros(Path::new(env!("CARGO_MANIFEST_DIR")).join("src").as_path());
 }
 
 #[test]

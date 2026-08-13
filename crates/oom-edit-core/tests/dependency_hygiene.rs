@@ -48,6 +48,35 @@ fn cargo_tree_output() -> String {
     stdout
 }
 
+#[test]
+fn workspace_is_exactly_two_crates_with_one_way_dependency() {
+    let root = workspace_root();
+    let workspace = std::fs::read_to_string(root.join("Cargo.toml"))
+        .expect("workspace manifest should be readable");
+    let core = std::fs::read_to_string(root.join("crates/oom-edit-core/Cargo.toml"))
+        .expect("core manifest should be readable");
+    let tui = std::fs::read_to_string(root.join("crates/oom-edit/Cargo.toml"))
+        .expect("TUI manifest should be readable");
+
+    assert!(
+        workspace.contains("members = [\"crates/oom-edit-core\", \"crates/oom-edit\"]"),
+        "baseline workspace must contain exactly oom-edit-core and oom-edit"
+    );
+    assert_eq!(
+        workspace.matches("members =").count(),
+        1,
+        "workspace membership must have one source of truth"
+    );
+    assert!(
+        tui.contains("oom-edit-core = { path = \"../oom-edit-core\", version = \"=0.4.0\" }"),
+        "TUI must depend directly on the exact-pinned core crate"
+    );
+    assert!(
+        !core.contains("oom-edit =") && !core.contains("../oom-edit\""),
+        "core must never depend on the TUI crate"
+    );
+}
+
 /// Check that the cargo tree output does not contain any of the banned patterns.
 fn assert_no_banned_deps(banned: &[&str], label: &str) {
     let stdout = cargo_tree_output();

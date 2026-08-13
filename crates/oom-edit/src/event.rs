@@ -21,6 +21,16 @@ use crate::app::App;
 /// without busy-spinning.
 pub const FRAME_BUDGET: Duration = Duration::from_millis(50);
 
+fn poll_duration(now: Instant, deadline: Option<Instant>) -> Duration {
+    deadline
+        .map(|deadline| deadline.saturating_duration_since(now).min(FRAME_BUDGET))
+        .unwrap_or(FRAME_BUDGET)
+}
+
+fn tick_and_poll_duration(app: &mut App, now: Instant) -> Duration {
+    poll_duration(now, app.tick(now))
+}
+
 /// Run the main event loop until [`App::should_quit`] is set.
 ///
 /// The loop shape:
@@ -43,7 +53,7 @@ pub fn run_event_loop(
 
     loop {
         let now = Instant::now();
-        let deadline = app.tick(now);
+        let poll_duration = tick_and_poll_duration(&mut app, now);
         terminal.draw(|frame| app.render(frame))?;
 
         if app.should_quit {
@@ -53,17 +63,6 @@ pub fn run_event_loop(
         }
 
         // Poll with deadline tightening: min(FRAME_BUDGET, deadline).
-        let poll_duration = deadline
-            .map(|d| {
-                let remaining = d.duration_since(now);
-                if remaining < FRAME_BUDGET {
-                    remaining
-                } else {
-                    FRAME_BUDGET
-                }
-            })
-            .unwrap_or(FRAME_BUDGET);
-
         if event::poll(poll_duration)? {
             read_sample_and_dispatch(&mut app, event::read, Instant::now)?;
         }
@@ -156,6 +155,45 @@ mod tests {
 
         assert_eq!(*order.borrow(), ["read", "sample", "dispatch"]);
         assert_eq!(app.pending_input, PendingAppInput::Space { since: sampled });
+    }
+
+    #[test]
+    fn poll_deadline_is_evaluated_from_the_pre_poll_tick_timestamp() {
+        let tick_now = Instant::now();
+
+        assert_eq!(poll_duration(tick_now, None), FRAME_BUDGET);
+        assert_eq!(
+            poll_duration(tick_now, Some(tick_now + Duration::from_millis(80))),
+            FRAME_BUDGET
+        );
+        assert_eq!(
+            poll_duration(tick_now, Some(tick_now + Duration::from_millis(12))),
+            Duration::from_millis(12)
+        );
+        assert_eq!(poll_duration(tick_now, Some(tick_now)), Duration::ZERO);
+        assert_eq!(
+            poll_duration(tick_now, Some(tick_now - Duration::from_millis(1))),
+            Duration::ZERO,
+            "an already-due deadline must not panic or extend the poll"
+        );
+    }
+
+    #[test]
+    fn production_tick_and_poll_step_reuses_one_timestamp() {
+        let pending_since = Instant::now();
+        let mut app = test_app();
+        dispatch_event_at(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
+            pending_since,
+        );
+
+        let tick_now = pending_since + Duration::from_millis(140);
+        assert_eq!(
+            tick_and_poll_duration(&mut app, tick_now),
+            Duration::from_millis(10),
+            "the production step must evaluate the tick deadline from the same pre-poll timestamp"
+        );
     }
 
     fn test_app() -> App {

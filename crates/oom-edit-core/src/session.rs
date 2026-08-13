@@ -564,24 +564,94 @@ mod tests {
 
     #[test]
     fn all_mutation_entry_points_refresh_derived_state() {
-        let mut session = EditorSession::from_text("alpha\n");
+        let mut session = EditorSession::from_text("---\ntitle: alpha\n---\n\nalpha\n");
+        let assert_derived = |session: &EditorSession| {
+            assert_eq!(session.live.highlighter().text(), session.document());
+            assert_eq!(
+                crate::frontmatter::parse_front_matter(&session.document()),
+                *session.front_matter()
+            );
+        };
+
         session.render_layout(20);
         session.handle_key(key('i'));
         session.insert_paste("prefix ");
+        assert_derived(&session);
+        assert!(session.front_matter().value().is_none());
         session.handle_key(esc());
         session.handle_key(key('u'));
+        assert_derived(&session);
+        assert_eq!(
+            session
+                .front_matter()
+                .value()
+                .and_then(|value| value.get("title")),
+            Some(&crate::frontmatter::Value::str("alpha".to_string()))
+        );
         session.handle_key(ctrl('r'));
+        assert_derived(&session);
+        assert!(session.front_matter().value().is_none());
         session.render_layout(20);
         session.handle_key(key('v'));
         session.handle_key(key('w'));
         session.handle_key(key('d'));
+        assert_derived(&session);
         session.handle_key(key('p'));
-        assert_eq!(session.live.highlighter().text(), session.document());
-        assert_eq!(
-            crate::frontmatter::parse_front_matter(&session.document()),
-            *session.front_matter()
-        );
+        assert_derived(&session);
+
+        for input in [
+            key(':'),
+            key('%'),
+            key('s'),
+            key('/'),
+            key('a'),
+            key('l'),
+            key('p'),
+            key('h'),
+            key('a'),
+            key('/'),
+            key('o'),
+            key('m'),
+            key('e'),
+            key('g'),
+            key('a'),
+            key('/'),
+            special(KeyCodeKind::Enter),
+        ] {
+            session.handle_key(input);
+        }
+        assert_derived(&session);
         assert!(session.rendered_state.layout_cache.is_none());
+    }
+
+    #[test]
+    fn canonical_cursor_remap_survives_reflow_without_moving_source() {
+        let text = "# Heading\n\nalpha beta gamma delta epsilon zeta\n";
+        let mut session = EditorSession::from_text(text);
+        session.live.jump_to(2, 17);
+        let canonical = session.cursor();
+        let source_offset = session.live.cursor_byte_offset();
+
+        for width in [12, 40, 9, 24] {
+            session.render_layout(width);
+            assert_eq!(session.cursor(), canonical);
+            let point = session.rendered_state.cursor.point();
+            let layout = session
+                .rendered_state
+                .layout_cache
+                .as_ref()
+                .expect("rendered layout should be cached");
+            let source = layout.lines[point.row].atoms.iter().find_map(|atom| {
+                atom.columns
+                    .contains(&point.column)
+                    .then_some(atom.source.as_ref())
+                    .flatten()
+            });
+            assert!(
+                source.is_some_and(|range| range.contains(&source_offset)),
+                "width {width} remapped away from canonical byte {source_offset}: {source:?}"
+            );
+        }
     }
 
     #[test]

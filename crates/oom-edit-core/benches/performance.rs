@@ -3,11 +3,15 @@
 //! Run through `make bench`; every row reports its fixture, iterations,
 //! average, worst observation, and exact documented target.
 
+#[path = "../perf/fixtures.rs"]
+mod fixtures;
+
 use std::time::{Duration, Instant};
 
 use oom_edit_core::{EditorSession, KeyCode, KeyCodeKind, KeyInput, Mode, Modifiers, Viewport};
 
 const ONE_MIB: usize = 1024 * 1024;
+const FIXTURE_SEED: u64 = 0x00_0D_D1_7E;
 
 #[derive(Clone, Copy)]
 struct Stats {
@@ -70,30 +74,11 @@ fn report(name: &str, target: Duration, bytes: usize, lines: usize, stats: Stats
 }
 
 fn source_fixture_1mb() -> String {
-    const LINE: &str =
-        "source viewport line with markdown *content* and unicode λ 0123456789 repeated prose keeps the deterministic one-mebibyte fixture near ten thousand physical lines while exercising syntax and wrapping behavior.\n\n";
-    let mut text = String::with_capacity(ONE_MIB);
-    while text.len() + LINE.len() <= ONE_MIB {
-        text.push_str(LINE);
-    }
-    text.push_str(&"x".repeat(ONE_MIB - text.len()));
-    assert_eq!(text.len(), ONE_MIB);
-    text
+    fixtures::seeded_markdown_fixture(ONE_MIB, FIXTURE_SEED)
 }
 
 fn rendered_5000_line_fixture() -> String {
-    let text = (0..5_000)
-        .map(|line| match line % 5 {
-            0 => format!("## Heading {line}"),
-            1 => format!("Paragraph {line} has enough prose to exercise wrapping."),
-            2 => format!("- list item {line}"),
-            3 => format!("> quote {line}"),
-            _ => String::new(),
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert_eq!(text.matches('\n').count() + 1, 5_000);
-    text
+    fixtures::seeded_rendered_fixture(5_000, FIXTURE_SEED)
 }
 
 fn injection_heavy_doc() -> String {
