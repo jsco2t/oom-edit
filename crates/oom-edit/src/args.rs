@@ -2,10 +2,12 @@
 //!
 //! Hand-parsed (no `clap` — design rule: hand-roll small well-specified things).
 //! Parsing runs in `main` **before** any terminal setup, so `--help`,
-//! `--version`, and error paths print to a normal screen and never flash
+//! `--version`, `--licenses`, and error paths print to a normal screen and never flash
 //! the alternate screen.
 
 use std::path::PathBuf;
+
+const LICENSES_TEXT: &str = include_str!("../assets/dict/SCOWL-LICENSE.txt");
 
 /// The parsed CLI arguments.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -20,7 +22,7 @@ pub struct Args {
 }
 
 /// The result of parsing: either run with the given args, or print a message
-/// (`--help`/`--version`) and exit 0.
+/// (`--help`/`--version`/`--licenses`) and exit 0.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseOutcome {
     /// Proceed to [`crate::run`] with these args.
@@ -31,7 +33,7 @@ pub enum ParseOutcome {
 
 impl Args {
     /// Parse arguments from an iterator (the first item — the program name — is
-    /// skipped). Returns [`ParseOutcome::Message`] for `--help`/`--version`, or
+    /// skipped). Returns [`ParseOutcome::Message`] for print-and-exit flags, or
     /// `Err(usage)` for an unknown flag or a missing value.
     ///
     /// # Errors
@@ -65,6 +67,10 @@ impl Args {
             match flag.as_str() {
                 "--help" | "-h" => return Ok(ParseOutcome::Message(help_text())),
                 "--version" | "-V" => return Ok(ParseOutcome::Message(version_text())),
+                "--licenses" => {
+                    reject_inline(&flag, inline.as_deref())?;
+                    return Ok(ParseOutcome::Message(LICENSES_TEXT.to_string()));
+                }
                 "--theme" => {
                     args.theme = Some(take_value(&flag, inline, &mut it)?);
                 }
@@ -136,6 +142,7 @@ USAGE:
 
 OPTIONS:
     --theme NAME        Theme (default-dark, default-light, accessible)
+    --licenses          Print bundled-data licenses and exit
     -h, --help          Print this help and exit
     -V, --version       Print version and exit
 
@@ -211,6 +218,26 @@ mod tests {
             Ok(ParseOutcome::Message(m)) => assert!(m.contains(env!("CARGO_PKG_VERSION"))),
             other => panic!("expected version message, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn licenses_is_exact_pre_terminal_message() {
+        match parse(&["--licenses"]) {
+            Ok(ParseOutcome::Message(message)) => assert_eq!(message, LICENSES_TEXT),
+            other => panic!("expected licenses message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn licenses_rejects_inline_value() {
+        let err = parse(&["--licenses=yes"]).expect_err("licenses takes no value");
+        assert!(err.contains("flag '--licenses' takes no value"), "{err}");
+    }
+
+    #[test]
+    fn double_dash_then_licenses_is_a_filename() {
+        let a = run_args(&["--", "--licenses"]);
+        assert_eq!(a.path, Some(PathBuf::from("--licenses")));
     }
 
     #[test]
@@ -293,6 +320,7 @@ mod tests {
                 assert!(m.contains("USAGE:"));
                 assert!(m.contains("oom-edit [OPTIONS] [--] [path]"));
                 assert!(m.contains("oom-edit"));
+                assert!(m.contains("--licenses"));
             }
             other => panic!("expected help message, got {other:?}"),
         }

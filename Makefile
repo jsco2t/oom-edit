@@ -6,6 +6,7 @@
 SHELL := /bin/bash
 DENY_FLAGS := check -D warnings
 AUDIT_FLAGS := -D warnings
+DATA_LICENSE_ROOT ?= $(CURDIR)
 
 .PHONY: help
 help: ## Show this help (default)
@@ -78,7 +79,7 @@ lint-fix: ## Apply safe clippy suggestions
 # Check — the local CI gate
 # ---------------------------------------------------------------------------
 .PHONY: check
-check: ## Run fmt-check + lint + build + test + deny + audit (with summary)
+check: ## Run fmt-check + lint + build + test + deny + audit + data-license-check (with summary)
 	@PASS=0; FAIL=0; \
 	fmt_ok=true; \
 	lint_ok=true; \
@@ -86,6 +87,7 @@ check: ## Run fmt-check + lint + build + test + deny + audit (with summary)
 	test_ok=true; \
 	deny_ok=true; \
 	audit_ok=true; \
+	data_license_ok=true; \
 	echo "=== oom-edit CI gate ==="; \
 	echo ""; \
 	echo "fmt-check"; \
@@ -130,6 +132,13 @@ check: ## Run fmt-check + lint + build + test + deny + audit (with summary)
 		echo "[FAIL] audit"; FAIL=$$((FAIL + 1)); audit_ok=false; \
 	fi; \
 	echo ""; \
+	echo "data-license-check"; \
+	if bash scripts/check-data-licenses.sh "$(DATA_LICENSE_ROOT)" 2>&1; then \
+		echo "[PASS] data-license-check"; PASS=$$((PASS + 1)); \
+	else \
+		echo "[FAIL] data-license-check"; FAIL=$$((FAIL + 1)); data_license_ok=false; \
+	fi; \
+	echo ""; \
 	echo "=== Summary ==="; \
 	echo "  Passed: $$PASS"; \
 	echo "  Failed: $$FAIL"; \
@@ -142,6 +151,7 @@ check: ## Run fmt-check + lint + build + test + deny + audit (with summary)
 		[ "$$test_ok" = false ]   && echo "  - test"; \
 		[ "$$deny_ok" = false ]   && echo "  - deny"; \
 		[ "$$audit_ok" = false ]  && echo "  - audit"; \
+		[ "$$data_license_ok" = false ] && echo "  - data-license-check"; \
 		echo ""; \
 		exit 1; \
 	fi; \
@@ -159,6 +169,14 @@ deny: ## License/ban/advisory checks (CI gate)
 .PHONY: audit
 audit: ## RustSec advisory checks (CI gate)
 	cargo audit $(AUDIT_FLAGS)
+
+.PHONY: dictionaries
+dictionaries: ## Regenerate pinned en_US/en_CA/en_AU dictionaries (requires network)
+	bash scripts/fetch-dictionaries.sh
+
+.PHONY: data-license-check
+data-license-check: ## Verify bundled-data hashes, headers, notices, and provenance
+	bash scripts/check-data-licenses.sh "$(DATA_LICENSE_ROOT)"
 
 # ---------------------------------------------------------------------------
 # Documentation
