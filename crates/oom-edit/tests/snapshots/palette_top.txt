@@ -1,0 +1,24 @@
+   1  ┌─ metadata ─────────────────────────────────────────────────────────────┐
+   2  │ title: Kitchen Sink                                                    │
+   3  │ ┌ Command Palette ─────────────────────────────────────────────┐       │
+   4  └─│>                                                             │───────┘
+        │                                                              │
+   6  █ │▸ v                    character-wise selection            sel│
+        │  V                    line-wise selection                 sel│
+   8  So│  Ctrl-V               block-wise selection                sel│
+        │  Esc / Ctrl-C         cancel selection                    can│
+  10  ┃ │  "{register}          select register                     sel│
+        │  y                    yank selection                      sel│
+      ▏ │  d / x                delete selection                    sel│
+  13  ▏ │  c                    change selection                    sel│
+  14  ▏ │  >                    indent selection                    sel│
+  15  ▏ │  <                    outdent selection                   sel│
+      ▏ │  o                    swap selection endpoint             sel│
+        │  help                 help / command palette         Space h │
+  18  ──│  save                 save                           Space w │────────
+        │  quit                 quit                           Space q │
+  20  An│  cycle-theme          cycle theme                    Space t │
+        └──────────────────────────────────────────────────────────────┘
+  22  More text here.
+
+ NORMAL  ↑↓ navigate · type to filter · Enter execute · Esc close

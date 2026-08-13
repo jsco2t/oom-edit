@@ -1,0 +1,31 @@
+[package]
+name = "hjkl-vim"
+description = "Vim modal state types and grammar primitives for the hjkl editor stack. Pre-1.0 churn."
+keywords = ["vim", "modal", "editor", "fsm"]
+categories = ["text-editors"]
+version.workspace = true
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/kryptic-sh/hjkl"
+authors = ["mxaddict <mxaddict@kryptic.sh>"]
+rust-version = "1.95"
+homepage = "https://hjkl.kryptic.sh"
+readme = "README.md"
+
+[dev-dependencies]
+proptest = "1"
+crossterm = { version = "0.29.0", features = ["event-stream"] }
+ratatui = { version = "0.30" }
+
+[dependencies]
+hjkl-engine.workspace = true
+hjkl-buffer.workspace = true
+hjkl-keymap.workspace = true
+# Arrived with the vim FSM in #267: the shared mode/operator/motion vocabulary,
+# `:s` pattern compilation, and FSM tracing.
+hjkl-vim-types.workspace = true
+regex = "1"
+tracing = "0.1"
+
+[lints]
+workspace = true

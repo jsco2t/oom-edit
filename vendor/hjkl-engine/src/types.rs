@@ -1,0 +1,2431 @@
+//! Core types for the engine trait surface.
+//!
+//! These are introduced alongside the legacy sqeel-vim public API. The
+//! trait extraction (phase 5) progressively rewires the existing FSM and
+//! Editor to operate on `Selection` / `SelectionSet` / `Edit` / `Pos`.
+//! Until that work lands, the legacy types in [`crate::editor`] remain
+//! authoritative.
+
+// `Pos`, `Edit` (as `EngineEdit`), `ContentEdit`, and `FoldOp` now live in
+// `hjkl-buffer` so `Buffer` can own per-buffer engine state without a
+// circular dependency. Re-exported here so all existing call sites compile
+// without change.
+pub use hjkl_buffer::ContentEdit;
+pub use hjkl_buffer::EngineEdit as Edit;
+pub use hjkl_buffer::FoldOp;
+pub use hjkl_buffer::Pos;
+
+use std::ops::Range;
+
+/// What kind of region a [`Selection`] covers.
+///
+/// - `Char`: classic vim `v` selection — closed range on the inline character
+///   axis.
+/// - `Line`: linewise (`V`) — anchor/head columns ignored, full lines covered
+///   between `min(anchor.line, head.line)` and `max(...)`.
+/// - `Block`: blockwise (`Ctrl-V`) — rectangle from `min(col)` to `max(col)`,
+///   each line a sub-range. Falls out of multi-cursor model: implementations
+///   may expand a `Block` selection into N sub-selections during edit
+///   dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SelectionKind {
+    #[default]
+    Char,
+    Line,
+    Block,
+}
+
+/// A single anchored selection. Empty (caret-only) when `anchor == head`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Selection {
+    pub anchor: Pos,
+    pub head: Pos,
+    pub kind: SelectionKind,
+}
+
+impl Selection {
+    /// Caret at `pos` with no extent.
+    pub const fn caret(pos: Pos) -> Self {
+        Self {
+            anchor: pos,
+            head: pos,
+            kind: SelectionKind::Char,
+        }
+    }
+
+    /// Inclusive range `[anchor, head]` (or reversed) as a `Char` selection.
+    pub const fn char_range(anchor: Pos, head: Pos) -> Self {
+        Self {
+            anchor,
+            head,
+            kind: SelectionKind::Char,
+        }
+    }
+
+    /// True if `anchor == head`.
+    pub fn is_empty(&self) -> bool {
+        self.anchor == self.head
+    }
+}
+
+/// Ordered set of selections. Always non-empty in valid states; `primary`
+/// indexes the cursor visible to vim mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectionSet {
+    pub items: Vec<Selection>,
+    pub primary: usize,
+}
+
+impl SelectionSet {
+    /// Single caret at `pos`.
+    pub fn caret(pos: Pos) -> Self {
+        Self {
+            items: vec![Selection::caret(pos)],
+            primary: 0,
+        }
+    }
+
+    /// Returns the primary selection, or the first if `primary` is out of
+    /// bounds.
+    pub fn primary(&self) -> &Selection {
+        self.items
+            .get(self.primary)
+            .or_else(|| self.items.first())
+            .expect("SelectionSet must contain at least one selection")
+    }
+}
+
+impl Default for SelectionSet {
+    fn default() -> Self {
+        Self::caret(Pos::ORIGIN)
+    }
+}
+
+/// Vim editor mode. Distinct from the legacy [`crate::VimMode`] — that one
+/// is the host-facing status-line summary; this is the engine's internal
+/// state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    #[default]
+    Normal,
+    Insert,
+    Visual,
+    Replace,
+    Command,
+    OperatorPending,
+}
+
+/// Cursor shape intent emitted on mode transitions. Hosts honor it via
+/// `Host::emit_cursor_shape` once the trait extraction lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum CursorShape {
+    #[default]
+    Block,
+    Bar,
+    Underline,
+}
+
+/// Engine-native style. Replaces direct ratatui `Style` use in the public
+/// API once phase 5 trait extraction completes; until then both coexist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Style {
+    pub fg: Option<Color>,
+    pub bg: Option<Color>,
+    pub attrs: Attrs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Color(pub u8, pub u8, pub u8);
+
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+    pub struct Attrs: u8 {
+        const BOLD       = 1 << 0;
+        const ITALIC     = 1 << 1;
+        const UNDERLINE  = 1 << 2;
+        const REVERSE    = 1 << 3;
+        const DIM        = 1 << 4;
+        const STRIKE     = 1 << 5;
+    }
+}
+
+/// Highlight kind emitted by the engine's render pass. The host's style
+/// resolver picks colors for `Selection`/`SearchMatch`/etc.; `Syntax(id)`
+/// carries an opaque host-supplied id whose styling lives in the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HighlightKind {
+    Selection,
+    SearchMatch,
+    IncSearch,
+    MatchParen,
+    Syntax(u32),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Highlight {
+    pub range: Range<Pos>,
+    pub kind: HighlightKind,
+}
+
+/// Editor settings surfaced via `:set`. Per SPEC. Consumed once trait
+/// extraction lands; today's legacy `Settings` (in [`crate::editor`])
+/// continues to drive runtime behaviour.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Options {
+    /// Display width of `\t` for column math + render. Default 8.
+    pub tabstop: u32,
+    /// Spaces per shift step (`>>`, `<<`, `Ctrl-T`, `Ctrl-D`).
+    pub shiftwidth: u32,
+    /// Insert spaces (`true`) or literal `\t` (`false`) for the Tab key.
+    pub expandtab: bool,
+    /// Soft tab stop in spaces. When `> 0`, the Tab key (with `expandtab`)
+    /// inserts spaces to the next softtabstop boundary, and Backspace at
+    /// the end of a softtabstop-aligned space run deletes the whole run.
+    /// `0` disables softtabstop semantics. Matches vim's `:set softtabstop`.
+    pub softtabstop: u32,
+    /// Characters considered part of a "word" for `w`/`b`/`*`/`#`.
+    /// Default `"@,48-57,_,192-255"` (ASCII letters, digits, `_`, plus
+    /// extended Latin); host may override per language.
+    pub iskeyword: String,
+    /// Default `false`: search is case-sensitive.
+    pub ignorecase: bool,
+    /// When `true` and `ignorecase` is `true`, an uppercase letter in the
+    /// pattern flips back to case-sensitive for that search.
+    pub smartcase: bool,
+    /// Highlight all matches of the last search.
+    pub hlsearch: bool,
+    /// Incrementally highlight matches while typing the search pattern.
+    pub incsearch: bool,
+    /// Wrap searches around the buffer ends.
+    pub wrapscan: bool,
+    /// Copy previous line's leading whitespace on Enter in insert mode.
+    pub autoindent: bool,
+    /// When `true`, bump indent by one `shiftwidth` after a line ending in
+    /// `{` / `(` / `[`, and strip one indent unit when the user types the
+    /// matching `}` / `)` / `]` on an otherwise-whitespace-only line.
+    /// Supersedes autoindent's plain copy when on.  Future: a
+    /// tree-sitter `indents.scm` provider will replace the heuristic; see
+    /// `compute_enter_indent` in `vim.rs` for the plug-in point.
+    pub smartindent: bool,
+    /// Multi-key sequence timeout (e.g., `<C-w>v`). Vim's `timeoutlen`.
+    pub timeout_len: core::time::Duration,
+    /// Maximum undo-tree depth. Older entries pruned.
+    pub undo_levels: u32,
+    /// Break the current undo group on cursor motion in insert mode.
+    /// Matches vim default; turn off to merge multi-segment edits.
+    pub undo_break_on_motion: bool,
+    /// Reject every edit. `:set ro` sets this; `:w!` clears it.
+    pub readonly: bool,
+    /// When `false`, block ALL buffer modifications including entering insert/replace
+    /// mode. Used for special buffers (explorer). Matches vim's `:set nomodifiable` /
+    /// `:set noma`. Default `true`.
+    pub modifiable: bool,
+    /// Soft-wrap behavior for lines that exceed the viewport width.
+    /// Maps directly to `:set wrap` / `:set linebreak` / `:set nowrap`.
+    pub wrap: WrapMode,
+    /// Wrap column for `gq{motion}` text reflow. Vim's default is 79.
+    pub textwidth: u32,
+    /// Show absolute line numbers in the gutter. Matches `:set number`.
+    /// Default `true`.
+    pub number: bool,
+    /// Show relative line offsets in the gutter. Combined with `number`,
+    /// enables hybrid mode. Matches `:set relativenumber`. Default `false`.
+    pub relativenumber: bool,
+    /// Minimum gutter width in cells for the line-number column.
+    /// Width grows past this to fit the largest displayed number.
+    /// Matches vim's `:set numberwidth` / `:set nuw`. Default `4`. Range 1..=20.
+    pub numberwidth: usize,
+    /// Highlight the row where the cursor sits. Matches vim's `:set cursorline`.
+    /// Default `false` — vim parity (`nocursorline`), and the same value
+    /// [`crate::editor::Settings::default`] carries. The two defaults used to
+    /// disagree (`Options` said `true`); they must stay in lockstep, which
+    /// `settings_default_matches_options_default` pins.
+    pub cursorline: bool,
+    /// Highlight the column where the cursor sits. Matches vim's `:set cursorcolumn`.
+    /// Default `false`.
+    pub cursorcolumn: bool,
+    /// Whether to reserve a 1-cell sign column for diagnostics and git signs.
+    /// Matches vim's `:set signcolumn`. Default [`SignColumnMode::Auto`].
+    pub signcolumn: SignColumnMode,
+    /// Number of cells reserved for a fold-marker gutter (0 = none, max 12).
+    /// Matches vim's `:set foldcolumn`. Default `0`.
+    pub foldcolumn: u32,
+    /// How folds are automatically generated. Matches vim's `:set foldmethod`.
+    /// Default [`FoldMethod::Expr`] (tree-sitter) — diverges from vim's
+    /// `manual` default; functions/if/match/blocks fold when `folds.scm` ships.
+    /// Alias `fdm`.
+    pub foldmethod: FoldMethod,
+    /// Enable auto-folds. When `false`, no folds are generated regardless
+    /// of `foldmethod`. Matches vim's `:set foldenable`. Alias `fen`.
+    /// Default `true`.
+    pub foldenable: bool,
+    /// Level at which folds start open. `99` (default) means all folds open;
+    /// `0` means all closed. Matches vim's `:set foldlevelstart`. Alias `fls`.
+    pub foldlevelstart: u32,
+    /// Open/close markers for [`FoldMethod::Marker`], as a comma-separated
+    /// pair `open,close`. Matches vim's `:set foldmarker` / `fmr`.
+    /// Default `"{{{,}}}"`. An invalid value (no comma, or an empty side)
+    /// falls back to the default at fold-extraction time.
+    pub foldmarker: String,
+    /// Comma-separated 1-based column indices for vertical rulers.
+    /// Empty string = no rulers. Matches vim's `:set colorcolumn`. Default `""`.
+    pub colorcolumn: String,
+    /// Format-options flags (subset of vim's `formatoptions` / `fo`).
+    /// `r` — auto-continue line comments on `<Enter>` in insert mode.
+    /// `o` — auto-continue line comments on `o` / `O` in normal mode.
+    /// Default `"ro"` (both on).
+    pub formatoptions: String,
+    /// Active filetype for the current buffer (e.g. `"rust"`, `"python"`).
+    /// Matches vim's `:set filetype` / `:set ft`. Default `""` (plain text).
+    pub filetype: String,
+    /// Minimum number of context rows kept visible above and below the cursor
+    /// when scrolling. `999` (or any value ≥ half the viewport height) keeps
+    /// the cursor centred. `0` disables the margin. Matches vim's
+    /// `:set scrolloff` / `:set so`. Default `5`.
+    pub scrolloff: usize,
+    /// Minimum number of context columns kept visible left and right of the
+    /// cursor when scrolling horizontally (no-wrap mode only). `0` disables.
+    /// Matches vim's `:set sidescrolloff` / `:set siso`. Default `0`.
+    pub sidescrolloff: usize,
+    /// Enable vim modeline parsing on file open. When `true`, hjkl scans
+    /// the first/last `modelines` lines for `vim:` / `ex:` / `vi:` markers
+    /// and applies per-buffer option overrides. Matches vim's `:set modeline`.
+    /// Default `true`.
+    pub modeline: bool,
+    /// Number of lines from each end to scan for vim modelines.
+    /// Matches vim's `:set modelines`. Default `5`.
+    pub modelines: u32,
+    /// Auto-reload a clean (non-dirty) buffer when its file changes on disk
+    /// (detected by `:checktime` / focus-regain). When `false`, an external
+    /// change is reported as a warning and the buffer is left untouched.
+    /// Matches vim's `:set autoread`. Default `true`.
+    pub autoreload: bool,
+    /// Enable vim-sneak style two-char digraph jump on `s` / `S` in normal
+    /// mode. When `true` (default), `s`/`S` operate as sneak jumps rather
+    /// than vim's built-in substitute-char / substitute-line.
+    /// `:set nomotion_sneak` reverts to standard vim behavior.
+    /// Default `true` — **BREAKING** for users relying on `s` = substitute-char.
+    pub motion_sneak: bool,
+    /// Render invisible characters (tabs, trailing spaces, EOL markers).
+    /// Matches vim's `:set list` / `:set nolist`. Default `false`.
+    pub list: bool,
+    /// Characters used to represent invisibles when `list` is on.
+    /// Matches vim's `:set listchars` / `:set lcs`.
+    /// Default matches vim: `tab:^I,eol:$`.
+    pub listchars: ListChars,
+    /// Render thin vertical indent guides at every `shiftwidth`-aligned
+    /// column in the viewport. hjkl-specific option. Default `true`.
+    /// `:set noindent_guides` / `:set noig` disables.
+    pub indent_guides: bool,
+    /// Character painted as the indent guide. Default `'│'`.
+    /// `:set indent_guide_char=<char>` / `:set igc=<char>` to customize.
+    pub indent_guide_char: char,
+    /// Enable inline color-literal preview (hex, rgb, hsl, named CSS colors).
+    /// hjkl-specific. Default `true`.
+    /// `:set nocolorizer` disables globally regardless of filetype.
+    pub colorizer: bool,
+    /// Allowlist of filetypes for which the colorizer runs.
+    /// Comma-separated in `:set colorizer_filetypes=css,scss,toml`.
+    /// Default: `["css","scss","sass","less","html","vue","svelte","tailwindcss","toml","lua","vim"]`.
+    pub colorizer_filetypes: Vec<String>,
+    /// Run the registered hjkl-mangler formatter for the buffer's path before
+    /// each `:w` save. On formatter error the save is aborted. When no formatter
+    /// is registered for the file extension, or the tool is not installed, the
+    /// save proceeds without formatting (warn-and-fall-through for missing tool).
+    /// hjkl-specific. Alias `fos`. Default `true`.
+    pub format_on_save: bool,
+    /// Strip trailing `[ \t]` from every line in the buffer before each `:w`
+    /// save. Applied in-place so post-save `:e` reflects the trimmed content.
+    /// hjkl-specific. Alias `tts`. Default `false`.
+    pub trim_trailing_whitespace: bool,
+    /// Enable helix-style rainbow bracket coloring via tree-sitter.
+    /// hjkl-specific. Alias `rb`. Default `true`.
+    pub rainbow_brackets: bool,
+    /// Milliseconds of inactivity after which the swap file is written.
+    /// Matches Vim's `:set updatetime` / `:set ut`. Default `4000`.
+    /// hjkl-specific swap-file write cadence; does NOT affect CursorHold.
+    pub updatetime: u32,
+    /// Highlight matching bracket pair under the cursor (vim matchparen).
+    /// When `true` (default), both the bracket under the cursor and its
+    /// matching partner are highlighted with the `match_paren` theme style.
+    /// C-style brackets only: `()[]{}` and `<>`. Alias `mps`.
+    /// `:set nomatchparen` disables. hjkl-specific.
+    pub matchparen: bool,
+    /// Vim `'fixendofline'` / `'fixeol'`. When `true` (the vim default), a
+    /// buffer whose last line has no terminating newline gets one added on
+    /// write. When `false`, the file's original end-of-line state
+    /// (`'endofline'`) is preserved byte-for-byte.
+    ///
+    /// This is a plain user option — unlike `'endofline'` it is NEVER
+    /// derived from the file. `'endofline'` is buffer-local state owned by
+    /// the host (it is set from the bytes actually read), so it has no
+    /// `Options` field; see `hjkl`'s `save::EolState`.
+    pub fixendofline: bool,
+}
+
+/// Invisibles rendering configuration for `:set list` / `:set listchars`.
+///
+/// Re-exported from [`hjkl_buffer::ListChars`] so callers programming to
+/// the engine surface don't need to import `hjkl-buffer` directly.
+pub use hjkl_buffer::ListChars;
+
+/// Fold method. Controls how folds are automatically generated.
+/// Matches vim's `:set foldmethod`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+
+pub enum FoldMethod {
+    /// No automatic folds; only manual `zf` folds. Matches vim's `manual`.
+    Manual,
+    /// Automatically generate folds from the tree-sitter parse tree using
+    /// per-grammar `folds.scm` queries. Matches vim's `expr`/`syntax`.
+    /// **Default** — hjkl diverges from vim's `manual` default; functions /
+    /// if / match / blocks fold automatically when a `folds.scm` ships.
+    #[default]
+    Expr,
+    /// Marker folds via `{{{` / `}}}` comment delimiters. Matches vim's
+    /// `marker`. Parsed but not yet active (P4). Accepted without error.
+    Marker,
+}
+
+/// Sign-column display mode. Controls whether a 1-cell gutter is reserved
+/// for diagnostic and git signs. Matches vim's `:set signcolumn`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+
+pub enum SignColumnMode {
+    /// Never reserve a sign column.
+    No,
+    /// Always reserve a sign column.
+    Yes,
+    /// Reserve only when at least one sign is visible (default).
+    #[default]
+    Auto,
+}
+
+/// Inline diagnostic ghost-text mode. Controls where the end-of-line `// …`
+/// diagnostic message is shown (Error-Lens style). Matches
+/// `:set diagnostics_inline=off|current|all`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+
+pub enum DiagInlineMode {
+    /// Never show inline diagnostic ghost text.
+    Off,
+    /// Show only on the cursor's current line.
+    Current,
+    /// Show on every line that has a diagnostic (default).
+    #[default]
+    All,
+}
+
+/// Soft-wrap mode for the renderer + scroll math + `gj` / `gk`.
+/// Engine-native equivalent of [`hjkl_buffer::Wrap`]; the engine
+/// converts at the boundary to the buffer's runtime wrap setting.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+
+pub enum WrapMode {
+    /// Long lines extend past the right edge; `top_col` clips the
+    /// left side. Matches vim's `:set nowrap`.
+    #[default]
+    None,
+    /// Break at the cell boundary regardless of word edges. Matches
+    /// `:set wrap`.
+    Char,
+    /// Break at the last whitespace inside the visible width when
+    /// possible; falls back to a char break for runs longer than the
+    /// width. Matches `:set linebreak`.
+    Word,
+}
+
+/// Typed value for [`Options::set_by_name`] / [`Options::get_by_name`].
+///
+/// `:set tabstop=4` parses as `OptionValue::Int(4)`;
+/// `:set noexpandtab` parses as `OptionValue::Bool(false)`;
+/// `:set iskeyword=...` as `OptionValue::String(...)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OptionValue {
+    Bool(bool),
+    Int(i64),
+    String(String),
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            tabstop: 4,
+            shiftwidth: 4,
+            expandtab: true,
+            softtabstop: 4,
+            iskeyword: "@,48-57,_,192-255".to_string(),
+            ignorecase: true,
+            smartcase: true,
+            hlsearch: true,
+            incsearch: true,
+            wrapscan: true,
+            autoindent: true,
+            smartindent: true,
+            timeout_len: core::time::Duration::from_millis(1000),
+            undo_levels: 1000,
+            undo_break_on_motion: true,
+            readonly: false,
+            modifiable: true,
+            wrap: WrapMode::None,
+            textwidth: 79,
+            number: true,
+            relativenumber: false,
+            numberwidth: 4,
+            cursorline: false,
+            cursorcolumn: false,
+            signcolumn: SignColumnMode::Auto,
+            foldcolumn: 0,
+            foldmethod: FoldMethod::Expr,
+            foldenable: true,
+            foldlevelstart: 99,
+            foldmarker: "{{{,}}}".to_string(),
+            colorcolumn: String::new(),
+            formatoptions: "ro".to_string(),
+            filetype: String::new(),
+            scrolloff: 5,
+            sidescrolloff: 0,
+            modeline: true,
+            modelines: 5,
+            autoreload: true,
+            motion_sneak: true,
+            list: false,
+            listchars: ListChars::default(),
+            indent_guides: true,
+            indent_guide_char: '│',
+            colorizer: true,
+            colorizer_filetypes: vec![
+                "css".to_string(),
+                "scss".to_string(),
+                "sass".to_string(),
+                "less".to_string(),
+                "html".to_string(),
+                "vue".to_string(),
+                "svelte".to_string(),
+                "tailwindcss".to_string(),
+                "toml".to_string(),
+                "lua".to_string(),
+                "vim".to_string(),
+            ],
+            format_on_save: true,
+            trim_trailing_whitespace: false,
+            rainbow_brackets: true,
+            updatetime: 4000,
+            matchparen: true,
+            fixendofline: true,
+        }
+    }
+}
+
+impl Options {
+    /// Set an option by name. Vim-flavored option naming. Returns
+    /// [`EngineError::Ex`] for unknown names or type-mismatched values.
+    ///
+    /// Booleans accept `OptionValue::Bool(_)` directly or
+    /// `OptionValue::Int(0)`/`Int(non_zero)`. Integers accept only
+    /// `Int(_)`. Strings accept only `String(_)`.
+    pub fn set_by_name(&mut self, name: &str, val: OptionValue) -> Result<(), EngineError> {
+        macro_rules! set_bool {
+            ($field:ident) => {{
+                self.$field = match val {
+                    OptionValue::Bool(b) => b,
+                    OptionValue::Int(n) => n != 0,
+                    other => {
+                        return Err(EngineError::Ex(format!(
+                            "option `{name}` expects bool, got {other:?}"
+                        )));
+                    }
+                };
+                Ok(())
+            }};
+        }
+        macro_rules! set_u32 {
+            ($field:ident) => {{
+                self.$field = match val {
+                    OptionValue::Int(n) if n >= 0 && n <= u32::MAX as i64 => n as u32,
+                    OptionValue::Int(n) => {
+                        return Err(EngineError::Ex(format!(
+                            "option `{name}` out of u32 range: {n}"
+                        )));
+                    }
+                    other => {
+                        return Err(EngineError::Ex(format!(
+                            "option `{name}` expects int, got {other:?}"
+                        )));
+                    }
+                };
+                Ok(())
+            }};
+        }
+        macro_rules! set_string {
+            ($field:ident) => {{
+                self.$field = match val {
+                    OptionValue::String(s) => s,
+                    other => {
+                        return Err(EngineError::Ex(format!(
+                            "option `{name}` expects string, got {other:?}"
+                        )));
+                    }
+                };
+                Ok(())
+            }};
+        }
+        match name {
+            "tabstop" | "ts" => set_u32!(tabstop),
+            "shiftwidth" | "sw" => set_u32!(shiftwidth),
+            "softtabstop" | "sts" => set_u32!(softtabstop),
+            "textwidth" | "tw" => set_u32!(textwidth),
+            "expandtab" | "et" => set_bool!(expandtab),
+            "iskeyword" | "isk" => set_string!(iskeyword),
+            "ignorecase" | "ic" => set_bool!(ignorecase),
+            "smartcase" | "scs" => set_bool!(smartcase),
+            "hlsearch" | "hls" => set_bool!(hlsearch),
+            "incsearch" | "is" => set_bool!(incsearch),
+            "wrapscan" | "ws" => set_bool!(wrapscan),
+            "autoindent" | "ai" => set_bool!(autoindent),
+            "smartindent" | "si" => set_bool!(smartindent),
+            "timeoutlen" | "tm" => {
+                self.timeout_len = match val {
+                    OptionValue::Int(n) if n >= 0 => core::time::Duration::from_millis(n as u64),
+                    other => {
+                        return Err(EngineError::Ex(format!(
+                            "option `{name}` expects non-negative int (millis), got {other:?}"
+                        )));
+                    }
+                };
+                Ok(())
+            }
+            "undolevels" | "ul" => set_u32!(undo_levels),
+            "undobreak" => set_bool!(undo_break_on_motion),
+            "readonly" | "ro" => set_bool!(readonly),
+            "modifiable" | "ma" => set_bool!(modifiable),
+            "wrap" => {
+                let on = match val {
+                    OptionValue::Bool(b) => b,
+                    OptionValue::Int(n) => n != 0,
+                    other => {
+                        return Err(EngineError::Ex(format!(
+                            "option `{name}` expects bool, got {other:?}"
+                        )));
+                    }
+                };
+                self.wrap = match (on, self.wrap) {
+                    (false, _) => WrapMode::None,
+                    (true, WrapMode::Word) => WrapMode::Word,
+                    (true, _) => WrapMode::Char,
+                };
+                Ok(())
+            }
+            "linebreak" | "lbr" => {
+                let on = match val {
+                    OptionValue::Bool(b) => b,
+                    OptionValue::Int(n) => n != 0,
+                    other => {
+                        return Err(EngineError::Ex(format!(
+                            "option `{name}` expects bool, got {other:?}"
+                        )));
+                    }
+                };
+                self.wrap = match (on, self.wrap) {
+                    (true, _) => WrapMode::Word,
+                    (false, WrapMode::Word) => WrapMode::Char,
+                    (false, other) => other,
+                };
+                Ok(())
+            }
+            "number" | "nu" => set_bool!(number),
+            "relativenumber" | "rnu" => set_bool!(relativenumber),
+            "numberwidth" | "nuw" => {
+                self.numberwidth = match val {
+                    OptionValue::Int(n) if (1..=20).contains(&n) => n as usize,
+                    OptionValue::Int(n) => {
+                        return Err(EngineError::Ex(format!(
+                            "option `{name}` must be in range 1..=20, got {n}"
+                        )));
+                    }
+                    other => {
+                        return Err(EngineError::Ex(format!(
+                            "option `{name}` expects int, got {other:?}"
+                        )));
+                    }
+                };
+                Ok(())
+            }
+            "cursorline" | "cul" => set_bool!(cursorline),
+            "cursorcolumn" | "cuc" => set_bool!(cursorcolumn),
+            "signcolumn" | "scl" => {
+                self.signcolumn = match val {
+                    OptionValue::String(ref s) => match s.as_str() {
+                        "yes" => SignColumnMode::Yes,
+                        "no" => SignColumnMode::No,
+                        "auto" => SignColumnMode::Auto,
+                        other => {
+                            return Err(EngineError::Ex(format!(
+                                "option `{name}` must be `yes`, `no`, or `auto`, got {other:?}"
+                            )));
+                        }
+                    },
+                    other => {
+                        return Err(EngineError::Ex(format!(
+                            "option `{name}` expects string (yes/no/auto), got {other:?}"
+                        )));
+                    }
+                };
+                Ok(())
+            }
+            "foldcolumn" | "fdc" => {
+                self.foldcolumn = match val {
+                    OptionValue::Int(n) if (0..=12).contains(&n) => n as u32,
+                    OptionValue::Int(n) => {
+                        return Err(EngineError::Ex(format!(
+                            "option `{name}` must be in range 0..=12, got {n}"
+                        )));
+                    }
+                    other => {
+                        return Err(EngineError::Ex(format!(
+                            "option `{name}` expects int (0-12), got {other:?}"
+                        )));
+                    }
+                };
+                Ok(())
+            }
+            "foldmethod" | "fdm" => {
+                self.foldmethod = match val {
+                    OptionValue::String(ref s) => match s.as_str() {
+                        "manual" => FoldMethod::Manual,
+                        "expr" | "syntax" => FoldMethod::Expr,
+                        "marker" => FoldMethod::Marker,
+                        other => {
+                            return Err(EngineError::Ex(format!(
+                                "option `{name}` must be `manual`, `expr`, `syntax`, or `marker`, got `{other}`"
+                            )));
+                        }
+                    },
+                    other => {
+                        return Err(EngineError::Ex(format!(
+                            "option `{name}` expects string, got {other:?}"
+                        )));
+                    }
+                };
+                Ok(())
+            }
+            "foldenable" | "fen" => set_bool!(foldenable),
+            "foldlevelstart" | "fls" => set_u32!(foldlevelstart),
+            "colorcolumn" | "cc" => set_string!(colorcolumn),
+            "formatoptions" | "fo" => set_string!(formatoptions),
+            "filetype" | "ft" => set_string!(filetype),
+            "scrolloff" | "so" => {
+                self.scrolloff = match val {
+                    OptionValue::Int(n) if n >= 0 => n as usize,
+                    OptionValue::Int(n) => {
+                        return Err(EngineError::Ex(format!(
+                            "option `{name}` must be >= 0, got {n}"
+                        )));
+                    }
+                    other => {
+                        return Err(EngineError::Ex(format!(
+                            "option `{name}` expects int, got {other:?}"
+                        )));
+                    }
+                };
+                Ok(())
+            }
+            "sidescrolloff" | "siso" => {
+                self.sidescrolloff = match val {
+                    OptionValue::Int(n) if n >= 0 => n as usize,
+                    OptionValue::Int(n) => {
+                        return Err(EngineError::Ex(format!(
+                            "option `{name}` must be >= 0, got {n}"
+                        )));
+                    }
+                    other => {
+                        return Err(EngineError::Ex(format!(
+                            "option `{name}` expects int, got {other:?}"
+                        )));
+                    }
+                };
+                Ok(())
+            }
+            "modeline" | "ml" => set_bool!(modeline),
+            "autoreload" | "ar" => set_bool!(autoreload),
+            "modelines" | "mls" => set_u32!(modelines),
+            "motion_sneak" | "snk" => set_bool!(motion_sneak),
+            "list" => set_bool!(list),
+            "listchars" | "lcs" => {
+                let s = match val {
+                    OptionValue::String(s) => s,
+                    other => {
+                        return Err(EngineError::Ex(format!(
+                            "option `{name}` expects string, got {other:?}"
+                        )));
+                    }
+                };
+                self.listchars = ListChars::parse(&s).map_err(EngineError::Ex)?;
+                Ok(())
+            }
+            "indent_guides" | "ig" => set_bool!(indent_guides),
+            "colorizer" | "clz" => set_bool!(colorizer),
+            "colorizer_filetypes" | "clzft" => {
+                let s = match val {
+                    OptionValue::String(s) => s,
+                    other => {
+                        return Err(EngineError::Ex(format!(
+                            "option `{name}` expects string, got {other:?}"
+                        )));
+                    }
+                };
+                self.colorizer_filetypes = s
+                    .split(',')
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect();
+                Ok(())
+            }
+            "indent_guide_char" | "igc" => {
+                let s = match val {
+                    OptionValue::String(s) => s,
+                    other => {
+                        return Err(EngineError::Ex(format!(
+                            "option `{name}` expects a single-char string, got {other:?}"
+                        )));
+                    }
+                };
+                let mut chars = s.chars();
+                let (Some(ch), None) = (chars.next(), chars.next()) else {
+                    return Err(EngineError::Ex(format!(
+                        "option `{name}` expects exactly one character, got {s:?}"
+                    )));
+                };
+                self.indent_guide_char = ch;
+                Ok(())
+            }
+            "format_on_save" | "fos" => set_bool!(format_on_save),
+            "trim_trailing_whitespace" | "tts" => set_bool!(trim_trailing_whitespace),
+            "rainbow_brackets" | "rb" => set_bool!(rainbow_brackets),
+            "updatetime" | "ut" => set_u32!(updatetime),
+            "matchparen" | "mps" => set_bool!(matchparen),
+            "fixendofline" | "fixeol" => set_bool!(fixendofline),
+            other => Err(EngineError::Ex(format!("unknown option `{other}`"))),
+        }
+    }
+
+    /// Read an option by name. `None` for unknown names.
+    pub fn get_by_name(&self, name: &str) -> Option<OptionValue> {
+        Some(match name {
+            "tabstop" | "ts" => OptionValue::Int(self.tabstop as i64),
+            "shiftwidth" | "sw" => OptionValue::Int(self.shiftwidth as i64),
+            "softtabstop" | "sts" => OptionValue::Int(self.softtabstop as i64),
+            "textwidth" | "tw" => OptionValue::Int(self.textwidth as i64),
+            "expandtab" | "et" => OptionValue::Bool(self.expandtab),
+            "iskeyword" | "isk" => OptionValue::String(self.iskeyword.clone()),
+            "ignorecase" | "ic" => OptionValue::Bool(self.ignorecase),
+            "smartcase" | "scs" => OptionValue::Bool(self.smartcase),
+            "hlsearch" | "hls" => OptionValue::Bool(self.hlsearch),
+            "incsearch" | "is" => OptionValue::Bool(self.incsearch),
+            "wrapscan" | "ws" => OptionValue::Bool(self.wrapscan),
+            "autoindent" | "ai" => OptionValue::Bool(self.autoindent),
+            "smartindent" | "si" => OptionValue::Bool(self.smartindent),
+            "timeoutlen" | "tm" => OptionValue::Int(self.timeout_len.as_millis() as i64),
+            "undolevels" | "ul" => OptionValue::Int(self.undo_levels as i64),
+            "undobreak" => OptionValue::Bool(self.undo_break_on_motion),
+            "readonly" | "ro" => OptionValue::Bool(self.readonly),
+            "modifiable" | "ma" => OptionValue::Bool(self.modifiable),
+            "wrap" => OptionValue::Bool(!matches!(self.wrap, WrapMode::None)),
+            "linebreak" | "lbr" => OptionValue::Bool(matches!(self.wrap, WrapMode::Word)),
+            "number" | "nu" => OptionValue::Bool(self.number),
+            "relativenumber" | "rnu" => OptionValue::Bool(self.relativenumber),
+            "numberwidth" | "nuw" => OptionValue::Int(self.numberwidth as i64),
+            "cursorline" | "cul" => OptionValue::Bool(self.cursorline),
+            "cursorcolumn" | "cuc" => OptionValue::Bool(self.cursorcolumn),
+            "signcolumn" | "scl" => OptionValue::String(
+                match self.signcolumn {
+                    SignColumnMode::Yes => "yes",
+                    SignColumnMode::No => "no",
+                    SignColumnMode::Auto => "auto",
+                }
+                .to_string(),
+            ),
+            "foldcolumn" | "fdc" => OptionValue::Int(self.foldcolumn as i64),
+            "foldmethod" | "fdm" => OptionValue::String(
+                match self.foldmethod {
+                    FoldMethod::Manual => "manual",
+                    FoldMethod::Expr => "expr",
+                    FoldMethod::Marker => "marker",
+                }
+                .to_string(),
+            ),
+            "foldenable" | "fen" => OptionValue::Bool(self.foldenable),
+            "foldlevelstart" | "fls" => OptionValue::Int(self.foldlevelstart as i64),
+            "colorcolumn" | "cc" => OptionValue::String(self.colorcolumn.clone()),
+            "formatoptions" | "fo" => OptionValue::String(self.formatoptions.clone()),
+            "filetype" | "ft" => OptionValue::String(self.filetype.clone()),
+            "scrolloff" | "so" => OptionValue::Int(self.scrolloff as i64),
+            "sidescrolloff" | "siso" => OptionValue::Int(self.sidescrolloff as i64),
+            "modeline" | "ml" => OptionValue::Bool(self.modeline),
+            "autoreload" | "ar" => OptionValue::Bool(self.autoreload),
+            "modelines" | "mls" => OptionValue::Int(self.modelines as i64),
+            "motion_sneak" | "snk" => OptionValue::Bool(self.motion_sneak),
+            "list" => OptionValue::Bool(self.list),
+            "listchars" | "lcs" => OptionValue::String(self.listchars.to_canonical_string()),
+            "indent_guides" | "ig" => OptionValue::Bool(self.indent_guides),
+            "indent_guide_char" | "igc" => OptionValue::String(self.indent_guide_char.to_string()),
+            "colorizer" | "clz" => OptionValue::Bool(self.colorizer),
+            "colorizer_filetypes" | "clzft" => {
+                OptionValue::String(self.colorizer_filetypes.join(","))
+            }
+            "format_on_save" | "fos" => OptionValue::Bool(self.format_on_save),
+            "trim_trailing_whitespace" | "tts" => OptionValue::Bool(self.trim_trailing_whitespace),
+            "rainbow_brackets" | "rb" => OptionValue::Bool(self.rainbow_brackets),
+            "updatetime" | "ut" => OptionValue::Int(self.updatetime as i64),
+            "matchparen" | "mps" => OptionValue::Bool(self.matchparen),
+            "fixendofline" | "fixeol" => OptionValue::Bool(self.fixendofline),
+            _ => return None,
+        })
+    }
+}
+
+/// Visible region of a buffer — the runtime viewport state the host
+/// owns and mutates per render frame.
+///
+/// 0.0.34 (Patch C-δ.1): semantic ownership moved from
+/// [`hjkl_buffer::View`] to [`Host`]. The struct still lives in
+/// `hjkl-buffer` (alongside [`hjkl_buffer::Wrap`] and the rope-walking
+/// `wrap_segments` math it depends on) so the dependency graph stays
+/// `engine → buffer`; the engine re-exports it as
+/// [`crate::types::Viewport`] (this alias) for hosts that program to
+/// the SPEC surface.
+///
+/// The architectural decision is "viewport lives on Host, not View":
+/// vim logic must work in GUI hosts (variable-width fonts, pixel
+/// canvases, soft-wrap by pixel) as well as TUI hosts, so the runtime
+/// viewport state is expressed in cells/rows/cols and is owned by the
+/// host. `top_row` and `top_col` are the first visible row / column
+/// (`top_col` is a char index).
+///
+/// `wrap` and `text_width` together drive soft-wrap-aware scrolling
+/// and motion. `text_width` is the cell width of the text area
+/// (i.e., `width` minus any gutter the host renders).
+pub use hjkl_buffer::Viewport;
+
+/// Opaque buffer identifier owned by the host. Engine echoes it back
+/// in [`Host::Intent`] variants for buffer-list operations
+/// (`SwitchBuffer`, etc.). Generation is the host's responsibility.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BufferId(pub u64);
+
+/// Modifier bits accompanying every keystroke.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Modifiers {
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
+    pub super_: bool,
+}
+
+/// Special key codes — anything that isn't a printable character.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum SpecialKey {
+    Esc,
+    Enter,
+    Backspace,
+    Tab,
+    BackTab,
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Insert,
+    Delete,
+    F(u8),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MouseKind {
+    Press,
+    Release,
+    Drag,
+    ScrollUp,
+    ScrollDown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MouseEvent {
+    pub kind: MouseKind,
+    pub pos: Pos,
+    pub mods: Modifiers,
+}
+
+/// Single input event handed to the engine.
+///
+/// `Paste` content bypasses insert-mode mappings, abbreviations, and
+/// autoindent; the engine inserts the bracketed-paste payload as-is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Input {
+    Char(char, Modifiers),
+    Key(SpecialKey, Modifiers),
+    Mouse(MouseEvent),
+    Paste(String),
+    FocusGained,
+    FocusLost,
+    Resize(u16, u16),
+}
+
+/// Host adapter consumed by the engine. Lives behind the planned
+/// `Editor<B: View, H: Host>` generic; today it's the contract that
+/// `buffr-modal::BuffrHost` and the (future) `sqeel-tui` Host impl
+/// align against.
+///
+/// Methods with default impls return safe no-ops so hosts that don't
+/// need a feature (cancellation, wrap-aware motion, syntax highlights)
+/// can ignore them.
+pub trait Host: Send {
+    /// Custom intent type. Hosts that don't fan out actions back to
+    /// themselves can use the unit type via the default impl approach
+    /// (set associated type explicitly).
+    type Intent;
+
+    // ── Clipboard (hybrid: write fire-and-forget, read cached) ──
+
+    /// Fire-and-forget clipboard write. Engine never blocks; the host
+    /// queues internally and flushes on its own task (OSC52, `wl-copy`,
+    /// `pbcopy`, …).
+    fn write_clipboard(&mut self, text: String);
+
+    /// Returns the last-known cached clipboard value. May be stale —
+    /// matches the OSC52/wl-paste model neovim and helix both ship.
+    fn read_clipboard(&mut self) -> Option<String>;
+
+    // ── Time + cancellation ──
+
+    /// Monotonic time. Multi-key timeout (`timeoutlen`) resolution
+    /// reads this; engine never reads `Instant::now()` directly so
+    /// macro replay stays deterministic.
+    fn now(&self) -> core::time::Duration;
+
+    /// Cooperative cancellation. Engine polls during long search /
+    /// regex / multi-cursor edit loops. Default returns `false`.
+    fn should_cancel(&self) -> bool {
+        false
+    }
+
+    // ── Search prompt ──
+
+    /// Synchronously prompt the user for a search pattern. Returning
+    /// `None` aborts the search.
+    fn prompt_search(&mut self) -> Option<String>;
+
+    // ── Wrap-aware motion (default: wrap is identity) ──
+
+    /// Map a logical position to its display line for `gj`/`gk`. Hosts
+    /// without wrapping may use the default identity impl.
+    fn display_line_for(&self, pos: Pos) -> u32 {
+        pos.line
+    }
+
+    /// Inverse of [`display_line_for`]. Default identity.
+    fn pos_for_display(&self, line: u32, col: u32) -> Pos {
+        Pos { line, col }
+    }
+
+    // ── Syntax highlights (default: none) ──
+
+    /// Host-supplied syntax highlights for `range`. Empty by default;
+    /// hosts wire tree-sitter or LSP semantic tokens here.
+    fn syntax_highlights(&self, range: Range<Pos>) -> Vec<Highlight> {
+        let _ = range;
+        Vec::new()
+    }
+
+    // ── Cursor shape ──
+
+    /// Engine emits this on every mode transition. Hosts repaint the
+    /// cursor in the requested shape.
+    fn emit_cursor_shape(&mut self, shape: CursorShape);
+
+    // ── Viewport (host owns runtime viewport state) ──
+
+    /// Borrow the host's viewport. The host writes `width`/`height`/
+    /// `text_width`/`wrap` per render frame; the engine reads/writes
+    /// `top_row` / `top_col` to scroll. 0.0.34 (Patch C-δ.1) moved
+    /// this off [`hjkl_buffer::View`] onto `Host`.
+    fn viewport(&self) -> &Viewport;
+
+    /// Mutable viewport access. Engine motion + scroll code routes
+    /// here when scrolloff math advances `top_row`.
+    fn viewport_mut(&mut self) -> &mut Viewport;
+
+    // ── Custom intent fan-out ──
+
+    /// Host-defined event the engine raises (LSP request, fold op,
+    /// buffer switch, …).
+    fn emit_intent(&mut self, intent: Self::Intent);
+}
+
+/// Default no-op [`Host`] implementation. Suitable for tests, headless
+/// embedding, or any host that doesn't yet need clipboard / cursor-shape
+/// / cancellation plumbing.
+///
+/// Behaviour:
+/// - `write_clipboard` stores the most recent payload in an in-memory
+///   slot; `read_clipboard` returns it. Round-trip-only — no OS-level
+///   clipboard touched.
+/// - `now` returns wall-clock duration since construction.
+/// - `prompt_search` returns `None` (search is aborted).
+/// - `emit_cursor_shape` records the most recent shape; readable via
+///   [`DefaultHost::last_cursor_shape`].
+/// - `emit_intent` discards intents (intent type is `()`).
+#[derive(Debug)]
+pub struct DefaultHost {
+    clipboard: Option<String>,
+    last_cursor_shape: CursorShape,
+    started: std::time::Instant,
+    viewport: Viewport,
+}
+
+impl Default for DefaultHost {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DefaultHost {
+    /// Default viewport size for headless / test hosts: 80x24, no
+    /// soft-wrap. Matches the conventional terminal default.
+    pub const DEFAULT_VIEWPORT: Viewport = Viewport {
+        top_row: 0,
+        top_col: 0,
+        width: 80,
+        height: 24,
+        wrap: hjkl_buffer::Wrap::None,
+        text_width: 80,
+        tab_width: 0,
+    };
+
+    pub fn new() -> Self {
+        Self {
+            clipboard: None,
+            last_cursor_shape: CursorShape::Block,
+            started: std::time::Instant::now(),
+            viewport: Self::DEFAULT_VIEWPORT,
+        }
+    }
+
+    /// Construct a [`DefaultHost`] with a custom initial viewport.
+    /// Useful for tests that want to exercise scrolloff math at a
+    /// specific window size.
+    pub fn with_viewport(viewport: Viewport) -> Self {
+        Self {
+            clipboard: None,
+            last_cursor_shape: CursorShape::Block,
+            started: std::time::Instant::now(),
+            viewport,
+        }
+    }
+
+    /// Most recent cursor shape requested by the engine.
+    pub fn last_cursor_shape(&self) -> CursorShape {
+        self.last_cursor_shape
+    }
+}
+
+impl Host for DefaultHost {
+    type Intent = ();
+
+    fn write_clipboard(&mut self, text: String) {
+        self.clipboard = Some(text);
+    }
+
+    fn read_clipboard(&mut self) -> Option<String> {
+        self.clipboard.clone()
+    }
+
+    fn now(&self) -> core::time::Duration {
+        self.started.elapsed()
+    }
+
+    fn prompt_search(&mut self) -> Option<String> {
+        None
+    }
+
+    fn emit_cursor_shape(&mut self, shape: CursorShape) {
+        self.last_cursor_shape = shape;
+    }
+
+    fn viewport(&self) -> &Viewport {
+        &self.viewport
+    }
+
+    fn viewport_mut(&mut self) -> &mut Viewport {
+        &mut self.viewport
+    }
+
+    fn emit_intent(&mut self, _intent: Self::Intent) {}
+}
+
+/// Engine render frame consumed by the host once per redraw.
+///
+/// Borrow-style — the engine builds it on demand from its internal
+/// state without allocating clones of large fields. Hosts diff across
+/// frames to decide what to repaint.
+///
+/// Coarse today: covers mode, cursor, cursor shape, viewport top, and
+/// a snapshot of the current line count (to size the gutter). The
+/// SPEC-target fields (`selections`, `highlights`, `command_line`,
+/// `search_prompt`, `status_line`) land once trait extraction wires
+/// the FSM through `SelectionSet` and the highlight pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RenderFrame {
+    pub mode: SnapshotMode,
+    pub cursor_row: u32,
+    pub cursor_col: u32,
+    pub cursor_shape: CursorShape,
+    pub viewport_top: u32,
+    pub line_count: u32,
+}
+
+/// Coarse editor snapshot suitable for serde round-tripping.
+///
+/// Today's shape is intentionally minimal — it carries only the bits
+/// the runtime [`crate::Editor`] knows how to round-trip without the
+/// trait extraction (mode, cursor, lines, viewport top, settings).
+/// Once `Editor<B: View, H: Host>` ships under phase 5, this struct
+/// grows to cover full SPEC state: registers, marks, jump list, change
+/// list, undo tree, full options.
+///
+/// Hosts that persist editor state between sessions should:
+///
+/// - Treat the snapshot as opaque. Don't manually mutate fields.
+/// - Always check `version` after deserialization; reject on
+///   mismatch rather than attempt migration.
+///
+/// # Wire-format stability
+///
+/// - **0.0.x:** [`Self::VERSION`] bumps with every structural change to
+///   the snapshot. Hosts must reject mismatched persisted state — no
+///   migration path is offered.
+/// - **0.1.0:** [`Self::VERSION`] freezes. Hosts persisting editor state
+///   between sessions can rely on the wire format being stable for the
+///   entire 0.1.x line.
+/// - **0.2.0+:** any further structural change to this struct requires a
+///   `VERSION++` bump and is gated behind a major version bump of the
+///   crate.
+#[derive(Debug, Clone)]
+
+pub struct EditorSnapshot {
+    /// Format version. See [`Self::VERSION`] for the lock policy.
+    /// Hosts use this to detect mismatched persisted state.
+    pub version: u32,
+    /// Mode at snapshot time (status-line granularity).
+    pub mode: SnapshotMode,
+    /// Cursor `(row, col)` in byte indexing.
+    pub cursor: (u32, u32),
+    /// View lines. Trailing `\n` not included.
+    pub lines: Vec<String>,
+    /// Viewport top line at snapshot time.
+    pub viewport_top: u32,
+    /// Register bank. Vim's `""`, `"0`–`"9`, `"a`–`"z`, `"+`/`"*`.
+    /// Skipped for `Eq`/`PartialEq` because [`crate::Registers`]
+    /// doesn't derive them today.
+    pub registers: crate::Registers,
+    /// Named marks — lowercase (`'a`–`'z`, buffer-scope). Round-trips
+    /// across tab swaps in the host.
+    ///
+    /// 0.0.36: consolidated from the prior `file_marks` field;
+    /// lowercase marks now persist as well since they live in the
+    /// same unified [`crate::Editor::marks`] map.
+    pub marks: std::collections::BTreeMap<char, (u32, u32)>,
+    /// Global (file) marks — uppercase (`'A`–`'Z`). Each entry records
+    /// `(buffer_id, row, col)` so cross-buffer jumps can switch to the
+    /// correct slot. Added in VERSION 5.
+    pub global_marks: std::collections::BTreeMap<char, (u64, u32, u32)>,
+}
+
+/// Status-line mode summary. Bridges to the legacy
+/// [`crate::VimMode`] without leaking the full FSM type into the
+/// snapshot wire format.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+
+pub enum SnapshotMode {
+    #[default]
+    Normal,
+    Insert,
+    Visual,
+    VisualLine,
+    VisualBlock,
+}
+
+impl EditorSnapshot {
+    /// Current snapshot format version.
+    ///
+    /// Bumped to 2 in v0.0.8: registers added.
+    /// Bumped to 3 in v0.0.9: file_marks added.
+    /// Bumped to 4 in v0.0.36: file_marks → unified `marks` map
+    /// (lowercase + uppercase consolidated).
+    /// Bumped to 5: `global_marks` field added for cross-buffer uppercase
+    /// marks (closes #175).
+    ///
+    /// # Lock policy
+    ///
+    /// - **0.0.x (today):** `VERSION` bumps freely with each structural
+    ///   change to [`EditorSnapshot`]. Persisted state from an older
+    ///   patch release will not round-trip; hosts must reject the
+    ///   snapshot rather than attempt a field-by-field migration.
+    /// - **0.1.0:** `VERSION` freezes. Hosts persisting editor state
+    ///   between sessions can rely on the wire format being stable for
+    ///   the entire 0.1.x line.
+    /// - **0.2.0+:** any further structural change requires `VERSION++`
+    ///   together with a major-version bump of `hjkl-engine`.
+    pub const VERSION: u32 = 5;
+}
+
+/// Errors surfaced from the engine to the host. Intentionally narrow —
+/// callsites that fail in user-facing ways return `Result<_,
+/// EngineError>`; internal invariant breaks use `debug_assert!`.
+#[derive(Debug, thiserror::Error)]
+pub enum EngineError {
+    /// `:s/pat/.../` couldn't compile the pattern. Host displays the
+    /// regex error in the status line.
+    #[error("regex compile error: {0}")]
+    Regex(#[from] regex::Error),
+
+    /// `:[range]` parse failed.
+    #[error("invalid range: {0}")]
+    InvalidRange(String),
+
+    /// Ex command parse failed (unknown command, malformed args).
+    #[error("ex parse: {0}")]
+    Ex(String),
+
+    /// Edit attempted on a read-only buffer.
+    #[error("buffer is read-only")]
+    ReadOnly,
+
+    /// Position passed by the caller pointed outside the buffer.
+    #[error("position out of bounds: {0:?}")]
+    OutOfBounds(Pos),
+
+    /// Snapshot version mismatch. Host should treat as "abandon
+    /// snapshot" rather than attempt migration.
+    #[error("snapshot version mismatch: file={0}, expected={1}")]
+    SnapshotVersion(u32, u32),
+}
+
+pub(crate) mod sealed {
+    /// Sealing trait for the planned 0.1.0 [`super::View`] surface.
+    /// Pre-1.0 the engine reserves the right to add methods to the
+    /// `View` super-trait without a major bump; downstream cannot
+    /// `impl View` from outside this family.
+    ///
+    /// The in-tree [`hjkl_buffer::View`] is the canonical impl; the
+    /// `Sealed` marker for it lives in `crate::buffer_impl`. The module
+    /// itself stays `pub(crate)` so the sibling impl module can name
+    /// the trait while keeping the seal closed to the outside world.
+    pub trait Sealed {}
+}
+
+/// Cursor sub-trait of [`View`].
+///
+/// `Pos` here is the engine's grapheme-indexed [`Pos`] type. View
+/// implementations convert at the boundary if their internal indexing
+/// differs (e.g., the rope's byte indexing).
+pub trait Cursor: Send {
+    /// Active primary cursor position.
+    fn cursor(&self) -> Pos;
+    /// Move the active primary cursor.
+    fn set_cursor(&mut self, pos: Pos);
+    /// Byte offset for `pos`. Used by regex search bridges.
+    fn byte_offset(&self, pos: Pos) -> usize;
+    /// Inverse of [`Self::byte_offset`].
+    fn pos_at_byte(&self, byte: usize) -> Pos;
+}
+
+/// Read-only query sub-trait of [`View`].
+pub trait Query: Send {
+    /// Number of logical lines (excluding the implicit trailing line).
+    fn line_count(&self) -> u32;
+    /// Return an owned copy of line `idx` (0-based). Implementations should
+    /// panic on out-of-bounds rather than silently return empty.
+    fn line(&self, idx: u32) -> String;
+    /// Total buffer length in bytes.
+    fn len_bytes(&self) -> usize;
+    /// Slice for the half-open `range`. May allocate (rope joins)
+    /// or borrow (contiguous storage). Returns
+    /// [`std::borrow::Cow<'_, str>`] so contiguous backends can
+    /// avoid the allocation.
+    fn slice(&self, range: core::ops::Range<Pos>) -> std::borrow::Cow<'_, str>;
+    /// Monotonic mutation generation counter. Increments on every
+    /// content-changing call (insert / delete / replace / fold-touch
+    /// edit / `set_content`). Read-only ops (cursor moves, queries,
+    /// view changes) leave it untouched.
+    ///
+    /// Engine consumers cache per-row data (search-match positions,
+    /// syntax spans, wrap layout) keyed off this counter — when it
+    /// advances, the cache is invalidated.
+    ///
+    /// Implementations may return any monotonically non-decreasing
+    /// value (zero is fine for non-canonical impls that don't have a
+    /// caching story); the contract is "if `dirty_gen` changed, the
+    /// content **may** have changed."
+    fn dirty_gen(&self) -> u64 {
+        0
+    }
+
+    /// Byte offset of the first byte of `row` within the buffer's
+    /// canonical `lines().join("\n")` rendering. Out-of-range rows
+    /// clamp to `len_bytes()`.
+    ///
+    /// Default implementation walks every prior row's byte length and
+    /// adds a separator byte per row gap. Backends with a faster path
+    /// (rope position-of-line) should override.
+    ///
+    /// Pre-0.1.0 default-impl addition — does not extend the sealed
+    /// surface for downstream impls.
+    fn byte_of_row(&self, row: usize) -> usize {
+        let n = self.line_count() as usize;
+        let row = row.min(n);
+        let mut acc = 0usize;
+        for r in 0..row {
+            acc += self.line(r as u32).len();
+            // Separator newline between rows. The canonical engine
+            // join uses `\n` between every pair of lines (no trailing
+            // newline), so add one separator per row strictly before
+            // the last buffer row.
+            if r + 1 < n {
+                acc += 1;
+            }
+        }
+        acc
+    }
+
+    /// Return the canonical `lines().join("\n")` rendering of the
+    /// document as an `Arc<String>`. Multiple per-tick consumers (syntax
+    /// pipeline, LSP notify, git signature, dirty hash) need this; the
+    /// `View` impl caches against `dirty_gen` so they share one
+    /// allocation per generation.
+    ///
+    /// Default impl walks `line(r)` for every row — slow but correct.
+    /// Backends with cheaper paths (rope contiguous view) should override.
+    fn content_joined(&self) -> std::sync::Arc<String> {
+        let n = self.line_count() as usize;
+        let mut acc = String::with_capacity(self.len_bytes());
+        for r in 0..n {
+            if r > 0 {
+                acc.push('\n');
+            }
+            acc.push_str(&self.line(r as u32));
+        }
+        std::sync::Arc::new(acc)
+    }
+
+    /// Byte length of `row`. Out-of-range rows return 0.
+    ///
+    /// Default impl pays a full `line(row)` clone just to read its length.
+    /// Backends with row-indexed storage (canonical `hjkl_buffer::View`)
+    /// should override to read the byte length under one lock with no
+    /// allocation — `Editor::restore_text` calls this on every undo/redo
+    /// to recompute the inverse `ContentEdit`.
+    fn line_bytes(&self, row: usize) -> usize {
+        let n = self.line_count() as usize;
+        if row >= n {
+            return 0;
+        }
+        self.line(row as u32).len()
+    }
+
+    /// Return a cheaply-cloned rope snapshot of the buffer. O(1) for the
+    /// canonical `hjkl_buffer::View` (Arc-backed B-tree clone). Used by
+    /// the syntax pipeline's `parse_initial_rope` / `parse_incremental_rope`
+    /// to stream bytes into tree-sitter without materializing a contiguous
+    /// `String`.
+    ///
+    /// Default impl builds a rope from `content_joined()` — correct but
+    /// O(N). Backends that own a rope internally should override.
+    fn rope(&self) -> ropey::Rope {
+        ropey::Rope::from_str(&self.content_joined())
+    }
+}
+
+/// Mutating sub-trait of [`View`]. Distinct trait name from the
+/// crate-root [`Edit`] struct — this one carries methods, the other
+/// is a value type.
+pub trait BufferEdit: Send {
+    /// Insert `text` at `pos`. Implementations clamp out-of-range
+    /// positions to the document end.
+    fn insert_at(&mut self, pos: Pos, text: &str);
+    /// Delete the half-open `range`.
+    fn delete_range(&mut self, range: core::ops::Range<Pos>);
+    /// Replace the half-open `range` with `replacement`.
+    fn replace_range(&mut self, range: core::ops::Range<Pos>, replacement: &str);
+    /// Replace the entire buffer content with `text`. The cursor is
+    /// clamped to the surviving content. Used by `:e!` / undo
+    /// restore / snapshot replay where expressing "replace whole
+    /// buffer" via [`replace_range`] would require knowing the end
+    /// position. Default impl uses [`replace_range`] with a
+    /// best-effort end (`u32::MAX` / `u32::MAX`); the canonical
+    /// in-tree impl overrides it for a single-shot rebuild.
+    fn replace_all(&mut self, text: &str) {
+        self.replace_range(
+            Pos::ORIGIN..Pos {
+                line: u32::MAX,
+                col: u32::MAX,
+            },
+            text,
+        );
+    }
+}
+
+/// Search sub-trait of [`View`]. The pattern is owned by the engine;
+/// buffers do not cache compiled regexes.
+pub trait Search: Send {
+    /// First match at-or-after `from`. `None` when no match remains.
+    fn find_next(&self, from: Pos, pat: &regex::Regex) -> Option<core::ops::Range<Pos>>;
+    /// Last match at-or-before `from`.
+    fn find_prev(&self, from: Pos, pat: &regex::Regex) -> Option<core::ops::Range<Pos>>;
+}
+
+/// View super-trait — the pre-1.0 contract every backend implements.
+///
+/// Sealed to the engine's own crate family (in-tree
+/// `hjkl_buffer::View` is the canonical impl). Pre-0.1.0 the engine
+/// reserves the right to add methods on patch bumps; downstream
+/// consumers depend on the full trait without naming
+/// [`sealed::Sealed`].
+pub trait View: Cursor + Query + BufferEdit + Search + sealed::Sealed + Send {}
+
+/// Fold-iteration + mutation trait. The engine asks "what's the next
+/// visible row" / "is this row hidden" through this surface, and
+/// dispatches fold mutations through [`FoldProvider::apply`], so fold
+/// storage can live wherever the host pleases (on the buffer, in a
+/// separate host-side fold tree, or absent entirely).
+///
+/// Introduced in 0.0.32 (Patch C-β) for read access; 0.0.38 (Patch
+/// C-δ.4) added [`FoldProvider::apply`] + [`FoldProvider::invalidate_range`]
+/// so engine call sites that used to call
+/// `hjkl_buffer::View::{open,close,toggle,…}_fold_at` directly route
+/// through this trait now. The canonical read-only implementation
+/// [`crate::buffer_impl::BufferFoldProvider`] wraps a
+/// `&hjkl_buffer::View`; the canonical mutable implementation
+/// [`crate::buffer_impl::BufferFoldProviderMut`] wraps a
+/// `&mut hjkl_buffer::View`. Hosts that don't care about folds can
+/// use [`NoopFoldProvider`].
+///
+/// The engine carries a `Box<dyn FoldProvider + 'a>` slot today and
+/// looks up rows through it. Once `Editor<B, H>` flips generic
+/// (Patch C, 0.1.0) the slot moves onto `Host` directly.
+pub trait FoldProvider: Send {
+    /// First visible row strictly after `row`, skipping hidden rows.
+    /// `None` past the end of the buffer.
+    fn next_visible_row(&self, row: usize, row_count: usize) -> Option<usize>;
+    /// First visible row strictly before `row`. `None` past the top.
+    fn prev_visible_row(&self, row: usize) -> Option<usize>;
+    /// Is `row` currently hidden by a closed fold?
+    fn is_row_hidden(&self, row: usize) -> bool;
+    /// Range `(start_row, end_row, closed)` of the fold containing
+    /// `row`, if any. Lets `za` / `zo` / `zc` find their target
+    /// without iterating the full fold list.
+    fn fold_at_row(&self, row: usize) -> Option<(usize, usize, bool)>;
+
+    /// Apply a [`FoldOp`] to the underlying fold storage. Read-only
+    /// providers (e.g. [`crate::buffer_impl::BufferFoldProvider`] which
+    /// holds a `&View`) and providers that don't track folds (e.g.
+    /// [`NoopFoldProvider`]) implement this as a no-op.
+    ///
+    /// Default impl is a no-op so that read-only / host-stub providers
+    /// don't need to override it; mutable providers
+    /// (e.g. [`crate::buffer_impl::BufferFoldProviderMut`]) override
+    /// this to dispatch to the underlying buffer's fold methods.
+    fn apply(&mut self, op: FoldOp) {
+        let _ = op;
+    }
+
+    /// Drop every fold whose range overlaps `[start_row, end_row]`.
+    /// Edit pipelines call this after a user edit so vim's "edits
+    /// inside a fold open it" behaviour fires. Default impl forwards
+    /// to [`FoldProvider::apply`] with a [`FoldOp::Invalidate`].
+    fn invalidate_range(&mut self, start_row: usize, end_row: usize) {
+        self.apply(FoldOp::Invalidate { start_row, end_row });
+    }
+}
+
+/// No-op [`FoldProvider`] for hosts that don't expose folds. Every
+/// row is visible; `is_row_hidden` always returns `false`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopFoldProvider;
+
+impl FoldProvider for NoopFoldProvider {
+    fn next_visible_row(&self, row: usize, row_count: usize) -> Option<usize> {
+        let last = row_count.saturating_sub(1);
+        if last == 0 && row == 0 {
+            return None;
+        }
+        let r = row.checked_add(1)?;
+        (r <= last).then_some(r)
+    }
+
+    fn prev_visible_row(&self, row: usize) -> Option<usize> {
+        row.checked_sub(1)
+    }
+
+    fn is_row_hidden(&self, _row: usize) -> bool {
+        false
+    }
+
+    fn fold_at_row(&self, _row: usize) -> Option<(usize, usize, bool)> {
+        None
+    }
+}
+
+/// Direction for insert-mode arrow movement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertDir {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// Scroll direction for `scroll_full_page`, `scroll_half_page`, and
+/// `scroll_line` controller methods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollDir {
+    /// Move forward / downward (toward end of buffer).
+    Down,
+    /// Move backward / upward (toward start of buffer).
+    Up,
+}
+
+pub const SEARCH_HISTORY_MAX: usize = 100;
+pub const CHANGE_LIST_MAX: usize = 100;
+
+/// Max jumplist depth. Matches vim default.
+pub const JUMPLIST_MAX: usize = 100;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn caret_is_empty() {
+        let sel = Selection::caret(Pos::new(2, 4));
+        assert!(sel.is_empty());
+        assert_eq!(sel.anchor, sel.head);
+    }
+
+    #[test]
+    fn selection_set_default_has_one_caret() {
+        let set = SelectionSet::default();
+        assert_eq!(set.items.len(), 1);
+        assert_eq!(set.primary, 0);
+        assert_eq!(set.primary().anchor, Pos::ORIGIN);
+    }
+
+    #[test]
+    fn edit_constructors() {
+        let p = Pos::new(0, 5);
+        assert_eq!(Edit::insert(p, "x").range, p..p);
+        assert!(Edit::insert(p, "x").replacement == "x");
+        assert!(Edit::delete(p..p).replacement.is_empty());
+    }
+
+    #[test]
+    fn attrs_flags() {
+        let a = Attrs::BOLD | Attrs::UNDERLINE;
+        assert!(a.contains(Attrs::BOLD));
+        assert!(!a.contains(Attrs::ITALIC));
+    }
+
+    #[test]
+    fn options_set_get_roundtrip() {
+        let mut o = Options::default();
+        o.set_by_name("tabstop", OptionValue::Int(4)).unwrap();
+        assert!(matches!(o.get_by_name("ts"), Some(OptionValue::Int(4))));
+        o.set_by_name("expandtab", OptionValue::Bool(true)).unwrap();
+        assert!(matches!(o.get_by_name("et"), Some(OptionValue::Bool(true))));
+        o.set_by_name("iskeyword", OptionValue::String("a-z".into()))
+            .unwrap();
+        match o.get_by_name("iskeyword") {
+            Some(OptionValue::String(s)) => assert_eq!(s, "a-z"),
+            other => panic!("expected String, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn options_unknown_name_errors_on_set() {
+        let mut o = Options::default();
+        assert!(matches!(
+            o.set_by_name("frobnicate", OptionValue::Int(1)),
+            Err(EngineError::Ex(_))
+        ));
+        assert!(o.get_by_name("frobnicate").is_none());
+    }
+
+    /// Security regression (CVE-2019-12735 class): vim's `:set makeprg=...`
+    /// / `errorformat` can be abused from a modeline to run an arbitrary
+    /// shell command on `:make`. `hjkl`'s modeline path
+    /// (`hjkl_app::modeline`) only ever applies an option if
+    /// `Options::set_by_name` accepts it first — so as long as `makeprg` /
+    /// `errorformat` are never recognized names, a modeline can never set
+    /// them, full stop. This pins that: if a future change ever adds these
+    /// fields to `Options` without deliberately excluding them from the
+    /// modeline-settable allowlist, this test catches it.
+    #[test]
+    fn set_by_name_rejects_makeprg_and_errorformat() {
+        let mut o = Options::default();
+        assert!(
+            matches!(
+                o.set_by_name("makeprg", OptionValue::String("rm -rf /".into())),
+                Err(EngineError::Ex(_))
+            ),
+            "`makeprg` must never be a settable option — a modeline must \
+             never be able to smuggle an arbitrary shell command into `:make`"
+        );
+        assert!(o.get_by_name("makeprg").is_none());
+        assert!(
+            matches!(
+                o.set_by_name("errorformat", OptionValue::String("%f:%l:%m".into())),
+                Err(EngineError::Ex(_))
+            ),
+            "`errorformat` rides the same `:make`/`:grep` shell-out surface \
+             as `makeprg` and must stay unsettable too"
+        );
+        assert!(o.get_by_name("errorformat").is_none());
+    }
+
+    #[test]
+    fn options_type_mismatch_errors() {
+        let mut o = Options::default();
+        assert!(matches!(
+            o.set_by_name("tabstop", OptionValue::String("nope".into())),
+            Err(EngineError::Ex(_))
+        ));
+        assert!(matches!(
+            o.set_by_name("iskeyword", OptionValue::Int(7)),
+            Err(EngineError::Ex(_))
+        ));
+    }
+
+    /// Verify that `Options::default()` ships with the recommended vim
+    /// settings: `ignorecase=true` and `smartcase=true`.
+    #[test]
+    fn default_options_ignorecase_and_smartcase_are_true() {
+        let o = Options::default();
+        assert!(o.ignorecase, "ignorecase must default to true");
+        assert!(o.smartcase, "smartcase must default to true");
+    }
+
+    #[test]
+    fn options_int_to_bool_coercion() {
+        // `:set ic=0` reads as boolean false; `:set ic=1` as true.
+        // Common vim spelling.
+        let mut o = Options::default();
+        o.set_by_name("ignorecase", OptionValue::Int(1)).unwrap();
+        assert!(matches!(o.get_by_name("ic"), Some(OptionValue::Bool(true))));
+        o.set_by_name("ignorecase", OptionValue::Int(0)).unwrap();
+        assert!(matches!(
+            o.get_by_name("ic"),
+            Some(OptionValue::Bool(false))
+        ));
+    }
+
+    #[test]
+    fn options_wrap_linebreak_roundtrip() {
+        let mut o = Options::default();
+        assert_eq!(o.wrap, WrapMode::None);
+        o.set_by_name("wrap", OptionValue::Bool(true)).unwrap();
+        assert_eq!(o.wrap, WrapMode::Char);
+        o.set_by_name("linebreak", OptionValue::Bool(true)).unwrap();
+        assert_eq!(o.wrap, WrapMode::Word);
+        assert!(matches!(
+            o.get_by_name("wrap"),
+            Some(OptionValue::Bool(true))
+        ));
+        assert!(matches!(
+            o.get_by_name("lbr"),
+            Some(OptionValue::Bool(true))
+        ));
+        o.set_by_name("linebreak", OptionValue::Bool(false))
+            .unwrap();
+        assert_eq!(o.wrap, WrapMode::Char);
+        o.set_by_name("wrap", OptionValue::Bool(false)).unwrap();
+        assert_eq!(o.wrap, WrapMode::None);
+    }
+
+    #[test]
+    fn options_default_modern() {
+        // 0.2.0: defaults flipped from vim's tabstop=8/expandtab=off to
+        // modern editor defaults (4-space soft tabs).
+        let o = Options::default();
+        assert_eq!(o.tabstop, 4);
+        assert_eq!(o.shiftwidth, 4);
+        assert_eq!(o.softtabstop, 4);
+        assert!(o.expandtab);
+        assert!(o.hlsearch);
+        assert!(o.wrapscan);
+        assert!(o.smartindent);
+        assert_eq!(o.timeout_len, core::time::Duration::from_millis(1000));
+    }
+
+    #[test]
+    fn editor_snapshot_version_const() {
+        assert_eq!(EditorSnapshot::VERSION, 5);
+    }
+
+    #[test]
+    fn editor_snapshot_default_shape() {
+        let s = EditorSnapshot {
+            version: EditorSnapshot::VERSION,
+            mode: SnapshotMode::Normal,
+            cursor: (0, 0),
+            lines: vec!["hello".to_string()],
+            viewport_top: 0,
+            registers: crate::Registers::default(),
+            marks: Default::default(),
+            global_marks: Default::default(),
+        };
+        assert_eq!(s.cursor, (0, 0));
+        assert_eq!(s.lines.len(), 1);
+    }
+
+    #[test]
+    fn engine_error_display() {
+        let e = EngineError::ReadOnly;
+        assert_eq!(e.to_string(), "buffer is read-only");
+        let e = EngineError::OutOfBounds(Pos::new(3, 7));
+        assert!(e.to_string().contains("out of bounds"));
+    }
+
+    // ── New render-level options ─────────────────────────────────────────────
+
+    #[test]
+    fn options_cursorline_roundtrip() {
+        let mut o = Options::default();
+        assert!(!o.cursorline, "cursorline defaults to false (vim parity)");
+        o.set_by_name("cursorline", OptionValue::Bool(true))
+            .unwrap();
+        assert!(matches!(
+            o.get_by_name("cul"),
+            Some(OptionValue::Bool(true))
+        ));
+        o.set_by_name("cul", OptionValue::Bool(false)).unwrap();
+        assert!(matches!(
+            o.get_by_name("cursorline"),
+            Some(OptionValue::Bool(false))
+        ));
+    }
+
+    #[test]
+    fn options_cursorcolumn_roundtrip() {
+        let mut o = Options::default();
+        assert!(!o.cursorcolumn, "cursorcolumn defaults to false");
+        o.set_by_name("cuc", OptionValue::Bool(true)).unwrap();
+        assert!(matches!(
+            o.get_by_name("cursorcolumn"),
+            Some(OptionValue::Bool(true))
+        ));
+    }
+
+    #[test]
+    fn options_signcolumn_roundtrip() {
+        let mut o = Options::default();
+        assert_eq!(
+            o.signcolumn,
+            SignColumnMode::Auto,
+            "signcolumn defaults to auto"
+        );
+        o.set_by_name("signcolumn", OptionValue::String("yes".into()))
+            .unwrap();
+        assert_eq!(o.signcolumn, SignColumnMode::Yes);
+        assert_eq!(
+            o.get_by_name("scl"),
+            Some(OptionValue::String("yes".into()))
+        );
+        o.set_by_name("scl", OptionValue::String("no".into()))
+            .unwrap();
+        assert_eq!(o.signcolumn, SignColumnMode::No);
+        o.set_by_name("scl", OptionValue::String("auto".into()))
+            .unwrap();
+        assert_eq!(o.signcolumn, SignColumnMode::Auto);
+    }
+
+    #[test]
+    fn options_signcolumn_rejects_invalid() {
+        let mut o = Options::default();
+        assert!(matches!(
+            o.set_by_name("signcolumn", OptionValue::String("maybe".into())),
+            Err(EngineError::Ex(_))
+        ));
+        // Type mismatch
+        assert!(matches!(
+            o.set_by_name("signcolumn", OptionValue::Bool(true)),
+            Err(EngineError::Ex(_))
+        ));
+    }
+
+    #[test]
+    fn options_foldcolumn_roundtrip() {
+        let mut o = Options::default();
+        assert_eq!(o.foldcolumn, 0, "foldcolumn defaults to 0");
+        o.set_by_name("fdc", OptionValue::Int(3)).unwrap();
+        assert_eq!(o.foldcolumn, 3);
+        assert_eq!(o.get_by_name("foldcolumn"), Some(OptionValue::Int(3)));
+    }
+
+    #[test]
+    fn options_foldcolumn_rejects_out_of_range() {
+        let mut o = Options::default();
+        assert!(matches!(
+            o.set_by_name("foldcolumn", OptionValue::Int(13)),
+            Err(EngineError::Ex(_))
+        ));
+        assert!(matches!(
+            o.set_by_name("foldcolumn", OptionValue::Int(-1)),
+            Err(EngineError::Ex(_))
+        ));
+    }
+
+    #[test]
+    fn options_colorcolumn_roundtrip() {
+        let mut o = Options::default();
+        assert_eq!(o.colorcolumn, "", "colorcolumn defaults to empty string");
+        o.set_by_name("cc", OptionValue::String("80,120".into()))
+            .unwrap();
+        assert_eq!(
+            o.get_by_name("colorcolumn"),
+            Some(OptionValue::String("80,120".into()))
+        );
+        o.set_by_name("colorcolumn", OptionValue::String(String::new()))
+            .unwrap();
+        assert_eq!(
+            o.get_by_name("cc"),
+            Some(OptionValue::String(String::new()))
+        );
+    }
+
+    #[test]
+    fn options_cursorline_alias_cul() {
+        let mut o = Options::default();
+        // `:set cul` — bare name turns bool on
+        o.set_by_name("cul", OptionValue::Bool(true)).unwrap();
+        assert!(o.cursorline);
+        // `:set nocul` → Bool(false)
+        o.set_by_name("cul", OptionValue::Bool(false)).unwrap();
+        assert!(!o.cursorline);
+    }
+
+    #[test]
+    fn sign_column_mode_default_is_auto() {
+        assert_eq!(SignColumnMode::default(), SignColumnMode::Auto);
+    }
+
+    #[test]
+    fn options_scrolloff_default_and_set() {
+        let mut o = Options::default();
+        assert_eq!(o.scrolloff, 5, "scrolloff defaults to 5");
+        o.set_by_name("scrolloff", OptionValue::Int(0)).unwrap();
+        assert_eq!(o.scrolloff, 0);
+        o.set_by_name("scrolloff", OptionValue::Int(999)).unwrap();
+        assert_eq!(o.scrolloff, 999);
+        assert_eq!(o.get_by_name("scrolloff"), Some(OptionValue::Int(999)));
+    }
+
+    #[test]
+    fn options_sidescrolloff_default_and_set() {
+        let mut o = Options::default();
+        assert_eq!(o.sidescrolloff, 0, "sidescrolloff defaults to 0");
+        o.set_by_name("sidescrolloff", OptionValue::Int(5)).unwrap();
+        assert_eq!(o.sidescrolloff, 5);
+        assert_eq!(o.get_by_name("sidescrolloff"), Some(OptionValue::Int(5)));
+    }
+
+    #[test]
+    fn options_alias_so_siso() {
+        let mut o = Options::default();
+        // `so` sets scrolloff
+        o.set_by_name("so", OptionValue::Int(3)).unwrap();
+        assert_eq!(o.scrolloff, 3);
+        assert_eq!(o.get_by_name("so"), Some(OptionValue::Int(3)));
+        // `siso` sets sidescrolloff
+        o.set_by_name("siso", OptionValue::Int(2)).unwrap();
+        assert_eq!(o.sidescrolloff, 2);
+        assert_eq!(o.get_by_name("siso"), Some(OptionValue::Int(2)));
+    }
+
+    // ---- list / listchars options -----------------------------------------------
+
+    #[test]
+    fn options_list_default_false_and_set() {
+        let mut o = Options::default();
+        assert!(!o.list, "list default is false");
+        o.set_by_name("list", OptionValue::Bool(true)).unwrap();
+        assert!(o.list);
+        assert_eq!(o.get_by_name("list"), Some(OptionValue::Bool(true)));
+        o.set_by_name("list", OptionValue::Bool(false)).unwrap();
+        assert!(!o.list);
+    }
+
+    #[test]
+    fn options_listchars_default_matches_vim() {
+        let o = Options::default();
+        let lc = &o.listchars;
+        assert_eq!(lc.tab_lead, '^');
+        assert_eq!(lc.tab_fill, Some('I'));
+        assert_eq!(lc.eol, Some('$'));
+        assert_eq!(lc.space, None);
+        assert_eq!(lc.trail, None);
+        assert_eq!(lc.nbsp, None);
+    }
+
+    #[test]
+    fn options_listchars_set_and_get() {
+        let mut o = Options::default();
+        o.set_by_name("listchars", OptionValue::String("tab:>-,eol:$".to_string()))
+            .unwrap();
+        assert_eq!(o.listchars.tab_lead, '>');
+        assert_eq!(o.listchars.tab_fill, Some('-'));
+        assert_eq!(o.listchars.eol, Some('$'));
+    }
+
+    #[test]
+    fn options_lcs_alias_sets_listchars() {
+        let mut o = Options::default();
+        o.set_by_name("lcs", OptionValue::String("tab:>-,trail:~".to_string()))
+            .unwrap();
+        assert_eq!(o.listchars.tab_lead, '>');
+        assert_eq!(o.listchars.trail, Some('~'));
+    }
+
+    #[test]
+    fn options_listchars_get_by_name_returns_string() {
+        let o = Options::default();
+        match o.get_by_name("listchars") {
+            Some(OptionValue::String(s)) => {
+                assert!(s.contains("tab:"), "canonical string should contain tab:");
+            }
+            other => panic!("expected String, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn options_listchars_invalid_value_returns_err() {
+        let mut o = Options::default();
+        assert!(
+            o.set_by_name("listchars", OptionValue::String("bogus:x".to_string()))
+                .is_err()
+        );
+    }
+
+    // ── indent_guides / indent_guide_char option tests ──────────────────────
+
+    #[test]
+    fn indent_guides_default_true() {
+        assert!(
+            Options::default().indent_guides,
+            "indent_guides must default to true"
+        );
+    }
+
+    #[test]
+    fn options_indent_guides_set_and_get() {
+        let mut opts = Options::default();
+        // Disable via full name.
+        opts.set_by_name("indent_guides", OptionValue::Bool(false))
+            .unwrap();
+        assert!(!opts.indent_guides);
+        // Re-enable via alias.
+        opts.set_by_name("ig", OptionValue::Bool(true)).unwrap();
+        assert!(opts.indent_guides);
+        // Read back via both names.
+        assert_eq!(opts.get_by_name("ig"), Some(OptionValue::Bool(true)));
+        assert_eq!(
+            opts.get_by_name("indent_guides"),
+            Some(OptionValue::Bool(true))
+        );
+    }
+
+    #[test]
+    fn options_indent_guide_char_set_and_get() {
+        let mut opts = Options::default();
+        opts.set_by_name("indent_guide_char", OptionValue::String(":".to_string()))
+            .unwrap();
+        assert_eq!(opts.indent_guide_char, ':');
+        // Alias.
+        opts.set_by_name("igc", OptionValue::String("┊".to_string()))
+            .unwrap();
+        assert_eq!(opts.indent_guide_char, '┊');
+        // Read back via alias.
+        assert_eq!(
+            opts.get_by_name("igc"),
+            Some(OptionValue::String("┊".to_string()))
+        );
+        assert_eq!(
+            opts.get_by_name("indent_guide_char"),
+            Some(OptionValue::String("┊".to_string()))
+        );
+    }
+
+    #[test]
+    fn options_indent_guide_char_rejects_multi_char() {
+        let mut opts = Options::default();
+        assert!(
+            opts.set_by_name("indent_guide_char", OptionValue::String("ab".to_string()))
+                .is_err(),
+            "multi-char value must be rejected"
+        );
+    }
+
+    #[test]
+    fn options_indent_guide_char_rejects_empty() {
+        let mut opts = Options::default();
+        assert!(
+            opts.set_by_name("indent_guide_char", OptionValue::String(String::new()))
+                .is_err(),
+            "empty string must be rejected"
+        );
+    }
+
+    // ── colorizer option tests ───────────────────────────────────────────────
+
+    #[test]
+    fn colorizer_default_true() {
+        assert!(
+            Options::default().colorizer,
+            "colorizer must default to true"
+        );
+    }
+
+    #[test]
+    fn colorizer_filetypes_includes_css() {
+        let o = Options::default();
+        assert!(
+            o.colorizer_filetypes.iter().any(|f| f == "css"),
+            "default colorizer_filetypes must include 'css'"
+        );
+    }
+
+    #[test]
+    fn options_colorizer_set_and_get() {
+        let mut o = Options::default();
+        o.set_by_name("colorizer", OptionValue::Bool(false))
+            .unwrap();
+        assert_eq!(o.get_by_name("colorizer"), Some(OptionValue::Bool(false)));
+        o.set_by_name("clz", OptionValue::Bool(true)).unwrap();
+        assert_eq!(o.get_by_name("clz"), Some(OptionValue::Bool(true)));
+    }
+
+    #[test]
+    fn options_colorizer_filetypes_set_and_get() {
+        let mut o = Options::default();
+        o.set_by_name(
+            "colorizer_filetypes",
+            OptionValue::String("css,scss,toml".into()),
+        )
+        .unwrap();
+        assert_eq!(o.colorizer_filetypes, vec!["css", "scss", "toml"]);
+        assert_eq!(
+            o.get_by_name("clzft"),
+            Some(OptionValue::String("css,scss,toml".into()))
+        );
+    }
+
+    // ── format_on_save / trim_trailing_whitespace ─────────────────────────────
+
+    #[test]
+    fn format_on_save_default_true() {
+        let o = Options::default();
+        assert!(o.format_on_save, "format_on_save must default to true");
+    }
+
+    #[test]
+    fn trim_trailing_whitespace_default_false() {
+        let o = Options::default();
+        assert!(
+            !o.trim_trailing_whitespace,
+            "trim_trailing_whitespace must default to false"
+        );
+    }
+
+    #[test]
+    fn options_fos_alias_sets_format_on_save() {
+        let mut o = Options::default();
+        o.set_by_name("fos", OptionValue::Bool(true)).unwrap();
+        assert!(o.format_on_save, "fos alias must set format_on_save");
+        assert_eq!(
+            o.get_by_name("fos"),
+            Some(OptionValue::Bool(true)),
+            "get_by_name(fos) must reflect the new value"
+        );
+        assert_eq!(
+            o.get_by_name("format_on_save"),
+            Some(OptionValue::Bool(true)),
+            "get_by_name(format_on_save) must also reflect the new value"
+        );
+    }
+
+    #[test]
+    fn options_tts_alias_sets_trim_trailing_whitespace() {
+        let mut o = Options::default();
+        o.set_by_name("tts", OptionValue::Bool(true)).unwrap();
+        assert!(
+            o.trim_trailing_whitespace,
+            "tts alias must set trim_trailing_whitespace"
+        );
+        assert_eq!(
+            o.get_by_name("tts"),
+            Some(OptionValue::Bool(true)),
+            "get_by_name(tts) must reflect the new value"
+        );
+        assert_eq!(
+            o.get_by_name("trim_trailing_whitespace"),
+            Some(OptionValue::Bool(true)),
+            "get_by_name(trim_trailing_whitespace) must also reflect the new value"
+        );
+    }
+
+    // ── rainbow_brackets ──────────────────────────────────────────────────────
+
+    #[test]
+    fn rainbow_brackets_default_true() {
+        let o = Options::default();
+        assert!(o.rainbow_brackets, "rainbow_brackets must default to true");
+    }
+
+    #[test]
+    fn options_rb_alias_sets_rainbow_brackets() {
+        let mut o = Options::default();
+        o.set_by_name("rb", OptionValue::Bool(false)).unwrap();
+        assert!(
+            !o.rainbow_brackets,
+            "rb alias must set rainbow_brackets to false"
+        );
+        assert_eq!(
+            o.get_by_name("rb"),
+            Some(OptionValue::Bool(false)),
+            "get_by_name(rb) must reflect the new value"
+        );
+        assert_eq!(
+            o.get_by_name("rainbow_brackets"),
+            Some(OptionValue::Bool(false)),
+            "get_by_name(rainbow_brackets) must also reflect the new value"
+        );
+    }
+
+    #[test]
+    fn autoreload_default_true() {
+        assert!(
+            Options::default().autoreload,
+            "autoreload must default true"
+        );
+    }
+
+    #[test]
+    fn options_ar_alias_sets_autoreload() {
+        let mut o = Options::default();
+        o.set_by_name("ar", OptionValue::Bool(false)).unwrap();
+        assert!(!o.autoreload, "ar alias must set autoreload");
+        assert_eq!(o.get_by_name("autoreload"), Some(OptionValue::Bool(false)));
+    }
+
+    // ── updatetime ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn updatetime_default_4000() {
+        let o = Options::default();
+        assert_eq!(o.updatetime, 4000, "updatetime must default to 4000 ms");
+        assert_eq!(
+            o.get_by_name("updatetime"),
+            Some(OptionValue::Int(4000)),
+            "get_by_name(updatetime) must return Int(4000)"
+        );
+    }
+
+    #[test]
+    fn options_ut_alias_sets_updatetime() {
+        let mut o = Options::default();
+        o.set_by_name("ut", OptionValue::Int(1000)).unwrap();
+        assert_eq!(o.updatetime, 1000, "ut alias must set updatetime");
+        assert_eq!(
+            o.get_by_name("ut"),
+            Some(OptionValue::Int(1000)),
+            "get_by_name(ut) must reflect the new value"
+        );
+        assert_eq!(
+            o.get_by_name("updatetime"),
+            Some(OptionValue::Int(1000)),
+            "get_by_name(updatetime) must also reflect the new value"
+        );
+    }
+
+    // ── matchparen ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn matchparen_default_true() {
+        let o = Options::default();
+        assert!(o.matchparen, "matchparen must default to true");
+        assert_eq!(
+            o.get_by_name("matchparen"),
+            Some(OptionValue::Bool(true)),
+            "get_by_name(matchparen) must return Bool(true)"
+        );
+    }
+
+    #[test]
+    fn options_matchparen_set_and_get() {
+        let mut o = Options::default();
+        o.set_by_name("matchparen", OptionValue::Bool(false))
+            .unwrap();
+        assert!(!o.matchparen, "matchparen must be false after set");
+        assert_eq!(
+            o.get_by_name("matchparen"),
+            Some(OptionValue::Bool(false)),
+            "get_by_name(matchparen) must reflect false"
+        );
+        // Alias mps
+        o.set_by_name("mps", OptionValue::Bool(true)).unwrap();
+        assert!(o.matchparen, "mps alias must set matchparen to true");
+        assert_eq!(
+            o.get_by_name("mps"),
+            Some(OptionValue::Bool(true)),
+            "get_by_name(mps) must reflect true"
+        );
+    }
+
+    // ── fixendofline ──────────────────────────────────────────────────────────
+
+    /// vim's default is `fixendofline` ON — a missing final newline is added
+    /// on write. Confirmed against nvim 0.12 (`"abc"` saves as `"abc\n"`).
+    #[test]
+    fn fixendofline_default_true() {
+        let o = Options::default();
+        assert!(o.fixendofline, "fixendofline must default to true");
+        assert_eq!(
+            o.get_by_name("fixendofline"),
+            Some(OptionValue::Bool(true)),
+            "get_by_name(fixendofline) must return Bool(true)"
+        );
+    }
+
+    #[test]
+    fn options_fixendofline_set_and_get() {
+        let mut o = Options::default();
+        o.set_by_name("fixendofline", OptionValue::Bool(false))
+            .unwrap();
+        assert!(!o.fixendofline, "fixendofline must be false after set");
+        assert_eq!(
+            o.get_by_name("fixendofline"),
+            Some(OptionValue::Bool(false)),
+            "get_by_name(fixendofline) must reflect false"
+        );
+        // Alias fixeol
+        o.set_by_name("fixeol", OptionValue::Bool(true)).unwrap();
+        assert!(o.fixendofline, "fixeol alias must set fixendofline to true");
+        assert_eq!(
+            o.get_by_name("fixeol"),
+            Some(OptionValue::Bool(true)),
+            "get_by_name(fixeol) must reflect true"
+        );
+    }
+
+    // ── foldmethod / foldenable / foldlevelstart ──────────────────────────────
+
+    #[test]
+    fn foldmethod_default_expr() {
+        let o = Options::default();
+        assert_eq!(
+            o.foldmethod,
+            FoldMethod::Expr,
+            "foldmethod must default to Expr (tree-sitter)"
+        );
+        assert_eq!(
+            o.get_by_name("foldmethod"),
+            Some(OptionValue::String("expr".into())),
+            "get_by_name(foldmethod) must return \"expr\""
+        );
+    }
+
+    #[test]
+    fn foldmethod_fdm_alias_roundtrip() {
+        let mut o = Options::default();
+        o.set_by_name("fdm", OptionValue::String("manual".into()))
+            .unwrap();
+        assert_eq!(o.foldmethod, FoldMethod::Manual);
+        assert_eq!(
+            o.get_by_name("fdm"),
+            Some(OptionValue::String("manual".into()))
+        );
+        o.set_by_name("foldmethod", OptionValue::String("expr".into()))
+            .unwrap();
+        assert_eq!(o.foldmethod, FoldMethod::Expr);
+        o.set_by_name("foldmethod", OptionValue::String("marker".into()))
+            .unwrap();
+        assert_eq!(o.foldmethod, FoldMethod::Marker);
+        // "syntax" is an alias for "expr"
+        o.set_by_name("foldmethod", OptionValue::String("syntax".into()))
+            .unwrap();
+        assert_eq!(o.foldmethod, FoldMethod::Expr);
+    }
+
+    #[test]
+    fn foldmethod_rejects_invalid_value() {
+        let mut o = Options::default();
+        let err = o
+            .set_by_name("foldmethod", OptionValue::String("bogus".into()))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("must be"),
+            "expected error about valid values, got: {err}"
+        );
+    }
+
+    #[test]
+    fn foldenable_default_true() {
+        let o = Options::default();
+        assert!(o.foldenable, "foldenable must default to true");
+        assert_eq!(
+            o.get_by_name("foldenable"),
+            Some(OptionValue::Bool(true)),
+            "get_by_name(foldenable) must return Bool(true)"
+        );
+    }
+
+    #[test]
+    fn foldenable_fen_alias_roundtrip() {
+        let mut o = Options::default();
+        o.set_by_name("fen", OptionValue::Bool(false)).unwrap();
+        assert!(!o.foldenable, "fen alias must disable foldenable");
+        assert_eq!(o.get_by_name("fen"), Some(OptionValue::Bool(false)));
+        o.set_by_name("foldenable", OptionValue::Bool(true))
+            .unwrap();
+        assert!(o.foldenable);
+    }
+
+    #[test]
+    fn foldlevelstart_default_99() {
+        let o = Options::default();
+        assert_eq!(o.foldlevelstart, 99, "foldlevelstart must default to 99");
+        assert_eq!(
+            o.get_by_name("foldlevelstart"),
+            Some(OptionValue::Int(99)),
+            "get_by_name(foldlevelstart) must return Int(99)"
+        );
+    }
+
+    #[test]
+    fn foldlevelstart_fls_alias_roundtrip() {
+        let mut o = Options::default();
+        o.set_by_name("fls", OptionValue::Int(0)).unwrap();
+        assert_eq!(
+            o.foldlevelstart, 0,
+            "fls alias must set foldlevelstart to 0"
+        );
+        assert_eq!(o.get_by_name("fls"), Some(OptionValue::Int(0)));
+        o.set_by_name("foldlevelstart", OptionValue::Int(5))
+            .unwrap();
+        assert_eq!(o.foldlevelstart, 5);
+    }
+}

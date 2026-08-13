@@ -1,0 +1,10 @@
+This is outside the quote.
+
+┃ This is a blockquote. It spans multiple lines.
+┃ ┃ Nested blockquote level 2. Still nested.
+┃ Back to level 1.
+
+Blockquote with list:
+
+┃ • Item in quote
+┃ • Another item

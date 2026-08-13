@@ -1,0 +1,8 @@
+☐ Unchecked task
+☑ Checked task
+☐ Another unchecked
+
+Ordered task list:
+
+☐ First task
+☑ Completed task

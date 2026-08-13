@@ -1,0 +1,11 @@
+<div class="example">
+<p>HTML block content</p>
+</div>
+
+<!-- HTML comment -->
+
+<table>
+<tr><td>HTML table</td></tr>
+</table>
+
+Inline HTML: <span>inline span</span> and <strong>inline strong</strong>.

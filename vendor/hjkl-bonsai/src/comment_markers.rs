@@ -1,0 +1,1054 @@
+//! `CommentMarkerPass` — TODO/FIXME/NOTE/WARN comment-marker overlay.
+//!
+//! After `Highlighter::highlight_range` produces a `Vec<HighlightSpan>`,
+//! call `CommentMarkerPass::apply` to append extra spans for marker words
+//! (TODO, FIXME, FIX, NOTE, INFO, WARN) found inside comment spans. The
+//! added spans carry capture names like `"comment.marker.todo"` and
+//! `"comment.marker.tail.todo"` which `DotFallbackTheme` maps to coloured
+//! badges.
+//!
+//! # Inheritance
+//!
+//! When two single-line comments are *consecutive* (only whitespace /
+//! nothing between them), the second comment inherits the active marker
+//! colour from the first. This mirrors sqeel's marker-overlay behaviour.
+//! Set `with_inheritance(false)` to disable.
+//!
+//! # Seed scan
+//!
+//! When the highlight range starts mid-buffer the pass walks up to 500
+//! lines backward (string-scan fallback) to seed the inherited colour so
+//! the first visible comment already has the right tint.
+
+use std::ops::Range;
+use std::sync::Arc;
+
+use crate::highlighter::HighlightSpan;
+use crate::rope_slice::{ceil_char_boundary, floor_char_boundary};
+
+// ---------------------------------------------------------------------------
+// Public API types
+// ---------------------------------------------------------------------------
+
+/// A marker word and the capture names it emits.
+#[derive(Clone, Debug)]
+pub struct MarkerWord {
+    /// The keyword to look for (ASCII, uppercase).
+    pub word: &'static str,
+    /// Capture name for the label (the word + surrounding badge).
+    pub label_capture: &'static str,
+    /// Capture name for the tail / continuation text.
+    pub tail_capture: &'static str,
+}
+
+/// Default marker set.
+pub fn default_markers() -> &'static [MarkerWord] {
+    &[
+        MarkerWord {
+            word: "TODO",
+            label_capture: "comment.marker.todo",
+            tail_capture: "comment.marker.tail.todo",
+        },
+        MarkerWord {
+            word: "FIXME",
+            label_capture: "comment.marker.fixme",
+            tail_capture: "comment.marker.tail.fixme",
+        },
+        MarkerWord {
+            word: "FIX",
+            label_capture: "comment.marker.fixme",
+            tail_capture: "comment.marker.tail.fixme",
+        },
+        MarkerWord {
+            word: "NOTE",
+            label_capture: "comment.marker.note",
+            tail_capture: "comment.marker.tail.note",
+        },
+        MarkerWord {
+            word: "INFO",
+            label_capture: "comment.marker.note",
+            tail_capture: "comment.marker.tail.note",
+        },
+        MarkerWord {
+            word: "WARN",
+            label_capture: "comment.marker.warn",
+            tail_capture: "comment.marker.tail.warn",
+        },
+    ]
+}
+
+/// Comment-marker overlay pass.
+///
+/// Call [`apply`](CommentMarkerPass::apply) after
+/// `Highlighter::highlight_range` to splice marker + tail spans into the
+/// flat span list. The caller then passes the augmented list to the theme
+/// resolver / `build_by_row` as usual.
+#[derive(Clone, Debug)]
+pub struct CommentMarkerPass {
+    markers: Vec<MarkerWord>,
+    /// When `true` (default), consecutive single-line comments inherit the
+    /// active marker capture from the previous comment line.
+    inheritance: bool,
+}
+
+impl CommentMarkerPass {
+    /// Create with the default marker set and inheritance enabled.
+    pub fn new() -> Self {
+        Self {
+            markers: default_markers().to_vec(),
+            inheritance: true,
+        }
+    }
+
+    /// Replace the marker set.
+    pub fn with_markers(mut self, markers: Vec<MarkerWord>) -> Self {
+        self.markers = markers;
+        self
+    }
+
+    /// Enable or disable cross-line inheritance.
+    pub fn with_inheritance(mut self, on: bool) -> Self {
+        self.inheritance = on;
+        self
+    }
+
+    /// Append marker / tail spans onto `spans` in place.
+    ///
+    /// `bytes` is the full document so the pass can do a backward seed scan.
+    /// `spans` must already contain comment spans from
+    /// `Highlighter::highlight_range`; this pass identifies them by capture
+    /// (`"comment"` or any capture starting with `"comment."`).
+    pub fn apply(&self, spans: &mut Vec<HighlightSpan>, bytes: &[u8]) {
+        // Collect comment spans sorted by start byte.
+        let mut comments: Vec<Range<usize>> = spans
+            .iter()
+            .filter(|s| s.capture() == "comment" || s.capture().starts_with("comment."))
+            .map(|s| s.byte_range.clone())
+            .collect();
+        comments.sort_by_key(|r| r.start);
+        comments.dedup_by(|b, a| {
+            // Merge overlapping / adjacent comment spans (block comments
+            // can produce multiple spans for the same range).
+            if b.start < a.end {
+                a.end = a.end.max(b.end);
+                true
+            } else {
+                false
+            }
+        });
+
+        if comments.is_empty() {
+            return;
+        }
+
+        // Seed the inherited capture by scanning backward from the first
+        // comment span.
+        let first_start = comments[0].start;
+        let mut active: Option<&MarkerWord> = if self.inheritance {
+            self.seed_active(bytes, first_start)
+        } else {
+            None
+        };
+
+        let mut extra: Vec<HighlightSpan> = Vec::new();
+
+        let mut prev_end: Option<usize> = None;
+
+        for comment_range in &comments {
+            // Check whether this comment is consecutive with the previous one
+            // (only whitespace between the two, on adjacent/same lines).
+            let consecutive = if let Some(pe) = prev_end {
+                self.inheritance && is_consecutive(bytes, pe, comment_range.start)
+            } else {
+                false
+            };
+
+            if !consecutive {
+                // Gap — reset inherited colour.
+                active = None;
+            }
+
+            // Compute body range (skip delimiter).
+            let body_start = delimiter_skip(bytes, comment_range.start);
+            let body_end = comment_range.end;
+
+            if body_start >= body_end {
+                prev_end = Some(comment_range.end);
+                continue;
+            }
+
+            // Scan for markers in the body.
+            let found = scan_markers(bytes, body_start, body_end, &self.markers);
+
+            if found.is_empty() {
+                // No marker on this comment — inherit active colour for
+                // the whole body.
+                if let Some(mw) = active {
+                    extra.push(HighlightSpan {
+                        byte_range: body_start..body_end,
+                        capture: Arc::from(mw.tail_capture),
+                        metadata: None,
+                    });
+                }
+                prev_end = Some(comment_range.end);
+                continue;
+            }
+
+            // Emit label + tail spans for each found marker.
+            let mut cursor = body_start;
+            for m in &found {
+                // Tail from cursor to just before this marker's label start.
+                let label_start = m.word_start.saturating_sub(1).max(body_start);
+                if let Some(mw) = active
+                    && cursor < label_start
+                {
+                    extra.push(HighlightSpan {
+                        byte_range: cursor..label_start,
+                        capture: Arc::from(mw.tail_capture),
+                        metadata: None,
+                    });
+                }
+                // Label span: char before marker through end of word.
+                extra.push(HighlightSpan {
+                    byte_range: label_start..m.word_end,
+                    capture: Arc::from(m.marker.label_capture),
+                    metadata: None,
+                });
+                // Trail char after the word (e.g. ':').
+                let trail_end = if m.word_end < body_end {
+                    m.word_end + 1
+                } else {
+                    m.word_end
+                };
+                if trail_end > m.word_end {
+                    extra.push(HighlightSpan {
+                        byte_range: m.word_end..trail_end,
+                        capture: Arc::from(m.marker.label_capture),
+                        metadata: None,
+                    });
+                }
+                cursor = trail_end;
+                active = Some(m.marker);
+            }
+            // Tail after the last marker.
+            if let Some(mw) = active
+                && cursor < body_end
+            {
+                extra.push(HighlightSpan {
+                    byte_range: cursor..body_end,
+                    capture: Arc::from(mw.tail_capture),
+                    metadata: None,
+                });
+            }
+
+            prev_end = Some(comment_range.end);
+        }
+
+        spans.extend(extra);
+    }
+
+    /// Scan backward from `first_comment_start` (up to 500 lines) using a
+    /// string-scan fallback to seed the inherited colour.
+    fn seed_active<'m>(
+        &'m self,
+        bytes: &[u8],
+        first_comment_start: usize,
+    ) -> Option<&'m MarkerWord> {
+        const CAP: usize = 500;
+        if first_comment_start == 0 {
+            return None;
+        }
+        // Walk backward from the first viewport comment via memchr's SIMD
+        // reverse newline iterator and stop after CAP+1 hits. Previously
+        // this was a per-byte linear scan of `bytes[..first_comment_start]`
+        // — on a 1.86 M-line buffer with the cursor near the bottom,
+        // that meant a ~3 MB scan per render (visible as paste lag).
+        // Bounded backward scan touches ~CAP × avg_row_len bytes
+        // regardless of where in the buffer the viewport sits.
+        let prefix = &bytes[..first_comment_start];
+        let mut newline_positions: Vec<usize> =
+            memchr::memrchr_iter(b'\n', prefix).take(CAP + 1).collect();
+        // We collected from the end going back; restore forward order.
+        newline_positions.reverse();
+
+        let line_starts: Vec<usize> = {
+            // If we hit the CAP and there's earlier content we didn't
+            // scan, the very first line_start sits at the byte after the
+            // oldest newline we kept; otherwise the buffer's true start.
+            let start_at_buffer_head = newline_positions.len() <= CAP;
+            let mut v: Vec<usize> = Vec::with_capacity(newline_positions.len() + 1);
+            if start_at_buffer_head {
+                v.push(0);
+                for &nl in &newline_positions {
+                    v.push(nl + 1);
+                }
+            } else {
+                // Drop the oldest newline; its line_start would precede
+                // our scan window.
+                for &nl in &newline_positions[1..] {
+                    v.push(nl + 1);
+                }
+                // First line_start in the window is the byte after that
+                // dropped newline.
+                v.insert(0, newline_positions[0] + 1);
+            }
+            // When the newline immediately preceding `first_comment_start`
+            // sits right at `first_comment_start - 1` (the common case: the
+            // viewport's first comment is the first thing on its line), the
+            // loop above pushes a spurious final entry equal to
+            // `first_comment_start` itself. That "line" is empty (its start
+            // and end coincide), so it always fails the delimiter check
+            // below and resets `active` to `None` on the very last
+            // iteration — silently discarding whatever the real preceding
+            // lines found. Drop any entry that isn't strictly before
+            // `first_comment_start`; it doesn't represent a real prior line.
+            v.retain(|&s| s < first_comment_start);
+            v
+        };
+
+        let mut active: Option<&'m MarkerWord> = None;
+
+        for &ls in &line_starts {
+            let le = bytes[ls..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(first_comment_start, |p| ls + p);
+            let le = le.min(first_comment_start);
+            let line_bytes = &bytes[ls..le];
+            // String-scan fallback: look for comment delimiters.
+            if let Some(del_off) = find_comment_delimiter(line_bytes) {
+                // Skip by the matched delimiter's actual length via
+                // `delimiter_skip` (2 bytes for `--`/`//`/`/*`, 1 byte for
+                // `#`) instead of a hardcoded `+ 2` — the hardcoded skip ate
+                // one byte of the body after a `#`, turning `#TODO:` into
+                // `ODO:` and losing the marker match.
+                let body_start = ls + delimiter_skip(line_bytes, del_off);
+                let body_end = le;
+                if body_start < body_end {
+                    let found = scan_markers(bytes, body_start, body_end, &self.markers);
+                    if let Some(last) = found.last() {
+                        active = Some(last.marker);
+                    }
+                    // else: inherit active unchanged.
+                }
+            } else {
+                // Non-comment line resets.
+                active = None;
+            }
+        }
+        active
+    }
+
+    /// Like [`apply`](CommentMarkerPass::apply) but reads source text from a
+    /// `ropey::Rope`. Only the bytes required (a window around the comments)
+    /// are materialised — no full-document `String` allocation.
+    ///
+    /// The algorithm is identical to `apply`; the `bytes` parameter is replaced
+    /// by a window slice extracted from the rope, with absolute byte offsets
+    /// translated into window-relative ones.
+    pub fn apply_rope(&self, spans: &mut Vec<HighlightSpan>, rope: &ropey::Rope) {
+        // Collect and deduplicate comment spans (same logic as `apply`).
+        let mut comments: Vec<Range<usize>> = spans
+            .iter()
+            .filter(|s| s.capture() == "comment" || s.capture().starts_with("comment."))
+            .map(|s| s.byte_range.clone())
+            .collect();
+        comments.sort_by_key(|r| r.start);
+        comments.dedup_by(|b, a| {
+            if b.start < a.end {
+                a.end = a.end.max(b.end);
+                true
+            } else {
+                false
+            }
+        });
+
+        if comments.is_empty() {
+            return;
+        }
+
+        const CAP: usize = 500;
+        let first_start = comments[0].start;
+        let last_end = comments[comments.len() - 1].end;
+        let rope_len = rope.len_bytes();
+
+        // Materialise a window: from up to CAP lines before the first comment
+        // (for the seed scan) through the last comment's end byte.
+        // We use a fixed byte cap of CAP * 200 (≈ 100 KB) as a safe upper bound
+        // instead of scanning newlines from the rope, which avoids a second pass.
+        // Both edges are snapped outward to char boundaries: the fixed byte cap
+        // (and untrusted span ends) can land mid-way through a multi-byte char,
+        // and `Rope::byte_slice` panics on non-char-boundary indices.
+        let window_start =
+            floor_char_boundary(rope, first_start.saturating_sub(CAP * 200).min(first_start));
+        let window_end = ceil_char_boundary(rope, last_end.min(rope_len));
+
+        let window_str: String = rope.byte_slice(window_start..window_end).to_string();
+        let window: &[u8] = window_str.as_bytes();
+
+        // Translate an absolute byte index into a window-relative index.
+        // Returns `None` when the index falls outside the window.
+        let to_win = |abs: usize| -> Option<usize> {
+            if abs < window_start || abs > window_end {
+                None
+            } else {
+                Some(abs - window_start)
+            }
+        };
+
+        // Seed the inherited capture by scanning backward from the first comment.
+        let win_first = to_win(first_start).unwrap_or(0);
+        let mut active: Option<&MarkerWord> = if self.inheritance && win_first > 0 {
+            self.seed_active(window, win_first)
+        } else {
+            None
+        };
+
+        let mut extra: Vec<HighlightSpan> = Vec::new();
+        let mut prev_end: Option<usize> = None;
+
+        for comment_range in &comments {
+            let consecutive = if let Some(pe) = prev_end {
+                if self.inheritance {
+                    // is_consecutive reads the gap bytes — translate to window.
+                    let win_pe = to_win(pe).unwrap_or(0);
+                    let win_ns = to_win(comment_range.start).unwrap_or(0);
+                    if win_pe <= win_ns {
+                        is_consecutive(window, win_pe, win_ns)
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if !consecutive {
+                active = None;
+            }
+
+            let Some(win_cr_start) = to_win(comment_range.start) else {
+                prev_end = Some(comment_range.end);
+                continue;
+            };
+            let win_cr_end = to_win(comment_range.end)
+                .unwrap_or(window.len())
+                .min(window.len());
+
+            let body_win_start = delimiter_skip(window, win_cr_start);
+            let body_win_end = win_cr_end;
+
+            if body_win_start >= body_win_end {
+                prev_end = Some(comment_range.end);
+                continue;
+            }
+
+            // scan_markers works in window-relative coords; translate back.
+            let found = scan_markers(window, body_win_start, body_win_end, &self.markers);
+
+            let body_start = comment_range.start + (body_win_start - win_cr_start);
+            let body_end = comment_range.end;
+
+            if found.is_empty() {
+                if let Some(mw) = active {
+                    extra.push(HighlightSpan {
+                        byte_range: body_start..body_end,
+                        capture: Arc::from(mw.tail_capture),
+                        metadata: None,
+                    });
+                }
+                prev_end = Some(comment_range.end);
+                continue;
+            }
+
+            let mut cursor = body_win_start;
+            for m in &found {
+                // Translate window-relative marker positions to absolute.
+                let abs_word_start = window_start + m.word_start;
+                let abs_word_end = window_start + m.word_end;
+                let label_start = abs_word_start.saturating_sub(1).max(body_start);
+                let win_cursor_abs = window_start + cursor;
+                if let Some(mw) = active
+                    && win_cursor_abs < label_start
+                {
+                    extra.push(HighlightSpan {
+                        byte_range: win_cursor_abs..label_start,
+                        capture: Arc::from(mw.tail_capture),
+                        metadata: None,
+                    });
+                }
+                extra.push(HighlightSpan {
+                    byte_range: label_start..abs_word_end,
+                    capture: Arc::from(m.marker.label_capture),
+                    metadata: None,
+                });
+                let trail_end = if abs_word_end < body_end {
+                    abs_word_end + 1
+                } else {
+                    abs_word_end
+                };
+                if trail_end > abs_word_end {
+                    extra.push(HighlightSpan {
+                        byte_range: abs_word_end..trail_end,
+                        capture: Arc::from(m.marker.label_capture),
+                        metadata: None,
+                    });
+                }
+                cursor = m.word_end + (trail_end - abs_word_end);
+                active = Some(m.marker);
+            }
+            let win_cursor_abs = window_start + cursor;
+            if let Some(mw) = active
+                && win_cursor_abs < body_end
+            {
+                extra.push(HighlightSpan {
+                    byte_range: win_cursor_abs..body_end,
+                    capture: Arc::from(mw.tail_capture),
+                    metadata: None,
+                });
+            }
+
+            prev_end = Some(comment_range.end);
+        }
+
+        spans.extend(extra);
+    }
+}
+
+impl Default for CommentMarkerPass {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// A found marker in a comment body.
+struct FoundMarker<'m> {
+    word_start: usize, // byte offset in `bytes`
+    word_end: usize,
+    marker: &'m MarkerWord,
+}
+
+/// Scan `bytes[body_start..body_end]` for word-boundary occurrences of each
+/// marker word. Returns results sorted by `word_start`.
+fn scan_markers<'m>(
+    bytes: &[u8],
+    body_start: usize,
+    body_end: usize,
+    markers: &'m [MarkerWord],
+) -> Vec<FoundMarker<'m>> {
+    let end = body_end.min(bytes.len());
+    if body_start >= end {
+        return Vec::new();
+    }
+    let body = &bytes[body_start..end];
+    let mut out: Vec<FoundMarker<'m>> = Vec::new();
+
+    for mw in markers {
+        let wbytes = mw.word.as_bytes();
+        let mut i = 0usize;
+        while i + wbytes.len() <= body.len() {
+            if &body[i..i + wbytes.len()] == wbytes {
+                let left_ok = i == 0 || !body[i - 1].is_ascii_alphanumeric();
+                let right_ok = body
+                    .get(i + wbytes.len())
+                    .is_none_or(|b| !b.is_ascii_alphanumeric());
+                if left_ok && right_ok {
+                    out.push(FoundMarker {
+                        word_start: body_start + i,
+                        word_end: body_start + i + wbytes.len(),
+                        marker: mw,
+                    });
+                    i += wbytes.len();
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+    out.sort_by_key(|m| m.word_start);
+    out
+}
+
+/// Skip over a known comment delimiter at `pos` in `bytes`.
+/// Recognises `--`, `//`, `/*`, `#` (1 byte). Returns the byte offset of the
+/// first body character.
+fn delimiter_skip(bytes: &[u8], pos: usize) -> usize {
+    if pos + 1 < bytes.len() {
+        let (a, b) = (bytes[pos], bytes[pos + 1]);
+        if (a == b'-' && b == b'-') || (a == b'/' && b == b'/') || (a == b'/' && b == b'*') {
+            return pos + 2;
+        }
+    }
+    if pos < bytes.len() && bytes[pos] == b'#' {
+        return pos + 1;
+    }
+    pos
+}
+
+/// Returns the offset of the start of a comment delimiter within `line_bytes`
+/// (relative to `line_bytes[0]`), or `None` if no delimiter is found.
+/// Used by the seed fallback scanner.
+fn find_comment_delimiter(line_bytes: &[u8]) -> Option<usize> {
+    // Look for `--`, `//`, `/*`, `#`.
+    let mut i = 0usize;
+    while i + 1 < line_bytes.len() {
+        let (a, b) = (line_bytes[i], line_bytes[i + 1]);
+        if (a == b'-' && b == b'-') || (a == b'/' && b == b'/') || (a == b'/' && b == b'*') {
+            return Some(i);
+        }
+        i += 1;
+    }
+    // Single-char `#`.
+    if line_bytes.contains(&b'#') {
+        return line_bytes.iter().position(|&b| b == b'#');
+    }
+    None
+}
+
+/// Return `true` when the two comment spans are on directly adjacent lines:
+/// the gap contains only space / tab / `\r` and exactly one `\n`. A blank
+/// line (two or more newlines) breaks the run, so an unrelated comment that
+/// follows a blank line does not inherit the previous comment's marker color.
+fn is_consecutive(bytes: &[u8], prev_end: usize, next_start: usize) -> bool {
+    if prev_end > next_start || next_start > bytes.len() {
+        return false;
+    }
+    let gap = &bytes[prev_end..next_start];
+    let mut newlines = 0usize;
+    for &b in gap {
+        match b {
+            b'\n' => {
+                newlines += 1;
+                if newlines > 1 {
+                    return false;
+                }
+            }
+            b' ' | b'\t' | b'\r' => {}
+            _ => return false,
+        }
+    }
+    newlines == 1
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Highlighter;
+    use crate::runtime::{Grammar, GrammarLoader, LangSpec, ManifestMeta, QuerySource};
+    use std::sync::{Arc, OnceLock};
+
+    /// Tree-sitter-rust pinned rev for tests; matches what `bonsai.toml` ships.
+    const RUST_GIT: &str = "https://github.com/tree-sitter/tree-sitter-rust";
+    const RUST_REV: &str = "e86119bdb4968b9799f6a014ca2401c178d54b5f";
+
+    /// Shared rust [`Grammar`], compiled once across all comment-marker tests
+    /// in a single process. Persistent under \$XDG_CACHE_HOME so subsequent
+    /// `cargo test --ignored` runs are warm.
+    fn rust_grammar() -> Arc<Grammar> {
+        static G: OnceLock<Arc<Grammar>> = OnceLock::new();
+        G.get_or_init(|| {
+            let meta = ManifestMeta {
+                helix_repo: "https://github.com/helix-editor/helix".into(),
+                helix_rev: "87d5c05c4432a079d3b7aaa10cda1cfe1803c18c".into(),
+                nvim_treesitter_repo: "https://github.com/nvim-treesitter/nvim-treesitter".into(),
+                nvim_treesitter_rev: "cf12346a3414fa1b06af75c79faebe7f76df080a".into(),
+            };
+            let loader = GrammarLoader::user_default(&meta).expect("XDG paths");
+            let spec = LangSpec {
+                git_url: RUST_GIT.into(),
+                git_rev: RUST_REV.into(),
+                subpath: None,
+                extensions: vec!["rs".into()],
+                c_files: vec!["src/parser.c".into(), "src/scanner.c".into()],
+                query_source: QuerySource::Helix,
+                query_subdir: None,
+                source: None,
+            };
+            Arc::new(Grammar::load("rust", &spec, &loader, &meta).expect("rust grammar"))
+        })
+        .clone()
+    }
+
+    fn rust_comment_spans(src: &[u8]) -> Vec<HighlightSpan> {
+        let mut h = Highlighter::new(rust_grammar()).unwrap();
+        h.parse_initial(src);
+        h.highlight_range(src, 0..src.len())
+    }
+
+    // Helper: apply pass, return added spans (captures starting with
+    // "comment.marker").
+    fn marker_spans(src: &[u8]) -> Vec<HighlightSpan> {
+        let mut spans = rust_comment_spans(src);
+        let pass = CommentMarkerPass::new();
+        pass.apply(&mut spans, src);
+        spans
+            .into_iter()
+            .filter(|s| s.capture().starts_with("comment.marker"))
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "network + compiler: clones tree-sitter-rust then builds it"]
+    fn single_line_todo_emits_label_and_tail() {
+        // "// TODO: refactor" — expect a label span (comment.marker.todo)
+        // and a tail span (comment.marker.tail.todo).
+        let src = b"// TODO: refactor";
+        let ms = marker_spans(src);
+        assert!(
+            ms.iter().any(|s| s.capture() == "comment.marker.todo"),
+            "expected label span; got {ms:#?}"
+        );
+        assert!(
+            ms.iter().any(|s| s.capture() == "comment.marker.tail.todo"),
+            "expected tail span; got {ms:#?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "network + compiler: clones tree-sitter-rust then builds it"]
+    fn multi_line_block_todo_spans_full_body() {
+        // /* TODO: long\nexplanation */ — body crosses newline; both label and
+        // tail should be present.
+        let src = b"/* TODO: long\nexplanation */";
+        let ms = marker_spans(src);
+        assert!(
+            ms.iter().any(|s| s.capture() == "comment.marker.todo"),
+            "expected label; got {ms:#?}"
+        );
+        assert!(
+            ms.iter().any(|s| s.capture() == "comment.marker.tail.todo"),
+            "expected tail; got {ms:#?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "network + compiler: clones tree-sitter-rust then builds it"]
+    fn consecutive_single_line_inheritance() {
+        // "// TODO foo\n// continuation" — second comment should carry
+        // comment.marker.tail.todo from the first.
+        let src = b"// TODO foo\n// continuation";
+        let ms = marker_spans(src);
+        // Second line starts at byte 12; find a tail span there.
+        let has_inherited_tail = ms
+            .iter()
+            .any(|s| s.capture() == "comment.marker.tail.todo" && s.byte_range.start >= 12);
+        assert!(
+            has_inherited_tail,
+            "expected inherited tail on second line; got {ms:#?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "network + compiler: clones tree-sitter-rust then builds it"]
+    fn inheritance_breaks_on_blank_line() {
+        // "// TODO foo\n\n// unrelated" — blank line between comments must
+        // reset the active marker color; second comment gets no tail.
+        let src = b"// TODO foo\n\n// unrelated";
+        let ms = marker_spans(src);
+        // Second comment starts at byte 13. Anything at or past 13 is inherited
+        // tail leaking across the blank line.
+        let leaked = ms
+            .iter()
+            .any(|s| s.capture() == "comment.marker.tail.todo" && s.byte_range.start >= 13);
+        assert!(!leaked, "blank line should break inheritance; got {ms:#?}");
+    }
+
+    #[test]
+    #[ignore = "network + compiler: clones tree-sitter-rust then builds it"]
+    fn inheritance_breaks_on_non_comment_line() {
+        // "// TODO\n  let x = 1;\n// next" — third comment has no inherited colour.
+        let src = b"// TODO\n  let x = 1;\n// next";
+        let ms = marker_spans(src);
+        // Comment starting at byte 21 (after "let" line) should have no tail.
+        let last_comment_byte = src.iter().rposition(|&b| b == b'/').unwrap_or(0) - 1;
+        let inherited = ms.iter().any(|s| {
+            s.capture() == "comment.marker.tail.todo" && s.byte_range.start > last_comment_byte
+        });
+        assert!(
+            !inherited,
+            "expected no inherited tail on '// next'; got {ms:#?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "network + compiler: clones tree-sitter-rust then builds it"]
+    fn inheritance_off_does_not_carry() {
+        let src = b"// TODO foo\n// continuation";
+        let mut spans = rust_comment_spans(src);
+        let pass = CommentMarkerPass::new().with_inheritance(false);
+        pass.apply(&mut spans, src);
+        let ms: Vec<_> = spans
+            .into_iter()
+            .filter(|s| s.capture().starts_with("comment.marker"))
+            .collect();
+        // The second comment line should have no marker spans at all.
+        let has_second_line_marker = ms.iter().any(|s| s.byte_range.start >= 12);
+        assert!(
+            !has_second_line_marker,
+            "expected no spans on second line with inheritance off; got {ms:#?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "network + compiler: clones tree-sitter-rust then builds it"]
+    fn marker_word_boundary_no_match() {
+        // "TODOlist" and "XTODO" must not trigger.
+        let src = b"// TODOlist\n// XTODO";
+        let ms = marker_spans(src);
+        assert!(
+            ms.is_empty(),
+            "expected no marker spans for non-boundary words; got {ms:#?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "network + compiler: clones tree-sitter-rust then builds it"]
+    fn multiple_markers_one_comment() {
+        // "// TODO foo FIXME bar" — two label spans, different captures.
+        let src = b"// TODO foo FIXME bar";
+        let ms = marker_spans(src);
+        let has_todo = ms.iter().any(|s| s.capture() == "comment.marker.todo");
+        let has_fixme = ms.iter().any(|s| s.capture() == "comment.marker.fixme");
+        assert!(has_todo, "expected todo label; got {ms:#?}");
+        assert!(has_fixme, "expected fixme label; got {ms:#?}");
+    }
+
+    #[test]
+    #[ignore = "network + compiler: clones tree-sitter-rust then builds it"]
+    fn fixme_marker_emits_correct_capture() {
+        let src = b"// FIXME: broken";
+        let ms = marker_spans(src);
+        assert!(
+            ms.iter().any(|s| s.capture() == "comment.marker.fixme"),
+            "expected fixme label; got {ms:#?}"
+        );
+        assert!(
+            ms.iter()
+                .any(|s| s.capture() == "comment.marker.tail.fixme"),
+            "expected fixme tail; got {ms:#?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "network + compiler: clones tree-sitter-rust then builds it"]
+    fn fix_marker_uses_fixme_capture() {
+        let src = b"// FIX: broken";
+        let ms = marker_spans(src);
+        assert!(
+            ms.iter().any(|s| s.capture() == "comment.marker.fixme"),
+            "FIX should map to comment.marker.fixme; got {ms:#?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "network + compiler: clones tree-sitter-rust then builds it"]
+    fn note_and_info_use_note_capture() {
+        for word in [b"NOTE" as &[u8], b"INFO"] {
+            let src = [b"// ".as_ref(), word, b": context"].concat();
+            let ms = marker_spans(&src);
+            assert!(
+                ms.iter().any(|s| s.capture() == "comment.marker.note"),
+                "{} should map to comment.marker.note; got {ms:#?}",
+                std::str::from_utf8(word).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "network + compiler: clones tree-sitter-rust then builds it"]
+    fn warn_marker_emits_correct_capture() {
+        let src = b"// WARN: danger";
+        let ms = marker_spans(src);
+        assert!(
+            ms.iter().any(|s| s.capture() == "comment.marker.warn"),
+            "expected warn label; got {ms:#?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "network + compiler: clones tree-sitter-rust then builds it"]
+    fn apply_is_idempotent_on_no_comments() {
+        // No comment in the source — pass should be a no-op.
+        let src = b"fn main() {}";
+        let mut spans = rust_comment_spans(src);
+        let before = spans.len();
+        let pass = CommentMarkerPass::new();
+        pass.apply(&mut spans, src);
+        let after = spans.len();
+        assert_eq!(before, after, "no-comment source should not grow spans");
+    }
+
+    #[test]
+    #[ignore = "network + compiler: clones tree-sitter-rust then builds it"]
+    fn default_pass_is_same_as_new() {
+        let a = CommentMarkerPass::new();
+        let b = CommentMarkerPass::default();
+        assert_eq!(a.inheritance, b.inheritance);
+        assert_eq!(a.markers.len(), b.markers.len());
+    }
+
+    #[test]
+    #[ignore = "network + compiler: clones tree-sitter-rust then builds it"]
+    fn scan_markers_word_boundary_left() {
+        // "XTODO" — left boundary fails.
+        let bytes = b"// XTODO";
+        let markers = default_markers();
+        let found = scan_markers(bytes, 3, bytes.len(), markers);
+        assert!(
+            found.is_empty(),
+            "XTODO should not match; got {found:?}",
+            found = found.iter().map(|m| m.marker.word).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    #[ignore = "network + compiler: clones tree-sitter-rust then builds it"]
+    fn scan_markers_word_boundary_right() {
+        // "TODOlist" — right boundary fails.
+        let bytes = b"// TODOlist";
+        let markers = default_markers();
+        let found = scan_markers(bytes, 3, bytes.len(), markers);
+        assert!(found.is_empty(), "TODOlist should not match");
+    }
+
+    #[test]
+    #[ignore = "network + compiler: clones tree-sitter-rust then builds it"]
+    fn is_consecutive_whitespace_only() {
+        let bytes = b"// a\n// b";
+        // prev_end=4 (after first comment), next_start=5 (start of second).
+        assert!(is_consecutive(bytes, 4, 5));
+    }
+
+    #[test]
+    #[ignore = "network + compiler: clones tree-sitter-rust then builds it"]
+    fn is_consecutive_non_whitespace_between() {
+        let bytes = b"// a\nlet x=1;\n// b";
+        assert!(!is_consecutive(bytes, 4, 14));
+    }
+
+    /// Smoke: `apply_rope` produces at least the same number of marker spans
+    /// as `apply` on a small TODO comment — no grammar required (we fabricate
+    /// the comment span directly).
+    #[test]
+    fn apply_rope_todo_emits_marker_spans() {
+        let src = "// TODO: refactor";
+        let bytes = src.as_bytes();
+        let rope = ropey::Rope::from_str(src);
+
+        // Fabricate a comment span covering the full string.
+        let comment_span = HighlightSpan {
+            byte_range: 0..bytes.len(),
+            capture: Arc::from("comment"),
+            metadata: None,
+        };
+
+        let pass = CommentMarkerPass::new();
+
+        let mut spans_bytes = vec![comment_span.clone()];
+        pass.apply(&mut spans_bytes, bytes);
+
+        let mut spans_rope = vec![comment_span];
+        pass.apply_rope(&mut spans_rope, &rope);
+
+        let marker_bytes: Vec<_> = spans_bytes
+            .iter()
+            .filter(|s| s.capture().starts_with("comment.marker"))
+            .collect();
+        let marker_rope: Vec<_> = spans_rope
+            .iter()
+            .filter(|s| s.capture().starts_with("comment.marker"))
+            .collect();
+
+        assert!(
+            !marker_bytes.is_empty(),
+            "bytes variant should find markers: {spans_bytes:#?}"
+        );
+        assert_eq!(
+            marker_bytes.len(),
+            marker_rope.len(),
+            "rope and bytes variants must emit same number of marker spans"
+        );
+        for (b, r) in marker_bytes.iter().zip(marker_rope.iter()) {
+            assert_eq!(b.capture, r.capture, "capture name mismatch");
+            assert_eq!(b.byte_range, r.byte_range, "byte_range mismatch");
+        }
+    }
+
+    /// Regression: `seed_active`'s string-scan fallback used to hardcode a
+    /// 2-byte delimiter skip (`del_off + 2`) after locating a comment
+    /// delimiter, which is correct for `--`/`//`/`/*` but wrong for the
+    /// 1-byte `#` delimiter — it eats one byte of the comment body along
+    /// with the `#`, so `#TODO: ...` is scanned as `ODO: ...` and the
+    /// `TODO` word never matches. A `#TODO:` line sitting just above a
+    /// scrolled viewport should still seed the inherited marker state.
+    #[test]
+    fn seed_active_recognizes_one_byte_hash_delimiter() {
+        let src = b"#TODO: fix this\n// next line\n";
+        let first_comment_start = src
+            .iter()
+            .position(|&b| b == b'/')
+            .expect("test fixture must contain a `//` comment");
+
+        let pass = CommentMarkerPass::new();
+        let active = pass.seed_active(src, first_comment_start);
+
+        assert!(
+            active.is_some_and(|m| m.word == "TODO"),
+            "seed scan must recognize `#TODO:` (1-byte delimiter) just above \
+             the viewport; got {:?}",
+            active.map(|m| m.word)
+        );
+    }
+
+    /// Companion: the 2-byte `//` delimiter path must keep working exactly
+    /// as before — this pins the non-regression side of the fix.
+    #[test]
+    fn seed_active_still_recognizes_two_byte_slash_delimiter() {
+        let src = b"// TODO: fix this\n// next line\n";
+        let first_comment_start = src.len() - b"// next line\n".len();
+
+        let pass = CommentMarkerPass::new();
+        let active = pass.seed_active(src, first_comment_start);
+
+        assert!(
+            active.is_some_and(|m| m.word == "TODO"),
+            "seed scan must still recognize `// TODO:` (2-byte delimiter); \
+             got {:?}",
+            active.map(|m| m.word)
+        );
+    }
+
+    /// Regression: the fixed `CAP * 200` seed-window offset must not panic
+    /// when it lands mid-way through a multi-byte char ('€' is 3 bytes, so
+    /// `comment_start - 100_000` falls on a non-char-boundary here).
+    #[test]
+    fn apply_rope_seed_window_start_mid_multibyte_char() {
+        let prefix = "€".repeat(34_000); // 102_000 bytes; boundaries at multiples of 3
+        let comment = "// TODO x";
+        let src = format!("{prefix}{comment}");
+        let rope = ropey::Rope::from_str(&src);
+        let comment_start = prefix.len(); // 102_000; 102_000 - 100_000 = 2_000 (mid-'€')
+
+        let mut spans = vec![HighlightSpan {
+            byte_range: comment_start..src.len(),
+            capture: Arc::from("comment"),
+            metadata: None,
+        }];
+        CommentMarkerPass::new().apply_rope(&mut spans, &rope);
+
+        assert!(
+            spans.iter().any(|s| s.capture() == "comment.marker.todo"),
+            "expected TODO marker span: {spans:#?}"
+        );
+    }
+}
