@@ -6,6 +6,28 @@ changes, and transitive exceptions, including license, rationale, and hand-roll 
 The 0.4.0 rendered Normal/Select migration added no dependency and did not
 change the resolved third-party graph or `vendor/`.
 
+## First-party `oom-spell` crate
+
+Phase 2 of FR-9 adds `oom-spell =0.1.0` as an exact local path dependency of
+both `oom-edit-core` and `oom-edit`. This creates the planned dependency diamond
+without adding any external package, transitive code, build script, or vendored
+source. The crate inherits the workspace MIT license and is guarded by a
+standalone `cargo tree` test that requires its normal dependency graph to
+contain only `oom-spell` itself.
+
+- **Maintenance and review:** the implementation is maintained in this
+  repository and reviewed with the workspace. Its curated facade owns only
+  normalization, resumable dictionary construction, lookup, and bounded OSA
+  suggestions; it has no filesystem, Markdown, editor, terminal, clock, or
+  network knowledge.
+- **Popularity baseline:** not applicable to first-party code.
+- **Vendored diff review:** not applicable; `Cargo.lock` gains only the local
+  package and the two direct path edges, while `vendor/` is unchanged.
+- **Could we hand-roll this?** Yes, and this crate is that deliberately narrow
+  greenfield implementation. Importing a spell, tokenizer, or distance crate
+  is forbidden by FR-9.8 and would add a much larger dependency and licensing
+  surface.
+
 ## Bundled SCOWL word-list data
 
 The committed `en_US`, `en_CA`, and `en_AU` size-60 plain word lists are generated from

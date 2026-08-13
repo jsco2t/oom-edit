@@ -105,7 +105,7 @@ fn public_facade_types_are_available_at_crate_root() {
 }
 
 #[test]
-fn public_facade_is_exactly_the_curated_pre_spell_surface() {
+fn public_facade_remains_curated_without_partial_spell_reexports() {
     let source = include_str!("../src/lib.rs");
     let declarations = public_use_declarations(source);
     assert_eq!(
@@ -132,6 +132,7 @@ fn public_facade_is_exactly_the_curated_pre_spell_surface() {
         "crate-root facade must consist only of the curated re-exports: {unexpected_public_items:?}"
     );
     assert_no_exported_macros(Path::new(env!("CARGO_MANIFEST_DIR")).join("src").as_path());
+    assert!(!source.contains("pub use oom_spell"));
 }
 
 #[test]

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/oom-edit-core", "crates/oom-edit"]
+members = ["crates/oom-spell", "crates/oom-edit-core", "crates/oom-edit"]
 
 [workspace.package]
 edition = "2021"

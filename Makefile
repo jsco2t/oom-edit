@@ -201,6 +201,7 @@ bench: ## Run performance benchmarks
 
 .PHONY: bench-check
 bench-check: ## Run perf-smoke asserts with relaxed regression thresholds
+	cargo test -p oom-spell --offline --locked --test perf_smoke
 	cargo test -p oom-edit-core --offline --locked --test perf_smoke
 
 # ---------------------------------------------------------------------------

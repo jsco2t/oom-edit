@@ -1020,6 +1020,7 @@ dependencies = [
  "crossterm",
  "libc",
  "oom-edit-core",
+ "oom-spell",
  "ratatui",
  "serde",
  "tempfile",
@@ -1034,6 +1035,7 @@ dependencies = [
  "hjkl-buffer",
  "hjkl-engine",
  "hjkl-vim",
+ "oom-spell",
  "proptest",
  "pulldown-cmark",
  "tempfile",
@@ -1052,6 +1054,10 @@ dependencies = [
  "tree-sitter-yaml",
  "unicode-width",
 ]
+
+[[package]]
+name = "oom-spell"
+version = "0.1.0"
 
 [[package]]
 name = "ordered-float"

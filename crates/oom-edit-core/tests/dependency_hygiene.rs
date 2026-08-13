@@ -49,7 +49,7 @@ fn cargo_tree_output() -> String {
 }
 
 #[test]
-fn workspace_is_exactly_two_crates_with_one_way_dependency() {
+fn workspace_is_exactly_three_crates_with_the_spell_dependency_diamond() {
     let root = workspace_root();
     let workspace = std::fs::read_to_string(root.join("Cargo.toml"))
         .expect("workspace manifest should be readable");
@@ -59,8 +59,10 @@ fn workspace_is_exactly_two_crates_with_one_way_dependency() {
         .expect("TUI manifest should be readable");
 
     assert!(
-        workspace.contains("members = [\"crates/oom-edit-core\", \"crates/oom-edit\"]"),
-        "baseline workspace must contain exactly oom-edit-core and oom-edit"
+        workspace.contains(
+            "members = [\"crates/oom-spell\", \"crates/oom-edit-core\", \"crates/oom-edit\"]"
+        ),
+        "workspace must contain exactly oom-spell, oom-edit-core, and oom-edit"
     );
     assert_eq!(
         workspace.matches("members =").count(),
@@ -70,6 +72,14 @@ fn workspace_is_exactly_two_crates_with_one_way_dependency() {
     assert!(
         tui.contains("oom-edit-core = { path = \"../oom-edit-core\", version = \"=0.4.0\" }"),
         "TUI must depend directly on the exact-pinned core crate"
+    );
+    assert!(
+        core.contains("oom-spell = { path = \"../oom-spell\", version = \"=0.1.0\" }"),
+        "core must depend directly on the exact-pinned spell crate"
+    );
+    assert!(
+        tui.contains("oom-spell = { path = \"../oom-spell\", version = \"=0.1.0\" }"),
+        "TUI must depend directly on the exact-pinned spell crate"
     );
     assert!(
         !core.contains("oom-edit =") && !core.contains("../oom-edit\""),
