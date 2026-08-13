@@ -31,11 +31,17 @@ use crate::vim::TextEdit;
 /// Inline elements (emphasis, strong, inline code, strikethrough, links)
 /// are handled by the inline injection grammar, not this block-level query.
 ///
-/// Node types are from tree-sitter-md's actual grammar (not nvim-treesitter
-/// extensions like atx_h1_marker which are not in the upstream grammar).
+/// Node types are from the pinned tree-sitter-md grammar, including its
+/// level-specific ATX markers and Setext underlines.
 const MD_HIGHLIGHT_QUERY: &str = r#"
-(atx_heading) @heading
-(setext_heading) @heading
+(atx_heading (atx_h1_marker)) @heading.1
+(atx_heading (atx_h2_marker)) @heading.2
+(atx_heading (atx_h3_marker)) @heading.3
+(atx_heading (atx_h4_marker)) @heading.4
+(atx_heading (atx_h5_marker)) @heading.5
+(atx_heading (atx_h6_marker)) @heading.6
+(setext_heading (setext_h1_underline)) @heading.1
+(setext_heading (setext_h2_underline)) @heading.2
 (fenced_code_block) @fence.block
 (fenced_code_block_delimiter) @fence.delimiter
 (code_fence_content) @fence.content
@@ -52,7 +58,7 @@ const MD_HIGHLIGHT_QUERY: &str = r#"
 (html_block) @html.block
 (minus_metadata) @fm.yaml
 (plus_metadata) @fm.toml
-(pipe_table) @table
+(pipe_table_header) @strong
 "#;
 
 /// Highlight query for markdown inline content (emphasis, code spans, links, etc.).
@@ -67,6 +73,7 @@ const MD_INLINE_QUERY: &str = r#"
 (link_text) @link.text
 (link_label) @link.label
 (link_title) @link.title
+(html_tag) @html.inline
 "#;
 
 // ── Injection region ────────────────────────────────────────────────────────
@@ -461,6 +468,20 @@ impl Highlighter {
                             let capture_name =
                                 injection.query.capture_names()[capture.index as usize];
                             let inj_node = capture.node;
+                            if injection.kind == InjectionKind::FrontMatter
+                                && injection.language_name == "toml"
+                                && capture_name
+                                    .strip_prefix('@')
+                                    .unwrap_or(capture_name)
+                                    .starts_with("property")
+                                && inj_node.kind() == "pair"
+                            {
+                                // tree-sitter-toml-ng captures the complete
+                                // pair as @property in addition to its key.
+                                // Keeping that broad capture would flatten the
+                                // value into FmKey after overlap resolution.
+                                continue;
+                            }
                             let style = injection_capture_to_style(
                                 injection.kind,
                                 injection.language_name,
@@ -525,8 +546,10 @@ impl Highlighter {
                 self.collect_inline_spans_in_range(spans, child, text, range);
             }
 
-            // For inline nodes, parse with the inline grammar
-            if kind == "inline" {
+            // Parse ordinary inline nodes and table cells with the inline
+            // grammar. The block grammar exposes table-cell payload directly
+            // rather than wrapping it in an `inline` node.
+            if kind == "inline" || kind == "pipe_table_cell" {
                 // Inline constructs can cross physical-line and viewport
                 // boundaries. Parse the complete containing node for grammar
                 // context, then constrain query work and emitted captures to
@@ -700,7 +723,8 @@ impl Highlighter {
 /// fence is highlighted as an independent snippet, not as part of the
 /// document's incremental tree (FR-3.5).
 ///
-/// Unknown languages return the text unstyled (CodeBlock style).
+/// Unknown languages and uncaptured known-language text use `CodeBlock`;
+/// recognized language captures override that base style.
 pub fn highlight_snippet(lang: &str, text: &str) -> Vec<StyledLine> {
     if text.is_empty() {
         return vec![StyledLine {
@@ -710,33 +734,36 @@ pub fn highlight_snippet(lang: &str, text: &str) -> Vec<StyledLine> {
     }
 
     let Some(lang_def) = languages::find_by_alias(lang) else {
-        // Unknown language — return unstyled
-        return highlight_lines_for_text(text);
+        return code_block_lines_for_text(text);
     };
     let lang_obj = (lang_def.language_fn)();
 
     let query = Query::new(&lang_obj, lang_def.highlights_query).ok();
     let Some(query) = query else {
-        return highlight_lines_for_text(text);
+        return code_block_lines_for_text(text);
     };
 
     let mut parser = Parser::new();
     if parser.set_language(&lang_obj).is_err() {
-        return highlight_lines_for_text(text);
+        return code_block_lines_for_text(text);
     }
 
     let tree = parser.parse(text, None);
 
     let Some(tree) = tree else {
-        return highlight_lines_for_text(text);
+        return code_block_lines_for_text(text);
     };
 
     let text_bytes = text.as_bytes();
     let root = tree.root_node();
     let mut cursor = QueryCursor::new();
 
-    // Collect all spans from the query
-    let mut all_spans: Vec<ByteSpan> = Vec::new();
+    // Seed the low-priority fallback before collecting granular captures.
+    let mut all_spans = vec![ByteSpan {
+        start_byte: 0,
+        end_byte: text.len(),
+        style: SemanticStyle::CodeBlock,
+    }];
     let mut matches = cursor.matches(&query, root, text_bytes);
 
     while let Some(m) = matches.next() {
@@ -809,12 +836,19 @@ pub fn highlight_snippet(lang: &str, text: &str) -> Vec<StyledLine> {
     result
 }
 
-/// Helper: split text into lines and return unstyled StyledLines.
-fn highlight_lines_for_text(text: &str) -> Vec<StyledLine> {
+/// Split fallback text into lines with an explicit `CodeBlock` base style.
+fn code_block_lines_for_text(text: &str) -> Vec<StyledLine> {
     text.lines()
         .map(|line| StyledLine {
             text: line.to_string(),
-            spans: Vec::new(),
+            spans: (!line.is_empty())
+                .then(|| Span {
+                    start_col: 0,
+                    end_col: line.chars().count(),
+                    style: SemanticStyle::CodeBlock,
+                })
+                .into_iter()
+                .collect(),
         })
         .collect()
 }
@@ -924,8 +958,16 @@ fn md_capture_to_style(capture: &str) -> SemanticStyle {
     let name = capture.strip_prefix('@').unwrap_or(capture);
 
     // Heading styles
-    if name.starts_with("heading") {
-        return SemanticStyle::Heading1;
+    if let Some(style) = match name {
+        "heading.1" => Some(SemanticStyle::Heading1),
+        "heading.2" => Some(SemanticStyle::Heading2),
+        "heading.3" => Some(SemanticStyle::Heading3),
+        "heading.4" => Some(SemanticStyle::Heading4),
+        "heading.5" => Some(SemanticStyle::Heading5),
+        "heading.6" => Some(SemanticStyle::Heading6),
+        _ => None,
+    } {
+        return style;
     }
     if name.starts_with("emphasis") {
         return SemanticStyle::Emphasis;
@@ -1530,6 +1572,137 @@ mod tests {
         let lines = h.highlight_lines(0..3);
         assert_eq!(lines.len(), 3);
         assert!(!lines[0].spans.is_empty(), "heading line should have spans");
+    }
+
+    #[test]
+    fn source_headings_preserve_atx_and_setext_levels() {
+        let text = concat!(
+            "# h1_é\n",
+            "## h2_plain *h2_em* `h2_code`\n",
+            "### h3_token\n",
+            "#### h4_token\n",
+            "##### h5_token\n",
+            "###### h6_token\n",
+            "setext_h1\n===========\n",
+            "setext_h2\n-----------\n",
+            "> ## nested_h2\n",
+        );
+        let lines = Highlighter::new(text).highlight_lines(0..usize::MAX);
+
+        for (line_index, token, expected) in [
+            (0, "h1_é", SemanticStyle::Heading1),
+            (1, "h2_plain", SemanticStyle::Heading2),
+            (2, "h3_token", SemanticStyle::Heading3),
+            (3, "h4_token", SemanticStyle::Heading4),
+            (4, "h5_token", SemanticStyle::Heading5),
+            (5, "h6_token", SemanticStyle::Heading6),
+            (6, "setext_h1", SemanticStyle::Heading1),
+            (8, "setext_h2", SemanticStyle::Heading2),
+            (10, "nested_h2", SemanticStyle::Heading2),
+        ] {
+            assert_eq!(
+                style_covering_token(&lines[line_index], token),
+                expected,
+                "wrong heading style for {token:?}: {:?}",
+                lines[line_index].spans
+            );
+        }
+
+        for (line_index, expected) in [
+            (0, SemanticStyle::Heading1),
+            (2, SemanticStyle::Heading3),
+            (3, SemanticStyle::Heading4),
+            (4, SemanticStyle::Heading5),
+            (5, SemanticStyle::Heading6),
+            (6, SemanticStyle::Heading1),
+            (7, SemanticStyle::Heading1),
+            (8, SemanticStyle::Heading2),
+            (9, SemanticStyle::Heading2),
+        ] {
+            assert_eq!(
+                lines[line_index].spans,
+                vec![Span {
+                    start_col: 0,
+                    end_col: lines[line_index].text.chars().count(),
+                    style: expected,
+                }],
+                "heading line {line_index} must retain its exact full-line base range"
+            );
+        }
+
+        assert_eq!(
+            style_covering_token(&lines[1], "##"),
+            SemanticStyle::Heading2
+        );
+        assert_eq!(
+            style_covering_token(&lines[10], "##"),
+            SemanticStyle::Heading2
+        );
+
+        assert_eq!(
+            style_covering_token(&lines[1], "h2_em"),
+            SemanticStyle::Emphasis
+        );
+        assert_eq!(
+            style_covering_token(&lines[1], "h2_code"),
+            SemanticStyle::CodeSpan
+        );
+    }
+
+    #[test]
+    fn source_table_header_uses_strong_style() {
+        let text = concat!(
+            "| header_plain | *header_emphasis* |\n",
+            "| --- | --- |\n",
+            "| body_plain | body_other |\n",
+        );
+        let lines = Highlighter::new(text).highlight_lines(0..usize::MAX);
+
+        assert_eq!(
+            style_covering_token(&lines[0], "header_plain"),
+            SemanticStyle::Strong
+        );
+        assert_eq!(
+            style_covering_token(&lines[0], "header_emphasis"),
+            SemanticStyle::Emphasis
+        );
+        assert_eq!(
+            style_covering_token(&lines[2], "body_plain"),
+            SemanticStyle::Text
+        );
+    }
+
+    #[test]
+    fn highlight_snippet_uses_code_block_as_base_style() {
+        let rust = highlight_snippet(
+            "rust",
+            "fn captured_function() {\n    let uncaptured_界 = \"captured_string\"; // captured_comment\n\n}\n",
+        );
+
+        for (line, token, expected) in [
+            (0, "fn", SemanticStyle::Keyword),
+            (0, "captured_function", SemanticStyle::Function),
+            (1, "uncaptured_界", SemanticStyle::CodeBlock),
+            (1, "captured_string", SemanticStyle::StringLit),
+            (1, "captured_comment", SemanticStyle::Comment),
+        ] {
+            assert_eq!(style_covering_token(&rust[line], token), expected);
+        }
+        assert!(rust[2].text.is_empty());
+        assert!(rust[2].spans.is_empty());
+
+        let unknown = highlight_snippet("unknown-language", "unknown_界\n\nsecond_unknown\n");
+        assert_eq!(unknown.len(), 3);
+        assert_eq!(
+            style_covering_token(&unknown[0], "unknown_界"),
+            SemanticStyle::CodeBlock
+        );
+        assert!(unknown[1].text.is_empty());
+        assert!(unknown[1].spans.is_empty());
+        assert_eq!(
+            style_covering_token(&unknown[2], "second_unknown"),
+            SemanticStyle::CodeBlock
+        );
     }
 
     #[test]
@@ -2540,13 +2713,20 @@ mod tests {
     fn highlighter_headings() {
         let text = "# H1\n## H2\n### H3\n#### H4\n##### H5\n###### H6\n";
         let h = Highlighter::new(text);
-        for i in 0..6 {
+        for (i, expected) in [
+            SemanticStyle::Heading1,
+            SemanticStyle::Heading2,
+            SemanticStyle::Heading3,
+            SemanticStyle::Heading4,
+            SemanticStyle::Heading5,
+            SemanticStyle::Heading6,
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let lines = h.highlight_lines(i..i + 1);
             assert_eq!(lines.len(), 1);
-            let has_heading = lines[0]
-                .spans
-                .iter()
-                .any(|s| matches!(s.style, SemanticStyle::Heading1));
+            let has_heading = lines[0].spans.iter().any(|s| s.style == expected);
             assert!(has_heading, "line {} should have heading style", i);
         }
     }
@@ -3060,6 +3240,19 @@ mod tests {
             .skip(span.start_col)
             .take(span.end_col - span.start_col)
             .collect()
+    }
+
+    fn style_covering_token(line: &StyledLine, token: &str) -> SemanticStyle {
+        let byte_start = line
+            .text
+            .find(token)
+            .unwrap_or_else(|| panic!("missing token {token:?} in {:?}", line.text));
+        let start = line.text[..byte_start].chars().count();
+        let end = start + token.chars().count();
+        line.spans
+            .iter()
+            .find(|span| span.start_col <= start && span.end_col >= end)
+            .map_or(SemanticStyle::Text, |span| span.style)
     }
 
     fn assert_edit_matches_fresh(initial: &str, edit: TextEdit) -> Vec<StyledLine> {

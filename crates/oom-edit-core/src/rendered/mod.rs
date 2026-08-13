@@ -262,6 +262,9 @@ impl<'a> RenderedLayoutBuilder<'a> {
             prefix_atoms.append(&mut rendered_line.atoms);
             rendered_line.atoms = prefix_atoms;
             for span in &mut rendered_line.styled.spans {
+                if prefix_style == Some(SemanticStyle::Quote) && span.style == SemanticStyle::Text {
+                    span.style = SemanticStyle::Quote;
+                }
                 span.start_col += prefix_char_len;
                 span.end_col += prefix_char_len;
             }
@@ -271,6 +274,10 @@ impl<'a> RenderedLayoutBuilder<'a> {
                     end_col: prefix_char_len,
                     style,
                 });
+                rendered_line
+                    .styled
+                    .spans
+                    .sort_by_key(|span| span.start_col);
             }
         }
     }
@@ -827,14 +834,23 @@ impl<'a> RenderedLayoutBuilder<'a> {
         let link_index = self.link_index.clone();
         for (marker, dest) in &link_index {
             let line_text = format!("[{}] {}", marker, dest);
+            let marker_end = format!("[{}]", marker).chars().count();
+            let destination_start = marker_end + 1;
             self.make_synthetic_styled_line(
                 StyledLine {
                     text: line_text,
-                    spans: vec![Span {
-                        start_col: 0,
-                        end_col: format!("[{}]", marker).chars().count(),
-                        style: SemanticStyle::Link,
-                    }],
+                    spans: vec![
+                        Span {
+                            start_col: 0,
+                            end_col: marker_end,
+                            style: SemanticStyle::Link,
+                        },
+                        Span {
+                            start_col: destination_start,
+                            end_col: destination_start + dest.chars().count(),
+                            style: SemanticStyle::LinkUrl,
+                        },
+                    ],
                 },
                 Range { start: 0, end: 0 },
             );
@@ -1172,6 +1188,135 @@ mod tests {
     }
 
     #[test]
+    fn source_and_rendered_payload_styles_are_consistent() {
+        for (front_matter, fm_key, fm_value) in [
+            (
+                "---\nyaml_key_token: yaml_value_token\n---\n",
+                "yaml_key_token",
+                "yaml_value_token",
+            ),
+            (
+                "+++\ntoml_key_token = 424242\n+++\n",
+                "toml_key_token",
+                "424242",
+            ),
+        ] {
+            let text = format!(
+                "{front_matter}\n\
+# heading_one\n\n\
+## heading_two\n\n\
+### heading_three\n\n\
+#### heading_four\n\n\
+##### heading_five\n\n\
+###### heading_six\n\n\
+setext_one\n===========\n\n\
+setext_two\n-----------\n\n\
+plain_payload *emphasis_payload* **strong_payload** ~~strike_payload~~ `inline_code_payload` [link_payload](https://destination-token.example/path)\n\n\
+- list_payload\n\n\
+| table_header_payload | *table_header_emphasis* | table_header_three | table_header_four | table_header_five |\n\
+| --- | --- | --- | --- | --- |\n\
+| `table_body_code` | **table_body_strong** | ~~table_body_strike~~ | [table_body_link](https://table-body-destination.example/path) | <table-body-html>table_body_html_content</table-body-html> |\n\n\
+> quote_outer_payload\n\
+> > quote_nested_payload *quote_emphasis_payload*\n\n\
+<div>html_payload</div>\n\n\
+```rust\n\
+fn known_function_payload() {{\n\
+    let known_base_界 = \"known_string_payload\";\n\
+}}\n\
+```\n\n\
+```unknown-language\n\
+unknown_code_payload\n\
+```\n"
+            );
+            let highlighter = syntax::Highlighter::new(&text);
+            let source = highlighter.highlight_lines(0..usize::MAX);
+            let model = BlockModel::build(&text, crate::frontmatter::front_matter_span(&text));
+            let layout = RenderedLayout::build(&model, 160, &highlighter);
+
+            let mut expected = vec![
+                ("heading_one", SemanticStyle::Heading1),
+                ("heading_two", SemanticStyle::Heading2),
+                ("heading_three", SemanticStyle::Heading3),
+                ("heading_four", SemanticStyle::Heading4),
+                ("heading_five", SemanticStyle::Heading5),
+                ("heading_six", SemanticStyle::Heading6),
+                ("setext_one", SemanticStyle::Heading1),
+                ("setext_two", SemanticStyle::Heading2),
+                ("plain_payload", SemanticStyle::Text),
+                ("emphasis_payload", SemanticStyle::Emphasis),
+                ("strong_payload", SemanticStyle::Strong),
+                ("strike_payload", SemanticStyle::Strikethrough),
+                ("inline_code_payload", SemanticStyle::CodeSpan),
+                ("link_payload", SemanticStyle::Link),
+                (
+                    "https://destination-token.example/path",
+                    SemanticStyle::LinkUrl,
+                ),
+                ("list_payload", SemanticStyle::Text),
+                ("table_header_payload", SemanticStyle::Strong),
+                ("table_header_emphasis", SemanticStyle::Emphasis),
+                ("table_body_code", SemanticStyle::CodeSpan),
+                ("table_body_strong", SemanticStyle::Strong),
+                ("table_body_strike", SemanticStyle::Strikethrough),
+                ("table_body_link", SemanticStyle::Link),
+                ("table-body-html", SemanticStyle::HtmlRaw),
+                ("table_body_html_content", SemanticStyle::Text),
+                ("quote_outer_payload", SemanticStyle::Quote),
+                ("quote_nested_payload", SemanticStyle::Quote),
+                ("quote_emphasis_payload", SemanticStyle::Emphasis),
+                ("html_payload", SemanticStyle::HtmlRaw),
+                ("known_function_payload", SemanticStyle::Function),
+                ("known_base_界", SemanticStyle::CodeBlock),
+                ("known_string_payload", SemanticStyle::StringLit),
+                ("unknown_code_payload", SemanticStyle::CodeBlock),
+            ];
+            expected.extend([
+                (fm_key, SemanticStyle::FmKey),
+                (fm_value, SemanticStyle::FmValue),
+            ]);
+
+            for (token, expected_style) in expected {
+                let source_style = source_style_for_token(&source, token);
+                let rendered_style = rendered_style_for_token(&layout, token);
+                assert_eq!(
+                    source_style, expected_style,
+                    "wrong source role for {token:?}: {source:?}"
+                );
+                assert_eq!(
+                    rendered_style, expected_style,
+                    "wrong rendered role for {token:?}"
+                );
+                assert_eq!(
+                    source_style, rendered_style,
+                    "source/rendered role drift for {token:?}"
+                );
+            }
+
+            let rendered_text = layout
+                .lines
+                .iter()
+                .map(|line| line.styled.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("*emphasis_payload*"));
+            assert!(text.contains("`inline_code_payload`"));
+            assert!(!rendered_text.contains("*emphasis_payload*"));
+            assert!(!rendered_text.contains("`inline_code_payload`"));
+
+            for (line_token, glyph) in [
+                ("heading_one", "█"),
+                ("list_payload", "•"),
+                ("quote_outer_payload", "┃"),
+                ("known_base_界", "▏"),
+                ("table_header_payload", "│"),
+                ("https://destination-token.example/path", "[0]"),
+            ] {
+                assert_generated_glyph_is_source_less(&layout, line_token, glyph);
+            }
+        }
+    }
+
+    #[test]
     fn unicode_front_matter_panel_spans_select_key_and_value() {
         let text = "---\ntítulo: café\n---\n";
         let layout = front_matter_layout(text);
@@ -1275,6 +1420,63 @@ mod tests {
             .skip(span.start_col)
             .take(span.end_col - span.start_col)
             .collect()
+    }
+
+    fn source_style_for_token(lines: &[StyledLine], token: &str) -> SemanticStyle {
+        let line = lines
+            .iter()
+            .find(|line| line.text.contains(token))
+            .unwrap_or_else(|| panic!("source is missing token {token:?}"));
+        style_for_token(&line.text, &line.spans, token)
+    }
+
+    fn rendered_style_for_token(layout: &RenderedLayout, token: &str) -> SemanticStyle {
+        let line = layout
+            .lines
+            .iter()
+            .find(|line| line.styled.text.contains(token))
+            .unwrap_or_else(|| panic!("rendered layout is missing token {token:?}"));
+        style_for_token(&line.styled.text, &line.styled.spans, token)
+    }
+
+    fn style_for_token(text: &str, spans: &[Span], token: &str) -> SemanticStyle {
+        let byte_start = text
+            .find(token)
+            .unwrap_or_else(|| panic!("missing token {token:?} in {text:?}"));
+        let start = text[..byte_start].chars().count();
+        let end = start + token.chars().count();
+        spans
+            .iter()
+            .find(|span| span.start_col <= start && span.end_col >= end)
+            .map_or(SemanticStyle::Text, |span| span.style)
+    }
+
+    fn assert_generated_glyph_is_source_less(
+        layout: &RenderedLayout,
+        line_token: &str,
+        glyph: &str,
+    ) {
+        let line = layout
+            .lines
+            .iter()
+            .find(|line| line.styled.text.contains(line_token))
+            .unwrap_or_else(|| panic!("rendered layout is missing line token {line_token:?}"));
+        let glyph_byte = line.styled.text.find(glyph).unwrap_or_else(|| {
+            panic!(
+                "line for {line_token:?} is missing generated glyph {glyph:?}: {:?}",
+                line.styled.text
+            )
+        });
+        let column = text_width(&line.styled.text[..glyph_byte]);
+        let atom = line
+            .atoms
+            .iter()
+            .find(|atom| atom.columns.start <= column && atom.columns.end > column)
+            .unwrap_or_else(|| panic!("generated glyph {glyph:?} has no display atom"));
+        assert_eq!(
+            atom.source, None,
+            "generated glyph {glyph:?} beside {line_token:?} must stay outside payload parity"
+        );
     }
 }
 

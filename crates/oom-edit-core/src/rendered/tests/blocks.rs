@@ -785,8 +785,8 @@ fn fenced_layout_marks_complete_surface_role() {
             .iter()
             .map(|span| span.style)
             .collect::<Vec<_>>(),
-        [SemanticStyle::Muted, SemanticStyle::Text],
-        "unknown-language content must retain its existing plain-text foreground"
+        [SemanticStyle::Muted, SemanticStyle::CodeBlock],
+        "unknown-language content must use the fenced-code fallback role"
     );
     assert_eq!(&text[known_body.source.clone()], "fn main() {}\n");
     assert_eq!(&text[unknown_body.source.clone()], "opaque");

@@ -12,16 +12,16 @@
 use std::path::PathBuf;
 
 use ratatui::backend::TestBackend;
-use ratatui::style::Modifier;
+use ratatui::style::{Modifier, Style};
 use ratatui::Terminal;
 
-use oom_edit_core::EditorSession;
 use oom_edit_core::RecordingClipboardSink;
+use oom_edit_core::{EditorSession, SemanticStyle};
 
 use crate::app::App;
 use crate::command::Contexts;
 use crate::theme::{
-    get_theme, EnvParts, PaletteKind, ThemeSource, Tier, UiSlot, ZED_CYAN, ZED_ORANGE, ZED_UI_TEXT,
+    get_theme, EnvParts, PaletteKind, ThemeSource, Tier, UiSlot, ZED_CYAN, ZED_UI_TEXT, ZED_YELLOW,
 };
 
 fn resolve_test_theme_at(name: &str, capability: Tier) -> crate::theme::ResolvedTheme {
@@ -208,6 +208,47 @@ Just some plain text here.
 
 No lists, no code blocks, no blockquotes.
 "
+}
+
+fn cross_mode_style_fixture() -> &'static str {
+    r#"---
+fm_key_token: fm_value_token
+---
+
+# heading_one_token
+
+## heading_two_token
+
+### heading_three_token
+
+#### heading_four_token
+
+##### heading_five_token
+
+###### heading_six_token
+
+plain_token *emphasis_token* **strong_token** ~~strike_token~~ `inline_code_token` [link_text_token](https://link-url-token.example/path)
+
+- list_payload_token
+
+| table_header_token | *table_header_emphasis_token* |
+| --- | --- |
+| table_body_token | `table_body_code_token` |
+
+> quote_token
+
+<div>html_token</div>
+
+```rust
+fn captured_function_token() {
+    let known_base_token = "string_token"; // comment_token
+}
+```
+
+```unknown-language
+unknown_code_token
+```
+"#
 }
 
 // ── Assert snapshot ─────────────────────────────────────────────────────────
@@ -797,7 +838,7 @@ fn default_dark_render_uses_zed_colors_for_plain_text_and_headings() {
     const WIDTH: u16 = 80;
     const HEIGHT: u16 = 10;
 
-    let mut app = test_app("plain text\n\n# Cyan heading\n\n## Orange heading\n");
+    let mut app = test_app("plain text\n\n# Cyan heading\n\n## Yellow heading\n");
     let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
     terminal.draw(|frame| app.render(frame)).unwrap();
     let buffer = terminal.backend().buffer();
@@ -805,7 +846,7 @@ fn default_dark_render_uses_zed_colors_for_plain_text_and_headings() {
     for (token, expected) in [
         ("plain text", ZED_UI_TEXT),
         ("Cyan heading", ZED_CYAN),
-        ("Orange heading", ZED_ORANGE),
+        ("Yellow heading", ZED_YELLOW),
     ] {
         let (start_x, y) = (0..HEIGHT)
             .find_map(|y| {
@@ -829,7 +870,10 @@ fn default_dark_render_uses_zed_colors_for_plain_text_and_headings() {
 }
 
 #[test]
-fn default_dark_styles_reach_all_four_modes() {
+fn default_theme_styles_reach_all_four_modes() {
+    const WIDTH: u16 = 180;
+    const HEIGHT: u16 = 70;
+
     for theme_name in ["default-dark", "default-light"] {
         for capability in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
             for (mode_key, badge, slot) in [
@@ -838,8 +882,8 @@ fn default_dark_styles_reach_all_four_modes() {
                 (Some('v'), " SELECT ", UiSlot::BadgeSelect),
                 (Some(':'), " :CMD ", UiSlot::BadgeCommand),
             ] {
-                let mut session = EditorSession::from_text("plain\n\n# Colored heading\n");
-                session.render_layout(74);
+                let mut session = EditorSession::from_text(cross_mode_style_fixture());
+                session.render_layout(WIDTH - 4);
                 let resolved = resolve_test_theme_at(theme_name, capability);
                 assert_eq!(resolved.source, ThemeSource::Cli);
                 assert_eq!(resolved.capability, capability);
@@ -860,18 +904,101 @@ fn default_dark_styles_reach_all_four_modes() {
                         ),
                     ));
                 }
-                let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+                let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
                 terminal.draw(|frame| app.render(frame)).unwrap();
                 let buffer = terminal.backend().buffer();
-                let heading_style =
-                    get_theme(theme_name).style(capability, oom_edit_core::SemanticStyle::Heading1);
-                let (heading_x, heading_y) = find_buffer_token(buffer, 60, 8, "Colored heading");
-                for x in heading_x..heading_x + "Colored heading".chars().count() as u16 {
-                    let cell = buffer.cell((x, heading_y)).unwrap();
-                    assert_eq!(cell.fg, heading_style.fg.unwrap_or_default());
-                    assert_eq!(cell.bg, heading_style.bg.unwrap_or_default());
-                    assert!(cell.modifier.contains(heading_style.add_modifier));
+                let is_rendered = mode_key != Some('i');
+                for (token, semantic, rendered_surface) in [
+                    ("heading_one_token", SemanticStyle::Heading1, None),
+                    ("heading_two_token", SemanticStyle::Heading2, None),
+                    ("heading_three_token", SemanticStyle::Heading3, None),
+                    ("heading_four_token", SemanticStyle::Heading4, None),
+                    ("heading_five_token", SemanticStyle::Heading5, None),
+                    ("heading_six_token", SemanticStyle::Heading6, None),
+                    ("plain_token", SemanticStyle::Text, None),
+                    ("emphasis_token", SemanticStyle::Emphasis, None),
+                    ("strong_token", SemanticStyle::Strong, None),
+                    ("strike_token", SemanticStyle::Strikethrough, None),
+                    ("inline_code_token", SemanticStyle::CodeSpan, None),
+                    ("link_text_token", SemanticStyle::Link, None),
+                    (
+                        "https://link-url-token.example/path",
+                        SemanticStyle::LinkUrl,
+                        None,
+                    ),
+                    ("list_payload_token", SemanticStyle::Text, None),
+                    ("table_header_token", SemanticStyle::Strong, None),
+                    ("table_header_emphasis_token", SemanticStyle::Emphasis, None),
+                    ("table_body_token", SemanticStyle::Text, None),
+                    ("table_body_code_token", SemanticStyle::CodeSpan, None),
+                    ("quote_token", SemanticStyle::Quote, None),
+                    ("html_token", SemanticStyle::HtmlRaw, None),
+                    (
+                        "fm_key_token",
+                        SemanticStyle::FmKey,
+                        Some(UiSlot::MetadataPanel),
+                    ),
+                    (
+                        "fm_value_token",
+                        SemanticStyle::FmValue,
+                        Some(UiSlot::MetadataPanel),
+                    ),
+                    (
+                        "captured_function_token",
+                        SemanticStyle::Function,
+                        Some(UiSlot::CodeFence),
+                    ),
+                    (
+                        "known_base_token",
+                        SemanticStyle::CodeBlock,
+                        Some(UiSlot::CodeFence),
+                    ),
+                    (
+                        "string_token",
+                        SemanticStyle::StringLit,
+                        Some(UiSlot::CodeFence),
+                    ),
+                    (
+                        "comment_token",
+                        SemanticStyle::Comment,
+                        Some(UiSlot::CodeFence),
+                    ),
+                    (
+                        "unknown_code_token",
+                        SemanticStyle::CodeBlock,
+                        Some(UiSlot::CodeFence),
+                    ),
+                ] {
+                    let mut expected = get_theme(theme_name).style(capability, semantic);
+                    if is_rendered {
+                        if let Some(surface) = rendered_surface {
+                            expected =
+                                expected.patch(get_theme(theme_name).ui_style(capability, surface));
+                        }
+                    }
+                    assert_buffer_token_style(
+                        buffer, WIDTH, HEIGHT, token, expected, theme_name, capability, badge,
+                    );
                 }
+
+                if is_rendered {
+                    for (token, semantic, surface) in [
+                        ("•", SemanticStyle::ListMarker, None),
+                        ("┃", SemanticStyle::Quote, None),
+                        ("▏", SemanticStyle::Muted, Some(UiSlot::CodeFence)),
+                        ("[0]", SemanticStyle::Link, None),
+                    ] {
+                        let mut expected = get_theme(theme_name).style(capability, semantic);
+                        if let Some(surface) = surface {
+                            expected =
+                                expected.patch(get_theme(theme_name).ui_style(capability, surface));
+                        }
+                        assert_buffer_token_style(
+                            buffer, WIDTH, HEIGHT, token, expected, theme_name, capability, badge,
+                        );
+                    }
+                }
+
                 let badge_style = get_theme(theme_name).ui_style(capability, slot);
                 let expected_badge = format!(
                     "{:<width$}",
@@ -879,7 +1006,7 @@ fn default_dark_styles_reach_all_four_modes() {
                     width = crate::widgets::status_bar::MODE_BADGE_COLS as usize
                 );
                 for (x, expected) in expected_badge.chars().enumerate() {
-                    let cell = buffer.cell((x as u16, 7)).unwrap();
+                    let cell = buffer.cell((x as u16, HEIGHT - 1)).unwrap();
                     assert_eq!(cell.symbol(), expected.to_string());
                     assert_eq!(cell.fg, badge_style.fg.unwrap_or_default());
                     assert_eq!(cell.bg, badge_style.bg.unwrap_or_default());
@@ -891,7 +1018,7 @@ fn default_dark_styles_reach_all_four_modes() {
                 }
                 let status_style = get_theme(theme_name).ui_style(capability, UiSlot::StatusBar);
                 let gap = buffer
-                    .cell((crate::widgets::status_bar::MODE_BADGE_COLS, 7))
+                    .cell((crate::widgets::status_bar::MODE_BADGE_COLS, HEIGHT - 1))
                     .unwrap();
                 assert_eq!(gap.symbol(), " ");
                 assert_eq!(gap.fg, status_style.fg.unwrap_or_default());
@@ -899,6 +1026,37 @@ fn default_dark_styles_reach_all_four_modes() {
                 assert!(gap.modifier.contains(status_style.add_modifier));
             }
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assert_buffer_token_style(
+    buffer: &ratatui::buffer::Buffer,
+    width: u16,
+    height: u16,
+    token: &str,
+    expected: Style,
+    theme_name: &str,
+    capability: Tier,
+    mode_badge: &str,
+) {
+    let (start_x, y) = find_buffer_token(buffer, width, height, token);
+    for x in start_x..start_x + token.chars().count() as u16 {
+        let cell = buffer.cell((x, y)).expect("token cell");
+        assert_eq!(
+            cell.fg,
+            expected.fg.unwrap_or_default(),
+            "wrong foreground for {token:?} in {theme_name}/{capability:?}/{mode_badge} at ({x},{y})"
+        );
+        assert_eq!(
+            cell.bg,
+            expected.bg.unwrap_or_default(),
+            "wrong background for {token:?} in {theme_name}/{capability:?}/{mode_badge} at ({x},{y})"
+        );
+        assert_eq!(
+            cell.modifier, expected.add_modifier,
+            "wrong modifiers for {token:?} in {theme_name}/{capability:?}/{mode_badge} at ({x},{y})"
+        );
     }
 }
 

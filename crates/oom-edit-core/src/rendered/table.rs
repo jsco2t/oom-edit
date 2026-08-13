@@ -9,7 +9,9 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::rendered::blocks::{Inline, InlineLeaf, TableAlignment};
 use crate::rendered::wrap::MappedLine;
-use crate::style::{SemanticStyle, Span, StyledLine};
+#[cfg(test)]
+use crate::style::Span;
+use crate::style::{SemanticStyle, StyledLine};
 
 /// Maximum display width of a single table cell before wrapping kicks in.
 const CELL_CAP: usize = 40;
@@ -41,33 +43,8 @@ pub(super) struct RenderedTableLine {
 
 impl RenderedTableLine {
     pub(super) fn into_parts(self) -> (StyledLine, Vec<crate::style::RenderedSourceAtom>) {
-        finalize_table_line(self.mapped, self.logical_row == Some(0))
+        self.mapped.into_parts()
     }
-}
-
-fn finalize_table_line(
-    mapped: MappedLine,
-    header: bool,
-) -> (StyledLine, Vec<crate::style::RenderedSourceAtom>) {
-    let (mut styled, atoms) = mapped.into_parts();
-    styled.spans.clear();
-    let char_count = styled.text.chars().count();
-    if char_count > 0 {
-        if header && char_count > 2 {
-            styled.spans.push(Span {
-                start_col: 1,
-                end_col: char_count - 1,
-                style: SemanticStyle::Strong,
-            });
-        } else {
-            styled.spans.push(Span {
-                start_col: 0,
-                end_col: char_count,
-                style: SemanticStyle::Text,
-            });
-        }
-    }
-    (styled, atoms)
 }
 
 /// Render table lines while retaining row identity for source mapping.
@@ -179,17 +156,27 @@ fn inline_to_mapped(inlines: &[Inline], style: SemanticStyle) -> MappedLine {
     let mut line = MappedLine::default();
     for inline in inlines {
         match inline {
-            Inline::Text(leaf)
-            | Inline::Code(leaf)
-            | Inline::SoftBreak(leaf)
-            | Inline::HardBreak(leaf)
-            | Inline::FootnoteRef(leaf)
-            | Inline::Html(leaf) => append_leaf(&mut line, leaf, style),
-            Inline::Emph(inner) | Inline::Strong(inner) | Inline::Strike(inner) => {
-                line.append(inline_to_mapped(inner, style));
+            Inline::Text(leaf) | Inline::SoftBreak(leaf) | Inline::HardBreak(leaf) => {
+                append_leaf(&mut line, leaf, style);
             }
-            Inline::Link { text, .. } => line.append(inline_to_mapped(text, style)),
-            Inline::Image { alt, .. } => line.append(inline_to_mapped(alt, style)),
+            Inline::Code(leaf) => append_leaf(&mut line, leaf, SemanticStyle::CodeSpan),
+            Inline::Emph(inner) => {
+                line.append(inline_to_mapped(inner, SemanticStyle::Emphasis));
+            }
+            Inline::Strong(inner) => {
+                line.append(inline_to_mapped(inner, SemanticStyle::Strong));
+            }
+            Inline::Strike(inner) => {
+                line.append(inline_to_mapped(inner, SemanticStyle::Strikethrough));
+            }
+            Inline::Link { text, .. } => {
+                line.append(inline_to_mapped(text, SemanticStyle::Link));
+            }
+            Inline::Image { alt, .. } => {
+                line.append(inline_to_mapped(alt, SemanticStyle::Link));
+            }
+            Inline::FootnoteRef(leaf) => append_leaf(&mut line, leaf, SemanticStyle::Link),
+            Inline::Html(leaf) => append_leaf(&mut line, leaf, SemanticStyle::HtmlRaw),
         }
     }
     line
@@ -310,7 +297,9 @@ fn build_data_row(
         for (ci, cell_lines) in wrapped_cells.iter().enumerate() {
             let mut chunk = cell_lines.get(line_index).cloned().unwrap_or_default();
             for fragment in &mut chunk.fragments {
-                fragment.style = header_style;
+                if fragment.style == SemanticStyle::Text {
+                    fragment.style = header_style;
+                }
             }
             let width = col_widths[ci];
             let padding = width.saturating_sub(chunk.width());
@@ -343,7 +332,9 @@ fn build_data_row(
         if header_style == SemanticStyle::Strong && line.fragments.len() > 2 {
             let last = line.fragments.len() - 1;
             for fragment in &mut line.fragments[1..last] {
-                fragment.style = SemanticStyle::Strong;
+                if fragment.style == SemanticStyle::Text {
+                    fragment.style = SemanticStyle::Strong;
+                }
             }
         }
         lines.push(line);
@@ -621,10 +612,13 @@ mod tests {
 
         assert_eq!(lines.len(), 5);
         for line in &lines[1..3] {
-            assert_eq!(line.spans.len(), 1);
-            assert_eq!(line.spans[0].style, SemanticStyle::Strong);
-            assert_eq!(line.spans[0].start_col, 1);
-            assert_eq!(line.spans[0].end_col, line.text.chars().count() - 1);
+            assert_eq!(line.spans.len(), 3);
+            let strong = &line.spans[1];
+            assert_eq!(strong.style, SemanticStyle::Strong);
+            assert_eq!(strong.start_col, 1);
+            assert_eq!(strong.end_col, line.text.chars().count() - 1);
+            assert_eq!(line.spans[0].style, SemanticStyle::Text);
+            assert_eq!(line.spans[2].style, SemanticStyle::Text);
         }
     }
 
@@ -717,33 +711,27 @@ mod tests {
 
         for (line_index, line) in lines.iter().enumerate() {
             let char_count = line.text.chars().count();
-            assert_eq!(
-                line.spans.len(),
-                1,
-                "rendered table row should have exactly one span: {:?}",
-                line.text
-            );
-            let span = &line.spans[0];
-            assert!(span.start_col <= span.end_col);
-            assert!(
-                span.end_col <= char_count,
-                "span [{}, {}) exceeds {char_count} chars in {:?}",
-                span.start_col,
-                span.end_col,
-                line.text
-            );
             if line_index == 1 {
-                assert_eq!(span.style, SemanticStyle::Strong);
-                assert_eq!(span.start_col, 1);
-                assert_eq!(span.end_col, char_count - 1);
+                assert_eq!(line.spans.len(), 3);
+                assert_eq!(line.spans[0], span(0, 1, SemanticStyle::Text));
+                assert_eq!(
+                    line.spans[1],
+                    span(1, char_count - 1, SemanticStyle::Strong)
+                );
+                assert_eq!(
+                    line.spans[2],
+                    span(char_count - 1, char_count, SemanticStyle::Text)
+                );
                 let content: String = line
                     .text
                     .chars()
                     .skip(1)
                     .take(char_count.saturating_sub(2))
                     .collect();
-                assert_eq!(span_text(line, span), content);
+                assert_eq!(span_text(line, &line.spans[1]), content);
             } else {
+                assert_eq!(line.spans.len(), 1);
+                let span = &line.spans[0];
                 assert_eq!(span.style, SemanticStyle::Text);
                 assert_eq!(span.start_col, 0);
                 assert_eq!(span.end_col, char_count);
@@ -761,8 +749,12 @@ mod tests {
             &[cells[0].display_width],
             SemanticStyle::Strong,
         );
-        let line = finalize_table_line(lines[0].clone(), true).0;
-        let span = line.spans.first().expect("header row should be styled");
+        let line = lines[0].clone().into_parts().0;
+        let span = line
+            .spans
+            .iter()
+            .find(|span| span.style == SemanticStyle::Strong)
+            .expect("header payload should be strong");
 
         assert_eq!(span.start_col, 1);
         assert_eq!(span.end_col, line.text.chars().count() - 1);
@@ -807,5 +799,13 @@ mod tests {
             .skip(span.start_col)
             .take(span.end_col - span.start_col)
             .collect()
+    }
+
+    fn span(start_col: usize, end_col: usize, style: SemanticStyle) -> Span {
+        Span {
+            start_col,
+            end_col,
+            style,
+        }
     }
 }

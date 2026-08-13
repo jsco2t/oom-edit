@@ -47,7 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Expanded front matter no longer sorts and compacts parsed values into a pseudo-table, so source order, comments, blank lines, nesting, and scalar spelling remain visible.
 - Rendered Markdown now preserves nested-list source order and renders depth-specific bullets, declared ordered-list numbers, nested task markers, and aligned continuations.
 - Rendered navigation now reuses the renderer-selected layout width without rebuilding and cloning the document on every scroll key, eliminating width-dependent CPU thrash and lag.
-- Theme cycling now keeps light and dark config slots mode-compatible, the default dark TrueColor palette uses exact Zed OneDark Markdown RGB values, and rendered headings apply their per-level colors to heading text as well as markers.
+- Theme cycling now keeps light and dark config slots mode-compatible, the default-dark TrueColor palette uses the Zed OneDark Markdown colors with a custom H2/H3 order, and rendered headings apply their per-level colors to heading text as well as markers.
+- Source and rendered Markdown now assign the same semantic styles to shared heading, table-header, blockquote, fenced-code fallback, and link-destination payload.
 - The command palette now clears its full surface, grows responsively from a 40×12 floor, keeps the filter fixed, and scrolls to keep the selected command or Vim reference visible.
 - The bottom application row now keeps a fixed, mode-colored badge at the left edge, uses a distinct full-row background, shows unique registry-derived hints, and opens Help through `Space h` without an F1 binding.
 - Line numbers now leave a two-cell gap before content and are absolute by default; `relative_line_numbers = true` enables hybrid-relative numbering in rendered Normal, Select, and Command while Insert remains absolute.

@@ -21,7 +21,7 @@ pub(crate) const ZED_UI_TEXT: Color = Color::Rgb(200, 204, 212);
 #[cfg(test)]
 pub(crate) const ZED_CYAN: Color = Color::Rgb(110, 180, 191);
 #[cfg(test)]
-pub(crate) const ZED_ORANGE: Color = Color::Rgb(191, 149, 106);
+pub(crate) const ZED_YELLOW: Color = Color::Rgb(223, 193, 132);
 #[cfg(test)]
 pub(crate) const TEST_EXACT_BLACK: Color = Color::Rgb(0, 0, 0);
 
@@ -589,13 +589,13 @@ fn heading_fg_dark(tier: &mut Vec<Color>) -> Color {
     }
 }
 
-/// Heading ladder for dark theme: each level gets a distinct color.
+/// Configured ANSI heading sequence for the dark theme; tiers may reuse colors.
 #[expect(dead_code)]
 fn heading_colors_dark() -> [Color; 6] {
     [
         Color::Yellow,
-        Color::Yellow,
         Color::Cyan,
+        Color::Yellow,
         Color::Cyan,
         Color::Magenta,
         Color::Magenta,
@@ -618,12 +618,12 @@ pub static DEFAULT_DARK: Theme = Theme {
             ),
             (
                 SemanticStyle::Heading2,
-                Color::Rgb(191, 149, 106),
+                Color::Rgb(223, 193, 132),
                 Modifier::BOLD,
             ),
             (
                 SemanticStyle::Heading3,
-                Color::Rgb(223, 193, 132),
+                Color::Rgb(191, 149, 106),
                 Modifier::BOLD,
             ),
             (
@@ -887,8 +887,8 @@ pub static DEFAULT_DARK: Theme = Theme {
         semantic: &[
             (SemanticStyle::Text, Color::White, Modifier::empty()),
             (SemanticStyle::Heading1, Color::Yellow, Modifier::BOLD),
-            (SemanticStyle::Heading2, Color::Yellow, Modifier::BOLD),
-            (SemanticStyle::Heading3, Color::Cyan, Modifier::BOLD),
+            (SemanticStyle::Heading2, Color::Cyan, Modifier::BOLD),
+            (SemanticStyle::Heading3, Color::Yellow, Modifier::BOLD),
             (SemanticStyle::Heading4, Color::Cyan, Modifier::BOLD),
             (SemanticStyle::Heading5, Color::Magenta, Modifier::BOLD),
             (SemanticStyle::Heading6, Color::Magenta, Modifier::BOLD),
@@ -2156,12 +2156,12 @@ mod tests {
     }
 
     #[test]
-    fn default_dark_truecolor_matches_zed_onedark_md() {
+    fn default_dark_truecolor_matches_configured_palette() {
         let expected_semantic = [
             (SemanticStyle::Text, Color::Rgb(200, 204, 212)),
             (SemanticStyle::Heading1, Color::Rgb(110, 180, 191)),
-            (SemanticStyle::Heading2, Color::Rgb(191, 149, 106)),
-            (SemanticStyle::Heading3, Color::Rgb(223, 193, 132)),
+            (SemanticStyle::Heading2, Color::Rgb(223, 193, 132)),
+            (SemanticStyle::Heading3, Color::Rgb(191, 149, 106)),
             (SemanticStyle::Heading4, Color::Rgb(161, 193, 129)),
             (SemanticStyle::Heading5, Color::Rgb(110, 180, 191)),
             (SemanticStyle::Heading6, Color::Rgb(180, 119, 207)),
@@ -2228,6 +2228,353 @@ mod tests {
                 .bg,
             Some(Color::Rgb(47, 52, 62))
         );
+    }
+
+    #[test]
+    fn default_dark_heading_swap_is_isolated() {
+        assert_style_parts(
+            DEFAULT_DARK.style(Tier::TrueColor, SemanticStyle::Heading2),
+            Some(Color::Rgb(223, 193, 132)),
+            None,
+            Modifier::BOLD,
+        );
+        assert_style_parts(
+            DEFAULT_DARK.style(Tier::TrueColor, SemanticStyle::Heading3),
+            Some(Color::Rgb(191, 149, 106)),
+            None,
+            Modifier::BOLD,
+        );
+        assert_style_parts(
+            DEFAULT_DARK.style(Tier::Color16, SemanticStyle::Heading2),
+            Some(Color::Cyan),
+            None,
+            Modifier::BOLD,
+        );
+        assert_style_parts(
+            DEFAULT_DARK.style(Tier::Color16, SemanticStyle::Heading3),
+            Some(Color::Yellow),
+            None,
+            Modifier::BOLD,
+        );
+
+        for (slot, truecolor, ansi) in [
+            (
+                SemanticStyle::Heading1,
+                Color::Rgb(110, 180, 191),
+                Color::Yellow,
+            ),
+            (
+                SemanticStyle::Heading4,
+                Color::Rgb(161, 193, 129),
+                Color::Cyan,
+            ),
+            (
+                SemanticStyle::Heading5,
+                Color::Rgb(110, 180, 191),
+                Color::Magenta,
+            ),
+            (
+                SemanticStyle::Heading6,
+                Color::Rgb(180, 119, 207),
+                Color::Magenta,
+            ),
+        ] {
+            assert_style_parts(
+                DEFAULT_DARK.style(Tier::TrueColor, slot),
+                Some(truecolor),
+                None,
+                Modifier::BOLD,
+            );
+            assert_style_parts(
+                DEFAULT_DARK.style(Tier::Color16, slot),
+                Some(ansi),
+                None,
+                Modifier::BOLD,
+            );
+        }
+
+        for (slot, truecolor, true_modifiers, ansi, ansi_modifiers) in [
+            (
+                SemanticStyle::Text,
+                Color::Rgb(200, 204, 212),
+                Modifier::empty(),
+                Color::White,
+                Modifier::empty(),
+            ),
+            (
+                SemanticStyle::Emphasis,
+                Color::Rgb(180, 119, 207),
+                Modifier::ITALIC,
+                Color::White,
+                Modifier::ITALIC,
+            ),
+            (
+                SemanticStyle::Strong,
+                Color::Rgb(223, 193, 132),
+                Modifier::BOLD,
+                Color::White,
+                Modifier::BOLD,
+            ),
+            (
+                SemanticStyle::CodeBlock,
+                Color::Rgb(161, 193, 129),
+                Modifier::empty(),
+                Color::Green,
+                Modifier::empty(),
+            ),
+            (
+                SemanticStyle::Quote,
+                Color::Rgb(223, 193, 132),
+                Modifier::empty(),
+                Color::Yellow,
+                Modifier::empty(),
+            ),
+            (
+                SemanticStyle::LinkUrl,
+                Color::Rgb(110, 180, 191),
+                Modifier::UNDERLINED,
+                Color::DarkGray,
+                Modifier::empty(),
+            ),
+            (
+                SemanticStyle::FmKey,
+                Color::Rgb(223, 193, 132),
+                Modifier::BOLD,
+                Color::Yellow,
+                Modifier::BOLD,
+            ),
+            (
+                SemanticStyle::Keyword,
+                Color::Rgb(180, 119, 207),
+                Modifier::BOLD,
+                Color::Red,
+                Modifier::BOLD,
+            ),
+            (
+                SemanticStyle::Muted,
+                Color::Rgb(59, 64, 72),
+                Modifier::DIM,
+                Color::DarkGray,
+                Modifier::DIM,
+            ),
+        ] {
+            assert_style_parts(
+                DEFAULT_DARK.style(Tier::TrueColor, slot),
+                Some(truecolor),
+                None,
+                true_modifiers,
+            );
+            assert_style_parts(
+                DEFAULT_DARK.style(Tier::Color16, slot),
+                Some(ansi),
+                None,
+                ansi_modifiers,
+            );
+        }
+        for tier in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
+            assert!(DEFAULT_DARK
+                .style(tier, SemanticStyle::Selection)
+                .add_modifier
+                .contains(Modifier::REVERSED));
+        }
+
+        for (slot, foreground, background, modifiers) in [
+            (
+                UiSlot::StatusBar,
+                Some(Color::Rgb(200, 204, 212)),
+                Some(Color::Rgb(47, 52, 62)),
+                Modifier::DIM,
+            ),
+            (
+                UiSlot::BadgeNormal,
+                Some(Color::Rgb(0, 0, 0)),
+                Some(Color::Rgb(115, 173, 233)),
+                Modifier::BOLD,
+            ),
+            (
+                UiSlot::BadgeInsert,
+                Some(Color::Rgb(0, 0, 0)),
+                Some(Color::Rgb(161, 193, 129)),
+                Modifier::BOLD,
+            ),
+            (
+                UiSlot::BadgeSelect,
+                Some(Color::Rgb(0, 0, 0)),
+                Some(Color::Rgb(180, 119, 207)),
+                Modifier::BOLD,
+            ),
+            (
+                UiSlot::BadgeCommand,
+                Some(Color::Rgb(0, 0, 0)),
+                Some(Color::Rgb(223, 193, 132)),
+                Modifier::BOLD,
+            ),
+            (
+                UiSlot::Border,
+                Some(Color::Rgb(47, 52, 62)),
+                None,
+                Modifier::empty(),
+            ),
+            (
+                UiSlot::HintKey,
+                Some(Color::Rgb(223, 193, 132)),
+                None,
+                Modifier::BOLD,
+            ),
+            (
+                UiSlot::HintDesc,
+                Some(Color::Rgb(200, 204, 212)),
+                None,
+                Modifier::empty(),
+            ),
+            (
+                UiSlot::StatusSuccess,
+                Some(Color::Rgb(161, 193, 129)),
+                None,
+                Modifier::empty(),
+            ),
+            (
+                UiSlot::StatusInfo,
+                Some(Color::Rgb(115, 173, 233)),
+                None,
+                Modifier::empty(),
+            ),
+            (
+                UiSlot::StatusWarning,
+                Some(Color::Rgb(223, 193, 132)),
+                None,
+                Modifier::empty(),
+            ),
+            (
+                UiSlot::StatusError,
+                Some(Color::Rgb(208, 114, 119)),
+                None,
+                Modifier::empty(),
+            ),
+            (
+                UiSlot::Gutter,
+                Some(Color::Rgb(93, 99, 111)),
+                None,
+                Modifier::DIM,
+            ),
+            (
+                UiSlot::GutterCurrent,
+                Some(Color::Rgb(200, 204, 212)),
+                None,
+                Modifier::BOLD,
+            ),
+            (
+                UiSlot::CursorLine,
+                None,
+                Some(Color::Rgb(47, 52, 62)),
+                Modifier::DIM,
+            ),
+            (
+                UiSlot::CodeFence,
+                None,
+                Some(Color::Rgb(44, 48, 56)),
+                Modifier::empty(),
+            ),
+            (
+                UiSlot::TabActive,
+                Some(Color::Rgb(200, 204, 212)),
+                None,
+                Modifier::BOLD,
+            ),
+            (
+                UiSlot::TabInactive,
+                Some(Color::Rgb(93, 99, 111)),
+                None,
+                Modifier::DIM,
+            ),
+            (
+                UiSlot::MetadataPanel,
+                None,
+                Some(Color::Rgb(47, 52, 62)),
+                Modifier::DIM,
+            ),
+            (
+                UiSlot::TabSeparator,
+                Some(Color::Rgb(47, 52, 62)),
+                None,
+                Modifier::DIM,
+            ),
+        ] {
+            assert_style_parts(
+                DEFAULT_DARK.ui_style(Tier::TrueColor, slot),
+                foreground,
+                background,
+                modifiers,
+            );
+        }
+
+        for (slot, expected) in [
+            (SemanticStyle::Heading1, Color::Red),
+            (SemanticStyle::Heading2, Color::Red),
+            (SemanticStyle::Heading3, Color::Blue),
+            (SemanticStyle::Heading4, Color::Blue),
+            (SemanticStyle::Heading5, Color::Magenta),
+            (SemanticStyle::Heading6, Color::Magenta),
+        ] {
+            for tier in [Tier::TrueColor, Tier::Color16] {
+                assert_style_parts(
+                    DEFAULT_LIGHT.style(tier, slot),
+                    Some(expected),
+                    None,
+                    Modifier::BOLD,
+                );
+            }
+        }
+        assert_style_parts(
+            DEFAULT_LIGHT.ui_style(Tier::TrueColor, UiSlot::CodeFence),
+            None,
+            Some(Color::Rgb(245, 246, 248)),
+            Modifier::empty(),
+        );
+
+        for theme in [&DEFAULT_DARK, &DEFAULT_LIGHT, &ACCESSIBLE] {
+            for tier in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
+                if theme.name == "accessible" || tier == Tier::Monochrome {
+                    assert_style_parts(
+                        theme.style(tier, SemanticStyle::Heading2),
+                        Some(Color::Reset),
+                        None,
+                        Modifier::BOLD,
+                    );
+                    assert_style_parts(
+                        theme.style(tier, SemanticStyle::Heading3),
+                        Some(Color::Reset),
+                        None,
+                        Modifier::BOLD,
+                    );
+                    assert_style_parts(
+                        theme.style(tier, SemanticStyle::Link),
+                        Some(Color::Reset),
+                        None,
+                        Modifier::UNDERLINED,
+                    );
+                    assert_style_parts(
+                        theme.ui_style(tier, UiSlot::CodeFence),
+                        Some(Color::Reset),
+                        None,
+                        Modifier::empty(),
+                    );
+                }
+            }
+        }
+    }
+
+    #[track_caller]
+    fn assert_style_parts(
+        style: Style,
+        foreground: Option<Color>,
+        background: Option<Color>,
+        modifiers: Modifier,
+    ) {
+        assert_eq!(style.fg, foreground);
+        assert_eq!(style.bg, background);
+        assert_eq!(style.add_modifier, modifiers);
+        assert_eq!(style.sub_modifier, Modifier::empty());
     }
 
     #[test]
