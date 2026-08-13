@@ -28,6 +28,10 @@ toolchain: ## Install dev toolchain (rustup, cargo-deny, cargo-audit)
 build: ## Build the workspace
 	cargo build --workspace --offline --locked
 
+.PHONY: build-release
+build-release: ## Build the release binary
+	cargo build --release --package oom-edit --bin oom-edit --offline --locked
+
 .PHONY: build-examples
 build-examples: ## Build all examples with locked offline dependencies
 	cargo build --workspace --examples --offline --locked

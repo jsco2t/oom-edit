@@ -2,7 +2,7 @@
 //!
 //! The reusable core has its own dependency-boundary checks. These tests cover
 //! the workspace policy that belongs to the terminal crate: one crossterm
-//! lineage and warning-fatal dependency-check entry points.
+//! lineage, warning-fatal dependency-check entry points, and release builds.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -136,4 +136,20 @@ fn make_audit_and_check_promote_warnings() {
             "make --dry-run {target} should consume the shared AUDIT_FLAGS variable:\n{stdout}"
         );
     }
+}
+
+#[test]
+fn make_build_release_builds_only_the_locked_offline_binary() {
+    let output = Command::new("make")
+        .args(["--dry-run", "build-release"])
+        .current_dir(workspace_root())
+        .output()
+        .expect("make --dry-run build-release should run");
+    let stdout = checked_stdout(output, "make --dry-run build-release");
+
+    assert_eq!(
+        stdout.trim(),
+        "cargo build --release --package oom-edit --bin oom-edit --offline --locked",
+        "build-release should build only the release binary with locked offline dependencies"
+    );
 }
