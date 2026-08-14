@@ -737,6 +737,65 @@ fn selection_row(
     }
 }
 
+/// Project a source byte range into source-backed rendered display intervals.
+///
+/// Separate intervals are retained when synthetic atoms split source-backed
+/// content, so renderer-created glyphs never inherit a decoration.
+pub(crate) fn project_source_range(
+    source_range: &Range<usize>,
+    visible_rows: Range<usize>,
+    layout: &RenderedLayout,
+) -> Vec<(usize, Range<usize>)> {
+    if source_range.start >= source_range.end || visible_rows.start >= visible_rows.end {
+        return Vec::new();
+    }
+
+    let start = visible_rows.start.min(layout.lines.len());
+    let end = visible_rows.end.min(layout.lines.len());
+    let mut projected = Vec::new();
+    for row in start..end {
+        for columns in project_atom_intervals(source_range, &layout.lines[row].atoms) {
+            projected.push((row, columns));
+        }
+    }
+    projected
+}
+
+pub(crate) fn project_atom_intervals(
+    source_range: &Range<usize>,
+    atoms: &[crate::style::RenderedSourceAtom],
+) -> Vec<Range<usize>> {
+    let mut projected = Vec::new();
+    let mut current: Option<Range<usize>> = None;
+    for atom in atoms {
+        let intersects = atom.source.as_ref().is_some_and(|source| {
+            source.start < source_range.end && source_range.start < source.end
+        });
+        if !intersects || atom.columns.start >= atom.columns.end {
+            if let Some(columns) = current.take() {
+                projected.push(columns);
+            }
+            continue;
+        }
+
+        if current
+            .as_ref()
+            .is_some_and(|columns| columns.end == atom.columns.start)
+        {
+            current.as_mut().unwrap().end = atom.columns.end;
+        } else {
+            if let Some(columns) = current.take() {
+                projected.push(columns);
+            }
+            current = Some(atom.columns.clone());
+        }
+    }
+    if let Some(columns) = current {
+        projected.push(columns);
+    }
+    projected
+}
+
 fn expand_physical_line(source: &Range<usize>, text: &str) -> Range<usize> {
     let start = source.start.min(text.len());
     let end = source.end.min(text.len());

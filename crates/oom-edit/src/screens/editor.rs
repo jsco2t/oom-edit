@@ -124,9 +124,23 @@ fn render_body(
 
     // Build lines for ratatui from the source frame.
     let mut lines = Vec::with_capacity(height);
-    for styled_line in &frame_data.lines {
-        let spans = spans::build_spans(&styled_line.text, &styled_line.spans, theme, tier);
-        lines.push(Line::from(spans));
+    let search_style = theme.style(tier, oom_edit_core::SemanticStyle::Match);
+    for (row, styled_line) in frame_data.lines.iter().enumerate() {
+        let mut row_spans = spans::build_spans(&styled_line.text, &styled_line.spans, theme, tier);
+        for decoration in frame_data
+            .decorations
+            .iter()
+            .filter(|decoration| decoration.row == row)
+        {
+            row_spans = spans::apply_interval_style(
+                row_spans,
+                decoration.columns.clone(),
+                theme.decoration_style(tier, decoration.kind),
+                Some(search_style),
+            )
+            .spans;
+        }
+        lines.push(Line::from(row_spans));
     }
 
     // Fill remaining lines with empty ones.
@@ -276,8 +290,9 @@ fn mode_to_context(mode: oom_edit_core::Mode) -> Contexts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::theme::DEFAULT_DARK;
+    use crate::theme::{get_theme, Tier, DEFAULT_DARK};
     use oom_edit_core::{KeyCode, KeyCodeKind, KeyInput, Modifiers};
+    use oom_spell::{BuildProgress, SpellEngineBuilder};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -326,6 +341,137 @@ mod tests {
             })
             .unwrap();
         terminal
+    }
+
+    fn spell_engine() -> oom_spell::SpellEngine {
+        let mut builder = SpellEngineBuilder::new(vec!["known\n".to_string()]);
+        for _ in 0..100 {
+            if builder.step(4096) == BuildProgress::Complete {
+                return builder.finish().unwrap();
+            }
+        }
+        panic!("test spell engine failed to finish within 100 steps");
+    }
+
+    fn drain_spell(session: &mut EditorSession, engine: &oom_spell::SpellEngine) {
+        for _ in 0..10_000 {
+            if !session.diagnostics_pending() {
+                return;
+            }
+            assert!(session.spell_tick(engine, 8));
+        }
+        panic!("test spell scan failed to finish within 10,000 ticks");
+    }
+
+    #[test]
+    fn source_spell_decorations_reach_insert_across_every_theme_and_tier() {
+        for name in crate::theme::built_in_themes() {
+            for tier in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
+                let engine = spell_engine();
+                let mut session = EditorSession::from_text("# misspelledd\n");
+                drain_spell(&mut session, &engine);
+                feed(&mut session, "i");
+                let theme = get_theme(name);
+                let mut terminal = Terminal::new(TestBackend::new(40, 2)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        render_editor(
+                            frame,
+                            &mut session,
+                            EditorViewport::new(0, true, 0, 0),
+                            false,
+                            frame.area(),
+                            theme,
+                            tier,
+                        );
+                    })
+                    .unwrap();
+
+                let gutter = (status_bar::gutter_width(session.line_count()) as u16).max(4);
+                let cell = terminal.backend().buffer().cell((gutter + 2, 0)).unwrap();
+                assert!(cell.modifier.contains(Modifier::UNDERLINED));
+                assert!(cell.modifier.contains(Modifier::ITALIC));
+                assert!(cell.modifier.contains(Modifier::BOLD));
+                let decoration = theme.decoration_style(
+                    tier,
+                    oom_edit_core::DecorationKind::Diagnostic {
+                        provider: oom_edit_core::DiagnosticProvider::Spell,
+                        severity: oom_edit_core::DiagnosticSeverity::Warning,
+                    },
+                );
+                if let Some(foreground) = decoration.fg {
+                    assert_eq!(cell.fg, foreground);
+                } else {
+                    assert_eq!(cell.fg, ratatui::buffer::Cell::default().fg);
+                }
+                let neighbor = terminal.backend().buffer().cell((gutter + 14, 0)).unwrap();
+                assert!(!neighbor.modifier.contains(Modifier::ITALIC));
+            }
+        }
+    }
+
+    #[test]
+    fn source_search_wins_foreground_while_retaining_spell_carriers() {
+        let engine = spell_engine();
+        let mut session = EditorSession::from_text("# misspelledd\n");
+        drain_spell(&mut session, &engine);
+        session.rendered_layout_mut(34);
+        feed(&mut session, "/misspelledd");
+        session.handle_key(KeyInput {
+            code: KeyCode {
+                kind: KeyCodeKind::Enter,
+            },
+            mods: Modifiers::default(),
+        });
+        feed(&mut session, "i");
+        assert_eq!(
+            session
+                .rendered_search()
+                .map(|search| search.pattern.as_str()),
+            Some("misspelledd")
+        );
+        let source_frame = session.render_source(oom_edit_core::Viewport {
+            top_line: 0,
+            height: 2,
+            width: 34,
+            wrap: true,
+            left_col: 0,
+            skip_rows: 0,
+        });
+        assert!(source_frame.lines[0].spans.iter().any(|span| {
+            span.start_col <= 2
+                && span.end_col > 2
+                && span.style == oom_edit_core::SemanticStyle::Match
+        }));
+        assert!(source_frame
+            .decorations
+            .iter()
+            .any(|decoration| decoration.row == 0 && decoration.columns.contains(&2)));
+        let mut terminal = Terminal::new(TestBackend::new(40, 2)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_editor(
+                    frame,
+                    &mut session,
+                    EditorViewport::new(0, true, 0, 0),
+                    false,
+                    frame.area(),
+                    &DEFAULT_DARK,
+                    Tier::TrueColor,
+                );
+            })
+            .unwrap();
+
+        let gutter = (status_bar::gutter_width(session.line_count()) as u16).max(4);
+        let cell = terminal.backend().buffer().cell((gutter + 2, 0)).unwrap();
+        assert_eq!(
+            Some(cell.fg),
+            DEFAULT_DARK
+                .style(Tier::TrueColor, oom_edit_core::SemanticStyle::Match)
+                .fg
+        );
+        assert!(cell.modifier.contains(Modifier::UNDERLINED));
+        assert!(cell.modifier.contains(Modifier::ITALIC));
     }
 
     #[test]

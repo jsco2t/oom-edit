@@ -46,18 +46,23 @@ pub fn render_rendered(
     session.render_layout(text_width);
     let cursor_line = session.rendered_cursor_line();
     let selection = session.rendered_selection();
-    let layout = session
+    let search = session.rendered_search().cloned();
+    let max_lines = session
         .rendered_layout()
-        .expect("rendered layout was built for this frame");
-
-    if layout.lines.is_empty() {
+        .expect("rendered layout was built for this frame")
+        .lines
+        .len();
+    if max_lines == 0 {
         return;
     }
 
     // Compute visible line range.
-    let max_lines = layout.lines.len();
     let rendered_top = rendered_top.min(max_lines.saturating_sub(1));
     let rendered_bottom = (rendered_top + height).min(max_lines);
+    let decorations = session.diagnostic_decoration_rows(rendered_top..rendered_bottom);
+    let layout = session
+        .rendered_layout()
+        .expect("rendered layout was built for this frame");
 
     if gutter_width > 0 && gutter_width < area.width {
         let gutter_area = Rect::new(area.x, area.y, gutter_width, area.height);
@@ -91,6 +96,26 @@ pub fn render_rendered(
         let base_surface = line_surface(theme, tier, rendered_line.role);
         if let Some(style) = base_surface {
             spans = build_highlighted_line(spans, text_width, style).spans;
+        }
+        for decoration in decorations.iter().filter(|decoration| decoration.row == i) {
+            let style = theme.decoration_style(tier, decoration.kind);
+            spans =
+                spans::apply_interval_style(spans, decoration.columns.clone(), style, None).spans;
+        }
+        if let Some(search) = &search {
+            let search_style = theme.style(tier, oom_edit_core::SemanticStyle::Match);
+            for start in search.find_matches(&rendered_line.styled.text) {
+                let end = start + search.pattern.len();
+                let start_column = Line::from(&rendered_line.styled.text[..start]).width();
+                let end_column = Line::from(&rendered_line.styled.text[..end]).width();
+                spans = spans::apply_interval_style(
+                    spans,
+                    start_column..end_column,
+                    search_style,
+                    None,
+                )
+                .spans;
+            }
         }
 
         let selected = selection
@@ -207,8 +232,9 @@ fn build_highlighted_line<'a>(mut spans: Vec<Span<'a>>, width: u16, style: Style
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::theme::{Tier, DEFAULT_DARK, DEFAULT_LIGHT};
+    use crate::theme::{get_theme, Tier, DEFAULT_DARK, DEFAULT_LIGHT};
     use oom_edit_core::{KeyCode, KeyCodeKind, KeyInput, Modifiers, SemanticStyle};
+    use oom_spell::{BuildProgress, SpellEngine, SpellEngineBuilder};
     use ratatui::backend::TestBackend;
     use ratatui::style::Modifier;
     use ratatui::Terminal;
@@ -226,6 +252,265 @@ mod tests {
         let mut input = key(ch);
         input.mods.ctrl = true;
         input
+    }
+
+    fn spell_engine() -> SpellEngine {
+        let mut builder = SpellEngineBuilder::new(vec!["known\n".to_string()]);
+        for _ in 0..100 {
+            if builder.step(4096) == BuildProgress::Complete {
+                return builder.finish().unwrap();
+            }
+        }
+        panic!("test spell engine failed to finish within 100 steps");
+    }
+
+    fn drain_spell(session: &mut EditorSession, engine: &SpellEngine) {
+        for _ in 0..10_000 {
+            if !session.diagnostics_pending() {
+                return;
+            }
+            assert!(session.spell_tick(engine, 8));
+        }
+        panic!("test spell scan failed to finish within 10,000 ticks");
+    }
+
+    fn misspelled_session() -> EditorSession {
+        let engine = spell_engine();
+        let mut session = EditorSession::from_text("# misspelledd\n");
+        drain_spell(&mut session, &engine);
+        session
+    }
+
+    #[test]
+    fn spell_decorations_reach_every_rendered_theme_tier_and_public_mode_path() {
+        for name in crate::theme::built_in_themes() {
+            for tier in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
+                let theme = get_theme(name);
+                let mut session = misspelled_session();
+                session.render_layout(34);
+                let decoration = session.diagnostic_decoration_rows(0..usize::MAX)[0].clone();
+                let mut terminal = Terminal::new(TestBackend::new(40, 2)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        render_rendered(frame, &mut session, 0, false, frame.area(), theme, tier);
+                    })
+                    .unwrap();
+                let gutter = (status_bar::gutter_width(session.line_count()) as u16).max(4);
+                let cell = terminal
+                    .backend()
+                    .buffer()
+                    .cell((
+                        gutter + decoration.columns.start as u16,
+                        decoration.row as u16,
+                    ))
+                    .unwrap();
+                assert!(cell.modifier.contains(Modifier::UNDERLINED));
+                assert!(cell.modifier.contains(Modifier::ITALIC));
+                assert!(cell.modifier.contains(Modifier::BOLD));
+                let decoration_style = theme.decoration_style(tier, decoration.kind);
+                if let Some(foreground) = decoration_style.fg {
+                    assert_eq!(cell.fg, foreground);
+                }
+                let neighbor = terminal
+                    .backend()
+                    .buffer()
+                    .cell((
+                        gutter + decoration.columns.end as u16,
+                        decoration.row as u16,
+                    ))
+                    .unwrap();
+                assert!(!neighbor.modifier.contains(Modifier::ITALIC));
+            }
+        }
+
+        for enter_mode in [Some('v'), Some(':'), None] {
+            let mut session = misspelled_session();
+            session.render_layout(34);
+            session.handle_key(key('/'));
+            for character in "misspelledd".chars() {
+                session.handle_key(key(character));
+            }
+            session.handle_key(KeyInput {
+                code: KeyCode {
+                    kind: KeyCodeKind::Enter,
+                },
+                mods: Modifiers::default(),
+            });
+            if let Some(character) = enter_mode {
+                session.handle_key(key(character));
+            }
+            let decoration = session.diagnostic_decoration_rows(0..usize::MAX)[0].clone();
+            let mut terminal = Terminal::new(TestBackend::new(40, 2)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_rendered(
+                        frame,
+                        &mut session,
+                        0,
+                        false,
+                        frame.area(),
+                        &DEFAULT_DARK,
+                        Tier::TrueColor,
+                    );
+                })
+                .unwrap();
+            let gutter = (status_bar::gutter_width(session.line_count()) as u16).max(4);
+            let cell = terminal
+                .backend()
+                .buffer()
+                .cell((
+                    gutter + decoration.columns.start as u16,
+                    decoration.row as u16,
+                ))
+                .unwrap();
+            assert!(cell.modifier.contains(Modifier::UNDERLINED));
+            assert!(cell.modifier.contains(Modifier::ITALIC));
+            assert_eq!(
+                Some(cell.fg),
+                DEFAULT_DARK.style(Tier::TrueColor, SemanticStyle::Match).fg
+            );
+            if enter_mode == Some('v') {
+                assert!(cell.modifier.contains(Modifier::REVERSED));
+            } else {
+                assert_eq!(
+                    Some(cell.bg),
+                    DEFAULT_DARK
+                        .ui_style(Tier::TrueColor, UiSlot::CursorLine)
+                        .bg
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rendered_compositor_uses_display_cells_for_wide_and_wrapped_diagnostics() {
+        let engine = spell_engine();
+        let mut wide = EditorSession::from_text("東京 wrng known\n");
+        drain_spell(&mut wide, &engine);
+        let mut wide_terminal = Terminal::new(TestBackend::new(20, 2)).unwrap();
+        wide_terminal
+            .draw(|frame| {
+                render_rendered(
+                    frame,
+                    &mut wide,
+                    0,
+                    false,
+                    frame.area(),
+                    &DEFAULT_DARK,
+                    Tier::TrueColor,
+                );
+            })
+            .unwrap();
+        let gutter = (status_bar::gutter_width(wide.line_count()) as u16).max(4);
+        for column in 5..9 {
+            let cell = wide_terminal
+                .backend()
+                .buffer()
+                .cell((gutter + column, 0))
+                .unwrap();
+            assert!(cell.modifier.contains(Modifier::UNDERLINED));
+        }
+        for column in [4, 9] {
+            let cell = wide_terminal
+                .backend()
+                .buffer()
+                .cell((gutter + column, 0))
+                .unwrap();
+            assert!(!cell.modifier.contains(Modifier::UNDERLINED));
+        }
+
+        let mut wrapped = EditorSession::from_text("misspelledd known\n");
+        drain_spell(&mut wrapped, &engine);
+        let mut wrapped_terminal = Terminal::new(TestBackend::new(11, 4)).unwrap();
+        wrapped_terminal
+            .draw(|frame| {
+                render_rendered(
+                    frame,
+                    &mut wrapped,
+                    0,
+                    false,
+                    frame.area(),
+                    &DEFAULT_DARK,
+                    Tier::TrueColor,
+                );
+            })
+            .unwrap();
+        let gutter = (status_bar::gutter_width(wrapped.line_count()) as u16).max(4);
+        assert_eq!(
+            wrapped
+                .diagnostic_decoration_rows(0..usize::MAX)
+                .into_iter()
+                .map(|row| (row.row, row.columns))
+                .collect::<Vec<_>>(),
+            [(0, 0..5), (1, 0..5), (2, 0..1)]
+        );
+        for (row, columns) in [(0, 0..5), (1, 0..5), (2, 0..1)] {
+            for column in columns {
+                let cell = wrapped_terminal
+                    .backend()
+                    .buffer()
+                    .cell((gutter + column as u16, row as u16))
+                    .unwrap();
+                assert!(cell.modifier.contains(Modifier::UNDERLINED));
+            }
+        }
+        let neighbor = wrapped_terminal
+            .backend()
+            .buffer()
+            .cell((gutter + 1, 2))
+            .unwrap();
+        assert!(!neighbor.modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn diagnostic_composition_keeps_distinguishable_semantic_sibling_cells() {
+        let decoration = DEFAULT_DARK.decoration_style(
+            Tier::TrueColor,
+            oom_edit_core::DecorationKind::Diagnostic {
+                provider: oom_edit_core::DiagnosticProvider::Spell,
+                severity: oom_edit_core::DiagnosticSeverity::Warning,
+            },
+        );
+        let semantics = [
+            SemanticStyle::Heading1,
+            SemanticStyle::Emphasis,
+            SemanticStyle::Link,
+            SemanticStyle::CodeBlock,
+        ];
+        let lines = semantics
+            .iter()
+            .map(|&semantic| {
+                let source = [oom_edit_core::Span {
+                    start_col: 0,
+                    end_col: 2,
+                    style: semantic,
+                }];
+                let base = spans::build_spans("xx", &source, &DEFAULT_DARK, Tier::TrueColor)
+                    .into_iter()
+                    .map(|span| Span::styled(span.content.into_owned(), span.style))
+                    .collect();
+                spans::apply_interval_style(base, 0..1, decoration, None)
+            })
+            .collect::<Vec<_>>();
+        let mut terminal = Terminal::new(TestBackend::new(2, semantics.len() as u16)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(ratatui::widgets::Paragraph::new(lines), frame.area());
+            })
+            .unwrap();
+
+        for (row, semantic) in semantics.into_iter().enumerate() {
+            let decorated = terminal.backend().buffer().cell((0, row as u16)).unwrap();
+            assert!(decorated.modifier.contains(Modifier::UNDERLINED));
+            assert!(decorated.modifier.contains(Modifier::ITALIC));
+
+            let sibling = terminal.backend().buffer().cell((1, row as u16)).unwrap();
+            let base_style = DEFAULT_DARK.style(Tier::TrueColor, semantic);
+            let default_cell = ratatui::buffer::Cell::default();
+            assert_eq!(sibling.fg, base_style.fg.unwrap_or(default_cell.fg));
+            assert_eq!(sibling.bg, base_style.bg.unwrap_or(default_cell.bg));
+            assert_eq!(sibling.modifier, base_style.add_modifier);
+        }
     }
 
     #[test]

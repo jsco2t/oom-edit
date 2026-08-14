@@ -12,7 +12,7 @@
 //! **No color-only signals:** every style carries a modifier (bold, italic,
 //! reverse, underline) so it is visible in monochrome terminals too.
 
-use oom_edit_core::SemanticStyle;
+use oom_edit_core::{DecorationKind, DiagnosticProvider, DiagnosticSeverity, SemanticStyle};
 use ratatui::style::{Color, Modifier, Style};
 use std::fmt;
 
@@ -204,6 +204,32 @@ impl Theme {
             Tier::Color16 => self.color16.resolve_ui(slot),
             Tier::Monochrome => self.monochrome.resolve_ui(slot),
         }
+    }
+
+    /// Resolve a renderer-neutral diagnostic decoration for the active tier.
+    pub fn decoration_style(&self, tier: Tier, kind: DecorationKind) -> Style {
+        let severity = match kind {
+            DecorationKind::Diagnostic {
+                provider: DiagnosticProvider::Spell,
+                severity,
+            } => severity,
+        };
+        let mut style = Style::default().add_modifier(Modifier::UNDERLINED | Modifier::ITALIC);
+        if matches!(self.palette_for(tier), Palette::Monochrome { .. }) {
+            return style;
+        }
+        let slot = match severity {
+            DiagnosticSeverity::Error => UiSlot::StatusError,
+            DiagnosticSeverity::Warning => UiSlot::StatusWarning,
+            DiagnosticSeverity::Info => UiSlot::StatusInfo,
+            DiagnosticSeverity::Hint => UiSlot::HintKey,
+        };
+        if let Some(foreground) = self.ui_style(tier, slot).fg {
+            if foreground != Color::Reset {
+                style = style.fg(foreground);
+            }
+        }
+        style
     }
 
     /// Get the palette for the active tier (for completeness tests).
@@ -1523,6 +1549,7 @@ pub static ACCESSIBLE: Theme = Theme {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oom_edit_core::{DecorationKind, DiagnosticProvider, DiagnosticSeverity};
 
     // ── Semantic style completeness ─────────────────────────────────────
 
@@ -1663,6 +1690,30 @@ mod tests {
                     "Search match must carry UNDERLINED on {tier:?} in {}",
                     theme.name
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn diagnostic_decorations_are_complete_for_every_theme_and_tier() {
+        let diagnostic = DecorationKind::Diagnostic {
+            provider: DiagnosticProvider::Spell,
+            severity: DiagnosticSeverity::Warning,
+        };
+        for theme in BUILTIN_THEMES.iter().map(|spec| spec.theme) {
+            for tier in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
+                let style = theme.decoration_style(tier, diagnostic);
+                assert!(style.add_modifier.contains(Modifier::UNDERLINED));
+                assert!(style.add_modifier.contains(Modifier::ITALIC));
+                let palette_is_monochrome =
+                    matches!(theme.palette_for(tier), Palette::Monochrome { .. });
+                assert_eq!(
+                    style.fg.is_none(),
+                    palette_is_monochrome,
+                    "diagnostic color drift in {} {tier:?}",
+                    theme.name
+                );
+                assert!(style.bg.is_none());
             }
         }
     }

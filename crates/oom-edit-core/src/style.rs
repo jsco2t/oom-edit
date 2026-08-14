@@ -105,12 +105,25 @@ pub struct StyledLine {
     pub spans: Vec<Span>,
 }
 
+/// One independent source-view decoration in viewport display-cell coordinates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceDecoration {
+    /// Zero-based visual row within the returned [`SourceFrame`].
+    pub row: usize,
+    /// Half-open display-cell interval on `row`.
+    pub columns: std::ops::Range<usize>,
+    /// Shared renderer-neutral decoration payload.
+    pub kind: crate::spell::DecorationKind,
+}
+
 /// The full rendered source frame for the Insert-mode viewport.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceFrame {
     /// Exactly `viewport.height` lines (padded with empty StyledLines if the
     /// buffer has fewer lines).
     pub lines: Vec<StyledLine>,
+    /// Diagnostic decorations kept independent from semantic spans.
+    pub decorations: Vec<SourceDecoration>,
     /// The document line number displayed for each visual row. The first
     /// visual row of a document line is `Some(1-based line number)`; wrapped
     /// continuation rows and padding rows are `None`.

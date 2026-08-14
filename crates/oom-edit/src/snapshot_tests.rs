@@ -17,6 +17,7 @@ use ratatui::Terminal;
 
 use oom_edit_core::RecordingClipboardSink;
 use oom_edit_core::{EditorSession, SemanticStyle};
+use oom_spell::{BuildProgress, SpellEngineBuilder};
 
 use crate::app::App;
 use crate::command::Contexts;
@@ -398,6 +399,39 @@ fn golden_rendered_normal() {
         app.render(frame);
     });
     assert_snapshot(&lines, "rendered_normal");
+}
+
+#[test]
+fn golden_spell_decoration_does_not_change_layout_glyphs() {
+    let mut builder = SpellEngineBuilder::new(vec!["known\n".to_string()]);
+    let mut engine = None;
+    for _ in 0..100 {
+        if builder.step(4096) == BuildProgress::Complete {
+            engine = Some(builder.finish().unwrap());
+            break;
+        }
+    }
+    let engine = engine.expect("test spell engine must finish within 100 steps");
+    let mut session = EditorSession::from_text("# misspelledd\n\nknown\n");
+    for _ in 0..10_000 {
+        if !session.diagnostics_pending() {
+            break;
+        }
+        assert!(session.spell_tick(&engine, 8));
+    }
+    assert!(!session.diagnostics_pending());
+    let lines = render_app_lines(24, 4, |frame| {
+        crate::screens::rendered::render_rendered(
+            frame,
+            &mut session,
+            0,
+            false,
+            frame.area(),
+            get_theme("default-dark"),
+            Tier::TrueColor,
+        );
+    });
+    assert_snapshot(&lines, "spell_decoration_layout");
 }
 
 /// Rendered Normal with hybrid-relative line numbers explicitly enabled.

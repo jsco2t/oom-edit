@@ -1,6 +1,6 @@
 use oom_edit_core::{
-    DiagnosticProvider, DiagnosticSeverity, EditorSession, Effect, KeyCode, KeyCodeKind, KeyInput,
-    Modifiers, PositionError, TextPosition,
+    DecorationKind, DiagnosticProvider, DiagnosticSeverity, EditorSession, Effect, KeyCode,
+    KeyCodeKind, KeyInput, Modifiers, PositionError, SemanticStyle, TextPosition, Viewport,
 };
 use oom_spell::{BuildProgress, SpellEngine, SpellEngineBuilder};
 use proptest::prelude::*;
@@ -495,6 +495,195 @@ fn suggestions_require_a_current_diagnostic() {
     assert!(session
         .spell_suggestions(&engine, &diagnostic, 9)
         .is_empty());
+}
+
+#[test]
+fn rendered_decoration_projection_handles_wrapping_wide_cells_tables_and_synthetic_glyphs() {
+    let engine = engine("known\n");
+    let kind = DecorationKind::Diagnostic {
+        provider: DiagnosticProvider::Spell,
+        severity: DiagnosticSeverity::Warning,
+    };
+
+    let mut wide = EditorSession::from_text("東京 wrng known\n");
+    drain(&mut wide, &engine, 5);
+    wide.render_layout(40);
+    assert_eq!(
+        wide.diagnostic_decoration_rows(0..usize::MAX),
+        [oom_edit_core::DiagnosticDecorationRow {
+            row: 0,
+            columns: 5..9,
+            kind,
+        }]
+    );
+
+    let mut wrapped = EditorSession::from_text("misspelledd known\n");
+    drain(&mut wrapped, &engine, 5);
+    let wrapped_layout = wrapped.render_layout(5).clone();
+    let wrapped_rows = wrapped.diagnostic_decoration_rows(0..usize::MAX);
+    assert_eq!(
+        wrapped_rows
+            .iter()
+            .map(|row| (row.row, row.columns.clone()))
+            .collect::<Vec<_>>(),
+        [(0, 0..5), (1, 0..5), (2, 0..1)]
+    );
+    assert_eq!(
+        wrapped.diagnostic_decoration_rows(1..2),
+        [oom_edit_core::DiagnosticDecorationRow {
+            row: 1,
+            columns: 0..5,
+            kind,
+        }]
+    );
+    assert!(wrapped_layout.lines[2].styled.text.starts_with('d'));
+
+    for (text, expected_text, expected_row, expected_columns) in [
+        ("- wrng known\n", "• wrng known", 0, 2..6),
+        (
+            "| wrng | known |\n| --- | --- |\n",
+            "│ wrng │ known │",
+            1,
+            2..6,
+        ),
+    ] {
+        let mut session = EditorSession::from_text(text);
+        drain(&mut session, &engine, 5);
+        let layout = session.render_layout(40).clone();
+        assert_eq!(layout.lines[expected_row].styled.text, expected_text);
+        let rows = session.diagnostic_decoration_rows(0..usize::MAX);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].row, expected_row);
+        assert_eq!(rows[0].columns, expected_columns);
+        assert_eq!(rows[0].kind, kind);
+        for column in rows[0].columns.clone() {
+            assert!(layout.lines[expected_row].atoms.iter().any(|atom| {
+                atom.source.is_some() && atom.columns.start <= column && column < atom.columns.end
+            }));
+        }
+    }
+
+    assert!(wrapped
+        .diagnostic_decoration_rows(usize::MAX..usize::MAX)
+        .is_empty());
+    let descending = std::ops::Range { start: 5, end: 2 };
+    assert!(wrapped.diagnostic_decoration_rows(descending).is_empty());
+
+    wrapped.set_spell_enabled(false);
+    assert!(wrapped.diagnostic_decoration_rows(0..usize::MAX).is_empty());
+}
+
+#[test]
+fn rendered_decoration_query_preserves_every_required_semantic_span_role() {
+    let engine = engine("known\n");
+    let mut session = EditorSession::from_text(
+        "# wrng\n\n*wrng*\n\n[wrng](https://example.com)\n\n```\nknown\n```\n",
+    );
+    drain(&mut session, &engine, 5);
+    let layout = session.render_layout(80).clone();
+    let before = layout
+        .lines
+        .iter()
+        .map(|line| line.styled.spans.clone())
+        .collect::<Vec<_>>();
+    for required in [
+        SemanticStyle::Heading1,
+        SemanticStyle::Emphasis,
+        SemanticStyle::Link,
+        SemanticStyle::CodeBlock,
+    ] {
+        assert!(
+            before.iter().flatten().any(|span| span.style == required),
+            "fixture must exercise {required:?}"
+        );
+    }
+
+    assert_eq!(session.diagnostic_decoration_rows(0..usize::MAX).len(), 3);
+    let after = session
+        .rendered_layout()
+        .unwrap()
+        .lines
+        .iter()
+        .map(|line| line.styled.spans.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        after, before,
+        "decoration projection must not rewrite spans"
+    );
+}
+
+#[test]
+fn source_frame_decorations_use_display_cells_and_preserve_semantic_spans() {
+    let engine = engine("known\n");
+    let mut session = EditorSession::from_text("# 東京 wrng known\n");
+    let before = session
+        .render_source(Viewport {
+            top_line: 0,
+            height: 3,
+            width: 8,
+            wrap: true,
+            left_col: 0,
+            skip_rows: 0,
+        })
+        .lines
+        .into_iter()
+        .map(|line| line.spans)
+        .collect::<Vec<_>>();
+    drain(&mut session, &engine, 5);
+    let frame = session.render_source(Viewport {
+        top_line: 0,
+        height: 3,
+        width: 8,
+        wrap: true,
+        left_col: 0,
+        skip_rows: 0,
+    });
+
+    assert_eq!(
+        frame
+            .lines
+            .iter()
+            .map(|line| line.spans.clone())
+            .collect::<Vec<_>>(),
+        before,
+        "spell decoration must not rewrite semantic spans"
+    );
+    assert!(frame
+        .lines
+        .iter()
+        .flat_map(|line| &line.spans)
+        .any(|span| { matches!(span.style, SemanticStyle::Heading1 | SemanticStyle::Punct) }));
+    assert_eq!(frame.decorations.len(), 2, "wrng crosses the width-8 wrap");
+    assert_eq!(frame.decorations[0].row, 0);
+    assert_eq!(frame.decorations[0].columns, 7..8);
+    assert_eq!(frame.decorations[1].row, 1);
+    assert_eq!(frame.decorations[1].columns, 0..3);
+
+    let mut clipped = EditorSession::from_text("東京 abcdefgh wrng tail\n");
+    drain(&mut clipped, &engine, 5);
+    let clipped_frame = clipped.render_source(Viewport {
+        top_line: 0,
+        height: 1,
+        width: 8,
+        wrap: false,
+        left_col: 3,
+        skip_rows: 0,
+    });
+    assert_eq!(clipped_frame.lines[0].text, "«bcdefg»");
+    assert_eq!(clipped_frame.decorations.len(), 1);
+    assert_eq!(clipped_frame.decorations[0].row, 0);
+    assert_eq!(clipped_frame.decorations[0].columns, 1..7);
+
+    session.set_spell_enabled(false);
+    let disabled = session.render_source(Viewport {
+        top_line: 0,
+        height: 3,
+        width: 8,
+        wrap: true,
+        left_col: 0,
+        skip_rows: 0,
+    });
+    assert!(disabled.decorations.is_empty());
 }
 
 proptest! {

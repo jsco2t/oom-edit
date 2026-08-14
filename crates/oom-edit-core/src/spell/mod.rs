@@ -42,6 +42,29 @@ pub enum DiagnosticSeverity {
     Hint,
 }
 
+/// Renderer-neutral decoration payload shared by source and rendered geometry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DecorationKind {
+    /// Decoration for a provider-authored document diagnostic.
+    Diagnostic {
+        /// Subsystem that produced the diagnostic.
+        provider: DiagnosticProvider,
+        /// Presentation-neutral diagnostic severity.
+        severity: DiagnosticSeverity,
+    },
+}
+
+/// One diagnostic interval in rendered display-cell coordinates.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiagnosticDecorationRow {
+    /// Zero-based row in the complete rendered layout.
+    pub row: usize,
+    /// Half-open display-cell interval on `row`.
+    pub columns: Range<usize>,
+    /// Shared decoration payload.
+    pub kind: DecorationKind,
+}
+
 /// Zero-based source position whose column counts Unicode scalar values.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TextPosition {

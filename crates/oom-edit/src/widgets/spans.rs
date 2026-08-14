@@ -2,7 +2,7 @@
 
 use oom_edit_core::SemanticStyle;
 use ratatui::style::Style;
-use ratatui::text::Span;
+use ratatui::text::{Line, Span};
 
 use crate::theme::{Theme, Tier};
 
@@ -74,6 +74,53 @@ pub fn build_spans<'a>(
 /// Resolve a core [`SemanticStyle`] to a ratatui [`Style`].
 pub fn resolve_style(theme: &Theme, tier: Tier, style: SemanticStyle) -> Style {
     theme.style(tier, style)
+}
+
+/// Compose one style layer over a display-cell interval without replacing the
+/// semantic spans that produced the base styles. `higher_priority` protects a
+/// later layer from an earlier layer's foreground while retaining modifiers.
+pub fn apply_interval_style<'a>(
+    spans: Vec<Span<'a>>,
+    columns: std::ops::Range<usize>,
+    decoration: Style,
+    higher_priority: Option<Style>,
+) -> Line<'a> {
+    let mut result = Vec::new();
+    let mut display_column = 0usize;
+    for span in spans {
+        let mut groups: Vec<String> = Vec::new();
+        for character in span.content.chars() {
+            if Span::raw(character.to_string()).width() == 0 {
+                if let Some(previous) = groups.last_mut() {
+                    previous.push(character);
+                } else {
+                    groups.push(character.to_string());
+                }
+            } else {
+                groups.push(character.to_string());
+            }
+        }
+        for group in groups {
+            let width = Span::raw(group.as_str()).width();
+            let group_columns = display_column..display_column + width;
+            display_column += width;
+            let decorated = group_columns.end > columns.start && group_columns.start < columns.end;
+            let mut style = span.style;
+            if decorated {
+                style = style.add_modifier(decoration.add_modifier);
+                if higher_priority != Some(span.style) {
+                    if let Some(foreground) = decoration.fg {
+                        style = style.fg(foreground);
+                    }
+                }
+                if let Some(background) = decoration.bg {
+                    style = style.bg(background);
+                }
+            }
+            result.push(Span::styled(group, style));
+        }
+    }
+    Line::from(result)
 }
 
 #[cfg(test)]

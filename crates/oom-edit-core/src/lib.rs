@@ -77,11 +77,14 @@ pub use frontmatter::{FrontMatter, Num, Value};
 pub use input::{KeyCode, KeyCodeKind, KeyInput, Modifiers};
 pub use session::EditorSession;
 pub use session::{Effect, Mode, Severity, Viewport};
-pub use spell::{Diagnostic, DiagnosticProvider, DiagnosticSeverity, PositionError, TextPosition};
+pub use spell::{
+    DecorationKind, Diagnostic, DiagnosticDecorationRow, DiagnosticProvider, DiagnosticSeverity,
+    PositionError, TextPosition,
+};
 pub use style::{
     JumpTarget, LineKind, RenderedLayout, RenderedLine, RenderedLineRole, RenderedPoint,
     RenderedSearch, RenderedSelection, RenderedSelectionRow, RenderedSourceAtom, SearchDirection,
-    SelectionShape, SemanticStyle, SourceFrame, Span, StyledLine, TargetKind,
+    SelectionShape, SemanticStyle, SourceDecoration, SourceFrame, Span, StyledLine, TargetKind,
 };
 
 #[cfg(test)]

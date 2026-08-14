@@ -877,13 +877,17 @@ use crate::error::{OpenError, SaveError};
 use crate::frontmatter::FrontMatter;
 use crate::rendered::nav;
 use crate::rendered::BlockModel;
-use crate::spell::{Diagnostic, DiagnosticProvider, PositionError, TextPosition};
+use crate::spell::{
+    DecorationKind, Diagnostic, DiagnosticDecorationRow, DiagnosticProvider, PositionError,
+    TextPosition,
+};
 use crate::style::{
     RenderedCursor, RenderedLayout, RenderedPoint, RenderedSearch, RenderedSelection,
-    SearchDirection, SelectionShape,
+    RenderedSourceAtom, SearchDirection, SelectionShape, SourceDecoration,
 };
 use live_document::LiveDocument;
 use std::ops::Range;
+use unicode_width::UnicodeWidthChar;
 
 /// Vim action applied after mapping a rendered cursor to source editing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1341,6 +1345,44 @@ impl EditorSession {
             .find(|diagnostic| diagnostic.range.contains(&offset))
     }
 
+    /// Project visible diagnostics into rendered display-cell intervals.
+    ///
+    /// Call [`Self::render_layout`] first to establish the host width. Rows
+    /// outside `visible` are clipped, and source-less presentation atoms are
+    /// never included.
+    pub fn diagnostic_decoration_rows(
+        &mut self,
+        visible: Range<usize>,
+    ) -> Vec<DiagnosticDecorationRow> {
+        let Some(layout) = self.rendered_state.layout_cache.as_ref() else {
+            return Vec::new();
+        };
+        let start = visible.start.min(layout.lines.len());
+        let end = visible.end.min(layout.lines.len());
+        if start >= end {
+            return Vec::new();
+        }
+        let source_intervals = Self::visible_source_intervals(
+            layout.lines[start..end]
+                .iter()
+                .map(|line| line.atoms.as_slice()),
+        );
+        let diagnostics = self.diagnostics();
+        Self::visible_diagnostic_indices(diagnostics, &source_intervals)
+            .into_iter()
+            .flat_map(|index| {
+                let diagnostic = &diagnostics[index];
+                let kind = DecorationKind::Diagnostic {
+                    provider: diagnostic.provider,
+                    severity: diagnostic.severity,
+                };
+                nav::project_source_range(&diagnostic.range, visible.clone(), layout)
+                    .into_iter()
+                    .map(move |(row, columns)| DiagnosticDecorationRow { row, columns, kind })
+            })
+            .collect()
+    }
+
     /// Return deterministic spelling suggestions for a current diagnostic.
     ///
     /// Stale diagnostics and diagnostics from another provider return an
@@ -1655,16 +1697,24 @@ impl EditorSession {
             .live
             .highlighter()
             .highlight_lines(start_line..end_line);
+        let rendered_search = self.rendered_state.search.current().cloned();
         for (offset, styled_line) in highlighted.iter_mut().enumerate() {
             for search_match in self.live.search_matches_for_line(start_line + offset) {
                 Self::overlay_search_match(styled_line, search_match);
+            }
+            if let Some(search) = &rendered_search {
+                for start in search.find_matches(&styled_line.text) {
+                    Self::overlay_search_match(styled_line, start..start + search.pattern.len());
+                }
             }
         }
 
         // Build visual rows and their gutter metadata.
         let mut lines = Vec::with_capacity(vp.height as usize);
         let mut line_numbers = Vec::with_capacity(vp.height as usize);
+        let mut source_rows = Vec::with_capacity(vp.height as usize);
         let mut screen_cursor = (0usize, 0usize);
+        let mut line_start = Self::source_line_start(self.live.text_ref(), start_line);
 
         if vp.wrap {
             for (offset, styled_line) in highlighted.iter().enumerate() {
@@ -1700,7 +1750,13 @@ impl EditorSession {
                     );
                 }
 
-                for (wrapped_row, row) in wrapped.into_iter().enumerate().skip(skip) {
+                let mut wrapped_source_start = line_start;
+                for (wrapped_row, row) in wrapped.into_iter().enumerate() {
+                    let atoms = Self::source_atoms(&row.text, wrapped_source_start);
+                    wrapped_source_start = wrapped_source_start.saturating_add(row.text.len());
+                    if wrapped_row < skip {
+                        continue;
+                    }
                     if lines.len() == vp.height as usize {
                         break;
                     }
@@ -1709,12 +1765,18 @@ impl EditorSession {
                     } else {
                         None
                     });
+                    source_rows.push(atoms);
                     lines.push(row);
                 }
 
                 if lines.len() == vp.height as usize {
                     break;
                 }
+                line_start = Self::next_source_line_start(
+                    self.live.text_ref(),
+                    line_start,
+                    styled_line.text.len(),
+                );
             }
         } else {
             for (offset, styled_line) in highlighted.iter().enumerate() {
@@ -1730,8 +1792,19 @@ impl EditorSession {
                             .min(vp.width.saturating_sub(1) as usize),
                     );
                 }
+                source_rows.push(Self::horizontal_window_atoms(
+                    &styled_line.text,
+                    line_start,
+                    vp.left_col,
+                    vp.width,
+                ));
                 lines.push(Self::horizontal_window(styled_line, vp.left_col, vp.width));
                 line_numbers.push(Some(doc_line + 1));
+                line_start = Self::next_source_line_start(
+                    self.live.text_ref(),
+                    line_start,
+                    styled_line.text.len(),
+                );
             }
         }
 
@@ -1742,14 +1815,36 @@ impl EditorSession {
                 spans: Vec::new(),
             });
             line_numbers.push(None);
+            source_rows.push(Vec::new());
         }
 
         // Truncate to exactly viewport.height (in case we over-highlighted)
         lines.truncate(vp.height as usize);
         line_numbers.truncate(vp.height as usize);
+        source_rows.truncate(vp.height as usize);
+
+        let decorations = self
+            .diagnostics_for_source_rows(&source_rows)
+            .into_iter()
+            .flat_map(|diagnostic| {
+                let kind = DecorationKind::Diagnostic {
+                    provider: diagnostic.provider,
+                    severity: diagnostic.severity,
+                };
+                source_rows
+                    .iter()
+                    .enumerate()
+                    .flat_map(move |(row, atoms)| {
+                        nav::project_atom_intervals(&diagnostic.range, atoms)
+                            .into_iter()
+                            .map(move |columns| SourceDecoration { row, columns, kind })
+                    })
+            })
+            .collect();
 
         crate::style::SourceFrame {
             lines,
+            decorations,
             line_numbers,
             first_line_number: first_visible + 1,
             cursor: (
@@ -1757,6 +1852,146 @@ impl EditorSession {
                 screen_cursor.1.min(vp.width.saturating_sub(1) as usize) as u16,
             ),
         }
+    }
+
+    fn diagnostics_for_source_rows<'a>(
+        &'a self,
+        source_rows: &[Vec<RenderedSourceAtom>],
+    ) -> Vec<&'a Diagnostic> {
+        let intervals =
+            Self::visible_source_intervals(source_rows.iter().map(|atoms| atoms.as_slice()));
+        let diagnostics = self.diagnostics();
+        Self::visible_diagnostic_indices(diagnostics, &intervals)
+            .into_iter()
+            .map(|index| &diagnostics[index])
+            .collect()
+    }
+
+    fn visible_source_intervals<'a>(
+        rows: impl Iterator<Item = &'a [RenderedSourceAtom]>,
+    ) -> Vec<Range<usize>> {
+        let mut intervals = rows
+            .flat_map(|atoms| atoms.iter().filter_map(|atom| atom.source.clone()))
+            .filter(|source| source.start < source.end)
+            .collect::<Vec<_>>();
+        intervals.sort_by_key(|source| (source.start, source.end));
+
+        let mut merged: Vec<Range<usize>> = Vec::new();
+        for source in intervals {
+            if let Some(previous) = merged.last_mut() {
+                if source.start <= previous.end {
+                    previous.end = previous.end.max(source.end);
+                    continue;
+                }
+            }
+            merged.push(source);
+        }
+        merged
+    }
+
+    fn visible_diagnostic_indices(
+        diagnostics: &[Diagnostic],
+        source_intervals: &[Range<usize>],
+    ) -> Vec<usize> {
+        let mut indices = Vec::new();
+        let Some(first_source) = source_intervals.first() else {
+            return indices;
+        };
+        let mut diagnostic_index =
+            diagnostics.partition_point(|diagnostic| diagnostic.range.end <= first_source.start);
+        for source in source_intervals {
+            while diagnostic_index < diagnostics.len()
+                && diagnostics[diagnostic_index].range.end <= source.start
+            {
+                diagnostic_index += 1;
+            }
+            while diagnostic_index < diagnostics.len()
+                && diagnostics[diagnostic_index].range.start < source.end
+            {
+                indices.push(diagnostic_index);
+                diagnostic_index += 1;
+            }
+        }
+        indices
+    }
+
+    fn source_line_start(text: &str, line: usize) -> usize {
+        if line == 0 {
+            return 0;
+        }
+        text.match_indices('\n')
+            .nth(line - 1)
+            .map_or(text.len(), |(offset, _)| offset + 1)
+    }
+
+    fn next_source_line_start(text: &str, start: usize, line_len: usize) -> usize {
+        let end = start.saturating_add(line_len).min(text.len());
+        end + usize::from(text.as_bytes().get(end) == Some(&b'\n'))
+    }
+
+    fn source_atoms(text: &str, source_start: usize) -> Vec<RenderedSourceAtom> {
+        let mut atoms: Vec<RenderedSourceAtom> = Vec::new();
+        let mut column = 0usize;
+        for (byte, character) in text.char_indices() {
+            let source = source_start + byte..source_start + byte + character.len_utf8();
+            let width = character.width().unwrap_or(0);
+            if width == 0 {
+                if let Some(previous) = atoms.last_mut() {
+                    if let Some(previous_source) = previous.source.as_mut() {
+                        previous_source.end = source.end;
+                    }
+                }
+                continue;
+            }
+            atoms.push(RenderedSourceAtom {
+                columns: column..column + width,
+                source: Some(source),
+            });
+            column += width;
+        }
+        atoms
+    }
+
+    fn horizontal_window_atoms(
+        text: &str,
+        source_start: usize,
+        left_col: usize,
+        width: u16,
+    ) -> Vec<RenderedSourceAtom> {
+        let chars: Vec<(usize, char)> = text.char_indices().collect();
+        let width = usize::from(width);
+        if width == 0 || left_col >= chars.len() {
+            return Vec::new();
+        }
+        let end_col = left_col.saturating_add(width).min(chars.len());
+        let right_clipped = chars.len() > end_col;
+        let mut atoms: Vec<RenderedSourceAtom> = Vec::new();
+        let mut display_column = 0usize;
+        for (window_index, &(byte, character)) in chars[left_col..end_col].iter().enumerate() {
+            let synthetic = (left_col > 0 && window_index == 0)
+                || (right_clipped && window_index + 1 == end_col - left_col);
+            let display_width = if synthetic {
+                1
+            } else {
+                character.width().unwrap_or(0)
+            };
+            let source = (!synthetic)
+                .then_some(source_start + byte..source_start + byte + character.len_utf8());
+            if display_width == 0 {
+                if let (Some(previous), Some(source)) = (atoms.last_mut(), source) {
+                    if let Some(previous_source) = previous.source.as_mut() {
+                        previous_source.end = source.end;
+                    }
+                }
+                continue;
+            }
+            atoms.push(RenderedSourceAtom {
+                columns: display_column..display_column + display_width,
+                source,
+            });
+            display_column += display_width;
+        }
+        atoms
     }
 
     fn wrapped_cursor_position(

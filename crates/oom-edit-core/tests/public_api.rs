@@ -1,13 +1,13 @@
 //! Downstream-style guards for the curated root facade.
 
 use oom_edit_core::{
-    ClipboardError, ClipboardSink, Diagnostic, DiagnosticProvider, DiagnosticSeverity,
-    EditorSession, Effect, FmError, FrontMatter, JumpTarget, KeyCode, KeyCodeKind, KeyInput,
-    LineEnding, LineKind, Mode, Modifiers, Num, OpenError, PositionError, RecordingClipboardSink,
-    RenderedLayout, RenderedLine, RenderedLineRole, RenderedPoint, RenderedSearch,
-    RenderedSelection, RenderedSelectionRow, RenderedSourceAtom, SaveError, SearchDirection,
-    SelectionShape, SemanticStyle, Severity, SourceFrame, Span, StyledLine, TargetKind,
-    TextPosition, Value, Viewport,
+    ClipboardError, ClipboardSink, DecorationKind, Diagnostic, DiagnosticDecorationRow,
+    DiagnosticProvider, DiagnosticSeverity, EditorSession, Effect, FmError, FrontMatter,
+    JumpTarget, KeyCode, KeyCodeKind, KeyInput, LineEnding, LineKind, Mode, Modifiers, Num,
+    OpenError, PositionError, RecordingClipboardSink, RenderedLayout, RenderedLine,
+    RenderedLineRole, RenderedPoint, RenderedSearch, RenderedSelection, RenderedSelectionRow,
+    RenderedSourceAtom, SaveError, SearchDirection, SelectionShape, SemanticStyle, Severity,
+    SourceDecoration, SourceFrame, Span, StyledLine, TargetKind, TextPosition, Value, Viewport,
 };
 use std::path::Path;
 
@@ -78,7 +78,9 @@ fn public_facade_types_are_available_at_crate_root() {
 
     let _nameable = std::any::TypeId::of::<(
         ClipboardError,
+        DecorationKind,
         Diagnostic,
+        DiagnosticDecorationRow,
         DiagnosticProvider,
         DiagnosticSeverity,
         Effect,
@@ -102,6 +104,7 @@ fn public_facade_types_are_available_at_crate_root() {
         SelectionShape,
         SemanticStyle,
         Severity,
+        SourceDecoration,
         Span,
         StyledLine,
         TargetKind,
@@ -124,8 +127,8 @@ fn public_facade_remains_curated_without_partial_spell_reexports() {
             "pub use input::{KeyCode, KeyCodeKind, KeyInput, Modifiers};",
             "pub use session::EditorSession;",
             "pub use session::{Effect, Mode, Severity, Viewport};",
-            "pub use spell::{ Diagnostic, DiagnosticProvider, DiagnosticSeverity, PositionError, TextPosition, };",
-            "pub use style::{ JumpTarget, LineKind, RenderedLayout, RenderedLine, RenderedLineRole, RenderedPoint, RenderedSearch, RenderedSelection, RenderedSelectionRow, RenderedSourceAtom, SearchDirection, SelectionShape, SemanticStyle, SourceFrame, Span, StyledLine, TargetKind, };",
+            "pub use spell::{ DecorationKind, Diagnostic, DiagnosticDecorationRow, DiagnosticProvider, DiagnosticSeverity, PositionError, TextPosition, };",
+            "pub use style::{ JumpTarget, LineKind, RenderedLayout, RenderedLine, RenderedLineRole, RenderedPoint, RenderedSearch, RenderedSelection, RenderedSelectionRow, RenderedSourceAtom, SearchDirection, SelectionShape, SemanticStyle, SourceDecoration, SourceFrame, Span, StyledLine, TargetKind, };",
         ],
         "crate-root facade changed; update the API contract and this guard together"
     );
@@ -140,10 +143,7 @@ fn public_facade_remains_curated_without_partial_spell_reexports() {
     );
     assert_no_exported_macros(Path::new(env!("CARGO_MANIFEST_DIR")).join("src").as_path());
     assert!(!source.contains("pub use oom_spell"));
-    assert!(
-        !include_str!("../src/session.rs").contains("diagnostic_decoration_rows"),
-        "Phase 5 projection must not be declared as a placeholder in Phase 4"
-    );
+    assert!(include_str!("../src/session.rs").contains("pub fn diagnostic_decoration_rows"));
 }
 
 #[test]
