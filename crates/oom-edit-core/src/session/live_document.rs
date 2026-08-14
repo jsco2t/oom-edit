@@ -7,6 +7,7 @@ use std::ops::Range;
 
 use crate::frontmatter::{parse_front_matter, FrontMatter};
 use crate::input::KeyInput;
+use crate::spell::{Diagnostic, SpellState};
 use crate::syntax::Highlighter;
 use crate::vim::{
     Mode as VimMode, ProjectedSelection, RangeOperator, Register, UndoMark, VimCore, VimEffect,
@@ -32,6 +33,7 @@ pub(super) struct LiveDocument {
     vim: VimCore,
     highlighter: Highlighter,
     front_matter: FrontMatter,
+    spell: SpellState,
 }
 
 impl LiveDocument {
@@ -40,6 +42,7 @@ impl LiveDocument {
             vim: VimCore::new(text),
             highlighter: Highlighter::new(text),
             front_matter: parse_front_matter(text),
+            spell: SpellState::new(text.len()),
         }
     }
 
@@ -77,6 +80,35 @@ impl LiveDocument {
 
     pub(super) fn highlighter(&self) -> &Highlighter {
         &self.highlighter
+    }
+
+    pub(super) fn text_ref(&self) -> &str {
+        self.highlighter.text()
+    }
+
+    pub(super) fn spell_enabled(&self) -> bool {
+        self.spell.enabled()
+    }
+
+    pub(super) fn set_spell_enabled(&mut self, enabled: bool) {
+        self.spell.set_enabled(enabled);
+    }
+
+    pub(super) fn diagnostics(&self) -> &[Diagnostic] {
+        self.spell.diagnostics()
+    }
+
+    pub(super) fn diagnostics_pending(&self) -> bool {
+        self.spell.pending()
+    }
+
+    pub(super) fn spell_tick(&mut self, engine: &oom_spell::SpellEngine, max_bytes: usize) -> bool {
+        self.spell.tick(
+            self.highlighter.text(),
+            &self.highlighter,
+            engine,
+            max_bytes,
+        )
     }
 
     pub(super) fn front_matter(&self) -> &FrontMatter {
@@ -155,11 +187,30 @@ impl LiveDocument {
         Ok(MutationOutcome { effects })
     }
 
+    pub(super) fn replace_range(
+        &mut self,
+        range: Range<usize>,
+        replacement: &str,
+    ) -> Option<MutationOutcome> {
+        let edits = self.vim.replace_range(range, replacement)?;
+        let effects = if edits.is_empty() {
+            Vec::new()
+        } else {
+            vec![VimEffect::Edited { edits }]
+        };
+        self.refresh_derived(&effects);
+        Some(MutationOutcome { effects })
+    }
+
     fn refresh_derived(&mut self, effects: &[VimEffect]) {
         let mut edited = false;
         for effect in effects {
             if let VimEffect::Edited { edits } = effect {
+                let invalidation = self
+                    .spell
+                    .prepare_invalidation(self.highlighter.text(), edits);
                 self.highlighter.apply_edit(edits);
+                self.spell.invalidate(invalidation, self.highlighter.text());
                 edited = true;
             }
         }

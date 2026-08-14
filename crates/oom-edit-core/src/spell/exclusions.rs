@@ -1,8 +1,7 @@
 use std::ops::Range;
 
 /// Resumable Markdown non-prose exclusion discovery.
-pub(super) struct ProseExclusionScanner<'a> {
-    text: &'a str,
+pub(super) struct ProseExclusionScanner {
     scan: Range<usize>,
     cursor: usize,
     block_ranges: Vec<Range<usize>>,
@@ -268,9 +267,9 @@ impl HtmlTagState {
     }
 }
 
-impl<'a> ProseExclusionScanner<'a> {
+impl ProseExclusionScanner {
     pub(super) fn new(
-        text: &'a str,
+        text: &str,
         scan: Range<usize>,
         block_ranges: Vec<Range<usize>>,
         reference_labels: Vec<String>,
@@ -286,7 +285,6 @@ impl<'a> ProseExclusionScanner<'a> {
             .collect();
         block_ranges = normalize_ranges(block_ranges);
         Self {
-            text,
             cursor: scan.start,
             scan,
             block_ranges,
@@ -303,7 +301,8 @@ impl<'a> ProseExclusionScanner<'a> {
     }
 
     /// Advance by at most `max_bytes`; true means the configured range is complete.
-    pub(super) fn step(&mut self, max_bytes: usize) -> bool {
+    pub(super) fn step(&mut self, text: &str, max_bytes: usize) -> bool {
+        assert!(self.scan.end <= text.len(), "exclusion scan exceeds text");
         if self.is_complete() || max_bytes == 0 {
             return self.is_complete();
         }
@@ -314,12 +313,36 @@ impl<'a> ProseExclusionScanner<'a> {
                 self.enter_or_continue_block(limit);
                 continue;
             }
-            self.advance_inline(limit);
+            self.advance_inline(text, limit);
         }
         if self.cursor == self.scan.end {
             self.finish_at_end();
         }
         self.is_complete()
+    }
+
+    pub(super) fn add_block_ranges(&mut self, ranges: Vec<Range<usize>>) {
+        for range in ranges {
+            let start = range.start.max(self.cursor).max(self.scan.start);
+            let end = range.end.min(self.scan.end);
+            if start >= end {
+                continue;
+            }
+            if let Some(last_index) = self.block_ranges.len().checked_sub(1) {
+                if start <= self.block_ranges[last_index].end {
+                    self.block_ranges[last_index].end = self.block_ranges[last_index].end.max(end);
+                    if self.block_recorded && self.block_index == last_index {
+                        let recorded = self
+                            .ranges
+                            .last_mut()
+                            .expect("recorded block must have an exclusion range");
+                        recorded.end = recorded.end.max(end);
+                    }
+                    continue;
+                }
+            }
+            self.block_ranges.push(start..end);
+        }
     }
 
     pub(super) fn position(&self) -> usize {
@@ -367,11 +390,11 @@ impl<'a> ProseExclusionScanner<'a> {
         self.cursor = range.end.min(limit);
     }
 
-    fn advance_inline(&mut self, limit: usize) {
+    fn advance_inline(&mut self, text: &str, limit: usize) {
         match self.mode.clone() {
-            InlineMode::Normal => self.advance_normal(),
+            InlineMode::Normal => self.advance_normal(text),
             InlineMode::CodeOpening { start, ticks } => {
-                if self.byte() == b'`' {
+                if self.byte(text) == b'`' {
                     self.cursor += 1;
                     self.mode = InlineMode::CodeOpening {
                         start,
@@ -390,7 +413,7 @@ impl<'a> ProseExclusionScanner<'a> {
                 delimiter,
                 closing_ticks,
             } => {
-                if self.byte() == b'`' {
+                if self.byte(text) == b'`' {
                     self.cursor += 1;
                     self.mode = InlineMode::Code {
                         start,
@@ -418,12 +441,12 @@ impl<'a> ProseExclusionScanner<'a> {
                 mut email,
                 mut has_whitespace,
             } => {
-                let byte = self.byte();
+                let byte = self.byte(text);
                 self.cursor += 1;
                 tag = tag.consume(byte);
                 let is_terminator = match terminator {
                     AngleTerminator::Tag => byte == b'>',
-                    _ => self.angle_terminator_matches(terminator),
+                    _ => self.angle_terminator_matches(text, terminator),
                 };
                 if !is_terminator {
                     email.consume(byte, self.cursor);
@@ -463,7 +486,7 @@ impl<'a> ProseExclusionScanner<'a> {
                 mut escaped,
                 mut validation,
             } => {
-                let byte = self.byte();
+                let byte = self.byte(text);
                 if escaped {
                     escaped = false;
                     if validation.pointy_destination_open {
@@ -560,7 +583,7 @@ impl<'a> ProseExclusionScanner<'a> {
                 content_start,
                 mut escaped,
             } => {
-                let byte = self.byte();
+                let byte = self.byte(text);
                 if escaped {
                     escaped = false;
                     self.cursor += 1;
@@ -571,7 +594,7 @@ impl<'a> ProseExclusionScanner<'a> {
                     if content_start < self.cursor
                         && self.cursor - content_start <= 999
                         && crate::spell::normalize_reference_label(
-                            &self.text[content_start..self.cursor],
+                            &text[content_start..self.cursor],
                         )
                         .is_some_and(|label| self.reference_labels.binary_search(&label).is_ok())
                     {
@@ -592,11 +615,11 @@ impl<'a> ProseExclusionScanner<'a> {
                 start,
                 mut trimmed_end,
             } => {
-                if is_bare_url_terminator(self.byte()) {
+                if is_bare_url_terminator(self.byte(text)) {
                     self.finish_bare_url(start, trimmed_end);
                     self.mode = InlineMode::Normal;
                 } else {
-                    if !is_bare_url_trailing_punctuation(self.byte()) {
+                    if !is_bare_url_trailing_punctuation(self.byte(text)) {
                         trimmed_end = self.cursor + 1;
                     }
                     self.cursor += 1;
@@ -607,8 +630,8 @@ impl<'a> ProseExclusionScanner<'a> {
         debug_assert!(self.cursor <= limit || self.cursor == self.scan.end);
     }
 
-    fn advance_normal(&mut self) {
-        let byte = self.byte();
+    fn advance_normal(&mut self, text: &str) {
+        let byte = self.byte(text);
         if self.escape_next {
             self.escape_next = false;
             self.link_label_closed = false;
@@ -623,7 +646,7 @@ impl<'a> ProseExclusionScanner<'a> {
             self.cursor += 1;
             return;
         }
-        if self.starts_bare_url() {
+        if self.starts_bare_url(text) {
             self.finish_email_run(self.cursor);
             self.link_label_closed = false;
             self.mode = InlineMode::BareUrl {
@@ -644,7 +667,7 @@ impl<'a> ProseExclusionScanner<'a> {
             b'<' => {
                 self.finish_email_run(self.cursor);
                 self.link_label_closed = false;
-                let rest = &self.text.as_bytes()[self.cursor..self.scan.end];
+                let rest = &text.as_bytes()[self.cursor..self.scan.end];
                 let terminator = if rest.starts_with(b"<!--") {
                     AngleTerminator::Comment
                 } else if rest.starts_with(b"<?") {
@@ -787,24 +810,24 @@ impl<'a> ProseExclusionScanner<'a> {
         self.email_run = None;
     }
 
-    fn starts_bare_url(&self) -> bool {
-        let rest = &self.text.as_bytes()[self.cursor..self.scan.end];
+    fn starts_bare_url(&self, text: &str) -> bool {
+        let rest = &text.as_bytes()[self.cursor..self.scan.end];
         let prefix = rest.starts_with(b"https://")
             || rest.starts_with(b"http://")
             || rest.starts_with(b"www.")
             || rest.starts_with(b"mailto:");
         prefix
             && self
-                .previous_byte()
+                .previous_byte(text)
                 .is_none_or(|byte| !byte.is_ascii_alphanumeric() && byte != b'_')
     }
 
-    fn byte(&self) -> u8 {
-        self.text.as_bytes()[self.cursor]
+    fn byte(&self, text: &str) -> u8 {
+        text.as_bytes()[self.cursor]
     }
 
-    fn angle_terminator_matches(&self, terminator: AngleTerminator) -> bool {
-        let consumed = &self.text.as_bytes()[self.scan.start..self.cursor];
+    fn angle_terminator_matches(&self, text: &str, terminator: AngleTerminator) -> bool {
+        let consumed = &text.as_bytes()[self.scan.start..self.cursor];
         match terminator {
             AngleTerminator::Tag => consumed.ends_with(b">"),
             AngleTerminator::Comment => consumed.ends_with(b"-->"),
@@ -813,11 +836,11 @@ impl<'a> ProseExclusionScanner<'a> {
         }
     }
 
-    fn previous_byte(&self) -> Option<u8> {
+    fn previous_byte(&self, text: &str) -> Option<u8> {
         self.cursor
             .checked_sub(1)
             .filter(|offset| *offset >= self.scan.start)
-            .map(|offset| self.text.as_bytes()[offset])
+            .map(|offset| text.as_bytes()[offset])
     }
 }
 
@@ -943,10 +966,34 @@ mod tests {
             ProseExclusionScanner::new(text, scan, blocks.to_vec(), reference_labels.to_vec());
         while !scanner.is_complete() {
             let before = scanner.position();
-            scanner.step(budget);
+            scanner.step(text, budget);
             let after = scanner.position();
             assert!(after > before, "scanner must make progress");
             assert!(after - before <= budget, "scanner exceeded its budget");
+        }
+        scanner.into_ranges()
+    }
+
+    fn ranges_with_lazy_blocks_budget(
+        text: &str,
+        scan: Range<usize>,
+        budget: usize,
+    ) -> Vec<Range<usize>> {
+        let highlighter = Highlighter::new(text);
+        let reference_labels = highlighter.spell_reference_labels();
+        let mut scanner =
+            ProseExclusionScanner::new(text, scan.clone(), Vec::new(), reference_labels);
+        let mut ticks = 0;
+        while !scanner.is_complete() {
+            let before = scanner.position();
+            let end = before.saturating_add(budget).min(scan.end);
+            scanner.add_block_ranges(highlighter.spell_block_exclusion_ranges(before..end));
+            scanner.step(text, budget);
+            let after = scanner.position();
+            assert!(after > before, "scanner must make progress");
+            assert!(after - before <= budget, "scanner exceeded its budget");
+            ticks += 1;
+            assert!(ticks <= scan.len(), "scanner exceeded its progress bound");
         }
         scanner.into_ranges()
     }
@@ -1059,6 +1106,21 @@ mod tests {
                 "visible repeated occurrence {occurrence} was excluded"
             );
         }
+    }
+
+    #[test]
+    fn lazily_supplied_block_ranges_match_eager_discovery() {
+        let text = concat!(
+            "---\ntitle: hidden_front\n---\nvisible\n\n",
+            "```text\nhidden_fence\n```\n\n",
+            "[target]: https://definition.test\n\n",
+            "<div>\nhidden_html\n</div>\n",
+        );
+        let expected = ranges_with_budget(text, 0..text.len(), 3);
+        assert_eq!(
+            ranges_with_lazy_blocks_budget(text, 0..text.len(), 3),
+            expected
+        );
     }
 
     #[test]
@@ -1202,7 +1264,7 @@ mod tests {
         let reference_labels = highlighter.spell_reference_labels();
         let mut scanner = ProseExclusionScanner::new(&text, scan.clone(), blocks, reference_labels);
         while !scanner.is_complete() {
-            scanner.step(3);
+            scanner.step(&text, 3);
             assert!(scanner.position() <= scan.end);
         }
         assert_eq!(scanner.position(), scan.end);
@@ -1217,7 +1279,7 @@ mod tests {
         let reference_labels = highlighter.spell_reference_labels();
         let mut scanner =
             ProseExclusionScanner::new(&text, 0..text.len(), blocks, reference_labels);
-        assert!(!scanner.step(4096));
+        assert!(!scanner.step(&text, 4096));
         assert_eq!(scanner.position(), 4096);
         assert!(!scanner.is_complete());
     }

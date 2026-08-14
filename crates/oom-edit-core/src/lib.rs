@@ -17,6 +17,7 @@
 //! - [`Viewport`] and [`SourceFrame`] — raw-source Insert rendering
 //! - [`RenderedLayout`] and [`RenderedSelection`] — rendered Normal/Select output
 //! - [`SemanticStyle`] — renderer-agnostic style slots
+//! - [`Diagnostic`] and [`TextPosition`] — provider-neutral diagnostics and source positions
 //!
 //! # Example
 //!
@@ -76,6 +77,7 @@ pub use frontmatter::{FrontMatter, Num, Value};
 pub use input::{KeyCode, KeyCodeKind, KeyInput, Modifiers};
 pub use session::EditorSession;
 pub use session::{Effect, Mode, Severity, Viewport};
+pub use spell::{Diagnostic, DiagnosticProvider, DiagnosticSeverity, PositionError, TextPosition};
 pub use style::{
     JumpTarget, LineKind, RenderedLayout, RenderedLine, RenderedLineRole, RenderedPoint,
     RenderedSearch, RenderedSelection, RenderedSelectionRow, RenderedSourceAtom, SearchDirection,

@@ -564,23 +564,53 @@ mod tests {
 
     #[test]
     fn all_mutation_entry_points_refresh_derived_state() {
-        let mut session = EditorSession::from_text("---\ntitle: alpha\n---\n\nalpha\n");
-        let assert_derived = |session: &EditorSession| {
+        let mut session = EditorSession::from_text("---\ntitle: alpha\n---\n\nalpha wrng\n");
+        let mut builder =
+            oom_spell::SpellEngineBuilder::new(vec!["alpha\ntitle\nprefix\n".to_string()]);
+        while builder.step(64) != oom_spell::BuildProgress::Complete {}
+        let engine = builder.finish().unwrap();
+        while session.diagnostics_pending() {
+            assert!(session.spell_tick(&engine, 5));
+        }
+        assert_eq!(session.diagnostics().len(), 1);
+        let assert_immediately_conservative = |session: &EditorSession| {
+            let mut fresh = EditorSession::from_text(&session.document());
+            while fresh.diagnostics_pending() {
+                assert!(fresh.spell_tick(&engine, 5));
+            }
+            for diagnostic in session.diagnostics() {
+                assert!(
+                    fresh.diagnostics().contains(diagnostic),
+                    "mutation retained stale diagnostic {diagnostic:?}"
+                );
+            }
+        };
+        let assert_derived = |session: &mut EditorSession| {
             assert_eq!(session.live.highlighter().text(), session.document());
             assert_eq!(
                 crate::frontmatter::parse_front_matter(&session.document()),
                 *session.front_matter()
             );
+            while session.diagnostics_pending() {
+                assert!(session.spell_tick(&engine, 5));
+            }
+            let mut fresh = EditorSession::from_text(&session.document());
+            while fresh.diagnostics_pending() {
+                assert!(fresh.spell_tick(&engine, 5));
+            }
+            assert_eq!(session.diagnostics(), fresh.diagnostics());
         };
 
         session.render_layout(20);
         session.handle_key(key('i'));
         session.insert_paste("prefix ");
-        assert_derived(&session);
+        assert_immediately_conservative(&session);
+        assert_derived(&mut session);
         assert!(session.front_matter().value().is_none());
         session.handle_key(esc());
         session.handle_key(key('u'));
-        assert_derived(&session);
+        assert_immediately_conservative(&session);
+        assert_derived(&mut session);
         assert_eq!(
             session
                 .front_matter()
@@ -589,15 +619,18 @@ mod tests {
             Some(&crate::frontmatter::Value::str("alpha".to_string()))
         );
         session.handle_key(ctrl('r'));
-        assert_derived(&session);
+        assert_immediately_conservative(&session);
+        assert_derived(&mut session);
         assert!(session.front_matter().value().is_none());
         session.render_layout(20);
         session.handle_key(key('v'));
         session.handle_key(key('w'));
         session.handle_key(key('d'));
-        assert_derived(&session);
+        assert_immediately_conservative(&session);
+        assert_derived(&mut session);
         session.handle_key(key('p'));
-        assert_derived(&session);
+        assert_immediately_conservative(&session);
+        assert_derived(&mut session);
 
         for input in [
             key(':'),
@@ -620,8 +653,18 @@ mod tests {
         ] {
             session.handle_key(input);
         }
-        assert_derived(&session);
+        assert_immediately_conservative(&session);
+        assert_derived(&mut session);
         assert!(session.rendered_state.layout_cache.is_none());
+        let diagnostic = session
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.source_text == "omega")
+            .cloned()
+            .expect("substitute must create a spelling diagnostic");
+        session.apply_spell_replacement(&diagnostic, "alpha");
+        assert_immediately_conservative(&session);
+        assert_derived(&mut session);
     }
 
     #[test]
@@ -834,6 +877,7 @@ use crate::error::{OpenError, SaveError};
 use crate::frontmatter::FrontMatter;
 use crate::rendered::nav;
 use crate::rendered::BlockModel;
+use crate::spell::{Diagnostic, DiagnosticProvider, PositionError, TextPosition};
 use crate::style::{
     RenderedCursor, RenderedLayout, RenderedPoint, RenderedSearch, RenderedSelection,
     SearchDirection, SelectionShape,
@@ -1253,6 +1297,150 @@ impl EditorSession {
     /// Return the full document text.
     pub fn document(&self) -> String {
         self.live.text()
+    }
+
+    /// Enable or disable spell checking for this session.
+    pub fn set_spell_enabled(&mut self, enabled: bool) {
+        self.live.set_spell_enabled(enabled);
+    }
+
+    /// Return whether spell checking is enabled for this session.
+    pub fn spell_enabled(&self) -> bool {
+        self.live.spell_enabled()
+    }
+
+    /// Advance spell scanning by at most `max_bytes` source bytes.
+    ///
+    /// Returns `true` when state or scan progress changed. Disabled sessions,
+    /// zero budgets, and already-clean sessions return `false`.
+    pub fn spell_tick(&mut self, engine: &oom_spell::SpellEngine, max_bytes: usize) -> bool {
+        self.live.spell_tick(engine, max_bytes)
+    }
+
+    /// Borrow the sorted, conservatively valid diagnostics visible to hosts.
+    ///
+    /// Disabled sessions expose an empty slice even while invalid scan state
+    /// is retained for a later re-enable.
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        self.live.diagnostics()
+    }
+
+    /// Return whether enabled spelling has incomplete scan work.
+    pub fn diagnostics_pending(&self) -> bool {
+        self.live.diagnostics_pending()
+    }
+
+    /// Return the diagnostic containing the canonical cursor byte offset.
+    ///
+    /// Diagnostic ranges are half-open: a cursor exactly at `range.end` is
+    /// outside that diagnostic.
+    pub fn diagnostic_at_cursor(&self) -> Option<&Diagnostic> {
+        let offset = self.live.cursor_byte_offset();
+        self.diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.range.contains(&offset))
+    }
+
+    /// Return deterministic spelling suggestions for a current diagnostic.
+    ///
+    /// Stale diagnostics and diagnostics from another provider return an
+    /// empty list.
+    pub fn spell_suggestions(
+        &self,
+        engine: &oom_spell::SpellEngine,
+        diagnostic: &Diagnostic,
+        max: usize,
+    ) -> Vec<String> {
+        if diagnostic.provider != DiagnosticProvider::Spell
+            || !self
+                .diagnostics()
+                .iter()
+                .any(|current| current == diagnostic)
+        {
+            return Vec::new();
+        }
+        let Some(word) = self.live.text_ref().get(diagnostic.range.clone()) else {
+            return Vec::new();
+        };
+        engine.suggest(word, max)
+    }
+
+    /// Apply one exact spelling correction after revalidating diagnostic identity and text.
+    ///
+    /// A stale diagnostic emits a warning and never changes the document.
+    pub fn apply_spell_replacement(
+        &mut self,
+        diagnostic: &Diagnostic,
+        replacement: &str,
+    ) -> Vec<Effect> {
+        let current = self
+            .diagnostics()
+            .iter()
+            .any(|candidate| candidate == diagnostic);
+        let text_matches = self
+            .live
+            .text_ref()
+            .get(diagnostic.range.clone())
+            .is_some_and(|text| text == diagnostic.source_text);
+        if diagnostic.provider != DiagnosticProvider::Spell || !current || !text_matches {
+            return vec![Effect::Message {
+                text: "Spelling diagnostic is stale; no replacement was applied".to_string(),
+                severity: Severity::Warning,
+            }];
+        }
+        let Some(outcome) = self
+            .live
+            .replace_range(diagnostic.range.clone(), replacement)
+        else {
+            return vec![Effect::Message {
+                text: "Spelling diagnostic range is invalid; no replacement was applied"
+                    .to_string(),
+                severity: Severity::Warning,
+            }];
+        };
+        self.translate_vim_effects(outcome)
+    }
+
+    /// Return an exact owned slice for a validated UTF-8 byte range.
+    ///
+    /// Reversed, out-of-bounds, and mid-scalar ranges return `None`; logical
+    /// EOF (`len..len`) is valid.
+    pub fn text_for_range(&self, range: Range<usize>) -> Option<String> {
+        if range.start > range.end {
+            return None;
+        }
+        self.live.text_ref().get(range).map(ToOwned::to_owned)
+    }
+
+    /// Map a UTF-8 byte offset to a zero-based line and Unicode-scalar column.
+    ///
+    /// Logical EOF is valid. Offsets beyond EOF or in the middle of a scalar
+    /// return `None`.
+    pub fn position_for_offset(&self, offset: usize) -> Option<TextPosition> {
+        let text = self.live.text_ref();
+        if offset > text.len() || !text.is_char_boundary(offset) {
+            return None;
+        }
+        let (line, column) = self.live.position_for_byte_offset(offset);
+        Some(TextPosition { line, column })
+    }
+
+    /// Atomically move both canonical and rendered cursors to a source offset.
+    pub fn jump_to_offset(&mut self, offset: usize) -> Result<Vec<Effect>, PositionError> {
+        let text = self.live.text_ref();
+        if offset > text.len() {
+            return Err(PositionError::OutOfBounds);
+        }
+        if !text.is_char_boundary(offset) {
+            return Err(PositionError::NotCharBoundary);
+        }
+        let position = self
+            .position_for_offset(offset)
+            .expect("validated source offset must have a position");
+        self.live.jump_to(position.line, position.column);
+        self.remap_active_cursor_from_canonical();
+        self.refresh_character_selection();
+        Ok(vec![Effect::CursorMoved])
     }
 
     /// Return the current file path, if this buffer has one.
@@ -1925,6 +2113,9 @@ impl EditorSession {
         if let Some(effects) = self.rendered_tab_effect(key) {
             return effects;
         }
+        if let Some(effects) = self.resolve_pending_spell_bracket(key) {
+            return effects;
+        }
         if let Some(effects) = self.forward_pending_native_g(key) {
             return effects;
         }
@@ -2189,6 +2380,65 @@ impl EditorSession {
             self.rendered_state.pending_heading_bracket = Some(bracket);
             true
         }
+    }
+
+    fn resolve_pending_spell_bracket(&mut self, key: KeyInput) -> Option<Vec<Effect>> {
+        let bracket = self.rendered_state.pending_heading_bracket?;
+        if key.mods == Modifiers::default() && matches!(key.code.kind, KeyCodeKind::Char('s')) {
+            self.rendered_state.pending_heading_bracket = None;
+            let count = std::mem::take(&mut self.rendered_state.count).max(1);
+            return Some(self.navigate_diagnostic(bracket == ']', count));
+        }
+        if key.mods == Modifiers::default()
+            && matches!(key.code.kind, KeyCodeKind::Char(current) if current == bracket)
+        {
+            return None;
+        }
+
+        self.rendered_state.pending_heading_bracket = None;
+        self.commit_rendered_cursor();
+        let mut effects = self.live.handle_key(KeyInput {
+            code: KeyCode {
+                kind: KeyCodeKind::Char(bracket),
+            },
+            mods: Modifiers::default(),
+        });
+        effects.effects.extend(self.live.handle_key(key).effects);
+        Some(self.translate_vim_effects(effects))
+    }
+
+    fn navigate_diagnostic(&mut self, forward: bool, count: usize) -> Vec<Effect> {
+        let diagnostics = self.diagnostics();
+        if diagnostics.is_empty() {
+            return Vec::new();
+        }
+        let offset = self.live.cursor_byte_offset();
+        let containing = diagnostics
+            .iter()
+            .position(|diagnostic| diagnostic.range.contains(&offset));
+        let steps = count % diagnostics.len();
+        let index = if let Some(index) = containing {
+            if forward {
+                (index + steps) % diagnostics.len()
+            } else {
+                (index + diagnostics.len() - steps) % diagnostics.len()
+            }
+        } else if forward {
+            let first = diagnostics
+                .iter()
+                .position(|diagnostic| diagnostic.range.start > offset)
+                .unwrap_or(0);
+            (first + count.saturating_sub(1)) % diagnostics.len()
+        } else {
+            let first = diagnostics
+                .iter()
+                .rposition(|diagnostic| diagnostic.range.start < offset)
+                .unwrap_or(diagnostics.len() - 1);
+            (first + diagnostics.len() - count.saturating_sub(1) % diagnostics.len())
+                % diagnostics.len()
+        };
+        let target = diagnostics[index].range.start;
+        self.jump_to_offset(target).unwrap_or_default()
     }
 
     fn handle_rendered_navigation_key(&mut self, key: KeyInput) -> Vec<Effect> {
@@ -2623,6 +2873,20 @@ impl EditorSession {
             "set" => match args.0 {
                 Some("wrap") => vec![Effect::SetWrap(true)],
                 Some("nowrap") => vec![Effect::SetWrap(false)],
+                Some("spell") => {
+                    self.set_spell_enabled(true);
+                    vec![Effect::Message {
+                        text: "Spell checking enabled".to_string(),
+                        severity: Severity::Info,
+                    }]
+                }
+                Some("nospell") => {
+                    self.set_spell_enabled(false);
+                    vec![Effect::Message {
+                        text: "Spell checking disabled".to_string(),
+                        severity: Severity::Info,
+                    }]
+                }
                 Some(unknown) => vec![Effect::Message {
                     text: format!("Unknown option: {unknown}"),
                     severity: Severity::Warning,

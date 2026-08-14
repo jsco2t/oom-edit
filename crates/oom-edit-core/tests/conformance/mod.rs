@@ -85,6 +85,20 @@ const REQUIRED_PUBLIC_BEHAVIORS: &[&str] = &[
     "V-X6:line",
     "V-X7:substitute",
     "V-X8:noh-help",
+    "SP-1:set-toggle",
+    "SP-1:session-isolation",
+    "SP-2:next-previous-wrap",
+    "SP-2:empty",
+    "SP-2:mid-diagnostic",
+    "SP-2:count",
+    "SP-3:cursor-half-open",
+    "SP-4:stale-replacement",
+    "SP-4:same-range-different-text",
+    "SP-5:disabled-queries",
+    "SP-5:disabled-edit-resume",
+    "SP-6:generation-self-heal",
+    "SP-7:utf8-eof-position",
+    "SP-8:atomic-jump",
 ];
 
 type ConformanceCase = (&'static str, &'static [&'static str], fn());
@@ -235,6 +249,46 @@ const COVERAGE_CASES: &[ConformanceCase] = &[
     ("Ex line jump", &["V-X6:line"], v_x6_line_jump),
     ("Ex substitute", &["V-X7:substitute"], v_x7_substitute),
     ("Ex noh/help", &["V-X8:noh-help"], v_x8_noh_and_help),
+    (
+        "spell toggles and session isolation",
+        &["SP-1:set-toggle", "SP-1:session-isolation"],
+        spell_toggles_and_session_isolation,
+    ),
+    (
+        "spell navigation",
+        &[
+            "SP-2:next-previous-wrap",
+            "SP-2:empty",
+            "SP-2:mid-diagnostic",
+            "SP-2:count",
+        ],
+        spell_navigation_empty_wrap_and_mid_diagnostic,
+    ),
+    (
+        "spell diagnostic cursor boundaries",
+        &["SP-3:cursor-half-open"],
+        spell_diagnostic_cursor_is_half_open,
+    ),
+    (
+        "spell replacement revalidation",
+        &["SP-4:stale-replacement", "SP-4:same-range-different-text"],
+        spell_replacement_revalidates_identity_and_text,
+    ),
+    (
+        "spell disabled semantics",
+        &["SP-5:disabled-queries", "SP-5:disabled-edit-resume"],
+        spell_disabled_queries_and_edit_resume,
+    ),
+    (
+        "spell generation self healing",
+        &["SP-6:generation-self-heal"],
+        spell_generation_self_heals,
+    ),
+    (
+        "spell positions and atomic jump",
+        &["SP-7:utf8-eof-position", "SP-8:atomic-jump"],
+        spell_positions_and_atomic_jump,
+    ),
 ];
 
 fn key(ch: char) -> KeyInput {
@@ -275,6 +329,26 @@ fn move_to_text(session: &mut EditorSession, needle: &str, width: u16) {
     while session.rendered_cursor_line() < target {
         session.handle_key(key('j'));
     }
+}
+
+fn spell_engine(words: &str) -> oom_spell::SpellEngine {
+    let mut builder = oom_spell::SpellEngineBuilder::new(vec![words.to_string()]);
+    while builder.step(31) != oom_spell::BuildProgress::Complete {}
+    builder.finish().unwrap()
+}
+
+fn drain_spell(session: &mut EditorSession, engine: &oom_spell::SpellEngine) {
+    while session.diagnostics_pending() {
+        assert!(session.spell_tick(engine, 7));
+    }
+}
+
+fn enter_ex(session: &mut EditorSession, command: &str) -> Vec<Effect> {
+    session.handle_key(key(':'));
+    for character in command.chars() {
+        session.handle_key(key(character));
+    }
+    session.handle_key(special(KeyCodeKind::Enter))
 }
 
 #[test]
@@ -1521,6 +1595,184 @@ fn v_x8_noh_and_help() {
     assert!(ex(&mut session, "help")
         .iter()
         .any(|effect| matches!(effect, Effect::HelpRequested)));
+}
+
+#[test]
+fn spell_toggles_and_session_isolation() {
+    let mut first = EditorSession::from_text("helo");
+    let second = EditorSession::from_text("helo");
+    let effects = enter_ex(&mut first, "set nospell");
+    assert!(!first.spell_enabled());
+    assert!(second.spell_enabled());
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::Message { .. })));
+    enter_ex(&mut first, "set spell");
+    assert!(first.spell_enabled());
+}
+
+#[test]
+fn spell_navigation_empty_wrap_and_mid_diagnostic() {
+    let engine = spell_engine("good\n");
+    let mut empty = EditorSession::from_text("good\n\ngood\n\ngood");
+    drain_spell(&mut empty, &engine);
+    empty.render_layout(20);
+    empty.handle_key(key('2'));
+    empty.handle_key(key(']'));
+    assert!(empty.handle_key(key('s')).is_empty());
+    assert_eq!(empty.cursor(), (0, 0));
+    empty.handle_key(key('G'));
+    assert_eq!(empty.cursor().0, 4, "empty ]s must consume its count");
+
+    let mut session = EditorSession::from_text("bad good wrng nope");
+    drain_spell(&mut session, &engine);
+    session.render_layout(30);
+    let diagnostics = session.diagnostics().to_vec();
+    session
+        .jump_to_offset(diagnostics[0].range.start + 1)
+        .unwrap();
+    session.handle_key(key(']'));
+    session.handle_key(key('s'));
+    assert_eq!(
+        session.cursor(),
+        session
+            .position_for_offset(diagnostics[1].range.start)
+            .map(|position| (position.line, position.column))
+            .unwrap()
+    );
+    session.handle_key(key('['));
+    session.handle_key(key('s'));
+    assert_eq!(
+        session.cursor(),
+        session
+            .position_for_offset(diagnostics[0].range.start)
+            .map(|position| (position.line, position.column))
+            .unwrap()
+    );
+    session.jump_to_offset(diagnostics[2].range.start).unwrap();
+    session.handle_key(key(']'));
+    session.handle_key(key('s'));
+    assert_eq!(session.diagnostic_at_cursor(), Some(&diagnostics[0]));
+    session.handle_key(key('2'));
+    session.handle_key(key(']'));
+    session.handle_key(key('s'));
+    assert_eq!(session.diagnostic_at_cursor(), Some(&diagnostics[2]));
+    session.handle_key(key(']'));
+    session.handle_key(key('s'));
+    assert_eq!(session.diagnostic_at_cursor(), Some(&diagnostics[0]));
+}
+
+#[test]
+fn spell_diagnostic_cursor_is_half_open() {
+    let engine = spell_engine("good\n");
+    let mut session = EditorSession::from_text("wrng good");
+    drain_spell(&mut session, &engine);
+    let diagnostic = session.diagnostics()[0].clone();
+    for offset in diagnostic.range.clone() {
+        session.jump_to_offset(offset).unwrap();
+        assert_eq!(session.diagnostic_at_cursor(), Some(&diagnostic));
+    }
+    session.jump_to_offset(diagnostic.range.end).unwrap();
+    assert_eq!(session.diagnostic_at_cursor(), None);
+}
+
+#[test]
+fn spell_replacement_revalidates_identity_and_text() {
+    let engine = spell_engine("hello\n");
+    let mut session = EditorSession::from_text("helo");
+    drain_spell(&mut session, &engine);
+    let stale = session.diagnostics()[0].clone();
+    session.handle_key(key('i'));
+    session.handle_key(special(KeyCodeKind::Delete));
+    session.handle_key(key('x'));
+    session.handle_key(special(KeyCodeKind::Esc));
+    let before = session.document();
+    let effects = session.apply_spell_replacement(&stale, "hello");
+    assert_eq!(session.document(), before);
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Message {
+            severity: oom_edit_core::Severity::Warning,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn spell_disabled_queries_and_edit_resume() {
+    let engine = spell_engine("hello\n");
+    let mut session = EditorSession::from_text("helo");
+    drain_spell(&mut session, &engine);
+    session.set_spell_enabled(false);
+    assert!(session.diagnostics().is_empty());
+    assert!(!session.diagnostics_pending());
+    assert!(!session.spell_tick(&engine, usize::MAX));
+    session.handle_key(key('i'));
+    session.handle_key(key('x'));
+    session.handle_key(special(KeyCodeKind::Esc));
+    session.set_spell_enabled(true);
+    drain_spell(&mut session, &engine);
+    assert_eq!(session.diagnostics()[0].source_text, "xhelo");
+}
+
+#[test]
+fn spell_generation_self_heals() {
+    let mut engine = spell_engine("hello\n");
+    let mut first = EditorSession::from_text("helo");
+    let mut second = EditorSession::from_text("helo");
+    drain_spell(&mut first, &engine);
+    drain_spell(&mut second, &engine);
+    engine.add_word("helo").unwrap();
+    assert!(first.spell_tick(&engine, 1));
+    assert!(second.spell_tick(&engine, 1));
+    drain_spell(&mut first, &engine);
+    drain_spell(&mut second, &engine);
+    assert!(first.diagnostics().is_empty());
+    assert!(second.diagnostics().is_empty());
+}
+
+#[test]
+fn spell_positions_and_atomic_jump() {
+    let mut session = EditorSession::from_text("aé\nxy");
+    assert_eq!(session.text_for_range(6..6).as_deref(), Some(""));
+    assert_eq!(session.text_for_range(1..2), None);
+    assert_eq!(
+        session.position_for_offset(6),
+        Some(oom_edit_core::TextPosition { line: 1, column: 2 })
+    );
+    assert_eq!(session.position_for_offset(2), None);
+    session.render_layout(20);
+    let effects = session.jump_to_offset(4).unwrap();
+    assert_eq!(session.cursor(), (1, 0));
+    assert!(effects.contains(&Effect::CursorMoved));
+    let rendered = session.rendered_cursor();
+    assert!(session.rendered_layout().unwrap().lines[rendered.row]
+        .atoms
+        .iter()
+        .any(|atom| atom.columns.contains(&rendered.column)
+            && atom
+                .source
+                .as_ref()
+                .is_some_and(|source| source.contains(&4))));
+    let before_invalid = (session.cursor(), session.rendered_cursor());
+    assert_eq!(
+        session.jump_to_offset(2),
+        Err(oom_edit_core::PositionError::NotCharBoundary)
+    );
+    assert_eq!(
+        (session.cursor(), session.rendered_cursor()),
+        before_invalid
+    );
+    assert_eq!(
+        session.jump_to_offset(7),
+        Err(oom_edit_core::PositionError::OutOfBounds)
+    );
+    assert_eq!(
+        (session.cursor(), session.rendered_cursor()),
+        before_invalid
+    );
+    session.jump_to_offset(6).unwrap();
+    assert_eq!(session.cursor(), (1, 2));
 }
 
 proptest! {

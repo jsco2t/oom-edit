@@ -921,6 +921,44 @@ impl VimCore {
         }])
     }
 
+    /// Replace one exact UTF-8 byte range as a single undoable edit.
+    pub(crate) fn replace_range(
+        &mut self,
+        range: Range<usize>,
+        replacement: &str,
+    ) -> Option<Vec<TextEdit>> {
+        let old_text = self.text();
+        if range.start > range.end
+            || range.end > old_text.len()
+            || !old_text.is_char_boundary(range.start)
+            || !old_text.is_char_boundary(range.end)
+        {
+            return None;
+        }
+        if old_text.get(range.clone()) == Some(replacement) {
+            return Some(Vec::new());
+        }
+
+        let (start_row, start_col) = self.position_for_byte_offset(range.start);
+        let (end_row, end_col) = self.position_for_byte_offset(range.end);
+        {
+            let _undo_group = self.editor.undo_group();
+            self.editor.push_undo();
+            self.editor.mutate_edit(hjkl_buffer::Edit::Replace {
+                start: hjkl_buffer::Position::new(start_row, start_col),
+                end: hjkl_buffer::Position::new(end_row, end_col),
+                with: replacement.to_string(),
+            });
+        }
+        let _ = self.editor.take_content_edits();
+        self.modified_since_save = true;
+        Some(vec![TextEdit {
+            range,
+            new_text_len: replacement.len(),
+            new_text: replacement.to_string(),
+        }])
+    }
+
     /// Move the cursor to the given (row, col) position.
     pub(crate) fn jump_to(&mut self, row: usize, col: usize) {
         let col = col.min(
@@ -1526,6 +1564,26 @@ mod projected_selection_tests {
             mods: crate::input::Modifiers::default(),
         });
         assert_eq!(vim.mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn tight_range_replace_is_utf8_exact_and_one_undo_step() {
+        let mut vim = VimCore::new("é helo helo");
+        let edits = vim.replace_range(3..7, "hello").unwrap();
+        assert_eq!(
+            edits,
+            [TextEdit {
+                range: 3..7,
+                new_text_len: 5,
+                new_text: "hello".to_string(),
+            }]
+        );
+        assert_eq!(vim.text(), "é hello helo");
+        vim.handle_key(VimCore::plain_key(KeyCodeKind::Char('u')));
+        assert_eq!(vim.text(), "é helo helo");
+        vim.handle_key(VimCore::plain_key(KeyCodeKind::Char('u')));
+        assert_eq!(vim.text(), "é helo helo");
+        assert!(vim.replace_range(1..2, "x").is_none());
     }
 
     #[test]
