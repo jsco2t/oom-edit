@@ -143,6 +143,7 @@ fn implementation_modules_are_not_public() {
         "frontmatter",
         "rendered",
         "session",
+        "spell",
         "style",
         "syntax",
         "vim",

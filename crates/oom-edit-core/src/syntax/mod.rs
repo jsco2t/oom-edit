@@ -167,6 +167,10 @@ pub struct Highlighter {
     md_parser: Parser,
     /// Injection regions (front matter, fenced code blocks).
     injections: Vec<Injection>,
+    /// Cached complete front-matter byte span, including parser edge cases.
+    spell_front_matter_span: Option<Range<usize>>,
+    /// Normalized labels owned by retained link-reference definitions.
+    spell_reference_labels: Vec<String>,
     /// Compiled injection queries, keyed by canonical registry language name.
     query_cache: HashMap<&'static str, Arc<Query>>,
     /// Most recent parser route, exposed only to regression tests.
@@ -201,6 +205,7 @@ impl Highlighter {
         let inline_query = Query::new(&inline_language, MD_INLINE_QUERY)
             .expect("markdown inline highlight query should compile");
 
+        let spell_reference_labels = collect_spell_reference_labels(tree.root_node(), text);
         let mut highlighter = Self {
             text: text.to_string(),
             line_starts: line_start_indices(text),
@@ -209,6 +214,8 @@ impl Highlighter {
             md_inline_query: inline_query,
             md_parser: parser,
             injections: Vec::new(),
+            spell_front_matter_span: crate::frontmatter::front_matter_span(text),
+            spell_reference_labels,
             query_cache: HashMap::new(),
             #[cfg(test)]
             last_parse_path: ParsePath::Full,
@@ -225,6 +232,41 @@ impl Highlighter {
     /// Return the current document text.
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// Return parser-owned block ranges that cannot contain checked prose.
+    ///
+    /// The walk prunes nodes outside `scan`, returns only owned byte ranges,
+    /// and stops below excluded leaves so parser types do not cross the seam.
+    #[allow(
+        dead_code,
+        reason = "the Phase 3 exclusion seam is exercised directly before SpellState consumes it"
+    )]
+    pub(crate) fn spell_block_exclusion_ranges(&self, scan: Range<usize>) -> Vec<Range<usize>> {
+        let scan = scan.start.min(self.text.len())..scan.end.min(self.text.len());
+        if scan.start >= scan.end {
+            return Vec::new();
+        }
+
+        let mut ranges = Vec::new();
+        collect_spell_block_exclusions(self.md_tree.root_node(), &scan, &mut ranges);
+        if let Some(front_matter) = &self.spell_front_matter_span {
+            let start = front_matter.start.max(scan.start);
+            let end = front_matter.end.min(scan.end);
+            if start < end {
+                ranges.push(start..end);
+            }
+        }
+        ranges.sort_by_key(|range| (range.start, range.end));
+        ranges
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the Phase 3 exclusion scanner owns cloned definition labels across ticks"
+    )]
+    pub(crate) fn spell_reference_labels(&self) -> Vec<String> {
+        self.spell_reference_labels.clone()
     }
 
     /// Apply a batch of text edits and update the retained parse tree.
@@ -262,6 +304,7 @@ impl Highlighter {
             apply_edit_to_line_starts(&mut self.line_starts, edit);
             apply_edit_to_string(&mut self.text, edit);
         }
+        self.spell_front_matter_span = crate::frontmatter::front_matter_span(&self.text);
 
         if !tree_was_edited {
             return;
@@ -285,6 +328,11 @@ impl Highlighter {
             {
                 self.last_parse_path = ParsePath::BlockNeutral;
             }
+        }
+
+        if block_reparse_required {
+            self.spell_reference_labels =
+                collect_spell_reference_labels(self.md_tree.root_node(), &self.text);
         }
 
         if rediscover_injections {
@@ -713,6 +761,111 @@ impl Highlighter {
             }
         }
     }
+}
+
+#[allow(
+    dead_code,
+    reason = "helper for the Phase 3 exclusion seam exercised by its focused tests"
+)]
+fn collect_spell_block_exclusions(
+    node: tree_sitter::Node<'_>,
+    scan: &Range<usize>,
+    ranges: &mut Vec<Range<usize>>,
+) {
+    if node.end_byte() <= scan.start || node.start_byte() >= scan.end {
+        return;
+    }
+    if matches!(
+        node.kind(),
+        "fenced_code_block"
+            | "indented_code_block"
+            | "html_block"
+            | "minus_metadata"
+            | "plus_metadata"
+            | "link_reference_definition"
+    ) {
+        let start = node.start_byte().max(scan.start);
+        let end = node.end_byte().min(scan.end);
+        if start < end {
+            ranges.push(start..end);
+        }
+        return;
+    }
+
+    let child_count = node.child_count();
+    let mut low = 0;
+    let mut high = child_count;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let child = node
+            .child(middle.try_into().expect("child index must fit u32"))
+            .expect("child index must be valid");
+        if child.end_byte() <= scan.start {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    for index in low..child_count {
+        let child = node
+            .child(index.try_into().expect("child index must fit u32"))
+            .expect("child index must be valid");
+        if child.start_byte() >= scan.end {
+            break;
+        }
+        collect_spell_block_exclusions(child, scan, ranges);
+    }
+}
+
+fn collect_spell_reference_labels(root: tree_sitter::Node<'_>, text: &str) -> Vec<String> {
+    fn walk(node: tree_sitter::Node<'_>, text: &str, labels: &mut Vec<String>) {
+        if node.kind() == "link_reference_definition" {
+            if let Some(label) = find_descendant_kind(node, "link_label") {
+                if let Some(normalized) = crate::spell::normalize_reference_label(
+                    &text[label.start_byte()..label.end_byte()],
+                ) {
+                    labels.push(normalized);
+                }
+            }
+            return;
+        }
+        let mut cursor = node.walk();
+        if cursor.goto_first_child() {
+            loop {
+                walk(cursor.node(), text, labels);
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn find_descendant_kind<'tree>(
+        node: tree_sitter::Node<'tree>,
+        expected: &str,
+    ) -> Option<tree_sitter::Node<'tree>> {
+        if node.kind() == expected {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        if cursor.goto_first_child() {
+            loop {
+                if let Some(found) = find_descendant_kind(cursor.node(), expected) {
+                    return Some(found);
+                }
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+        None
+    }
+
+    let mut labels = Vec::new();
+    walk(root, text, &mut labels);
+    labels.sort_unstable();
+    labels.dedup();
+    labels
 }
 
 // ── Standalone snippet highlighting ─────────────────────────────────────────

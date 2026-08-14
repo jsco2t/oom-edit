@@ -57,6 +57,7 @@ mod frontmatter;
 mod input;
 mod rendered;
 mod session;
+mod spell;
 mod style;
 mod syntax;
 mod vim;

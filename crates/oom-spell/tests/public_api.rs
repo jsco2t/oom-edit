@@ -1,8 +1,9 @@
 //! Downstream-style guards for the curated `oom-spell` facade and dependency graph.
 
 use oom_spell::{
-    normalize_dictionary_entry, AddWordOutcome, BuildIncomplete, BuildProgress,
-    DictionaryEntryError, SpellEngine, SpellEngineBuilder, MAX_CHECKED_WORD_BYTES,
+    classify_candidate, normalize_dictionary_entry, tokenize_chunk, AddWordOutcome,
+    BuildIncomplete, BuildProgress, CandidateDecision, DictionaryEntryError, SpellEngine,
+    SpellEngineBuilder, Token, TokenChunk, TokenShape, TokenizerState, MAX_CHECKED_WORD_BYTES,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -58,6 +59,13 @@ fn assert_no_exported_macros(path: &Path) {
 fn curated_facade_is_nameable_from_the_crate_root() {
     let _: usize = MAX_CHECKED_WORD_BYTES;
     let _: fn(&str) -> Result<Option<String>, DictionaryEntryError> = normalize_dictionary_entry;
+    let _: for<'a> fn(
+        &'a str,
+        &[std::ops::Range<usize>],
+        &mut TokenizerState,
+        usize,
+    ) -> TokenChunk<'a> = tokenize_chunk;
+    let _: for<'a> fn(&Token<'a>) -> CandidateDecision<'a> = classify_candidate;
     let _ = std::any::TypeId::of::<(
         AddWordOutcome,
         BuildIncomplete,
@@ -65,6 +73,10 @@ fn curated_facade_is_nameable_from_the_crate_root() {
         DictionaryEntryError,
         SpellEngine,
         SpellEngineBuilder,
+        Token<'static>,
+        TokenChunk<'static>,
+        TokenShape,
+        TokenizerState,
     )>();
 }
 
@@ -122,7 +134,11 @@ fn facade_is_curated_and_modules_remain_private() {
     assert!(!source.contains("extern crate"));
     assert_eq!(
         public_use_declarations(source),
-        ["pub use engine::{ normalize_dictionary_entry, AddWordOutcome, BuildIncomplete, BuildProgress, DictionaryEntryError, SpellEngine, SpellEngineBuilder, MAX_CHECKED_WORD_BYTES, };"],
+        [
+            "pub use engine::{ normalize_dictionary_entry, AddWordOutcome, BuildIncomplete, BuildProgress, DictionaryEntryError, SpellEngine, SpellEngineBuilder, MAX_CHECKED_WORD_BYTES, };",
+            "pub use policy::{classify_candidate, CandidateDecision};",
+            "pub use tokenize::{tokenize_chunk, Token, TokenChunk, TokenShape, TokenizerState};",
+        ],
         "the crate-root facade changed; update the architecture contract and guard together"
     );
     let unexpected_public_items: Vec<_> = source
