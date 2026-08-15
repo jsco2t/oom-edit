@@ -21,4 +21,4 @@
 
   22  More text here.
 
- NORMAL  v=character-wise selection  Space w=save                       6:3  26%
+ NORMAL  v=character-wise selection  Space w=save                   🅂 0 6:3  26%

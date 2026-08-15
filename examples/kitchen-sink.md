@@ -32,10 +32,10 @@ status: draft
 
 ## Inline Formatting
 
-This paragraph has **bold text**, *italic text*, ***bold and italic text***, and ~~strikethrough text~~. It also has `inline code` and an inline code span with backtick escaping: `` `backticks` inside code ``. Here is a hard line break (two trailing spaces):  
+This paragraph has **bold text**, _italic text_, _**bold and italic text**_, and ~~strikethrough text~~. It also has `inline code` and an inline code span with backtick escaping: `` `backticks` inside code ``. Here is a hard line break (two trailing spaces):\
 This line should start on a new line without a paragraph gap.
 
-You can also use _underscores for emphasis_ and __underscores for strong emphasis__ and ___both at once___.
+You can also use _underscores for emphasis_ and **underscores for strong emphasis** and _**both at once**_.
 
 Backslash escapes: \*not italic\*, \`not code\`, \[not a link\], \#not a heading.
 
@@ -45,7 +45,7 @@ Backslash escapes: \*not italic\*, \`not code\`, \[not a link\], \#not a heading
 
 ### Inline Links
 
-Here is [an inline link](https://example.com) and one with a title: [titled link](https://example.com "Example Site"). Links can contain **[bold text](https://example.com)** and *[italic text](https://example.com)*.
+Here is [an inline link](https://example.com) and one with a title: [titled link](https://example.com "Example Site"). Links can contain **[bold text](https://example.com)** and _[italic text](https://example.com)_.
 
 ### Autolinks
 
@@ -55,7 +55,7 @@ Bare URL (GFM extended autolink): https://example.com/path?query=value&other=123
 
 ### Reference Links
 
-Here is a [reference link][ref1] and a [collapsed reference link][] and a [shortcut reference link].
+Here is a [reference link][ref1] and a [collapsed reference link][collapsed reference link] and a [shortcut reference link].
 
 [ref1]: https://example.com/reference "Reference Title"
 [collapsed reference link]: https://example.com/collapsed
@@ -82,9 +82,9 @@ Here is a [reference link][ref1] and a [collapsed reference link][] and a [short
 
 > Nested block quotes:
 >
-> > This is a nested quote.
-> >
-> > > And a triple-nested quote.
+>> This is a nested quote.
+>>
+>>> And a triple-nested quote.
 
 > A block quote with a list inside:
 >
@@ -117,11 +117,11 @@ Nested unordered lists:
 
 Different bullet characters start different lists:
 
-* Asterisk item one
-* Asterisk item two
+- Asterisk item one
+- Asterisk item two
 
-+ Plus item one
-+ Plus item two
+* Plus item one
+* Plus item two
 
 - Dash item one
 - Dash item two
@@ -145,7 +145,7 @@ Nested ordered lists:
 1. Top-level ordered
    1. Nested ordered
    2. Another nested
-      1. Third level
+      1. Third level: misspelledd lazertific
    3. Back to second level
 2. Back to top level
 
@@ -176,11 +176,11 @@ Mixed nesting:
 
 ### Simple Table
 
-| Name    | Age | City        |
-| ------- | --- | ----------- |
-| Alice   | 30  | Portland    |
-| Bob     | 25  | Seattle     |
-| Charlie | 35  | San Diego   |
+| Name    | Age | City      |
+| ------- | --- | --------- |
+| Alice   | 30  | Portland  |
+| Bob     | 25  | Seattle   |
+| Charlie | 35  | San Diego |
 
 ### Aligned Columns
 
@@ -192,24 +192,24 @@ Mixed nesting:
 
 ### Multi-Column Table with Formatted Content
 
-| Feature         | Status    | Priority | Assignee | Notes                                             |
-| --------------- | --------- | -------- | -------- | ------------------------------------------------- |
-| Vim motions     | Done      | P0       | core     | `hjkl`, `w`, `b`, `e`, `0`, `$`, `gg`, `G`       |
-| Syntax highlight| Done      | P0       | core     | Tree-sitter based, **all** built-in grammars      |
-| Rendered Normal | Done      | P1       | core     | Rendered markdown with navigation                 |
-| Search          | Planned   | P1       | core     | `/pattern` with `n`/`N` for next/prev             |
-| Command palette | Planned   | P2       | tui      | `:` prefix, fuzzy matching                        |
-| Clipboard       | Planned   | P1       | core     | OSC 52 — *no external dependencies*               |
+| Feature          | Status  | Priority | Assignee | Notes                                        |
+| ---------------- | ------- | -------- | -------- | -------------------------------------------- |
+| Vim motions      | Done    | P0       | core     | `hjkl`, `w`, `b`, `e`, `0`, `$`, `gg`, `G`   |
+| Syntax highlight | Done    | P0       | core     | Tree-sitter based, **all** built-in grammars |
+| Rendered Normal  | Done    | P1       | core     | Rendered markdown with navigation            |
+| Search           | Planned | P1       | core     | `/pattern` with `n`/`N` for next/prev        |
+| Command palette  | Planned | P2       | tui      | `:` prefix, fuzzy matching                   |
+| Clipboard        | Planned | P1       | core     | OSC 52 — _no external dependencies_          |
 
 ### Table Requiring Text Wrapping
 
 This table has cells with content long enough to force horizontal scrolling or wrapping behavior in a terminal:
 
-| Component | Description | Implementation Details |
-| --------- | ----------- | ---------------------- |
-| Incremental Highlighter | The incremental highlighting engine re-highlights only the ranges affected by an edit, using tree-sitter's edit + reparse cycle. | Uses `InputEdit` to inform the old tree of byte-range changes, then calls `parser.parse()` with the old tree to produce a new tree. Only changed node ranges are re-queried for highlights, keeping large-file edits fast. |
-| Rendered Layout | Converts the canonical markdown buffer into styled headings, wrapped paragraphs, and navigable structure. | Walks the pulldown-cmark event stream, applying semantic styles per block type. Headings become bold + colored, code blocks get background fill, and links show their URL in a muted style. Cursor maps bi-directionally between rendered and source positions. |
-| Atomic Save | Ensures that a crash or kill signal during write never corrupts the file being edited. | Writes to a temporary file in the same directory, calls `fsync()`, then atomically renames over the target. If rename fails, the original file is untouched. The temp file name includes the PID to avoid collisions. |
+| Component               | Description                                                                                                                      | Implementation Details                                                                                                                                                                                                                                          |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Incremental Highlighter | The incremental highlighting engine re-highlights only the ranges affected by an edit, using tree-sitter's edit + reparse cycle. | Uses `InputEdit` to inform the old tree of byte-range changes, then calls `parser.parse()` with the old tree to produce a new tree. Only changed node ranges are re-queried for highlights, keeping large-file edits fast.                                      |
+| Rendered Layout         | Converts the canonical markdown buffer into styled headings, wrapped paragraphs, and navigable structure.                        | Walks the pulldown-cmark event stream, applying semantic styles per block type. Headings become bold + colored, code blocks get background fill, and links show their URL in a muted style. Cursor maps bi-directionally between rendered and source positions. |
+| Atomic Save             | Ensures that a crash or kill signal during write never corrupts the file being edited.                                           | Writes to a temporary file in the same directory, calls `fsync()`, then atomically renames over the target. If rename fails, the original file is untouched. The temp file name includes the PID to avoid collisions.                                           |
 
 ---
 
@@ -219,9 +219,9 @@ Three different syntaxes:
 
 ---
 
-***
+---
 
-___
+---
 
 ---
 
@@ -328,7 +328,11 @@ interface Config<T> {
   validate: (v: T) => boolean;
 }
 
-function createConfig<T>(key: string, value: T, validate: (v: T) => boolean): Config<T> {
+function createConfig<T>(
+  key: string,
+  value: T,
+  validate: (v: T) => boolean,
+): Config<T> {
   if (!validate(value)) {
     throw new Error(`Invalid value for ${key}`);
   }
@@ -573,9 +577,9 @@ Escaped characters: \* \_ \` \# \~ \[ \] \( \) \{ \} \| \\ \! \. \- \+
 
 Literal pipes in a table need escaping:
 
-| Expression      | Result |
-| --------------- | ------ |
-| `a \| b`        | a or b |
+| Expression        | Result |
+| ----------------- | ------ |
+| `a \| b`          | a or b |
 | `true \|\| false` | true   |
 
 HTML entities: &amp; &lt; &gt; &quot; &#42; &#x2a;
@@ -590,11 +594,11 @@ Unicode: em dash — en dash – ellipsis … bullet • copyright © section §
 
 Normally a heading has text, but can the editor handle one followed immediately by content?
 
-###
+### 
 
 The above line is `###` with nothing after it — some parsers treat it as an empty heading.
 
-### Heading with `code` and **bold** and *italic*
+### Heading with `code` and **bold** and _italic_
 
 ### Heading with a [link](https://example.com)
 
@@ -610,28 +614,26 @@ Back to a paragraph.
 
 ### Setext Headings
 
-This is a setext h1
-====================
+# This is a setext h1
 
-This is a setext h2
---------------------
+## This is a setext h2
 
 ---
 
 ## Long Table Stress Test
 
-| #  | Method   | Endpoint                          | Status | Latency | Description                                                        |
-| -- | -------- | --------------------------------- | ------ | ------- | ------------------------------------------------------------------ |
-| 1  | GET      | `/api/v1/users`                   | 200    | 45ms    | List all users with pagination                                     |
-| 2  | POST     | `/api/v1/users`                   | 201    | 120ms   | Create a new user account with email verification                  |
-| 3  | GET      | `/api/v1/users/:id`               | 200    | 32ms    | Retrieve a specific user by ID                                     |
-| 4  | PUT      | `/api/v1/users/:id`               | 200    | 88ms    | Update user profile information                                    |
-| 5  | DELETE   | `/api/v1/users/:id`               | 204    | 55ms    | Soft-delete a user account                                         |
-| 6  | GET      | `/api/v1/users/:id/orders`        | 200    | 150ms   | List all orders for a specific user                                |
-| 7  | POST     | `/api/v1/users/:id/orders`        | 201    | 200ms   | Create a new order for a user with inventory validation            |
-| 8  | GET      | `/api/v1/health`                  | 200    | 2ms     | Health check endpoint                                              |
-| 9  | POST     | `/api/v1/auth/login`              | 200    | 180ms   | Authenticate and receive JWT tokens                                |
-| 10 | POST     | `/api/v1/auth/refresh`            | 200    | 45ms    | Refresh an expired access token using a refresh token              |
+| #  | Method | Endpoint                   | Status | Latency | Description                                             |
+| -- | ------ | -------------------------- | ------ | ------- | ------------------------------------------------------- |
+| 1  | GET    | `/api/v1/users`            | 200    | 45ms    | List all users with pagination                          |
+| 2  | POST   | `/api/v1/users`            | 201    | 120ms   | Create a new user account with email verification       |
+| 3  | GET    | `/api/v1/users/:id`        | 200    | 32ms    | Retrieve a specific user by ID                          |
+| 4  | PUT    | `/api/v1/users/:id`        | 200    | 88ms    | Update user profile information                         |
+| 5  | DELETE | `/api/v1/users/:id`        | 204    | 55ms    | Soft-delete a user account                              |
+| 6  | GET    | `/api/v1/users/:id/orders` | 200    | 150ms   | List all orders for a specific user                     |
+| 7  | POST   | `/api/v1/users/:id/orders` | 201    | 200ms   | Create a new order for a user with inventory validation |
+| 8  | GET    | `/api/v1/health`           | 200    | 2ms     | Health check endpoint                                   |
+| 9  | POST   | `/api/v1/auth/login`       | 200    | 180ms   | Authenticate and receive JWT tokens                     |
+| 10 | POST   | `/api/v1/auth/refresh`     | 200    | 45ms    | Refresh an expired access token using a refresh token   |
 
 ---
 
@@ -639,7 +641,7 @@ This is a setext h2
 
 > # Quoted Heading
 >
-> A paragraph with **bold**, *italic*, ~~strikethrough~~, and `code`.
+> A paragraph with **bold**, _italic_, ~~strikethrough~~, and `code`.
 >
 > - List item one
 > - List item two
@@ -655,7 +657,7 @@ This is a setext h2
 > }
 > ```
 >
-> > Nested quote with a [link](https://example.com).
+>> Nested quote with a [link](https://example.com).
 
 ---
 

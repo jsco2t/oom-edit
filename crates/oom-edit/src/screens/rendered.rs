@@ -44,7 +44,8 @@ pub fn render_rendered(
         .min(area.width);
     let text_width = area.width.saturating_sub(gutter_width);
     session.render_layout(text_width);
-    let cursor_line = session.rendered_cursor_line();
+    let cursor = session.rendered_cursor();
+    let cursor_line = cursor.row;
     let selection = session.rendered_selection();
     let search = session.rendered_search().cloned();
     let max_lines = session
@@ -123,21 +124,31 @@ pub fn render_rendered(
             .and_then(|selection| selection.rows.iter().find(|row| row.row == i))
             .map(|row| row.columns.clone())
             .filter(|columns| columns.start < columns.end);
-        if let Some(columns) = selected {
+        let mut line = if let Some(columns) = selected {
             let mut style = theme.style(tier, oom_edit_core::SemanticStyle::Selection);
             if base_surface.is_some() {
                 style.bg = None;
             }
-            lines.push(build_interval_highlighted_line(spans, columns, style));
+            build_interval_highlighted_line(spans, columns, style)
         } else if i == cursor_line {
             let mut style = theme.ui_style(tier, UiSlot::CursorLine);
             if rendered_line.role == oom_edit_core::RenderedLineRole::Metadata {
                 style = style.add_modifier(ratatui::style::Modifier::UNDERLINED);
             }
-            lines.push(build_highlighted_line(spans, text_width, style));
+            build_highlighted_line(spans, text_width, style)
         } else {
-            lines.push(Line::from(spans));
+            Line::from(spans)
+        };
+
+        if mode == oom_edit_core::Mode::Normal && i == cursor.row {
+            line = spans::apply_interval_style(
+                line.spans,
+                cursor.column..cursor.column.saturating_add(1),
+                theme.ui_style(tier, UiSlot::NormalCursor),
+                None,
+            );
         }
+        lines.push(line);
     }
 
     // Fill remaining lines with blanks.
@@ -371,6 +382,13 @@ mod tests {
             );
             if enter_mode == Some('v') {
                 assert!(cell.modifier.contains(Modifier::REVERSED));
+            } else if enter_mode.is_none() {
+                assert_eq!(
+                    Some(cell.bg),
+                    DEFAULT_DARK
+                        .ui_style(Tier::TrueColor, UiSlot::NormalCursor)
+                        .bg
+                );
             } else {
                 assert_eq!(
                     Some(cell.bg),
@@ -569,10 +587,19 @@ mod tests {
             .unwrap();
 
         let gutter_width = status_bar::gutter_width(normal.line_count()) as u16;
-        let normal_cell = normal_terminal
+        let normal_line_cell = normal_terminal
             .backend()
             .buffer()
             .cell((gutter_width, 0))
+            .unwrap();
+        let normal_cursor = normal.rendered_cursor();
+        let normal_cursor_cell = normal_terminal
+            .backend()
+            .buffer()
+            .cell((
+                gutter_width + normal_cursor.column as u16,
+                normal_cursor.row as u16,
+            ))
             .unwrap();
         let select_cell = select_terminal
             .backend()
@@ -580,15 +607,73 @@ mod tests {
             .cell((gutter_width + 2, 0))
             .unwrap();
         assert_eq!(
-            normal_cell.bg,
+            normal_line_cell.bg,
             DEFAULT_DARK
                 .ui_style(Tier::TrueColor, UiSlot::CursorLine)
                 .bg
                 .unwrap()
         );
-        assert!(!normal_cell.modifier.contains(Modifier::REVERSED));
+        assert_eq!(
+            normal_cursor_cell.bg,
+            DEFAULT_DARK
+                .ui_style(Tier::TrueColor, UiSlot::NormalCursor)
+                .bg
+                .unwrap()
+        );
+        assert_ne!(normal_cursor_cell.bg, normal_line_cell.bg);
+        assert!(!normal_line_cell.modifier.contains(Modifier::REVERSED));
         assert!(select_cell.modifier.contains(Modifier::REVERSED));
-        assert_ne!(normal_cell.bg, select_cell.bg);
+        assert_ne!(normal_line_cell.bg, select_cell.bg);
+    }
+
+    #[test]
+    fn normal_cursor_cell_is_subtle_compositional_and_accessible() {
+        for name in crate::theme::built_in_themes() {
+            for tier in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
+                let theme = crate::theme::get_theme(name);
+                let mut session = EditorSession::from_text("plain text\n");
+                session.render_layout(36);
+                session.handle_key(key('l'));
+                let cursor = session.rendered_cursor();
+                let mut terminal = Terminal::new(TestBackend::new(40, 3)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        render_rendered(frame, &mut session, 0, false, frame.area(), theme, tier);
+                    })
+                    .unwrap();
+
+                let gutter = status_bar::gutter_width(session.line_count()) as u16;
+                let cursor_cell = terminal
+                    .backend()
+                    .buffer()
+                    .cell((gutter + cursor.column as u16, cursor.row as u16))
+                    .unwrap();
+                let neighbor = terminal
+                    .backend()
+                    .buffer()
+                    .cell((gutter + cursor.column as u16 + 1, cursor.row as u16))
+                    .unwrap();
+                let cursor_style = theme.ui_style(tier, UiSlot::NormalCursor);
+                let line_style = theme.ui_style(tier, UiSlot::CursorLine);
+
+                assert!(cursor_cell.modifier.contains(Modifier::BOLD));
+                assert_eq!(
+                    cursor_cell.fg,
+                    theme
+                        .style(tier, oom_edit_core::SemanticStyle::Text)
+                        .fg
+                        .unwrap()
+                );
+                if let Some(background) = cursor_style.bg {
+                    assert_eq!(cursor_cell.bg, background);
+                    assert_eq!(neighbor.bg, line_style.bg.unwrap());
+                    assert_ne!(cursor_cell.bg, neighbor.bg);
+                } else {
+                    assert!(cursor_cell.modifier.contains(Modifier::UNDERLINED));
+                    assert!(!neighbor.modifier.contains(Modifier::BOLD));
+                }
+            }
+        }
     }
 
     #[test]
@@ -806,6 +891,7 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let panel = DEFAULT_DARK.ui_style(Tier::TrueColor, UiSlot::MetadataPanel);
         let cursor_line = DEFAULT_DARK.ui_style(Tier::TrueColor, UiSlot::CursorLine);
+        let normal_cursor = DEFAULT_DARK.ui_style(Tier::TrueColor, UiSlot::NormalCursor);
         let delimiter = DEFAULT_DARK.style(Tier::TrueColor, SemanticStyle::FmDelimiter);
         let key_style = DEFAULT_DARK.style(Tier::TrueColor, SemanticStyle::FmKey);
         let value_style = DEFAULT_DARK.style(Tier::TrueColor, SemanticStyle::FmValue);
@@ -814,8 +900,9 @@ mod tests {
         let opening = buffer.cell((gutter, 0)).unwrap();
         assert_eq!(opening.symbol(), "┌");
         assert_eq!(Some(opening.fg), delimiter.fg);
-        assert_eq!(Some(opening.bg), cursor_line.bg);
+        assert_eq!(Some(opening.bg), normal_cursor.bg);
         assert!(opening.modifier.contains(cursor_line.add_modifier));
+        assert!(opening.modifier.contains(normal_cursor.add_modifier));
         assert!(opening.modifier.contains(Modifier::UNDERLINED));
 
         let metadata_key = buffer.cell((gutter + 2, 1)).unwrap();

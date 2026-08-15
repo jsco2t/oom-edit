@@ -21,4 +21,4 @@
 
   22  More text here.
 
- SELECT  Esc / Ctrl-C=cancel selection  y=yank selection             1:1  4% Top
+ SELECT  Esc / Ctrl-C=cancel selection  Space w=save             🅂 0 1:1  4% Top

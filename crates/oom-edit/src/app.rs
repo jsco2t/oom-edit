@@ -1983,6 +1983,41 @@ mod tests {
         assert!(status_line(&mut app).contains("[spell off]"));
         app.active_tab = 1;
         assert!(!status_line(&mut app).contains("[spell off]"));
+        assert!(status_line(&mut app).contains("🅂 0 1:1"));
+    }
+
+    #[test]
+    fn status_ruler_tracks_active_spelling_issue_count_and_hides_it_when_disabled() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = test_app_with_spell_host(
+            EditorSession::from_text("known misspelledd\n"),
+            crate::spell_host::SpellHost::testing("known\n"),
+            true,
+        );
+        drain_app_spelling(&mut app);
+
+        let status_line = |app: &mut App| {
+            let mut terminal = Terminal::new(TestBackend::new(80, 6)).unwrap();
+            terminal.draw(|frame| app.render(frame)).unwrap();
+            (0..80)
+                .map(|column| {
+                    terminal
+                        .backend()
+                        .buffer()
+                        .cell((column, 5))
+                        .unwrap()
+                        .symbol()
+                })
+                .collect::<String>()
+        };
+
+        assert!(status_line(&mut app).contains("🅂 1 1:1"));
+        app.tabs[0].session.set_spell_enabled(false);
+        let disabled = status_line(&mut app);
+        assert!(!disabled.contains('🅂'));
+        assert!(disabled.contains("[spell off]"));
     }
 
     #[test]

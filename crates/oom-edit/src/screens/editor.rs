@@ -244,7 +244,7 @@ pub fn render_status_row(
         cursor_line: cursor.0 + 1, // 1-based for display
         cursor_col: cursor.1 + 1,
         line_count: session.line_count(),
-        spell_enabled: session.spell_enabled(),
+        spell_issues: session.spell_enabled().then(|| session.diagnostics().len()),
         command_line: command_line.clone(),
     };
 
@@ -269,7 +269,7 @@ pub fn render_status_row(
             let mut flexible_width = area
                 .width
                 .saturating_sub(status_bar::STATUS_CONTENT_OFFSET)
-                .saturating_sub(status_bar::RULER_COLS);
+                .saturating_sub(status_text.ruler_width);
             if !indicators.is_empty() {
                 flexible_width = flexible_width
                     .saturating_sub(indicators.len() as u16)
@@ -541,7 +541,8 @@ mod tests {
         let terminal = render_session_status(&session, 70);
         let row = buffer_row(&terminal, 0, 70);
         let middle_start = status_bar::STATUS_CONTENT_OFFSET as usize;
-        let middle_end = 70 - status_bar::RULER_COLS as usize;
+        let spell_width = ratatui::text::Line::from("🅂 0 ").width();
+        let middle_end = 70 - status_bar::RULER_COLS as usize - spell_width;
         let middle = &row[middle_start..middle_end];
 
         assert_eq!(middle.trim_end(), "v=character-wise selection");

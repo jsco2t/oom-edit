@@ -4,9 +4,10 @@
 //! `StatusBarText`; `render()` maps it to ratatui widgets.
 //!
 //! Layout: `[badge Length(MODE_BADGE_COLS), gap Length(MODE_BADGE_GAP_COLS),
-//! middle Min(0), ruler Length(RULER_COLS)]`. Command and rendered-search prompts
-//! use the middle plus ruler region while the badge and gap remain fixed at the
-//! left edge.
+//! middle Min(0), ruler Length(dynamic)]`. The ruler reserves [`RULER_COLS`]
+//! columns for source position plus the exact display width of the optional
+//! spelling-issue indicator. Command and rendered-search prompts use the middle
+//! plus ruler region while the badge and gap remain fixed at the left edge.
 //!
 //! FR-6.2, FR-6.4.
 
@@ -27,7 +28,7 @@ use crate::theme::{Theme, Tier, UiSlot};
 /// Status bar transient message TTL: 4 seconds.
 pub const TRANSIENT_TTL: Duration = Duration::from_secs(4);
 
-/// Ruler column width: `line:col  n%` — max ~22 chars for large files.
+/// Base ruler column width: `line:col  n%` — max ~22 chars for large files.
 pub const RULER_COLS: u16 = 22;
 
 /// Fixed mode-badge width, sized for the longest public mode label.
@@ -85,8 +86,8 @@ pub struct StatusBar {
     pub cursor_col: usize,
     /// Total line count (for percentage calculation).
     pub line_count: usize,
-    /// Whether spell checking is enabled for the active session.
-    pub spell_enabled: bool,
+    /// Current spelling-issue count, or `None` when spell checking is disabled.
+    pub spell_issues: Option<usize>,
     /// Command-line text (when Command or rendered search is active).
     pub command_line: Option<String>,
 }
@@ -100,6 +101,8 @@ pub struct StatusBarText {
     pub content: Vec<Span<'static>>,
     /// Ruler text for the fixed right region.
     pub ruler: Span<'static>,
+    /// Display width reserved for the right-pinned ruler.
+    pub ruler_width: u16,
     /// Active command or rendered-search prompt, including its prefix.
     pub prompt: Option<String>,
     /// Whether the cursor should be visible at the end of the prompt.
@@ -129,7 +132,7 @@ impl StatusBar {
             left.push_str(" [+]");
         }
 
-        if !self.spell_enabled {
+        if self.spell_issues.is_none() {
             left.push_str(" [spell off]");
         }
 
@@ -145,8 +148,18 @@ impl StatusBar {
             .then(|| Span::raw(left))
             .into_iter()
             .collect();
+        let spell_indicator = self
+            .spell_issues
+            .map(|issues| format!("🅂 {issues} "))
+            .unwrap_or_default();
+        let ruler_width = RULER_COLS.saturating_add(
+            u16::try_from(Line::from(spell_indicator.as_str()).width()).unwrap_or(u16::MAX),
+        );
         let ruler = Span::styled(
-            ruler_text(self.cursor_line, self.cursor_col, self.line_count),
+            format!(
+                "{spell_indicator}{}",
+                ruler_text(self.cursor_line, self.cursor_col, self.line_count)
+            ),
             Style::default().add_modifier(ratatui::style::Modifier::DIM),
         );
 
@@ -154,6 +167,7 @@ impl StatusBar {
             badge,
             content,
             ruler,
+            ruler_width,
             prompt: self.command_line.clone(),
             prompt_cursor: self.command_line.is_some(),
         }
@@ -211,7 +225,7 @@ pub fn render(
     }
 
     let ruler_width = if show_ruler {
-        RULER_COLS.min(flexible_width)
+        text.ruler_width.min(flexible_width)
     } else {
         0
     };
@@ -397,7 +411,7 @@ mod tests {
             cursor_line: 1,
             cursor_col: 1,
             line_count: 10,
-            spell_enabled: true,
+            spell_issues: Some(0),
             command_line: None,
         }
     }
@@ -424,7 +438,7 @@ mod tests {
     #[test]
     fn disabled_spell_marker_is_active_session_content() {
         let mut bar = status(Mode::Normal);
-        bar.spell_enabled = false;
+        bar.spell_issues = None;
         let text = bar.build(None, &DEFAULT_DARK, Tier::TrueColor);
         let content = text
             .content
@@ -433,9 +447,60 @@ mod tests {
             .collect::<String>();
         assert_eq!(content, "test.md [spell off]");
 
-        bar.spell_enabled = true;
+        bar.spell_issues = Some(0);
         let text = bar.build(None, &DEFAULT_DARK, Tier::TrueColor);
         assert!(!text.content[0].content.contains("spell off"));
+    }
+
+    #[test]
+    fn spelling_issue_count_is_right_pinned_and_hidden_when_disabled() {
+        let mut bar = status(Mode::Normal);
+        bar.spell_issues = Some(12);
+        let text = bar.build(None, &DEFAULT_DARK, Tier::TrueColor);
+        assert_eq!(text.ruler.content.as_ref(), "🅂 12 1:1  10% Top");
+        assert_eq!(
+            text.ruler_width,
+            RULER_COLS + Line::from("🅂 12 ").width() as u16
+        );
+
+        bar.spell_issues = None;
+        let text = bar.build(None, &DEFAULT_DARK, Tier::TrueColor);
+        assert_eq!(text.ruler.content.as_ref(), "1:1  10% Top");
+        assert_eq!(text.ruler_width, RULER_COLS);
+    }
+
+    #[test]
+    fn spelling_issue_indicator_renders_at_the_right_edge_with_one_separator_space() {
+        let mut bar = status(Mode::Normal);
+        bar.spell_issues = Some(12);
+        let text = bar.build(None, &DEFAULT_DARK, Tier::TrueColor);
+        let mut terminal = Terminal::new(TestBackend::new(60, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    frame.area(),
+                    &text,
+                    "Space h=help",
+                    true,
+                    &DEFAULT_DARK,
+                    Tier::TrueColor,
+                );
+            })
+            .unwrap();
+
+        let row = (0..60)
+            .map(|column| {
+                terminal
+                    .backend()
+                    .buffer()
+                    .cell((column, 0))
+                    .unwrap()
+                    .symbol()
+            })
+            .collect::<String>();
+        assert!(row.ends_with("🅂 12 1:1  10% Top"), "{row:?}");
+        assert!(!row.contains("🅂 12  1:1"), "{row:?}");
     }
 
     #[test]

@@ -62,6 +62,8 @@ pub enum UiSlot {
     GutterCurrent,
     /// Full-width cursor-line chrome in the source editor.
     CursorLine,
+    /// Active rendered Normal-mode cursor cell; preserves semantic foregrounds.
+    NormalCursor,
     /// Renderer-owned surface behind fenced-code rows.
     CodeFence,
     /// Renderer-owned surface behind YAML/TOML metadata rows.
@@ -878,6 +880,12 @@ pub static DEFAULT_DARK: Theme = Theme {
                 Modifier::DIM,
             ),
             (
+                UiSlot::NormalCursor,
+                Color::Reset,
+                Some(Color::Rgb(68, 75, 90)),
+                Modifier::BOLD,
+            ),
+            (
                 UiSlot::CodeFence,
                 Color::Reset,
                 Some(Color::Rgb(44, 48, 56)),
@@ -1002,6 +1010,12 @@ pub static DEFAULT_DARK: Theme = Theme {
                 Modifier::DIM,
             ),
             (
+                UiSlot::NormalCursor,
+                Color::Reset,
+                Some(Color::Gray),
+                Modifier::BOLD,
+            ),
+            (
                 UiSlot::CodeFence,
                 Color::Reset,
                 Some(Color::DarkGray),
@@ -1071,6 +1085,7 @@ pub static DEFAULT_DARK: Theme = Theme {
             (UiSlot::Gutter, Modifier::DIM),
             (UiSlot::GutterCurrent, Modifier::BOLD),
             (UiSlot::CursorLine, Modifier::UNDERLINED),
+            (UiSlot::NormalCursor, Modifier::BOLD),
             (UiSlot::CodeFence, Modifier::empty()),
             (UiSlot::TabActive, Modifier::BOLD),
             (UiSlot::TabInactive, Modifier::DIM),
@@ -1171,6 +1186,12 @@ pub static DEFAULT_LIGHT: Theme = Theme {
                 Color::Reset,
                 Some(Color::Gray),
                 Modifier::DIM,
+            ),
+            (
+                UiSlot::NormalCursor,
+                Color::Reset,
+                Some(Color::Rgb(112, 112, 112)),
+                Modifier::BOLD,
             ),
             (
                 UiSlot::CodeFence,
@@ -1278,6 +1299,12 @@ pub static DEFAULT_LIGHT: Theme = Theme {
                 Modifier::DIM,
             ),
             (
+                UiSlot::NormalCursor,
+                Color::Reset,
+                Some(Color::DarkGray),
+                Modifier::BOLD,
+            ),
+            (
                 UiSlot::CodeFence,
                 Color::Reset,
                 Some(Color::Gray),
@@ -1347,6 +1374,7 @@ pub static DEFAULT_LIGHT: Theme = Theme {
             (UiSlot::Gutter, Modifier::DIM),
             (UiSlot::GutterCurrent, Modifier::BOLD),
             (UiSlot::CursorLine, Modifier::UNDERLINED),
+            (UiSlot::NormalCursor, Modifier::BOLD),
             (UiSlot::CodeFence, Modifier::empty()),
             (UiSlot::TabActive, Modifier::BOLD),
             (UiSlot::TabInactive, Modifier::DIM),
@@ -1413,6 +1441,7 @@ pub static ACCESSIBLE: Theme = Theme {
             (UiSlot::Gutter, Modifier::DIM),
             (UiSlot::GutterCurrent, Modifier::BOLD),
             (UiSlot::CursorLine, Modifier::UNDERLINED),
+            (UiSlot::NormalCursor, Modifier::BOLD),
             (UiSlot::CodeFence, Modifier::empty()),
             (UiSlot::TabActive, Modifier::BOLD),
             (UiSlot::TabInactive, Modifier::DIM),
@@ -1473,6 +1502,7 @@ pub static ACCESSIBLE: Theme = Theme {
             (UiSlot::Gutter, Modifier::DIM),
             (UiSlot::GutterCurrent, Modifier::BOLD),
             (UiSlot::CursorLine, Modifier::UNDERLINED),
+            (UiSlot::NormalCursor, Modifier::BOLD),
             (UiSlot::CodeFence, Modifier::empty()),
             (UiSlot::TabActive, Modifier::BOLD),
             (UiSlot::TabInactive, Modifier::DIM),
@@ -1533,6 +1563,7 @@ pub static ACCESSIBLE: Theme = Theme {
             (UiSlot::Gutter, Modifier::DIM),
             (UiSlot::GutterCurrent, Modifier::BOLD),
             (UiSlot::CursorLine, Modifier::UNDERLINED),
+            (UiSlot::NormalCursor, Modifier::BOLD),
             (UiSlot::CodeFence, Modifier::empty()),
             (UiSlot::TabActive, Modifier::BOLD),
             (UiSlot::TabInactive, Modifier::DIM),
@@ -1679,6 +1710,63 @@ mod tests {
         }
     }
 
+    #[test]
+    fn normal_cursor_preserves_foreground_and_contrasts_with_its_line() {
+        for theme in [&DEFAULT_DARK, &DEFAULT_LIGHT] {
+            for tier in [Tier::TrueColor, Tier::Color16] {
+                let line = theme.ui_style(tier, UiSlot::CursorLine);
+                let cursor = theme.ui_style(tier, UiSlot::NormalCursor);
+                assert_eq!(cursor.fg, None, "{} {tier:?}", theme.name);
+                assert_ne!(cursor.bg, line.bg, "{} {tier:?}", theme.name);
+                assert!(cursor.add_modifier.contains(Modifier::BOLD));
+            }
+        }
+
+        assert_eq!(
+            DEFAULT_DARK
+                .ui_style(Tier::TrueColor, UiSlot::NormalCursor)
+                .bg,
+            Some(Color::Rgb(68, 75, 90))
+        );
+        assert_eq!(
+            DEFAULT_DARK
+                .ui_style(Tier::Color16, UiSlot::NormalCursor)
+                .bg,
+            Some(Color::Gray)
+        );
+        assert_eq!(
+            DEFAULT_LIGHT
+                .ui_style(Tier::TrueColor, UiSlot::NormalCursor)
+                .bg,
+            Some(Color::Rgb(112, 112, 112))
+        );
+
+        let Some(Color::Rgb(line_r, line_g, line_b)) = DEFAULT_DARK
+            .ui_style(Tier::TrueColor, UiSlot::CursorLine)
+            .bg
+        else {
+            panic!("default-dark cursor line must use an RGB background");
+        };
+        let Some(Color::Rgb(cursor_r, cursor_g, cursor_b)) = DEFAULT_DARK
+            .ui_style(Tier::TrueColor, UiSlot::NormalCursor)
+            .bg
+        else {
+            panic!("default-dark Normal cursor must use an RGB background");
+        };
+        let line_luminance =
+            (299 * usize::from(line_r) + 587 * usize::from(line_g) + 114 * usize::from(line_b))
+                / 1000;
+        let cursor_luminance = (299 * usize::from(cursor_r)
+            + 587 * usize::from(cursor_g)
+            + 114 * usize::from(cursor_b))
+            / 1000;
+        assert!(
+            cursor_luminance >= line_luminance + 18,
+            "default-dark Normal cursor must remain visibly lighter than its row: \
+             cursor={cursor_luminance}, row={line_luminance}"
+        );
+    }
+
     /// Search matches must remain visible when foreground colors are absent.
     #[test]
     fn search_match_carries_underline() {
@@ -1745,6 +1833,7 @@ mod tests {
             UiSlot::Gutter,
             UiSlot::GutterCurrent,
             UiSlot::CursorLine,
+            UiSlot::NormalCursor,
             UiSlot::CodeFence,
             UiSlot::TabActive,
             UiSlot::TabInactive,
@@ -2521,6 +2610,12 @@ mod tests {
                 Modifier::DIM,
             ),
             (
+                UiSlot::NormalCursor,
+                None,
+                Some(Color::Rgb(68, 75, 90)),
+                Modifier::BOLD,
+            ),
+            (
                 UiSlot::CodeFence,
                 None,
                 Some(Color::Rgb(44, 48, 56)),
@@ -2655,7 +2750,10 @@ mod tests {
         for (slot, foreground, background, _) in *ui {
             if matches!(
                 slot,
-                UiSlot::CursorLine | UiSlot::CodeFence | UiSlot::MetadataPanel
+                UiSlot::CursorLine
+                    | UiSlot::NormalCursor
+                    | UiSlot::CodeFence
+                    | UiSlot::MetadataPanel
             ) {
                 assert_eq!(
                     *foreground,
@@ -2713,6 +2811,7 @@ mod tests {
             UiSlot::Gutter,
             UiSlot::GutterCurrent,
             UiSlot::CursorLine,
+            UiSlot::NormalCursor,
             UiSlot::CodeFence,
             UiSlot::TabActive,
             UiSlot::TabInactive,
@@ -2964,6 +3063,7 @@ mod tests {
     fn chrome_slots_retain_non_color_modifiers() {
         let slots = [
             UiSlot::CursorLine,
+            UiSlot::NormalCursor,
             UiSlot::TabActive,
             UiSlot::TabInactive,
             UiSlot::MetadataPanel,

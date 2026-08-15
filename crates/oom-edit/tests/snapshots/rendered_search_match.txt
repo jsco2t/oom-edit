@@ -21,4 +21,4 @@
 
       ─ links ─
       [0] https://example.com
- NORMAL  v=character-wise selection  Space w=save                      20:1  86%
+ NORMAL  v=character-wise selection  Space w=save                  🅂 0 20:1  86%

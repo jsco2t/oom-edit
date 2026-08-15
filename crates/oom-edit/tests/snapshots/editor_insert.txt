@@ -21,4 +21,4 @@
   20  Another heading.
   21
   22  More text here.
- INSERT  (new)                                                       1:1  4% Top
+ INSERT  (new)                                                   🅂 0 1:1  4% Top
