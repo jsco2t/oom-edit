@@ -29,7 +29,7 @@ use crate::config::ConfigStore;
 use crate::lifecycle::{
     CloseTabRequest, DirtyClosePolicy, LifecycleAction, SaveContinuation, SaveRequest,
 };
-use crate::overlay::{Overlay, SpellSuggestAction};
+use crate::overlay::{Overlay, SpellSuggestAction, TroubleAction, TroubleEntry, TroubleProgress};
 use crate::screens::editor::{render_editor, render_status_row, source_text_width, EditorViewport};
 use crate::screens::rendered::render_rendered;
 use crate::spell_host::SpellHost;
@@ -332,23 +332,24 @@ impl App {
             .tabs
             .get(self.active_tab)
             .is_some_and(|entry| entry.session.spell_enabled());
-        if !enabled {
-            return false;
-        }
-        if self.spell_host.engine().is_none() {
+        let worked = if !enabled {
+            false
+        } else if self.spell_host.engine().is_none() {
             let worked = self.spell_host.advance(true, max_bytes);
             if let Some(message) = self.spell_host.take_unavailable_warning() {
                 self.set_transient(message, oom_edit_core::Severity::Warning);
             }
-            return worked;
-        }
-
-        let Some(engine) = self.spell_host.engine() else {
-            return false;
+            worked
+        } else {
+            let Some(engine) = self.spell_host.engine() else {
+                return false;
+            };
+            self.tabs
+                .get_mut(self.active_tab)
+                .is_some_and(|entry| entry.session.spell_tick(engine, max_bytes))
         };
-        self.tabs
-            .get_mut(self.active_tab)
-            .is_some_and(|entry| entry.session.spell_tick(engine, max_bytes))
+        self.refresh_trouble_snapshot();
+        worked
     }
 
     #[cfg(test)]
@@ -636,7 +637,9 @@ impl App {
 
         // Suggestion input is fully modal. Resize remains a presentation
         // event, but paste and mouse input cannot reach the document beneath.
-        if self.overlay.is_spell_suggest() && matches!(event, Event::Paste(_) | Event::Mouse(_)) {
+        if (self.overlay.is_spell_suggest() || self.overlay.is_trouble())
+            && matches!(event, Event::Paste(_) | Event::Mouse(_))
+        {
             return;
         }
 
@@ -696,6 +699,13 @@ impl App {
         // returns semantic requests; App performs session/host mutations.
         if let Some(action) = self.overlay.handle_spell_suggest_key(&key_input) {
             self.execute_spell_suggest_action(action);
+            return;
+        }
+
+        // Trouble is equally modal: App revalidates requested jumps, while
+        // every other key remains owned by its presentation state.
+        if let Some(action) = self.overlay.handle_trouble_key(&key_input) {
+            self.execute_trouble_action(action);
             return;
         }
 
@@ -957,6 +967,101 @@ impl App {
                     oom_edit_core::Severity::Info,
                 );
             }
+            AppCommand::Trouble => self.open_trouble(),
+        }
+    }
+
+    fn trouble_snapshot(&self) -> (Vec<TroubleEntry>, TroubleProgress) {
+        let entries = self
+            .session()
+            .map(|session| {
+                session
+                    .diagnostics()
+                    .iter()
+                    .filter_map(|diagnostic| {
+                        session
+                            .position_for_offset(diagnostic.range.start)
+                            .map(|position| TroubleEntry::new(diagnostic.clone(), position))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let progress = if !self.session().is_some_and(EditorSession::spell_enabled) {
+            TroubleProgress::Complete
+        } else if let Some(reason) = self.spell_host.unavailable_reason() {
+            TroubleProgress::Unavailable(reason.to_string())
+        } else if self.spell_host.engine().is_none()
+            || self
+                .session()
+                .is_some_and(EditorSession::diagnostics_pending)
+        {
+            TroubleProgress::Pending
+        } else {
+            TroubleProgress::Complete
+        };
+        (entries, progress)
+    }
+
+    fn open_trouble(&mut self) {
+        let (entries, progress) = self.trouble_snapshot();
+        self.overlay = Overlay::open_trouble(entries, progress);
+        self.pending_input = PendingAppInput::Idle;
+    }
+
+    fn refresh_trouble_snapshot(&mut self) {
+        if !self.overlay.is_trouble() {
+            return;
+        }
+        let (entries, progress) = self.trouble_snapshot();
+        self.overlay.refresh_trouble(entries, progress);
+    }
+
+    fn execute_trouble_action(&mut self, action: TroubleAction) {
+        match action {
+            TroubleAction::StayOpen => {}
+            TroubleAction::Close => {
+                self.overlay.close();
+                self.pending_input = PendingAppInput::Idle;
+            }
+            TroubleAction::Jump(diagnostic) => self.jump_to_trouble_diagnostic(&diagnostic),
+        }
+    }
+
+    fn jump_to_trouble_diagnostic(&mut self, diagnostic: &oom_edit_core::Diagnostic) {
+        let current = self.session().is_some_and(|session| {
+            session
+                .diagnostics()
+                .iter()
+                .any(|candidate| candidate == diagnostic)
+                && session.text_for_range(diagnostic.range.clone()).as_deref()
+                    == Some(diagnostic.source_text.as_str())
+        });
+        if !current {
+            self.overlay
+                .mark_trouble_stale("selected diagnostic is stale; jump cancelled");
+            return;
+        }
+
+        let result = self
+            .tabs
+            .get_mut(self.active_tab)
+            .map(|entry| entry.session.jump_to_offset(diagnostic.range.start));
+        match result {
+            Some(Ok(effects)) => {
+                for effect in effects {
+                    self.handle_effect(effect);
+                }
+                self.overlay.close();
+                self.pending_input = PendingAppInput::Idle;
+                self.pending_scroll_follow = true;
+            }
+            Some(Err(error)) => self
+                .overlay
+                .mark_trouble_stale(format!("selected diagnostic is stale: {error}")),
+            None => self
+                .overlay
+                .mark_trouble_stale("selected diagnostic is stale; jump cancelled"),
         }
     }
 
@@ -2226,6 +2331,229 @@ mod tests {
                 .as_ref()
                 .map(|message| message.text.as_str()),
             Some("no spelling diagnostic under cursor")
+        );
+    }
+
+    #[test]
+    fn space_d_opens_for_pending_complete_and_unavailable_diagnostics() {
+        let mut pending = test_app_with_spell_host(
+            EditorSession::from_text("teh\n"),
+            crate::spell_host::SpellHost::testing("the\n"),
+            true,
+        );
+        press_space_command(&mut pending, 'd');
+        let Overlay::Trouble(state) = &pending.overlay else {
+            panic!("Space d must open Trouble while dictionaries are pending");
+        };
+        assert_eq!(state.progress(), &TroubleProgress::Pending);
+        assert!(state.entries().is_empty());
+
+        let mut complete = test_app_with_spell_host(
+            EditorSession::from_text("teh known\n"),
+            crate::spell_host::SpellHost::testing("known\n"),
+            true,
+        );
+        drain_app_spelling(&mut complete);
+        press_space_command(&mut complete, 'd');
+        let Overlay::Trouble(state) = &complete.overlay else {
+            panic!("Space d must open completed Trouble results");
+        };
+        assert_eq!(state.progress(), &TroubleProgress::Complete);
+        assert_eq!(state.entries().len(), 1);
+
+        let mut unavailable = test_app_with_spell_host(
+            EditorSession::from_text("teh\n"),
+            crate::spell_host::SpellHost::testing_unavailable("configured list failed"),
+            true,
+        );
+        press_space_command(&mut unavailable, 'd');
+        let Overlay::Trouble(state) = &unavailable.overlay else {
+            panic!("Space d must open unavailable Trouble state");
+        };
+        assert_eq!(
+            state.progress(),
+            &TroubleProgress::Unavailable("configured list failed".to_string())
+        );
+
+        let mut disabled = test_app_with_spell_default(EditorSession::from_text("teh\n"), false);
+        press_space_command(&mut disabled, 'd');
+        let Overlay::Trouble(state) = &disabled.overlay else {
+            panic!("Space d must open a terminal empty state while spelling is disabled");
+        };
+        assert_eq!(state.progress(), &TroubleProgress::Complete);
+        assert!(state.entries().is_empty());
+        assert!(!disabled.on_idle_unit(crate::event::SPELL_WORK_UNIT_BYTES));
+        assert_eq!(disabled.spell_host_phase(), "Unbuilt");
+    }
+
+    #[test]
+    fn trouble_refreshes_after_idle_and_modal_input_is_exclusive() {
+        let document = "teh known\n";
+        let mut app = test_app_with_spell_host(
+            EditorSession::from_text(document),
+            crate::spell_host::SpellHost::testing("known\n"),
+            true,
+        );
+        press_space_command(&mut app, 'd');
+
+        drain_app_spelling(&mut app);
+        let Overlay::Trouble(state) = &app.overlay else {
+            panic!("Trouble must remain open while idle results refresh");
+        };
+        assert_eq!(state.progress(), &TroubleProgress::Complete);
+        assert_eq!(state.entries().len(), 1);
+
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('i'),
+            KeyModifiers::NONE,
+        )));
+        app.handle_event(&Event::Paste("background edit".to_string()));
+        let rendered_top = app.tabs[0].rendered_top;
+        app.handle_event(&Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert!(matches!(app.overlay, Overlay::Trouble(_)));
+        assert_eq!(app.session().unwrap().mode(), Mode::Normal);
+        assert_eq!(app.session().unwrap().document(), document);
+        assert_eq!(app.tabs[0].rendered_top, rendered_top);
+    }
+
+    #[test]
+    fn trouble_enter_atomically_jumps_cursor_ruler_and_wrapped_viewport_then_closes() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let document = format!(
+            "é {}teh\n{}wrng\n",
+            "known ".repeat(12),
+            "known\n".repeat(10)
+        );
+        let mut app = test_app_with_spell_host(
+            EditorSession::from_text(&document),
+            crate::spell_host::SpellHost::testing("known\n"),
+            true,
+        );
+        drain_app_spelling(&mut app);
+
+        let target = app.session().unwrap().diagnostics()[1].clone();
+        let expected = app
+            .session()
+            .unwrap()
+            .position_for_offset(target.range.start)
+            .unwrap();
+
+        let mut terminal = Terminal::new(TestBackend::new(24, 6)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        press_space_command(&mut app, 'd');
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('j'),
+            KeyModifiers::NONE,
+        )));
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+
+        assert!(matches!(app.overlay, Overlay::None));
+        assert_eq!(
+            app.session().unwrap().cursor(),
+            (expected.line, expected.column)
+        );
+        let rendered = app.session().unwrap().rendered_cursor();
+        assert!(rendered.row > 1, "the first long line must wrap");
+        assert!(
+            app.session().unwrap().rendered_layout().unwrap().lines[rendered.row]
+                .atoms
+                .iter()
+                .any(|atom| atom.columns.contains(&rendered.column)
+                    && atom
+                        .source
+                        .as_ref()
+                        .is_some_and(|source| source.contains(&target.range.start)))
+        );
+        assert!(app.pending_scroll_follow);
+
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        assert!(
+            app.tabs[0].rendered_top > 0,
+            "jump must follow the viewport"
+        );
+        assert!(
+            app.tabs[0].rendered_top <= rendered.row
+                && rendered.row < app.tabs[0].rendered_top + app.viewport_height,
+            "jumped row must be inside the followed viewport"
+        );
+        let status_line = (0..24)
+            .map(|column| {
+                terminal
+                    .backend()
+                    .buffer()
+                    .cell((column, 5))
+                    .unwrap()
+                    .symbol()
+            })
+            .collect::<String>();
+        assert!(
+            status_line.contains(&format!("{}:{}", expected.line + 1, expected.column + 1)),
+            "ruler must use the canonical jumped position: {status_line:?}"
+        );
+    }
+
+    #[test]
+    fn stale_trouble_row_warns_and_closes_only_after_a_successful_jump() {
+        let mut app = test_app_with_spell_host(
+            EditorSession::from_text("teh\n"),
+            crate::spell_host::SpellHost::testing("the\n"),
+            true,
+        );
+        drain_app_spelling(&mut app);
+        press_space_command(&mut app, 'd');
+
+        let entry = app.tabs.get_mut(0).unwrap();
+        for kind in [
+            KeyCodeKind::Char('i'),
+            KeyCodeKind::Char('x'),
+            KeyCodeKind::Esc,
+        ] {
+            entry.session.handle_key(KeyInput {
+                code: KeyCode { kind },
+                mods: Modifiers::default(),
+            });
+        }
+
+        app.tabs[0].session.render_layout(74);
+        app.pending_scroll_follow = false;
+        let before = (
+            app.session().unwrap().cursor(),
+            app.session().unwrap().rendered_cursor(),
+            app.tabs[0].rendered_top,
+            app.pending_scroll_follow,
+        );
+
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        let Overlay::Trouble(state) = &app.overlay else {
+            panic!("a stale jump must keep Trouble open");
+        };
+        assert_eq!(
+            state.warning(),
+            Some("selected diagnostic is stale; jump cancelled")
+        );
+        assert_eq!(app.session().unwrap().document(), "xteh\n");
+        assert_eq!(
+            (
+                app.session().unwrap().cursor(),
+                app.session().unwrap().rendered_cursor(),
+                app.tabs[0].rendered_top,
+                app.pending_scroll_follow,
+            ),
+            before,
+            "a stale Trouble row must not move either cursor or the viewport"
         );
     }
 

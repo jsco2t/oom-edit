@@ -414,6 +414,45 @@ fn exact_range_and_unicode_scalar_position_contracts() {
 }
 
 #[test]
+fn jump_to_multibyte_offset_keeps_canonical_and_wrapped_rendered_cursors_atomic() {
+    let text = format!("é {}wrng tail", "known ".repeat(12));
+    let target = text.find("wrng").unwrap();
+    let expected_column = text[..target].chars().count();
+    assert_ne!(
+        target, expected_column,
+        "fixture must distinguish bytes from scalars"
+    );
+    let mut session = EditorSession::from_text(&text);
+    session.render_layout(10);
+
+    let effects = session.jump_to_offset(target).unwrap();
+    let expected = session.position_for_offset(target).unwrap();
+    assert_eq!(
+        expected,
+        TextPosition {
+            line: 0,
+            column: expected_column
+        }
+    );
+    assert_eq!(session.cursor(), (expected.line, expected.column));
+    assert_eq!(effects, vec![Effect::CursorMoved]);
+
+    let rendered = session.rendered_cursor();
+    assert!(
+        rendered.row > 0,
+        "the target must wrap below its multibyte source line's first visual row"
+    );
+    let layout = session.rendered_layout().unwrap();
+    assert!(layout.lines[rendered.row].atoms.iter().any(|atom| {
+        atom.columns.contains(&rendered.column)
+            && atom
+                .source
+                .as_ref()
+                .is_some_and(|source| source.contains(&target))
+    }));
+}
+
+#[test]
 fn diagnostic_cursor_lookup_and_wrapping_navigation_are_half_open() {
     let engine = engine("good\n");
     let mut session = EditorSession::from_text("bad good wrng nope");

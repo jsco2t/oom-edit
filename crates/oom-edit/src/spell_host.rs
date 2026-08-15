@@ -681,6 +681,13 @@ impl SpellHost {
         }
     }
 
+    pub(crate) fn unavailable_reason(&self) -> Option<&str> {
+        match self {
+            Self::Unavailable { reason, .. } => Some(reason),
+            _ => None,
+        }
+    }
+
     #[cfg(test)]
     fn phase(&self) -> HostPhase {
         match self {

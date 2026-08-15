@@ -153,3 +153,29 @@ fn make_build_release_builds_only_the_locked_offline_binary() {
         "build-release should build only the release binary with locked offline dependencies"
     );
 }
+
+#[test]
+fn tui_never_substitutes_rendered_remap_for_a_canonical_jump() {
+    let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut pending = vec![source_root];
+    let mut offenders = Vec::new();
+
+    while let Some(path) = pending.pop() {
+        for entry in std::fs::read_dir(&path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+                let source = std::fs::read_to_string(&path).unwrap();
+                if source.contains(".remap_rendered_cursor(") {
+                    offenders.push(path);
+                }
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "TUI jumps must call EditorSession::jump_to_offset, not remap only: {offenders:?}"
+    );
+}

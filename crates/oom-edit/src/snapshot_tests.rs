@@ -123,6 +123,34 @@ fn empty_spell_suggest_overlay() -> crate::overlay::Overlay {
     )
 }
 
+fn trouble_overlay() -> crate::overlay::Overlay {
+    crate::overlay::Overlay::open_trouble(
+        vec![
+            crate::overlay::TroubleEntry::new(
+                oom_edit_core::Diagnostic {
+                    provider: oom_edit_core::DiagnosticProvider::Spell,
+                    severity: oom_edit_core::DiagnosticSeverity::Warning,
+                    range: 0..3,
+                    source_text: "teh".to_string(),
+                    message: "Unknown word: teh".to_string(),
+                },
+                oom_edit_core::TextPosition { line: 0, column: 0 },
+            ),
+            crate::overlay::TroubleEntry::new(
+                oom_edit_core::Diagnostic {
+                    provider: oom_edit_core::DiagnosticProvider::Spell,
+                    severity: oom_edit_core::DiagnosticSeverity::Info,
+                    range: 20..24,
+                    source_text: "wierd".to_string(),
+                    message: "Review unusual spelling".to_string(),
+                },
+                oom_edit_core::TextPosition { line: 3, column: 6 },
+            ),
+        ],
+        crate::overlay::TroubleProgress::Pending,
+    )
+}
+
 fn test_app_with_relative_line_numbers(text: &str, relative_line_numbers: bool) -> App {
     let mut session = EditorSession::from_text(text);
     session.render_layout(74);
@@ -799,6 +827,59 @@ fn empty_spell_suggest_renders_exact_empty_state_without_selection() {
     assert!(!rendered.contains('▸'));
 }
 
+/// Trouble overlay — provider-neutral rows, one-based positions, and pending footer.
+#[test]
+fn golden_trouble() {
+    let mut app = test_app(kitchen_sink());
+    app.set_overlay(trouble_overlay());
+    let lines = render_app_lines(80, 24, |frame| {
+        app.render(frame);
+    });
+    assert_snapshot(&lines, "trouble");
+}
+
+#[test]
+fn trouble_rows_pin_selection_severity_provider_and_one_based_position() {
+    use ratatui::backend::TestBackend;
+
+    let overlay = trouble_overlay();
+    let theme = get_theme("default-dark");
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| overlay.render(frame, theme, Tier::TrueColor))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+
+    let (marker_x, marker_y) = find_buffer_token(buffer, 80, 24, "▸");
+    assert!(buffer
+        .cell((marker_x, marker_y))
+        .unwrap()
+        .modifier
+        .contains(Modifier::REVERSED));
+    let (warning_x, warning_y) = find_buffer_token(buffer, 80, 24, "warning");
+    let warning_cell = buffer.cell((warning_x, warning_y)).unwrap();
+    assert_eq!(
+        warning_cell.fg,
+        theme
+            .ui_style(Tier::TrueColor, UiSlot::StatusWarning)
+            .fg
+            .unwrap()
+    );
+    assert!(warning_cell.modifier.contains(Modifier::REVERSED));
+
+    let rendered = (0..24)
+        .map(|row| {
+            (0..80)
+                .map(|column| buffer.cell((column, row)).unwrap().symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("1:1 warning [spell] Unknown word: teh"));
+    assert!(rendered.contains("4:7 info    [spell] Review unusual spelling"));
+    assert!(rendered.contains("… checking diagnostics"));
+}
+
 /// Confirm quit overlay — dirty buffer.
 #[test]
 fn golden_confirm_quit() {
@@ -1298,16 +1379,18 @@ fn drift_overlay_hints_nonempty() {
         Overlay::None,
         Overlay::open_palette(Contexts::NORMAL),
         spell_suggest_overlay(),
+        trouble_overlay(),
         confirm_quit_overlay(),
         confirm_overwrite_overlay(),
     ];
-    assert_eq!(overlays.len(), 5, "current Overlay variant list is stale");
+    assert_eq!(overlays.len(), 6, "current Overlay variant list is stale");
 
     for overlay in overlays {
         match &overlay {
             Overlay::None
             | Overlay::Palette(_)
             | Overlay::SpellSuggest(_)
+            | Overlay::Trouble(_)
             | Overlay::ConfirmQuit(_)
             | Overlay::ConfirmOverwrite(_) => {}
         }

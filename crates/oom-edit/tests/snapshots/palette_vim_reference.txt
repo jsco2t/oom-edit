@@ -3,10 +3,10 @@
    3  │ ┌ Command Palette ─────────────────────────────────────────────┐       │
    4  └─│>                                                             │───────┘
         │                                                              │
-   6  █ │  cycle-theme          cycle theme                    Space t │
-        │  spell-suggest        spelling suggestions           Space s │
-   8  So│  spell-add            add word to personal dictionary Space a│
-        │  spell-toggle         toggle spelling                Space z │
+   6  █ │  spell-suggest        spelling suggestions           Space s │
+        │  spell-add            add word to personal dictionary Space a│
+   8  So│  spell-toggle         toggle spelling                Space z │
+        │  trouble              document diagnostics           Space d │
   10  ┃ │  ]s                   next spelling diagnostic            SP-│
         │  [s                   previous spelling diagnostic        SP-│
       ▏ │  :set spell / :set nospell enable or disable spelling        │

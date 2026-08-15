@@ -21,6 +21,7 @@ pub enum RegistryEntryId {
     SpellSuggest,
     SpellAdd,
     SpellToggle,
+    Trouble,
     SpellNext,
     SpellPrevious,
     SpellSet,
@@ -43,6 +44,7 @@ pub enum AppCommand {
     SpellSuggest,
     SpellAdd,
     SpellToggle,
+    Trouble,
 }
 
 /// Binding ownership and finite dispatch role.
@@ -309,6 +311,17 @@ pub static COMMANDS: &[CommandSpec] = &[
         },
         None
     ),
+    row!(
+        Trouble,
+        "trouble",
+        "document diagnostics",
+        RENDERED,
+        BindingRole::AppChord {
+            continuation: 'd',
+            command: AppCommand::Trouble
+        },
+        None
+    ),
     conformance_row!(
         SpellNext,
         "spell-next",
@@ -458,7 +471,28 @@ mod tests {
             assert!(!spec.contexts.is_empty());
             assert!(!rendered_binding(spec).is_empty());
         }
-        assert_eq!(COMMANDS.len(), 28);
+        assert_eq!(COMMANDS.len(), 29);
+    }
+
+    #[test]
+    fn phase_eight_trouble_row_is_complete_and_app_owned() {
+        let trouble = COMMANDS
+            .iter()
+            .find(|spec| spec.name == "trouble")
+            .expect("Space d Trouble row must land with its executable behavior");
+
+        assert_eq!(trouble.desc, "document diagnostics");
+        assert_eq!(trouble.contexts, RENDERED);
+        assert_eq!(rendered_binding(trouble), "Space d");
+        assert_eq!(
+            trouble.binding,
+            BindingRole::AppChord {
+                continuation: 'd',
+                command: AppCommand::Trouble,
+            }
+        );
+        assert_eq!(trouble.conformance_id, None);
+        assert_eq!(trouble.quick_bar_order, None);
     }
 
     #[test]
@@ -705,6 +739,17 @@ mod tests {
                 BindingRole::AppChord {
                     continuation: 'z',
                     command: AppCommand::SpellToggle,
+                },
+                None,
+            ),
+            (
+                RegistryEntryId::Trouble,
+                "trouble",
+                "document diagnostics",
+                RENDERED,
+                BindingRole::AppChord {
+                    continuation: 'd',
+                    command: AppCommand::Trouble,
                 },
                 None,
             ),

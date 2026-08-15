@@ -9,6 +9,7 @@
 pub mod confirm;
 pub mod palette;
 pub mod spell_suggest;
+pub mod trouble;
 
 pub use confirm::{
     ConfirmOverwrite, ConfirmQuit, ConfirmationResolution, DirtyCloseChoice, ExternalSaveChoice,
@@ -16,6 +17,8 @@ pub use confirm::{
 pub use palette::PaletteState;
 pub(crate) use spell_suggest::SpellSuggestAction;
 pub use spell_suggest::SpellSuggestState;
+pub use trouble::TroubleState;
+pub(crate) use trouble::{TroubleAction, TroubleEntry, TroubleProgress};
 
 use crate::command::{AppCommand, Contexts};
 use crate::lifecycle::{CloseTabRequest, SaveRequest};
@@ -31,6 +34,8 @@ pub enum Overlay {
     Palette(PaletteState),
     /// Spelling suggestions for one cloned, revalidated diagnostic.
     SpellSuggest(SpellSuggestState),
+    /// Provider-neutral document diagnostics.
+    Trouble(TroubleState),
     /// Confirm quit overlay (T16).
     ConfirmQuit(ConfirmQuit),
     /// Confirm overwrite overlay (T16).
@@ -54,6 +59,11 @@ impl Overlay {
         matches!(self, Overlay::SpellSuggest(_))
     }
 
+    /// Is the provider-neutral diagnostics modal open?
+    pub(crate) fn is_trouble(&self) -> bool {
+        matches!(self, Overlay::Trouble(_))
+    }
+
     /// Open the command palette.
     #[allow(dead_code)]
     pub fn open_palette(context: Contexts) -> Self {
@@ -66,6 +76,11 @@ impl Overlay {
         suggestions: Vec<String>,
     ) -> Self {
         Overlay::SpellSuggest(SpellSuggestState::new(diagnostic, suggestions))
+    }
+
+    /// Open a provider-neutral diagnostics overlay from an App-owned snapshot.
+    pub(crate) fn open_trouble(entries: Vec<TroubleEntry>, progress: TroubleProgress) -> Self {
+        Overlay::Trouble(TroubleState::new(entries, progress))
     }
 
     /// Open the confirm-quit overlay.
@@ -88,6 +103,7 @@ impl Overlay {
         match self {
             Overlay::Palette(p) => p.handle_key(key),
             Overlay::SpellSuggest(_) => true,
+            Overlay::Trouble(_) => true,
             Overlay::ConfirmQuit(_) | Overlay::ConfirmOverwrite(_) => true,
             Overlay::None => false,
         }
@@ -98,6 +114,7 @@ impl Overlay {
         match self {
             Overlay::Palette(p) => p.render(frame, theme, tier),
             Overlay::SpellSuggest(s) => s.render(frame, theme, tier),
+            Overlay::Trouble(t) => t.render(frame, theme, tier),
             Overlay::ConfirmQuit(q) => q.render(frame),
             Overlay::ConfirmOverwrite(o) => o.render(frame),
             Overlay::None => {}
@@ -110,6 +127,7 @@ impl Overlay {
         match self {
             Overlay::Palette(p) => p.geometry(),
             Overlay::SpellSuggest(s) => s.geometry(),
+            Overlay::Trouble(t) => t.geometry(),
             Overlay::ConfirmQuit(q) => q.geometry(),
             Overlay::ConfirmOverwrite(o) => o.geometry(),
             Overlay::None => (0, 0),
@@ -121,6 +139,7 @@ impl Overlay {
         match self {
             Overlay::Palette(p) => p.hints(),
             Overlay::SpellSuggest(s) => s.hints(),
+            Overlay::Trouble(t) => t.hints(),
             Overlay::ConfirmQuit(_) => "y/w save+quit · n quit · Esc cancel",
             Overlay::ConfirmOverwrite(_) => "o overwrite · r reload · Esc cancel",
             Overlay::None => "",
@@ -152,6 +171,35 @@ impl Overlay {
         match self {
             Overlay::SpellSuggest(state) => Some(state.diagnostic().clone()),
             _ => None,
+        }
+    }
+
+    /// Handle Trouble input exclusively and return a semantic App action.
+    pub(crate) fn handle_trouble_key(
+        &mut self,
+        key: &oom_edit_core::KeyInput,
+    ) -> Option<TroubleAction> {
+        match self {
+            Overlay::Trouble(state) => Some(state.handle_key(key)),
+            _ => None,
+        }
+    }
+
+    /// Refresh an open Trouble modal from a new App-owned snapshot.
+    pub(crate) fn refresh_trouble(
+        &mut self,
+        entries: Vec<TroubleEntry>,
+        progress: TroubleProgress,
+    ) {
+        if let Overlay::Trouble(state) = self {
+            state.refresh(entries, progress);
+        }
+    }
+
+    /// Keep a failed stale jump visible in the modal.
+    pub(crate) fn mark_trouble_stale(&mut self, message: impl Into<String>) {
+        if let Overlay::Trouble(state) = self {
+            state.mark_stale(message);
         }
     }
 
