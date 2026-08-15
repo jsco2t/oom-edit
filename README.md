@@ -6,19 +6,10 @@ Markdown is rendered and navigable by default, with tree-sitter highlighting
 for source editing, YAML/TOML front matter, and fenced code blocks.
 
 The editing core ships as the reusable `oom-edit-core` crate — embeddable in
-other applications with zero terminal dependencies.  The `oom-edit` binary is
+other applications with zero terminal dependencies. The `oom-edit` binary is
 a thin ratatui shell over it.
 
 **License:** MIT.
-
-## Planning docs
-
-Engineering plans live outside this repo in the project notebook:
-
-- [Project index](https://github.com/earendil-works/notebook/tree/main/projects/oom-edit)
-- [Plan & specification](https://github.com/earendil-works/notebook/tree/main/projects/oom-edit/plan.md)
-- [Architecture](https://github.com/earendil-works/notebook/tree/main/projects/oom-edit/architecture.md)
-- [Task list](https://github.com/earendil-works/notebook/tree/main/projects/oom-edit/tasks/index.md)
 
 ## Quickstart
 
@@ -59,11 +50,11 @@ rows; `z` collapses or expands it.
 
 Select follows Vim's three shapes:
 
-| Key | Shape |
-| --- | --- |
-| `v` | Character-wise, inclusive source-backed atoms |
-| `V` | Complete physical source lines |
-| `Ctrl-V` | Display-column block rectangle |
+| Key      | Shape                                         |
+| -------- | --------------------------------------------- |
+| `v`      | Character-wise, inclusive source-backed atoms |
+| `V`      | Complete physical source lines                |
+| `Ctrl-V` | Display-column block rectangle                |
 
 Motions extend the active endpoint, `o` swaps endpoints, and `Esc`/`Ctrl-C`
 cancels. `y`, `d`/`x`, `c`, `>` and `<` operate on raw Markdown; generated

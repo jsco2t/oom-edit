@@ -8,11 +8,14 @@
 
 pub mod confirm;
 pub mod palette;
+pub mod spell_suggest;
 
 pub use confirm::{
     ConfirmOverwrite, ConfirmQuit, ConfirmationResolution, DirtyCloseChoice, ExternalSaveChoice,
 };
 pub use palette::PaletteState;
+pub(crate) use spell_suggest::SpellSuggestAction;
+pub use spell_suggest::SpellSuggestState;
 
 use crate::command::{AppCommand, Contexts};
 use crate::lifecycle::{CloseTabRequest, SaveRequest};
@@ -26,6 +29,8 @@ pub enum Overlay {
     None,
     /// The command palette (FR-6.6/6.7).
     Palette(PaletteState),
+    /// Spelling suggestions for one cloned, revalidated diagnostic.
+    SpellSuggest(SpellSuggestState),
     /// Confirm quit overlay (T16).
     ConfirmQuit(ConfirmQuit),
     /// Confirm overwrite overlay (T16).
@@ -44,10 +49,23 @@ impl Overlay {
         matches!(self, Overlay::Palette(_))
     }
 
+    /// Is the spelling-suggestion modal open?
+    pub(crate) fn is_spell_suggest(&self) -> bool {
+        matches!(self, Overlay::SpellSuggest(_))
+    }
+
     /// Open the command palette.
     #[allow(dead_code)]
     pub fn open_palette(context: Contexts) -> Self {
         Overlay::Palette(PaletteState::new(context))
+    }
+
+    /// Open a spelling suggestion overlay.
+    pub fn open_spell_suggest(
+        diagnostic: oom_edit_core::Diagnostic,
+        suggestions: Vec<String>,
+    ) -> Self {
+        Overlay::SpellSuggest(SpellSuggestState::new(diagnostic, suggestions))
     }
 
     /// Open the confirm-quit overlay.
@@ -69,6 +87,7 @@ impl Overlay {
     pub fn handle_key(&mut self, key: &oom_edit_core::KeyInput) -> bool {
         match self {
             Overlay::Palette(p) => p.handle_key(key),
+            Overlay::SpellSuggest(_) => true,
             Overlay::ConfirmQuit(_) | Overlay::ConfirmOverwrite(_) => true,
             Overlay::None => false,
         }
@@ -78,6 +97,7 @@ impl Overlay {
     pub fn render(&self, frame: &mut ratatui::Frame<'_>, theme: &Theme, tier: Tier) {
         match self {
             Overlay::Palette(p) => p.render(frame, theme, tier),
+            Overlay::SpellSuggest(s) => s.render(frame, theme, tier),
             Overlay::ConfirmQuit(q) => q.render(frame),
             Overlay::ConfirmOverwrite(o) => o.render(frame),
             Overlay::None => {}
@@ -89,6 +109,7 @@ impl Overlay {
     pub fn geometry(&self) -> (u16, u16) {
         match self {
             Overlay::Palette(p) => p.geometry(),
+            Overlay::SpellSuggest(s) => s.geometry(),
             Overlay::ConfirmQuit(q) => q.geometry(),
             Overlay::ConfirmOverwrite(o) => o.geometry(),
             Overlay::None => (0, 0),
@@ -99,6 +120,7 @@ impl Overlay {
     pub fn hints(&self) -> &'static str {
         match self {
             Overlay::Palette(p) => p.hints(),
+            Overlay::SpellSuggest(s) => s.hints(),
             Overlay::ConfirmQuit(_) => "y/w save+quit · n quit · Esc cancel",
             Overlay::ConfirmOverwrite(_) => "o overwrite · r reload · Esc cancel",
             Overlay::None => "",
@@ -111,6 +133,25 @@ impl Overlay {
             p.selected_command()
         } else {
             None
+        }
+    }
+
+    /// Handle suggestion input exclusively and return a semantic App action.
+    pub(crate) fn handle_spell_suggest_key(
+        &mut self,
+        key: &oom_edit_core::KeyInput,
+    ) -> Option<SpellSuggestAction> {
+        match self {
+            Overlay::SpellSuggest(state) => Some(state.handle_key(key)),
+            _ => None,
+        }
+    }
+
+    /// Clone the diagnostic captured by the active suggestion modal.
+    pub(crate) fn spell_suggest_diagnostic(&self) -> Option<oom_edit_core::Diagnostic> {
+        match self {
+            Overlay::SpellSuggest(state) => Some(state.diagnostic().clone()),
+            _ => None,
         }
     }
 

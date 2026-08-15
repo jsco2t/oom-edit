@@ -122,13 +122,6 @@ impl WordlistReaderFactory for FileWordlistReaderFactory {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Phase 6 owns the tested persistence boundary; command routing is Phase 7"
-    )
-)]
 trait PersonalDictionaryStore {
     fn load(&mut self, max_bytes: usize) -> Result<PersonalLoadProgress, String>;
     fn save(&mut self, words: &[String]) -> Result<(), String>;
@@ -139,13 +132,6 @@ enum PersonalLoadProgress {
     Complete(Vec<String>),
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Phase 6 owns the tested atomic-save boundary; command routing is Phase 7"
-    )
-)]
 trait PersonalSaveOperations {
     type ParentDirectory;
 
@@ -156,13 +142,6 @@ trait PersonalSaveOperations {
     fn sync_parent(&mut self, directory: &Self::ParentDirectory) -> io::Result<()>;
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Phase 6 owns the tested atomic-save boundary; command routing is Phase 7"
-    )
-)]
 struct FilePersonalSaveOperations;
 
 impl PersonalSaveOperations for FilePersonalSaveOperations {
@@ -308,13 +287,6 @@ impl PersonalLine {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Phase 6 owns the tested atomic-save boundary; command routing is Phase 7"
-    )
-)]
 impl FilePersonalDictionaryStore {
     fn new(path: PathBuf) -> Self {
         Self {
@@ -516,21 +488,7 @@ pub(crate) struct BuildingState {
 
 pub(crate) struct ReadyState {
     engine: SpellEngine,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Phase 6 persistence is consumed by the Phase 7 command surface"
-        )
-    )]
     personal: Box<dyn PersonalDictionaryStore>,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Phase 6 persistence is consumed by the Phase 7 command surface"
-        )
-    )]
     personal_words: Vec<String>,
 }
 
@@ -552,6 +510,18 @@ impl SpellHost {
             source,
             Box::new(FileWordlistReaderFactory),
             Box::new(FilePersonalDictionaryStore::new(personal_path)),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_with_failing_personal_save(words: impl Into<String>) -> Self {
+        Self::new(
+            WordlistSource::testing(words),
+            Box::new(FileWordlistReaderFactory),
+            Box::new(MemoryPersonalDictionaryStore {
+                words: Vec::new(),
+                fail_save: true,
+            }),
         )
     }
 
@@ -702,13 +672,6 @@ impl SpellHost {
         Some(format!("spell unavailable: {reason}"))
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Phase 6 state messages are consumed by the Phase 7 command surface"
-        )
-    )]
     pub(crate) fn status_message(&self) -> Option<String> {
         match self {
             Self::Unbuilt(_) | Self::Loading(_) => Some("spell dictionaries loading".to_string()),
@@ -740,13 +703,6 @@ impl SpellHost {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Phase 6 persistence is consumed by the Phase 7 command surface"
-        )
-    )]
     pub(crate) fn add_personal_word(&mut self, word: &str) -> Result<AddWordOutcome, String> {
         let Self::Ready(state) = self else {
             return Err(self
@@ -885,6 +841,7 @@ impl WordlistLoader {
 #[derive(Default)]
 struct MemoryPersonalDictionaryStore {
     words: Vec<String>,
+    fail_save: bool,
 }
 
 #[cfg(test)]
@@ -894,6 +851,9 @@ impl PersonalDictionaryStore for MemoryPersonalDictionaryStore {
     }
 
     fn save(&mut self, words: &[String]) -> Result<(), String> {
+        if self.fail_save {
+            return Err("scripted personal save failure".to_string());
+        }
         self.words = words.to_vec();
         Ok(())
     }

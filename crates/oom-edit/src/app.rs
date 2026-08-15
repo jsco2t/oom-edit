@@ -29,7 +29,7 @@ use crate::config::ConfigStore;
 use crate::lifecycle::{
     CloseTabRequest, DirtyClosePolicy, LifecycleAction, SaveContinuation, SaveRequest,
 };
-use crate::overlay::Overlay;
+use crate::overlay::{Overlay, SpellSuggestAction};
 use crate::screens::editor::{render_editor, render_status_row, source_text_width, EditorViewport};
 use crate::screens::rendered::render_rendered;
 use crate::spell_host::SpellHost;
@@ -634,6 +634,12 @@ impl App {
             return;
         }
 
+        // Suggestion input is fully modal. Resize remains a presentation
+        // event, but paste and mouse input cannot reach the document beneath.
+        if self.overlay.is_spell_suggest() && matches!(event, Event::Paste(_) | Event::Mouse(_)) {
+            return;
+        }
+
         if let Event::Paste(text) = event {
             let effects = self
                 .tabs
@@ -683,6 +689,13 @@ impl App {
                 self.pending_input = PendingAppInput::Idle;
                 self.execute_confirmation(resolution);
             }
+            return;
+        }
+
+        // The spelling modal owns every key while open. Its state machine
+        // returns semantic requests; App performs session/host mutations.
+        if let Some(action) = self.overlay.handle_spell_suggest_key(&key_input) {
+            self.execute_spell_suggest_action(action);
             return;
         }
 
@@ -927,7 +940,177 @@ impl App {
                     oom_edit_core::Severity::Info,
                 );
             }
+            AppCommand::SpellSuggest => self.open_spell_suggestions(),
+            AppCommand::SpellAdd => self.add_current_spelling_word(),
+            AppCommand::SpellToggle => {
+                let Some(entry) = self.tabs.get_mut(self.active_tab) else {
+                    return;
+                };
+                let enabled = !entry.session.spell_enabled();
+                entry.session.set_spell_enabled(enabled);
+                self.set_transient(
+                    if enabled {
+                        "spell checking enabled".to_string()
+                    } else {
+                        "spell checking disabled".to_string()
+                    },
+                    oom_edit_core::Severity::Info,
+                );
+            }
         }
+    }
+
+    fn open_spell_suggestions(&mut self) {
+        let Some(engine) = self.spell_host.engine() else {
+            self.publish_spell_host_status();
+            return;
+        };
+        let Some(session) = self.session() else {
+            return;
+        };
+        let Some(diagnostic) = session.diagnostic_at_cursor().cloned() else {
+            self.set_transient(
+                "no spelling diagnostic under cursor".to_string(),
+                oom_edit_core::Severity::Warning,
+            );
+            return;
+        };
+        let suggestions = session.spell_suggestions(
+            engine,
+            &diagnostic,
+            crate::overlay::spell_suggest::MAX_SUGGESTIONS,
+        );
+        self.overlay = Overlay::open_spell_suggest(diagnostic, suggestions);
+        self.pending_input = PendingAppInput::Idle;
+    }
+
+    fn add_current_spelling_word(&mut self) {
+        if self.spell_host.engine().is_none() {
+            self.publish_spell_host_status();
+            return;
+        }
+        let Some(diagnostic) = self
+            .session()
+            .and_then(|session| session.diagnostic_at_cursor().cloned())
+        else {
+            self.set_transient(
+                "no spelling diagnostic under cursor".to_string(),
+                oom_edit_core::Severity::Warning,
+            );
+            return;
+        };
+        self.add_spelling_word(&diagnostic);
+    }
+
+    fn execute_spell_suggest_action(&mut self, action: SpellSuggestAction) {
+        match action {
+            SpellSuggestAction::StayOpen => {}
+            SpellSuggestAction::Close => {
+                self.overlay.close();
+                self.pending_input = PendingAppInput::Idle;
+            }
+            SpellSuggestAction::Apply(replacement) => {
+                let Some(diagnostic) = self.overlay.spell_suggest_diagnostic() else {
+                    return;
+                };
+                if self.apply_spelling_replacement(&diagnostic, &replacement) {
+                    self.overlay.close();
+                    self.pending_input = PendingAppInput::Idle;
+                }
+            }
+            SpellSuggestAction::AddWord => {
+                let Some(diagnostic) = self.overlay.spell_suggest_diagnostic() else {
+                    return;
+                };
+                if self.add_spelling_word(&diagnostic) {
+                    self.overlay.close();
+                    self.pending_input = PendingAppInput::Idle;
+                }
+            }
+        }
+    }
+
+    fn apply_spelling_replacement(
+        &mut self,
+        diagnostic: &oom_edit_core::Diagnostic,
+        replacement: &str,
+    ) -> bool {
+        let effects = self
+            .tabs
+            .get_mut(self.active_tab)
+            .map(|entry| {
+                entry
+                    .session
+                    .apply_spell_replacement(diagnostic, replacement)
+            })
+            .unwrap_or_default();
+        let success = effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Edited));
+        for effect in effects {
+            self.handle_effect(effect);
+        }
+        if success {
+            self.pending_scroll_follow = true;
+        }
+        success
+    }
+
+    fn add_spelling_word(&mut self, diagnostic: &oom_edit_core::Diagnostic) -> bool {
+        let current = self.session().is_some_and(|session| {
+            session
+                .diagnostics()
+                .iter()
+                .any(|candidate| candidate == diagnostic)
+                && session.text_for_range(diagnostic.range.clone()).as_deref()
+                    == Some(diagnostic.source_text.as_str())
+        });
+        if !current {
+            self.set_transient(
+                "spelling diagnostic is stale; word was not added".to_string(),
+                oom_edit_core::Severity::Warning,
+            );
+            return false;
+        }
+
+        match self.spell_host.add_personal_word(&diagnostic.source_text) {
+            Ok(oom_spell::AddWordOutcome::Inserted { normalized }) => {
+                self.set_transient(
+                    format!("added '{normalized}' to personal dictionary"),
+                    oom_edit_core::Severity::Info,
+                );
+                true
+            }
+            Ok(oom_spell::AddWordOutcome::AlreadyPresent { normalized }) => {
+                self.set_transient(
+                    format!("'{normalized}' is already in the personal dictionary"),
+                    oom_edit_core::Severity::Info,
+                );
+                true
+            }
+            Ok(oom_spell::AddWordOutcome::Ignored) => {
+                self.set_transient(
+                    "word is not eligible for the personal dictionary".to_string(),
+                    oom_edit_core::Severity::Warning,
+                );
+                false
+            }
+            Err(error) => {
+                self.set_transient(
+                    format!("failed to add word: {error}"),
+                    oom_edit_core::Severity::Warning,
+                );
+                false
+            }
+        }
+    }
+
+    fn publish_spell_host_status(&mut self) {
+        let message = self
+            .spell_host
+            .status_message()
+            .unwrap_or_else(|| "spell dictionary is not ready".to_string());
+        self.set_transient(message, oom_edit_core::Severity::Warning);
     }
 
     fn execute_lifecycle(&mut self, action: LifecycleAction) {
@@ -1576,6 +1759,18 @@ mod tests {
     }
 
     fn test_app_with_spell_default(session: EditorSession, enabled: bool) -> App {
+        test_app_with_spell_host(
+            session,
+            crate::spell_host::SpellHost::testing("known\n"),
+            enabled,
+        )
+    }
+
+    fn test_app_with_spell_host(
+        session: EditorSession,
+        spell_host: crate::spell_host::SpellHost,
+        enabled: bool,
+    ) -> App {
         App::new_with_spell(
             session,
             theme::ResolvedTheme::injected("default-dark", false, Tier::TrueColor),
@@ -1584,11 +1779,42 @@ mod tests {
             AppServices::new(
                 Box::new(RecordingClipboardSink::default()),
                 Box::new(crate::config::DisabledConfigStore),
-                crate::spell_host::SpellHost::testing("known\n"),
+                spell_host,
             ),
             enabled,
             Instant::now(),
         )
+    }
+
+    fn drain_app_spelling(app: &mut App) {
+        for _ in 0..10_000 {
+            app.on_idle_unit(crate::event::SPELL_WORK_UNIT_BYTES);
+            if app.spell_host_phase() == "Ready"
+                && app
+                    .session()
+                    .is_some_and(|session| !session.diagnostics_pending())
+            {
+                // The first Ready observation can precede the generation-mismatch
+                // tick that starts the initial scan.
+                app.on_idle_unit(crate::event::SPELL_WORK_UNIT_BYTES);
+                if app
+                    .session()
+                    .is_some_and(|session| !session.diagnostics_pending())
+                {
+                    return;
+                }
+            }
+        }
+        panic!("test App spell work did not drain");
+    }
+
+    fn press_space_command(app: &mut App, continuation: char) {
+        for ch in [' ', continuation] {
+            app.handle_event(&Event::Key(KeyEvent::new(
+                CrosstermKeyCode::Char(ch),
+                KeyModifiers::NONE,
+            )));
+        }
     }
 
     #[test]
@@ -1652,6 +1878,355 @@ mod tests {
         assert!(status_line(&mut app).contains("[spell off]"));
         app.active_tab = 1;
         assert!(!status_line(&mut app).contains("[spell off]"));
+    }
+
+    #[test]
+    fn space_z_toggles_only_the_active_session() {
+        let mut app = test_app(EditorSession::from_text("first\n"));
+        app.tabs
+            .push(TabEntry::new(EditorSession::from_text("second\n")));
+
+        assert!(app.tabs[0].session.spell_enabled(), "first before Space z");
+        assert!(app.tabs[1].session.spell_enabled(), "second before Space z");
+        press_space_command(&mut app, 'z');
+        assert!(!app.tabs[0].session.spell_enabled(), "first after Space z");
+        assert!(
+            app.tabs[1].session.spell_enabled(),
+            "second remains enabled"
+        );
+        assert_eq!(
+            app.transient.as_ref().map(|message| message.text.as_str()),
+            Some("spell checking disabled")
+        );
+        press_space_command(&mut app, 'z');
+        assert!(app.tabs[0].session.spell_enabled(), "first re-enabled");
+        assert!(
+            app.tabs[1].session.spell_enabled(),
+            "second remains enabled"
+        );
+        assert_eq!(
+            app.transient.as_ref().map(|message| message.text.as_str()),
+            Some("spell checking enabled")
+        );
+    }
+
+    #[test]
+    fn space_s_opens_first_selected_suggestion_and_modal_input_is_exclusive() {
+        let document = format!("teh\n{}", "known\n".repeat(40));
+        let mut app = test_app_with_spell_host(
+            EditorSession::from_text(&document),
+            crate::spell_host::SpellHost::testing("known\ntea\nten\nthe\n"),
+            true,
+        );
+        drain_app_spelling(&mut app);
+        app.tabs[0].session.render_layout(74);
+
+        press_space_command(&mut app, 's');
+        let Overlay::SpellSuggest(state) = &app.overlay else {
+            panic!("Space s must open the suggestion overlay");
+        };
+        assert_eq!(state.selected(), Some(0));
+        assert!(!state.suggestions().is_empty());
+
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('i'),
+            KeyModifiers::NONE,
+        )));
+        assert!(matches!(app.overlay, Overlay::SpellSuggest(_)));
+        assert_eq!(app.session().unwrap().mode(), Mode::Normal);
+        assert_eq!(app.session().unwrap().document(), document);
+
+        app.handle_event(&Event::Paste("background edit".to_string()));
+        let rendered_top = app.tabs[0].rendered_top;
+        app.handle_event(&Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert!(matches!(app.overlay, Overlay::SpellSuggest(_)));
+        assert_eq!(app.session().unwrap().document(), document);
+        assert_eq!(
+            app.tabs[0].rendered_top, rendered_top,
+            "mouse scrolling must not move the document behind the modal"
+        );
+    }
+
+    #[test]
+    fn suggestion_digit_applies_one_undoable_replacement_and_closes() {
+        let mut app = test_app_with_spell_host(
+            EditorSession::from_text("teh\n"),
+            crate::spell_host::SpellHost::testing("tea\nten\nthe\n"),
+            true,
+        );
+        drain_app_spelling(&mut app);
+        press_space_command(&mut app, 's');
+        let expected = match &app.overlay {
+            Overlay::SpellSuggest(state) => state.suggestions()[0].clone(),
+            _ => panic!("suggestion overlay must be open"),
+        };
+
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('1'),
+            KeyModifiers::NONE,
+        )));
+        assert!(matches!(app.overlay, Overlay::None));
+        assert_eq!(app.session().unwrap().document(), format!("{expected}\n"));
+
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('u'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.session().unwrap().document(), "teh\n");
+    }
+
+    #[test]
+    fn empty_suggestions_stay_open_until_add_succeeds() {
+        let mut app = test_app_with_spell_host(
+            EditorSession::from_text("zzzzzz\n"),
+            crate::spell_host::SpellHost::testing("known\n"),
+            true,
+        );
+        drain_app_spelling(&mut app);
+        press_space_command(&mut app, 's');
+        let Overlay::SpellSuggest(state) = &app.overlay else {
+            panic!("empty suggestion overlay must still open");
+        };
+        assert_eq!(state.selected(), None);
+        assert!(state.suggestions().is_empty());
+
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(matches!(app.overlay, Overlay::SpellSuggest(_)));
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('a'),
+            KeyModifiers::NONE,
+        )));
+        assert!(matches!(app.overlay, Overlay::None));
+        assert_eq!(
+            app.transient.as_ref().map(|message| message.text.as_str()),
+            Some("added 'zzzzzz' to personal dictionary")
+        );
+    }
+
+    #[test]
+    fn stale_replacement_warns_and_keeps_overlay_open() {
+        let mut app = test_app_with_spell_host(
+            EditorSession::from_text("teh\n"),
+            crate::spell_host::SpellHost::testing("the\n"),
+            true,
+        );
+        drain_app_spelling(&mut app);
+        press_space_command(&mut app, 's');
+
+        let entry = app.tabs.get_mut(0).unwrap();
+        entry.session.handle_key(KeyInput {
+            code: KeyCode {
+                kind: KeyCodeKind::Char('i'),
+            },
+            mods: Modifiers::default(),
+        });
+        entry.session.handle_key(KeyInput {
+            code: KeyCode {
+                kind: KeyCodeKind::Char('x'),
+            },
+            mods: Modifiers::default(),
+        });
+        entry.session.handle_key(KeyInput {
+            code: KeyCode {
+                kind: KeyCodeKind::Esc,
+            },
+            mods: Modifiers::default(),
+        });
+
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(matches!(app.overlay, Overlay::SpellSuggest(_)));
+        assert!(app
+            .transient
+            .as_ref()
+            .is_some_and(|message| message.text.contains("stale")));
+        assert_eq!(app.session().unwrap().document(), "xteh\n");
+    }
+
+    #[test]
+    fn failed_personal_persistence_warns_and_keeps_overlay_open() {
+        let mut app = test_app_with_spell_host(
+            EditorSession::from_text("teh\n"),
+            crate::spell_host::SpellHost::testing_with_failing_personal_save("the\n"),
+            true,
+        );
+        drain_app_spelling(&mut app);
+        press_space_command(&mut app, 's');
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('a'),
+            KeyModifiers::NONE,
+        )));
+
+        assert!(matches!(app.overlay, Overlay::SpellSuggest(_)));
+        assert_eq!(
+            app.transient.as_ref().map(|message| message.text.as_str()),
+            Some("failed to add word: scripted personal save failure")
+        );
+        assert_eq!(app.session().unwrap().diagnostics().len(), 1);
+        drain_app_spelling(&mut app);
+        assert_eq!(
+            app.session().unwrap().diagnostics().len(),
+            1,
+            "failed disk persistence must not mutate the shared engine"
+        );
+    }
+
+    #[test]
+    fn stale_add_warns_keeps_overlay_open_and_does_not_mutate_engine() {
+        let mut app = test_app_with_spell_host(
+            EditorSession::from_text("teh\n"),
+            crate::spell_host::SpellHost::testing("the\n"),
+            true,
+        );
+        drain_app_spelling(&mut app);
+        press_space_command(&mut app, 's');
+
+        let entry = app.tabs.get_mut(0).unwrap();
+        for kind in [
+            KeyCodeKind::Char('i'),
+            KeyCodeKind::Char('x'),
+            KeyCodeKind::Esc,
+        ] {
+            entry.session.handle_key(KeyInput {
+                code: KeyCode { kind },
+                mods: Modifiers::default(),
+            });
+        }
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('a'),
+            KeyModifiers::NONE,
+        )));
+
+        assert!(matches!(app.overlay, Overlay::SpellSuggest(_)));
+        assert_eq!(
+            app.transient.as_ref().map(|message| message.text.as_str()),
+            Some("spelling diagnostic is stale; word was not added")
+        );
+        assert!(!app.spell_host.engine().unwrap().check("teh"));
+    }
+
+    #[test]
+    fn escape_and_ctrl_c_close_suggestion_without_forwarding_to_document() {
+        for (code, modifiers) in [
+            (CrosstermKeyCode::Esc, KeyModifiers::NONE),
+            (CrosstermKeyCode::Char('c'), KeyModifiers::CONTROL),
+        ] {
+            let mut app = test_app_with_spell_host(
+                EditorSession::from_text("teh\n"),
+                crate::spell_host::SpellHost::testing("the\n"),
+                true,
+            );
+            drain_app_spelling(&mut app);
+            press_space_command(&mut app, 's');
+            app.handle_event(&Event::Key(KeyEvent::new(code, modifiers)));
+            assert!(matches!(app.overlay, Overlay::None));
+            assert_eq!(app.session().unwrap().document(), "teh\n");
+            assert_eq!(app.session().unwrap().mode(), Mode::Normal);
+        }
+    }
+
+    #[test]
+    fn space_a_adds_without_opening_and_generation_clears_the_diagnostic() {
+        let mut app = test_app_with_spell_host(
+            EditorSession::from_text("teh\n"),
+            crate::spell_host::SpellHost::testing("the\n"),
+            true,
+        );
+        drain_app_spelling(&mut app);
+        press_space_command(&mut app, 'a');
+        assert!(matches!(app.overlay, Overlay::None));
+        assert_eq!(
+            app.transient.as_ref().map(|message| message.text.as_str()),
+            Some("added 'teh' to personal dictionary")
+        );
+        drain_app_spelling(&mut app);
+        assert!(app.session().unwrap().diagnostics().is_empty());
+    }
+
+    #[test]
+    fn suggest_command_distinguishes_building_unavailable_and_no_diagnostic() {
+        let mut building = test_app_with_spell_host(
+            EditorSession::from_text("teh\n"),
+            crate::spell_host::SpellHost::testing("the\n"),
+            true,
+        );
+        while building.spell_host_phase() != "Building" {
+            assert!(building.on_idle_unit(crate::event::SPELL_WORK_UNIT_BYTES));
+        }
+        press_space_command(&mut building, 's');
+        assert!(matches!(building.overlay, Overlay::None));
+        assert_eq!(
+            building
+                .transient
+                .as_ref()
+                .map(|message| message.text.as_str()),
+            Some("spell dictionary building")
+        );
+        press_space_command(&mut building, 'a');
+        assert_eq!(
+            building
+                .transient
+                .as_ref()
+                .map(|message| message.text.as_str()),
+            Some("spell dictionary building")
+        );
+
+        let mut unavailable = test_app_with_spell_host(
+            EditorSession::from_text("teh\n"),
+            crate::spell_host::SpellHost::testing_unavailable("configured list failed"),
+            true,
+        );
+        press_space_command(&mut unavailable, 's');
+        assert!(matches!(unavailable.overlay, Overlay::None));
+        assert_eq!(
+            unavailable
+                .transient
+                .as_ref()
+                .map(|message| message.text.as_str()),
+            Some("spell unavailable: configured list failed")
+        );
+        press_space_command(&mut unavailable, 'a');
+        assert_eq!(
+            unavailable
+                .transient
+                .as_ref()
+                .map(|message| message.text.as_str()),
+            Some("spell unavailable: configured list failed")
+        );
+
+        let mut clean = test_app_with_spell_host(
+            EditorSession::from_text("known\n"),
+            crate::spell_host::SpellHost::testing("known\n"),
+            true,
+        );
+        drain_app_spelling(&mut clean);
+        press_space_command(&mut clean, 's');
+        assert!(matches!(clean.overlay, Overlay::None));
+        assert_eq!(
+            clean
+                .transient
+                .as_ref()
+                .map(|message| message.text.as_str()),
+            Some("no spelling diagnostic under cursor")
+        );
+        press_space_command(&mut clean, 'a');
+        assert_eq!(
+            clean
+                .transient
+                .as_ref()
+                .map(|message| message.text.as_str()),
+            Some("no spelling diagnostic under cursor")
+        );
     }
 
     #[test]

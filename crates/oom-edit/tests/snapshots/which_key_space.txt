@@ -21,4 +21,4 @@
 
   22  More text here.
 
- NORMAL  v=characSpace: h=help / command palette  w=save  q=quit  t=cycle themep
+ NORMAL  Space: h=help / command palette  w=save  q=quit  t=cycle theme  s=spell

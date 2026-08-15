@@ -18,6 +18,12 @@ pub enum RegistryEntryId {
     Save,
     Quit,
     CycleTheme,
+    SpellSuggest,
+    SpellAdd,
+    SpellToggle,
+    SpellNext,
+    SpellPrevious,
+    SpellSet,
     SpaceDigitTab,
     NextTab,
     PrevTab,
@@ -34,6 +40,9 @@ pub enum AppCommand {
     Save,
     Quit,
     CycleTheme,
+    SpellSuggest,
+    SpellAdd,
+    SpellToggle,
 }
 
 /// Binding ownership and finite dispatch role.
@@ -93,6 +102,8 @@ pub struct CommandSpec {
     pub desc: &'static str,
     pub contexts: Contexts,
     pub binding: BindingRole,
+    /// Core conformance requirement backing a non-executable reference row.
+    pub conformance_id: Option<&'static str>,
     /// Purpose-specific order for the compact hint bar only.
     pub quick_bar_order: Option<i16>,
 }
@@ -107,7 +118,22 @@ macro_rules! row {
             desc: $desc,
             contexts: $contexts,
             binding: $binding,
+            conformance_id: None,
             quick_bar_order: $quick,
+        }
+    };
+}
+
+macro_rules! conformance_row {
+    ($id:ident, $name:literal, $desc:literal, $contexts:expr, $binding:expr, $conformance:literal) => {
+        CommandSpec {
+            id: RegistryEntryId::$id,
+            name: $name,
+            desc: $desc,
+            contexts: $contexts,
+            binding: $binding,
+            conformance_id: Some($conformance),
+            quick_bar_order: None,
         }
     };
 }
@@ -251,6 +277,65 @@ pub static COMMANDS: &[CommandSpec] = &[
         None
     ),
     row!(
+        SpellSuggest,
+        "spell-suggest",
+        "spelling suggestions",
+        RENDERED,
+        BindingRole::AppChord {
+            continuation: 's',
+            command: AppCommand::SpellSuggest
+        },
+        None
+    ),
+    row!(
+        SpellAdd,
+        "spell-add",
+        "add word to personal dictionary",
+        RENDERED,
+        BindingRole::AppChord {
+            continuation: 'a',
+            command: AppCommand::SpellAdd
+        },
+        None
+    ),
+    row!(
+        SpellToggle,
+        "spell-toggle",
+        "toggle spelling",
+        RENDERED,
+        BindingRole::AppChord {
+            continuation: 'z',
+            command: AppCommand::SpellToggle
+        },
+        None
+    ),
+    conformance_row!(
+        SpellNext,
+        "spell-next",
+        "next spelling diagnostic",
+        RENDERED,
+        BindingRole::CoreKey { display: "]s" },
+        "SP-2:next-previous-wrap"
+    ),
+    conformance_row!(
+        SpellPrevious,
+        "spell-previous",
+        "previous spelling diagnostic",
+        RENDERED,
+        BindingRole::CoreKey { display: "[s" },
+        "SP-2:next-previous-wrap"
+    ),
+    conformance_row!(
+        SpellSet,
+        "spell-set",
+        "enable or disable spelling",
+        Contexts::COMMAND,
+        BindingRole::CoreEx {
+            display: ":set spell / :set nospell"
+        },
+        "SP-1:set-toggle"
+    ),
+    row!(
         SpaceDigitTab,
         "space-tab",
         "jump to tab",
@@ -373,7 +458,82 @@ mod tests {
             assert!(!spec.contexts.is_empty());
             assert!(!rendered_binding(spec).is_empty());
         }
-        assert_eq!(COMMANDS.len(), 22);
+        assert_eq!(COMMANDS.len(), 28);
+    }
+
+    #[test]
+    fn phase_seven_spell_rows_have_exact_identity_and_ownership() {
+        let expected = [
+            (
+                RegistryEntryId::SpellSuggest,
+                "spell-suggest",
+                BindingRole::AppChord {
+                    continuation: 's',
+                    command: AppCommand::SpellSuggest,
+                },
+                None,
+            ),
+            (
+                RegistryEntryId::SpellAdd,
+                "spell-add",
+                BindingRole::AppChord {
+                    continuation: 'a',
+                    command: AppCommand::SpellAdd,
+                },
+                None,
+            ),
+            (
+                RegistryEntryId::SpellToggle,
+                "spell-toggle",
+                BindingRole::AppChord {
+                    continuation: 'z',
+                    command: AppCommand::SpellToggle,
+                },
+                None,
+            ),
+            (
+                RegistryEntryId::SpellNext,
+                "spell-next",
+                BindingRole::CoreKey { display: "]s" },
+                Some("SP-2:next-previous-wrap"),
+            ),
+            (
+                RegistryEntryId::SpellPrevious,
+                "spell-previous",
+                BindingRole::CoreKey { display: "[s" },
+                Some("SP-2:next-previous-wrap"),
+            ),
+            (
+                RegistryEntryId::SpellSet,
+                "spell-set",
+                BindingRole::CoreEx {
+                    display: ":set spell / :set nospell",
+                },
+                Some("SP-1:set-toggle"),
+            ),
+        ];
+
+        let actual = COMMANDS
+            .iter()
+            .filter(|spec| {
+                matches!(
+                    spec.id,
+                    RegistryEntryId::SpellSuggest
+                        | RegistryEntryId::SpellAdd
+                        | RegistryEntryId::SpellToggle
+                        | RegistryEntryId::SpellNext
+                        | RegistryEntryId::SpellPrevious
+                        | RegistryEntryId::SpellSet
+                )
+            })
+            .map(|spec| (spec.id, spec.name, spec.binding, spec.conformance_id))
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
+        assert!(actual.iter().all(|(_, _, binding, conformance_id)| {
+            matches!(binding, BindingRole::AppChord { .. })
+                || conformance_id.is_some_and(|id| id.starts_with("SP-"))
+        }));
     }
 
     #[test]
@@ -512,6 +672,65 @@ mod tests {
                 BindingRole::AppChord {
                     continuation: 't',
                     command: AppCommand::CycleTheme,
+                },
+                None,
+            ),
+            (
+                RegistryEntryId::SpellSuggest,
+                "spell-suggest",
+                "spelling suggestions",
+                RENDERED,
+                BindingRole::AppChord {
+                    continuation: 's',
+                    command: AppCommand::SpellSuggest,
+                },
+                None,
+            ),
+            (
+                RegistryEntryId::SpellAdd,
+                "spell-add",
+                "add word to personal dictionary",
+                RENDERED,
+                BindingRole::AppChord {
+                    continuation: 'a',
+                    command: AppCommand::SpellAdd,
+                },
+                None,
+            ),
+            (
+                RegistryEntryId::SpellToggle,
+                "spell-toggle",
+                "toggle spelling",
+                RENDERED,
+                BindingRole::AppChord {
+                    continuation: 'z',
+                    command: AppCommand::SpellToggle,
+                },
+                None,
+            ),
+            (
+                RegistryEntryId::SpellNext,
+                "spell-next",
+                "next spelling diagnostic",
+                RENDERED,
+                BindingRole::CoreKey { display: "]s" },
+                None,
+            ),
+            (
+                RegistryEntryId::SpellPrevious,
+                "spell-previous",
+                "previous spelling diagnostic",
+                RENDERED,
+                BindingRole::CoreKey { display: "[s" },
+                None,
+            ),
+            (
+                RegistryEntryId::SpellSet,
+                "spell-set",
+                "enable or disable spelling",
+                Contexts::COMMAND,
+                BindingRole::CoreEx {
+                    display: ":set spell / :set nospell",
                 },
                 None,
             ),

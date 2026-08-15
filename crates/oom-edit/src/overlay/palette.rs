@@ -145,7 +145,7 @@ impl PaletteState {
                     rows.push(PaletteRow::Reference {
                         keys,
                         desc: spec.desc.to_string(),
-                        row_id: spec.name.to_string(),
+                        row_id: spec.conformance_id.unwrap_or(spec.name).to_string(),
                     });
                 }
             }
@@ -618,7 +618,7 @@ mod tests {
             assert!(rows.iter().any(|row| match row {
                 PaletteRow::Command { name, keys, .. } => name == spec.name && keys == &binding,
                 PaletteRow::Reference { row_id, keys, .. } => {
-                    row_id == spec.name && keys == &binding
+                    row_id == spec.conformance_id.unwrap_or(spec.name) && keys == &binding
                 }
             }));
         }

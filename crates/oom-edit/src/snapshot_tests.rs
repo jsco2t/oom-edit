@@ -97,6 +97,32 @@ fn confirm_overwrite_overlay() -> crate::overlay::Overlay {
     )
 }
 
+fn spell_suggest_overlay() -> crate::overlay::Overlay {
+    crate::overlay::Overlay::open_spell_suggest(
+        oom_edit_core::Diagnostic {
+            provider: oom_edit_core::DiagnosticProvider::Spell,
+            severity: oom_edit_core::DiagnosticSeverity::Warning,
+            range: 0..3,
+            source_text: "teh".to_string(),
+            message: "Unknown word: teh".to_string(),
+        },
+        vec!["the".to_string(), "ten".to_string()],
+    )
+}
+
+fn empty_spell_suggest_overlay() -> crate::overlay::Overlay {
+    crate::overlay::Overlay::open_spell_suggest(
+        oom_edit_core::Diagnostic {
+            provider: oom_edit_core::DiagnosticProvider::Spell,
+            severity: oom_edit_core::DiagnosticSeverity::Warning,
+            range: 0..6,
+            source_text: "zzzzzz".to_string(),
+            message: "Unknown word: zzzzzz".to_string(),
+        },
+        Vec::new(),
+    )
+}
+
 fn test_app_with_relative_line_numbers(text: &str, relative_line_numbers: bool) -> App {
     let mut session = EditorSession::from_text(text);
     session.render_layout(74);
@@ -700,7 +726,7 @@ fn golden_palette_vim_reference() {
     let mut app = test_app(kitchen_sink());
     open_palette_with_space_h(&mut app);
     // Navigate into the Vim reference section and beyond the list viewport.
-    for _ in 0..17 {
+    for _ in 0..crate::command::COMMANDS.len() {
         app.handle_event(&crossterm::event::Event::Key(
             crossterm::event::KeyEvent::new(
                 crossterm::event::KeyCode::Down,
@@ -749,6 +775,29 @@ fn golden_which_key_space() {
 }
 
 // ── Confirm-overlay goldens ─────────────────────────────────────────────────
+
+/// Suggestion overlay — selected first row and complete modal hints.
+#[test]
+fn golden_spell_suggest() {
+    let mut app = test_app(kitchen_sink());
+    app.set_overlay(spell_suggest_overlay());
+    let lines = render_app_lines(80, 24, |frame| {
+        app.render(frame);
+    });
+    assert_snapshot(&lines, "spell_suggest");
+}
+
+#[test]
+fn empty_spell_suggest_renders_exact_empty_state_without_selection() {
+    let mut app = test_app(kitchen_sink());
+    app.set_overlay(empty_spell_suggest_overlay());
+    let lines = render_app_lines(80, 24, |frame| {
+        app.render(frame);
+    });
+    let rendered = lines.join("\n");
+    assert!(rendered.contains("No suggestions"));
+    assert!(!rendered.contains('▸'));
+}
 
 /// Confirm quit overlay — dirty buffer.
 #[test]
@@ -1248,15 +1297,17 @@ fn drift_overlay_hints_nonempty() {
     let overlays = [
         Overlay::None,
         Overlay::open_palette(Contexts::NORMAL),
+        spell_suggest_overlay(),
         confirm_quit_overlay(),
         confirm_overwrite_overlay(),
     ];
-    assert_eq!(overlays.len(), 4, "current Overlay variant list is stale");
+    assert_eq!(overlays.len(), 5, "current Overlay variant list is stale");
 
     for overlay in overlays {
         match &overlay {
             Overlay::None
             | Overlay::Palette(_)
+            | Overlay::SpellSuggest(_)
             | Overlay::ConfirmQuit(_)
             | Overlay::ConfirmOverwrite(_) => {}
         }

@@ -3,21 +3,21 @@
    3  │ ┌ Command Palette ─────────────────────────────────────────────┐       │
    4  └─│>                                                             │───────┘
         │                                                              │
-   6  █ │  Esc / Ctrl-C         cancel selection                    can│
-        │  "{register}          select register                     sel│
-   8  So│  y                    yank selection                      sel│
-        │  d / x                delete selection                    sel│
-  10  ┃ │  c                    change selection                    sel│
-        │  >                    indent selection                    sel│
-      ▏ │  <                    outdent selection                   sel│
-  13  ▏ │  o                    swap selection endpoint             sel│
-  14  ▏ │  help                 help / command palette         Space h │
-  15  ▏ │  save                 save                           Space w │
-      ▏ │  quit                 quit                           Space q │
-        │  cycle-theme          cycle theme                    Space t │
-  18  ──│  Space 1-9            jump to tab                         spa│────────
-        │  g t                  next tab                            nex│
-  20  An│▸ g T                  previous tab                        pre│
+   6  █ │  cycle-theme          cycle theme                    Space t │
+        │  spell-suggest        spelling suggestions           Space s │
+   8  So│  spell-add            add word to personal dictionary Space a│
+        │  spell-toggle         toggle spelling                Space z │
+  10  ┃ │  ]s                   next spelling diagnostic            SP-│
+        │  [s                   previous spelling diagnostic        SP-│
+      ▏ │  :set spell / :set nospell enable or disable spelling        │
+  13  ▏ │  Space 1-9            jump to tab                         spa│
+  14  ▏ │  g t                  next tab                            nex│
+  15  ▏ │  g T                  previous tab                        pre│
+      ▏ │  {count} g t          jump to numbered tab                jum│
+        │  :tabnew {path}       open path in new tab                tab│
+  18  ──│  :tabclose            close tab                           tab│────────
+        │  :qa                  quit all tabs                       qui│
+  20  An│▸ j/k, ↑/↓             Move by rendered row.               R-N│
         └──────────────────────────────────────────────────────────────┘
   22  More text here.
 

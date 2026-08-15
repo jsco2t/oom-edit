@@ -117,7 +117,7 @@ mod tests {
                 ch('z'),
                 t0
             ),
-            AppInputTransition::Forward(ch('z'))
+            AppInputTransition::AppCommand(AppCommand::SpellToggle)
         );
         assert_eq!(
             resolve(
