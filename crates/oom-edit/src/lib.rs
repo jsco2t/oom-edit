@@ -33,6 +33,7 @@ pub(crate) mod overlay;
 pub(crate) mod screens;
 #[cfg(test)]
 pub(crate) mod snapshot_tests;
+pub(crate) mod spell_host;
 pub(crate) mod terminal_guard;
 pub(crate) mod theme;
 pub(crate) mod widgets;
@@ -45,8 +46,9 @@ use oom_edit_core::EditorSession;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use crate::app::App;
+use crate::app::{App, AppServices};
 use crate::config::{Config, ConfigPresence};
+use crate::spell_host::{resolve_wordlist_source, SpellHost};
 use crate::terminal_guard::TerminalGuard;
 use crate::theme::{EnvParts, ResolvedTheme};
 
@@ -87,6 +89,14 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let resolved_theme =
         resolve_startup_theme(args.theme.as_deref(), &config, config_presence, &env);
 
+    let config_path = crate::config::config_path();
+    let spell_resolution = resolve_wordlist_source(&config.spell, &config_path);
+    if let Some(warning) = &spell_resolution.warning {
+        eprintln!("oom-edit: warning: {warning}");
+    }
+    let personal_dictionary_path = config_path.with_file_name("dictionary.txt");
+    let spell_host = SpellHost::production(spell_resolution.source, personal_dictionary_path);
+
     // Announce theme to stderr before entering alternate screen (hidlins pattern).
     eprintln!("oom-edit: {resolved_theme}");
 
@@ -102,13 +112,17 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         None => EditorSession::from_text(""),
     };
 
-    let app = App::new(
+    let app = App::new_with_spell(
         session,
         resolved_theme,
         config.editor.wrap,
         config.relative_line_numbers,
-        Box::new(crate::clipboard::Osc52Clipboard::stdout()),
-        Box::new(crate::config::FileConfigStore::production()),
+        AppServices::new(
+            Box::new(crate::clipboard::Osc52Clipboard::stdout()),
+            Box::new(crate::config::FileConfigStore::production()),
+            spell_host,
+        ),
+        config.spell.enabled,
         std::time::Instant::now(),
     );
 

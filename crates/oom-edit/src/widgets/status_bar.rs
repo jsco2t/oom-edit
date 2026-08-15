@@ -85,6 +85,8 @@ pub struct StatusBar {
     pub cursor_col: usize,
     /// Total line count (for percentage calculation).
     pub line_count: usize,
+    /// Whether spell checking is enabled for the active session.
+    pub spell_enabled: bool,
     /// Command-line text (when Command or rendered search is active).
     pub command_line: Option<String>,
 }
@@ -125,6 +127,10 @@ impl StatusBar {
 
         if self.dirty {
             left.push_str(" [+]");
+        }
+
+        if !self.spell_enabled {
+            left.push_str(" [spell off]");
         }
 
         // Transient message with severity glyph.
@@ -391,6 +397,7 @@ mod tests {
             cursor_line: 1,
             cursor_col: 1,
             line_count: 10,
+            spell_enabled: true,
             command_line: None,
         }
     }
@@ -412,6 +419,23 @@ mod tests {
             })
             .unwrap();
         terminal
+    }
+
+    #[test]
+    fn disabled_spell_marker_is_active_session_content() {
+        let mut bar = status(Mode::Normal);
+        bar.spell_enabled = false;
+        let text = bar.build(None, &DEFAULT_DARK, Tier::TrueColor);
+        let content = text
+            .content
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(content, "test.md [spell off]");
+
+        bar.spell_enabled = true;
+        let text = bar.build(None, &DEFAULT_DARK, Tier::TrueColor);
+        assert!(!text.content[0].content.contains("spell off"));
     }
 
     #[test]

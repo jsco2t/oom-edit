@@ -1,0 +1,4 @@
+   1  known
+
+
+ NORMAL  [spell off]  v=character-wise selection                    1:1  50% Top

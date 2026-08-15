@@ -244,6 +244,7 @@ pub fn render_status_row(
         cursor_line: cursor.0 + 1, // 1-based for display
         cursor_col: cursor.1 + 1,
         line_count: session.line_count(),
+        spell_enabled: session.spell_enabled(),
         command_line: command_line.clone(),
     };
 
@@ -253,15 +254,35 @@ pub fn render_status_row(
     let cmdline_active = command_line.is_some();
     let middle = if cmdline_active || has_transient {
         String::new()
-    } else if !overlay_hints.is_empty() {
-        overlay_hints.to_string()
     } else {
-        let flexible_width = area
-            .width
-            .saturating_sub(status_bar::STATUS_CONTENT_OFFSET)
-            .saturating_sub(status_bar::RULER_COLS);
-        let cells = hint_bar::build_hints(ctx);
-        hint_bar::format_hints(&cells, flexible_width)
+        let mut indicators = Vec::new();
+        if dirty {
+            indicators.push("[+]");
+        }
+        if !session.spell_enabled() {
+            indicators.push("[spell off]");
+        }
+        let indicators = indicators.join(" ");
+        let base = if !overlay_hints.is_empty() {
+            overlay_hints.to_string()
+        } else {
+            let mut flexible_width = area
+                .width
+                .saturating_sub(status_bar::STATUS_CONTENT_OFFSET)
+                .saturating_sub(status_bar::RULER_COLS);
+            if !indicators.is_empty() {
+                flexible_width = flexible_width
+                    .saturating_sub(indicators.len() as u16)
+                    .saturating_sub(2);
+            }
+            let cells = hint_bar::build_hints(ctx);
+            hint_bar::format_hints(&cells, flexible_width)
+        };
+        match (indicators.is_empty(), base.is_empty()) {
+            (true, _) => base,
+            (false, true) => indicators,
+            (false, false) => format!("{indicators}  {base}"),
+        }
     };
 
     status_bar::render(
@@ -524,6 +545,36 @@ mod tests {
         let middle = &row[middle_start..middle_end];
 
         assert_eq!(middle.trim_end(), "v=character-wise selection");
+        assert!(!middle.contains("Space w"));
+    }
+
+    #[test]
+    fn spell_marker_reserves_width_before_hint_cells_are_composed() {
+        let mut session = EditorSession::from_text("hello");
+        session.set_spell_enabled(false);
+        let terminal = render_session_status(&session, 80);
+        let row = buffer_row(&terminal, 0, 80);
+        let middle_start = status_bar::STATUS_CONTENT_OFFSET as usize;
+        let middle_end = 80 - status_bar::RULER_COLS as usize;
+        let middle = &row[middle_start..middle_end];
+
+        assert_eq!(middle.trim_end(), "[spell off]  v=character-wise selection");
+        assert!(!middle.contains("Space w"));
+
+        feed(&mut session, "ix");
+        session.handle_key(KeyInput {
+            code: KeyCode {
+                kind: KeyCodeKind::Esc,
+            },
+            mods: Modifiers::default(),
+        });
+        let terminal = render_session_status(&session, 80);
+        let row = buffer_row(&terminal, 0, 80);
+        let middle = &row[middle_start..middle_end];
+        assert_eq!(
+            middle.trim_end(),
+            "[+] [spell off]  v=character-wise selection"
+        );
         assert!(!middle.contains("Space w"));
     }
 

@@ -839,6 +839,17 @@ fn golden_status_error_glyph() {
     assert_snapshot(&lines, "status_error_glyph");
 }
 
+#[test]
+fn golden_status_spell_off_active_tab_marker() {
+    let mut app = test_app("known\n");
+    app.active_mut()
+        .expect("test app has an active tab")
+        .session_mut()
+        .set_spell_enabled(false);
+    let lines = render_app_lines(80, 4, |frame| app.render(frame));
+    assert_snapshot(&lines, "status_spell_off");
+}
+
 // ── Narrow-degradation goldens ──────────────────────────────────────────────
 
 /// Source Insert at 40 columns — degradation test.

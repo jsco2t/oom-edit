@@ -32,6 +32,7 @@ use crate::lifecycle::{
 use crate::overlay::Overlay;
 use crate::screens::editor::{render_editor, render_status_row, source_text_width, EditorViewport};
 use crate::screens::rendered::render_rendered;
+use crate::spell_host::SpellHost;
 use crate::theme::{self, ResolvedTheme, Theme, Tier};
 use crate::widgets::status_bar;
 use crate::widgets::which_key;
@@ -84,6 +85,27 @@ pub(crate) struct TabEntry {
     skip_rows: usize,
     /// The first visible rendered row (owned by the TUI for scroll-follow in rendered mode).
     rendered_top: usize,
+}
+
+/// Explicit host-side services injected when constructing the TUI state.
+pub(crate) struct AppServices {
+    clipboard_sink: Box<dyn ClipboardSink>,
+    config_store: Box<dyn ConfigStore>,
+    spell_host: SpellHost,
+}
+
+impl AppServices {
+    pub(crate) fn new(
+        clipboard_sink: Box<dyn ClipboardSink>,
+        config_store: Box<dyn ConfigStore>,
+        spell_host: SpellHost,
+    ) -> Self {
+        Self {
+            clipboard_sink,
+            config_store,
+            spell_host,
+        }
+    }
 }
 
 impl TabEntry {
@@ -146,6 +168,12 @@ pub struct App {
     is_light: bool,
     /// Explicitly injected persistence for theme changes.
     config_store: Box<dyn ConfigStore>,
+    /// One resumable spell engine shared by every tab.
+    spell_host: SpellHost,
+    /// Configured default applied independently to every newly-created session.
+    spell_enabled_default: bool,
+    /// Time of the most recently observed terminal input event.
+    last_input: Instant,
     /// Active capability tier.
     tier: Tier,
     /// Clipboard sink for OSC 52 clipboard writes (T16).
@@ -156,6 +184,7 @@ pub struct App {
 
 impl App {
     /// Create a new App from an open session (starts with one tab).
+    #[cfg(test)]
     pub fn new(
         session: EditorSession,
         resolved_theme: ResolvedTheme,
@@ -165,9 +194,35 @@ impl App {
         config_store: Box<dyn ConfigStore>,
         initial_time: Instant,
     ) -> Self {
+        Self::new_with_spell(
+            session,
+            resolved_theme,
+            wrap_enabled,
+            relative_line_numbers,
+            AppServices::new(
+                clipboard_sink,
+                config_store,
+                SpellHost::testing("a\nan\nand\nknown\nspell\ntext\nthe\nword\n"),
+            ),
+            true,
+            initial_time,
+        )
+    }
+
+    /// Create an App with explicit spell resources and configured session default.
+    pub(crate) fn new_with_spell(
+        session: EditorSession,
+        resolved_theme: ResolvedTheme,
+        wrap_enabled: bool,
+        relative_line_numbers: bool,
+        services: AppServices,
+        spell_enabled_default: bool,
+        initial_time: Instant,
+    ) -> Self {
         let is_light = resolved_theme.is_light();
         let tier = resolved_theme.capability;
         let theme_name = resolved_theme.name;
+        let session = Self::seed_spell_config(session, spell_enabled_default);
         Self {
             tabs: vec![TabEntry::new(session)],
             active_tab: 0,
@@ -185,12 +240,20 @@ impl App {
             transient: None,
             theme_name,
             is_light,
-            config_store,
+            config_store: services.config_store,
+            spell_host: services.spell_host,
+            spell_enabled_default,
+            last_input: initial_time,
             tier,
-            clipboard_sink,
+            clipboard_sink: services.clipboard_sink,
             #[cfg(test)]
             scroll_follow_count: 0,
         }
+    }
+
+    fn seed_spell_config(mut session: EditorSession, enabled: bool) -> EditorSession {
+        session.set_spell_enabled(enabled);
+        session
     }
 
     /// Get a reference to the active tab entry.
@@ -250,7 +313,47 @@ impl App {
             .into_iter()
             .chain(which_key_deadline)
             .min()
-            .filter(|d| *d > now)
+            .filter(|deadline| *deadline >= now)
+    }
+
+    /// Record the post-read timestamp for any terminal input event.
+    pub(crate) fn record_input(&mut self, now: Instant) {
+        self.last_input = now;
+    }
+
+    /// Return whether the app has been input-idle for at least `duration`.
+    pub(crate) fn input_idle_for(&self, now: Instant, duration: std::time::Duration) -> bool {
+        now.saturating_duration_since(self.last_input) >= duration
+    }
+
+    /// Advance one bounded host-build or active-session scan unit.
+    pub(crate) fn on_idle_unit(&mut self, max_bytes: usize) -> bool {
+        let enabled = self
+            .tabs
+            .get(self.active_tab)
+            .is_some_and(|entry| entry.session.spell_enabled());
+        if !enabled {
+            return false;
+        }
+        if self.spell_host.engine().is_none() {
+            let worked = self.spell_host.advance(true, max_bytes);
+            if let Some(message) = self.spell_host.take_unavailable_warning() {
+                self.set_transient(message, oom_edit_core::Severity::Warning);
+            }
+            return worked;
+        }
+
+        let Some(engine) = self.spell_host.engine() else {
+            return false;
+        };
+        self.tabs
+            .get_mut(self.active_tab)
+            .is_some_and(|entry| entry.session.spell_tick(engine, max_bytes))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spell_host_phase(&self) -> &'static str {
+        self.spell_host.phase_name()
     }
 
     /// Number of open tabs.
@@ -510,6 +613,7 @@ impl App {
     /// Handle one event stamped with the exact post-read time.
     pub fn handle_event_at(&mut self, event: &Event, now: Instant) {
         self.now = now;
+        self.record_input(now);
         // Handle resize events — rebuild rendered layout on width change.
         if let Event::Resize(_width, height) = event {
             // Clamp viewport height using the same chrome rows as render().
@@ -665,6 +769,7 @@ impl App {
     fn open_tab(&mut self, path: &std::path::Path) {
         match EditorSession::open(path) {
             Ok(session) => {
+                let session = Self::seed_spell_config(session, self.spell_enabled_default);
                 let idx = self.tabs.len();
                 self.tabs.push(TabEntry::new(session));
                 self.active_tab = idx;
@@ -941,6 +1046,7 @@ impl App {
         }
         match EditorSession::open(path) {
             Ok(session) => {
+                let session = Self::seed_spell_config(session, self.spell_enabled_default);
                 let entry = &mut self.tabs[target];
                 entry.session = session;
                 entry.top_line = 0;
@@ -1467,6 +1573,117 @@ mod tests {
             Box::new(crate::config::DisabledConfigStore),
             initial_time,
         )
+    }
+
+    fn test_app_with_spell_default(session: EditorSession, enabled: bool) -> App {
+        App::new_with_spell(
+            session,
+            theme::ResolvedTheme::injected("default-dark", false, Tier::TrueColor),
+            true,
+            false,
+            AppServices::new(
+                Box::new(RecordingClipboardSink::default()),
+                Box::new(crate::config::DisabledConfigStore),
+                crate::spell_host::SpellHost::testing("known\n"),
+            ),
+            enabled,
+            Instant::now(),
+        )
+    }
+
+    #[test]
+    fn every_session_creation_path_uses_config_default_not_runtime_toggle() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_path = directory.path().join("first.md");
+        let second_path = directory.path().join("second.md");
+        std::fs::write(&first_path, "first\n").unwrap();
+        std::fs::write(&second_path, "second\n").unwrap();
+
+        let mut disabled =
+            test_app_with_spell_default(EditorSession::open(&first_path).unwrap(), false);
+        assert!(!disabled.tabs[0].session.spell_enabled());
+        disabled.open_tab(&second_path);
+        assert!(!disabled.tabs[1].session.spell_enabled());
+        disabled.replace_tab_from_disk(0, &second_path, false);
+        assert!(!disabled.tabs[0].session.spell_enabled());
+
+        let mut enabled =
+            test_app_with_spell_default(EditorSession::open(&first_path).unwrap(), true);
+        enabled.tabs[0].session.set_spell_enabled(false);
+        enabled.open_tab(&second_path);
+        assert!(
+            enabled.tabs[1].session.spell_enabled(),
+            "new tabs must use config rather than inheriting the active runtime toggle"
+        );
+        enabled.tabs[1].session.set_spell_enabled(false);
+        enabled.replace_tab_from_disk(1, &first_path, true);
+        assert!(
+            enabled.tabs[1].session.spell_enabled(),
+            "replacement/reload must use the same session-construction funnel"
+        );
+    }
+
+    #[test]
+    fn spell_off_marker_tracks_only_the_active_tab() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = test_app(EditorSession::from_text("first\n"));
+        app.tabs[0].session.set_spell_enabled(false);
+        let mut second = EditorSession::from_text("second\n");
+        second.set_spell_enabled(true);
+        app.tabs.push(TabEntry::new(second));
+
+        let status_line = |app: &mut App| {
+            let mut terminal = Terminal::new(TestBackend::new(80, 6)).unwrap();
+            terminal.draw(|frame| app.render(frame)).unwrap();
+            (0..80)
+                .map(|column| {
+                    terminal
+                        .backend()
+                        .buffer()
+                        .cell((column, 5))
+                        .unwrap()
+                        .symbol()
+                })
+                .collect::<String>()
+        };
+
+        assert!(status_line(&mut app).contains("[spell off]"));
+        app.active_tab = 1;
+        assert!(!status_line(&mut app).contains("[spell off]"));
+    }
+
+    #[test]
+    fn unavailable_spell_host_emits_one_warning_then_stays_quiescent() {
+        let initial = Instant::now();
+        let mut app = App::new_with_spell(
+            EditorSession::from_text("text\n"),
+            theme::ResolvedTheme::injected("default-dark", false, Tier::TrueColor),
+            true,
+            false,
+            AppServices::new(
+                Box::new(RecordingClipboardSink::default()),
+                Box::new(crate::config::DisabledConfigStore),
+                crate::spell_host::SpellHost::testing_unavailable("configured list failed"),
+            ),
+            true,
+            initial,
+        );
+
+        assert!(!app.on_idle_unit(crate::event::SPELL_WORK_UNIT_BYTES));
+        let warning = app.transient.as_ref().expect("warning must be published");
+        assert_eq!(warning.severity, oom_edit_core::Severity::Warning);
+        assert_eq!(warning.text, "spell unavailable: configured list failed");
+
+        app.transient = None;
+        app.status_message.clear();
+        assert!(!app.on_idle_unit(crate::event::SPELL_WORK_UNIT_BYTES));
+        assert!(
+            app.transient.is_none(),
+            "terminal host warning must not repeat"
+        );
+        assert_eq!(app.spell_host_phase(), "Unavailable");
     }
 
     fn large_source_fixture() -> String {
@@ -2589,6 +2806,16 @@ mod tests {
         assert_eq!(
             app.tick(initial),
             Some(initial + std::time::Duration::from_millis(150))
+        );
+        assert_eq!(
+            app.tick(initial + std::time::Duration::from_millis(150)),
+            Some(initial + std::time::Duration::from_millis(150)),
+            "a due deadline must remain observable by the post-poll idle gate"
+        );
+        assert_eq!(
+            app.tick(initial + std::time::Duration::from_millis(151)),
+            None,
+            "a previously-observed deadline must not create a busy loop"
         );
     }
 

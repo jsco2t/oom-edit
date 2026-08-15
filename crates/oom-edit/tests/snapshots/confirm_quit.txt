@@ -21,4 +21,4 @@
       ─ links ─
       [0] https://example.com
 
- NORMAL  y/w save+quit · n quit · Esc cancel
+ NORMAL  [+]  y/w save+quit · n quit · Esc cancel

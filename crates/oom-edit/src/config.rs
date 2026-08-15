@@ -1,7 +1,7 @@
 //! Configuration — `$XDG_CONFIG_HOME/oom-edit/config.toml` (fallback
 //! `~/.config/oom-edit/config.toml`).
 //!
-//! `[theme]` and `[editor]` sections.
+//! `[theme]`, `[editor]`, and `[spell]` sections.
 //! Load-with-defaults on missing/partial config. Atomic write on change.
 //! Never fail startup on malformed config (warn to stderr, use defaults).
 
@@ -206,6 +206,40 @@ pub struct Config {
     pub theme: ThemeConfig,
     #[serde(default)]
     pub editor: EditorConfig,
+    #[serde(default)]
+    pub spell: SpellConfig,
+}
+
+/// The `[spell]` section of the config.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpellConfig {
+    /// Whether newly-created sessions start with spell checking enabled.
+    #[serde(default = "default_spell_enabled")]
+    pub enabled: bool,
+    /// Built-in English dictionary dialect (`en_US`, `en_CA`, or `en_AU`).
+    #[serde(default = "default_spell_language")]
+    pub language: String,
+    /// Additional UTF-8 plain-wordlist dictionaries, in declaration order.
+    #[serde(default)]
+    pub additional_dictionaries: Vec<PathBuf>,
+}
+
+impl Default for SpellConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_spell_enabled(),
+            language: default_spell_language(),
+            additional_dictionaries: Vec::new(),
+        }
+    }
+}
+
+fn default_spell_enabled() -> bool {
+    true
+}
+
+fn default_spell_language() -> String {
+    "en_US".to_string()
 }
 
 /// The `[editor]` section of the config.
@@ -454,6 +488,32 @@ mod tests {
         assert_eq!(config.theme.dark, "default-dark");
         assert_eq!(config.theme.light, "default-light");
         assert!(config.editor.wrap);
+        assert!(config.spell.enabled);
+        assert_eq!(config.spell.language, "en_US");
+        assert!(config.spell.additional_dictionaries.is_empty());
+    }
+
+    #[test]
+    fn config_spell_section_defaults_and_roundtrips() {
+        let missing: Config = toml::from_str("[editor]\nwrap = false\n").unwrap();
+        assert_eq!(missing.spell, SpellConfig::default());
+
+        let source = r#"
+[spell]
+enabled = false
+language = "en_CA"
+additional_dictionaries = ["team.txt", "/opt/shared.txt"]
+"#;
+        let parsed: Config = toml::from_str(source).unwrap();
+        assert!(!parsed.spell.enabled);
+        assert_eq!(parsed.spell.language, "en_CA");
+        assert_eq!(
+            parsed.spell.additional_dictionaries,
+            [PathBuf::from("team.txt"), PathBuf::from("/opt/shared.txt")]
+        );
+
+        let serialized = toml::to_string(&parsed).unwrap();
+        assert_eq!(toml::from_str::<Config>(&serialized).unwrap(), parsed);
     }
 
     #[test]
@@ -489,6 +549,11 @@ mod tests {
                 light: "my-light".to_string(),
             },
             editor: EditorConfig { wrap: false },
+            spell: SpellConfig {
+                enabled: false,
+                language: "en_AU".to_string(),
+                additional_dictionaries: vec![PathBuf::from("project.words")],
+            },
         };
 
         let temp_dir = tempfile::tempdir().unwrap();
