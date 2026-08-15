@@ -744,8 +744,8 @@ impl Highlighter {
             return; // Don't recurse into fenced code blocks
         }
 
-        // Check for inline regions (deferred - inline highlighting is done
-        // by the markdown block query captures, not by separate injections)
+        // Inline highlighting is complete in the markdown block-query
+        // captures; inline nodes do not require a separate injection pass.
         if kind == "inline" {
             return;
         }

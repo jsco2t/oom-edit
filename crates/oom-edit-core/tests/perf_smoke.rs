@@ -1,7 +1,7 @@
 //! Performance-smoke assertions for NFR-1..NFR-4.
 //!
 //! These relaxed debug-build ceilings are paired with deterministic unit
-//! invariants. Exact release-profile budgets are reported by `make bench`.
+//! invariants. Exact release-profile budgets are asserted by `make bench`.
 
 #[path = "../perf/fixtures.rs"]
 mod fixtures;

@@ -155,6 +155,42 @@ fn make_build_release_builds_only_the_locked_offline_binary() {
 }
 
 #[test]
+fn spell_release_versions_and_exact_path_edges_are_reconciled() {
+    let root = workspace_root();
+    let tui_manifest = std::fs::read_to_string(root.join("crates/oom-edit/Cargo.toml"))
+        .expect("TUI manifest should be readable");
+    let core_manifest = std::fs::read_to_string(root.join("crates/oom-edit-core/Cargo.toml"))
+        .expect("core manifest should be readable");
+    let spell_manifest = std::fs::read_to_string(root.join("crates/oom-spell/Cargo.toml"))
+        .expect("spell manifest should be readable");
+    let lockfile =
+        std::fs::read_to_string(root.join("Cargo.lock")).expect("lockfile should be readable");
+    let changelog =
+        std::fs::read_to_string(root.join("CHANGELOG.md")).expect("changelog should be readable");
+
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.5.0");
+    assert!(tui_manifest.contains("version = \"0.5.0\""));
+    assert!(core_manifest.contains("version = \"0.5.0\""));
+    assert!(spell_manifest.contains("version = \"0.1.0\""));
+    assert!(tui_manifest
+        .contains("oom-edit-core = { path = \"../oom-edit-core\", version = \"=0.5.0\" }"));
+    assert_eq!(
+        lockfile
+            .matches("name = \"oom-edit\"\nversion = \"0.5.0\"")
+            .count(),
+        1
+    );
+    assert_eq!(
+        lockfile
+            .matches("name = \"oom-edit-core\"\nversion = \"0.5.0\"")
+            .count(),
+        1
+    );
+    assert!(changelog.contains("## [0.5.0] - 2026-08-15"));
+    assert!(changelog.contains("`oom-spell` 0.1.0"));
+}
+
+#[test]
 fn tui_never_substitutes_rendered_remap_for_a_canonical_jump() {
     let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut pending = vec![source_root];

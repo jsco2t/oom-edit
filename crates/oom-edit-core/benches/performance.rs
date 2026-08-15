@@ -85,6 +85,10 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
+fn duration_gate_passes(observed: Duration, target: Duration) -> bool {
+    observed < target
+}
+
 fn report(name: &str, target: Duration, bytes: usize, lines: usize, stats: Stats) {
     println!(
         "{name}: {bytes} bytes, {lines} lines, {} iterations, avg {}, worst {}, target <{}",
@@ -93,8 +97,15 @@ fn report(name: &str, target: Duration, bytes: usize, lines: usize, stats: Stats
         format_duration(stats.worst),
         format_duration(target),
     );
+    assert!(!stats.worst.is_zero(), "{name} measured no work");
+    let lowered = stats.worst.saturating_sub(Duration::from_nanos(1));
     assert!(
-        stats.worst < target,
+        !duration_gate_passes(stats.worst, lowered),
+        "{name} must reject its intentionally lowered threshold {}",
+        format_duration(lowered)
+    );
+    assert!(
+        duration_gate_passes(stats.worst, target),
         "{name} worst {} exceeded target {}",
         format_duration(stats.worst),
         format_duration(target)

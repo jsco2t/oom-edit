@@ -327,6 +327,44 @@ fn dictionary_make_targets_are_discoverable_and_integrated() {
 }
 
 #[test]
+fn spell_configuration_and_plain_wordlist_rules_are_documented() {
+    let root = workspace_root();
+    let readme = fs::read_to_string(root.join("README.md")).expect("README should be readable");
+    let spell_readme = fs::read_to_string(root.join("crates/oom-spell/README.md"))
+        .expect("oom-spell README should be readable");
+
+    for required in [
+        "[spell]",
+        "language = \"en_US\"",
+        "additional_dictionaries",
+        "directory containing `config.toml`",
+        "larger-than-16-MiB",
+        "one entry per line",
+        "non-whitespace character is `#`",
+        "64-byte maximum",
+        "dictionary.txt",
+        "`oom-edit --licenses`",
+    ] {
+        assert!(
+            readme.contains(required),
+            "root README must document {required:?}"
+        );
+    }
+    for required in [
+        "entry per physical line",
+        "first non-whitespace byte is `#`",
+        "Invalid, non-ASCII, and",
+        "at most 64 bytes",
+        "at most nine results",
+    ] {
+        assert!(
+            spell_readme.contains(required),
+            "oom-spell README must document {required:?}"
+        );
+    }
+}
+
+#[test]
 fn dictionary_generator_normalizes_local_archives_byte_identically() {
     let root = workspace_root();
     let fixture = tempfile::tempdir().expect("generator fixture tempdir");

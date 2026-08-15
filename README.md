@@ -15,7 +15,7 @@ a thin ratatui shell over it.
 
 ```bash
 make help          # list all targets
-make check         # fmt + lint + build + test + deny + audit — the CI gate
+make check         # fmt + lint + build + test + deny + audit + data licenses
 make run           # run the editor
 make run ARGS=file.md   # open a file
 make run-isolated ARGS=file.md  # verify without reading/writing your config
@@ -40,6 +40,45 @@ the active theme, effective palette, terminal capability, winning source, and
 display mode. Tests and manual verification use a temporary
 `XDG_CONFIG_HOME`; normal `make run` intentionally uses and may persist the
 real user configuration.
+
+### Spell checking
+
+Spell checking is enabled by default and runs only during proven idle time. It
+marks English prose in all four modes without replacing Markdown or source-code
+styling. `Space s` opens suggestions, `Space a` adds the current word to the
+personal dictionary, `Space z` toggles the active session, `]s`/`[s` navigate
+diagnostics, and `Space d` opens Trouble. `:set spell` and `:set nospell` are
+the command equivalents of the session toggle.
+
+Configure dictionaries in the same `config.toml`:
+
+```toml
+[spell]
+enabled = true
+language = "en_US" # en_US, en_CA, or en_AU
+additional_dictionaries = ["team.words", "/opt/shared/company.words"]
+```
+
+Exactly one bundled dialect is selected; additional dictionaries are merged in
+declaration order and deduplicated. Relative paths are resolved against the
+directory containing `config.toml`, while absolute paths are unchanged. An
+invalid dialect emits a warning and falls back to `en_US`. A missing,
+unreadable, larger-than-16-MiB, or non-UTF-8 additional dictionary disables the
+spell engine for that run with a stable warning; it is not retried in the idle
+loop.
+
+Additional dictionaries are UTF-8 plain word lists with one entry per line.
+Leading/trailing ASCII whitespace is ignored; blank lines and lines whose first
+non-whitespace character is `#` are comments. Entries are normalized to
+lowercase ASCII letters with optional internal straight apostrophes and a
+64-byte maximum; ineligible entries are skipped. Hunspell `.aff`/`.dic` files
+are not accepted directly—convert them to a plain list offline first.
+
+The personal dictionary is `dictionary.txt` beside `config.toml`. Successful
+adds are normalized, sorted, deduplicated, written with LF and a final newline,
+and persisted atomically before the live engine changes. Runtime toggles are
+per-session and are not written to configuration. Use `oom-edit --licenses` to
+print the complete bundled SCOWL data notices without starting the terminal UI.
 
 ## Rendered editing
 

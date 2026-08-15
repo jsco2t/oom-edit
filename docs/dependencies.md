@@ -4,11 +4,13 @@ This document records direct `oom-edit-core` dependencies, reviewed workspace de
 changes, and transitive exceptions, including license, rationale, and hand-roll assessment.
 
 The 0.4.0 rendered Normal/Select migration added no dependency and did not
-change the resolved third-party graph or `vendor/`.
+change the resolved third-party graph or `vendor/`. The 0.5.0 spell-checking
+release adds only the first-party `oom-spell` package and the pinned static data
+described below; the resolved third-party graph and `vendor/` remain unchanged.
 
 ## First-party `oom-spell` crate
 
-Phase 2 of FR-9 adds `oom-spell =0.1.0` as an exact local path dependency of
+FR-9 adds `oom-spell =0.1.0` as an exact local path dependency of
 both `oom-edit-core` and `oom-edit`. This creates the planned dependency diamond
 without adding any external package, transitive code, build script, or vendored
 source. The crate inherits the workspace MIT license and is guarded by a

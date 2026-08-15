@@ -196,11 +196,11 @@ vendor: ## Re-vendor dependencies (requires network)
 # Bench
 # ---------------------------------------------------------------------------
 .PHONY: bench
-bench: ## Run performance benchmarks
+bench: ## Run exact asserting release performance gates
 	cargo bench --workspace --offline --locked
 
 .PHONY: bench-check
-bench-check: ## Run perf-smoke asserts with relaxed regression thresholds
+bench-check: ## Run asserting debug performance smoke gates
 	cargo test -p oom-spell --offline --locked --test perf_smoke
 	cargo test -p oom-edit-core --offline --locked --test perf_smoke
 

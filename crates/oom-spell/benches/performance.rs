@@ -7,7 +7,9 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-const SYNTHETIC_UNIQUE_WORDS: usize = 110_000;
+const SYNTHETIC_UNIQUE_WORDS: usize = 113_642;
+const SYNTHETIC_GENERATED_WORDS: usize = SYNTHETIC_UNIQUE_WORDS - 2;
+const SINGLE_LENGTH_WORDS: usize = 110_000;
 const CHECK_ITERATIONS: u32 = 100_000;
 const CHECK_SAMPLES: usize = 10;
 const BUILD_SAMPLES: usize = 5;
@@ -71,22 +73,34 @@ fn encoded_word(mut value: usize, len: usize) -> String {
     String::from_utf8(bytes).expect("generated words are ASCII")
 }
 
-fn synthetic_dialect() -> String {
-    let mut list = String::with_capacity(SYNTHETIC_UNIQUE_WORDS * 10);
-    for index in 0..SYNTHETIC_UNIQUE_WORDS {
+fn synthetic_dialect(range: std::ops::Range<usize>) -> String {
+    let mut list = String::with_capacity(range.len() * 10);
+    for index in range {
         let length = 4 + index % 11;
         list.push_str(&encoded_word(index / 11, length));
         list.push('\n');
     }
-    list.push_str("the\n");
-    list.push_str(&"a".repeat(MAX_CHECKED_WORD_BYTES));
-    list.push('\n');
     list
 }
 
+fn synthetic_dialects() -> Vec<String> {
+    // Match the pinned SCOWL entry counts and 113,642-word merged set without
+    // depending on the licensed corpus. The overlapping ranges model dialect
+    // overlap; the two lookup/suggestion sentinels complete the exact union.
+    let mut en_us = synthetic_dialect(0..109_900);
+    en_us.push_str("the\n");
+    en_us.push_str(&"a".repeat(MAX_CHECKED_WORD_BYTES));
+    en_us.push('\n');
+    vec![
+        en_us,
+        synthetic_dialect(2_000..111_544),
+        synthetic_dialect(3_558..SYNTHETIC_GENERATED_WORDS),
+    ]
+}
+
 fn single_length_dialect() -> String {
-    let mut list = String::with_capacity(SYNTHETIC_UNIQUE_WORDS * 9);
-    for index in (0..SYNTHETIC_UNIQUE_WORDS).rev() {
+    let mut list = String::with_capacity(SINGLE_LENGTH_WORDS * 9);
+    for index in (0..SINGLE_LENGTH_WORDS).rev() {
         list.push_str(&encoded_word(index, 8));
         list.push('\n');
     }
@@ -103,9 +117,11 @@ fn memory_gate_passes(observed: usize, target: usize) -> bool {
 
 fn assert_duration_gate(label: &str, observed: Duration, target: Duration) {
     println!("{label}: {observed:?}, target <{target:?}");
+    assert!(!observed.is_zero(), "{label} measured no work");
+    let lowered = observed.saturating_sub(Duration::from_nanos(1));
     assert!(
-        !duration_gate_passes(observed, Duration::ZERO),
-        "{label} should reject an intentionally lowered zero threshold"
+        !duration_gate_passes(observed, lowered),
+        "{label} should reject its intentionally lowered threshold {lowered:?}"
     );
     assert!(
         duration_gate_passes(observed, target),
@@ -152,10 +168,6 @@ fn build_and_measure(lists: Vec<String>) -> (SpellEngine, Duration, Duration) {
     (engine, worst_step, total)
 }
 
-fn build_lists(dialect: &str) -> Vec<String> {
-    vec![dialect.to_owned(), dialect.to_owned(), dialect.to_owned()]
-}
-
 fn dense_suggestion_list() -> String {
     let mut list = String::new();
     let base = b"aaaaaaaa";
@@ -181,9 +193,9 @@ fn dense_suggestion_list() -> String {
     list
 }
 
-fn measure_build(dialect: &str) -> (SpellEngine, Duration, Duration, usize) {
-    let warm_engine = build_and_measure(build_lists(dialect)).0;
-    assert!(warm_engine.word_count() >= SYNTHETIC_UNIQUE_WORDS);
+fn measure_build(dialects: &[String]) -> (SpellEngine, Duration, Duration, usize) {
+    let warm_engine = build_and_measure(dialects.to_vec()).0;
+    assert_eq!(warm_engine.word_count(), SYNTHETIC_UNIQUE_WORDS);
     drop(warm_engine);
 
     let mut retained_engine = None;
@@ -191,7 +203,7 @@ fn measure_build(dialect: &str) -> (SpellEngine, Duration, Duration, usize) {
     let mut worst_total = Duration::ZERO;
     let mut peak_heap = 0;
     for sample in 0..BUILD_SAMPLES {
-        let lists = build_lists(dialect);
+        let lists = dialects.to_vec();
         let baseline = reset_peak();
         let (engine, sample_step, sample_total) = build_and_measure(lists);
         worst_step = worst_step.max(sample_step);
@@ -244,7 +256,7 @@ fn measure_pathological_step(list: &str) -> Duration {
                 .finish()
                 .expect("builder should complete")
                 .word_count(),
-            SYNTHETIC_UNIQUE_WORDS
+            SINGLE_LENGTH_WORDS
         );
     }
     worst
@@ -279,8 +291,11 @@ fn assert_suggestion_storage_is_capped() {
 }
 
 fn main() {
-    let dialect = synthetic_dialect();
-    let (engine, worst_step, total_build, peak_heap) = measure_build(&dialect);
+    let dialects = synthetic_dialects();
+    assert_eq!(dialects[0].lines().count(), 109_902);
+    assert_eq!(dialects[1].lines().count(), 109_544);
+    assert_eq!(dialects[2].lines().count(), 110_082);
+    let (engine, worst_step, total_build, peak_heap) = measure_build(&dialects);
 
     assert_duration_gate("4 KiB build step", worst_step, Duration::from_millis(2));
     assert_duration_gate(

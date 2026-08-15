@@ -18,3 +18,21 @@ v1 intentionally makes no Unicode normalization or non-ASCII case-fold claim.
 
 All supported API is re-exported from the crate root. Build and verification are
 run through the workspace `Makefile`.
+
+## Word-list contract
+
+`SpellEngineBuilder` accepts owned UTF-8 strings containing one dictionary
+entry per physical line. Leading and trailing ASCII whitespace is ignored;
+blank lines and lines whose first non-whitespace byte is `#` are ignored.
+Accepted entries contain lowercase-normalizable ASCII letters and optional
+internal straight apostrophes and are at most 64 bytes. Invalid, non-ASCII, and
+overlong builder entries are skipped. Call
+`normalize_dictionary_entry` directly when an embedding application needs to
+surface entry errors, as oom-edit does for its personal dictionary.
+
+Construction and tokenization are resumable: callers choose the byte budget for
+each `step`/chunk and remain responsible for clocks, idleness, I/O, and retry
+policy. `check` recognizes exact, ASCII-folded, and straight/curly possessive
+forms. `suggest` uses a project-owned bounded optimal-string-alignment distance,
+ranks by distance then lexical word, restores initial-capital/all-caps shape,
+and returns at most nine results.
