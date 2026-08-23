@@ -380,6 +380,33 @@ fn link_index_select_y_exits_and_enter_stays_without_source_ranges() {
 }
 
 #[test]
+fn link_index_select_y_preserves_source_backed_yank_semantics() {
+    let destination = "https://example.com/source-backed";
+    let source = format!("[label]({destination})\n");
+    let mut session = EditorSession::from_text(&source);
+    session.render_layout(80);
+
+    session.handle_key(key('V'));
+    session.handle_key(key('G'));
+    assert_eq!(
+        session
+            .rendered_selection()
+            .expect("selection should span the source and synthetic link row")
+            .source_ranges,
+        vec![0..source.len()]
+    );
+
+    let effects = session.handle_key(key('y'));
+    assert!(effects.iter().all(
+        |effect| !matches!(effect, Effect::ClipboardWrite(payload) if payload == destination)
+    ));
+    assert_eq!(session.mode(), Mode::Normal);
+
+    session.handle_key(key('p'));
+    assert_eq!(session.document(), format!("{source}{source}"));
+}
+
+#[test]
 fn unicode_selection_atoms_stay_utf8_safe() {
     let text = "e\u{301} 東京\n大阪\n";
     let mut session = EditorSession::from_text(text);

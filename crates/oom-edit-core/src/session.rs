@@ -2471,7 +2471,13 @@ impl EditorSession {
         if key.mods == Modifiers::default()
             && matches!(key.code.kind, KeyCodeKind::Char('y') | KeyCodeKind::Enter)
         {
-            if let Some(destination) = self.focused_synthetic_link_destination() {
+            let copy_focused_link = matches!(key.code.kind, KeyCodeKind::Enter)
+                || self
+                    .rendered_selection()
+                    .is_some_and(|selection| selection.source_ranges.is_empty());
+            if let (true, Some(destination)) =
+                (copy_focused_link, self.focused_synthetic_link_destination())
+            {
                 self.rendered_state.count = 0;
                 self.rendered_state.register_input = RegisterInput::Default;
                 let effects = vec![Effect::ClipboardWrite(destination)];
