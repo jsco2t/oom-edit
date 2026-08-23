@@ -14,10 +14,14 @@
 use std::io::{stdout, Write};
 use std::sync::Once;
 
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::cursor::SetCursorStyle;
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, EndSynchronizedUpdate, EnterAlternateScreen,
+    LeaveAlternateScreen,
 };
 
 /// Owns the raw-mode + alternate-screen state for the lifetime of the TUI.
@@ -80,6 +84,8 @@ impl TerminalGuard {
 
         // Best-effort mouse capture (FR-6.11 is Should-have; proceed keyboard-only).
         let _ = execute!(stdout(), EnableMouseCapture);
+        // Best-effort bracketed paste; unsupported terminals remain usable.
+        let _ = execute!(stdout(), EnableBracketedPaste);
 
         Ok(Self { _private: () })
     }
@@ -99,6 +105,11 @@ impl Drop for TerminalGuard {
 /// the raw-mode restoration. The termios half is covered by manual
 /// verification, not the in-process test.
 pub fn restore_terminal(out: &mut impl Write) {
+    // End any frame that was interrupted between synchronized-update commands.
+    let _ = execute!(out, EndSynchronizedUpdate);
+    // Restore the user's configured cursor before returning to their shell.
+    let _ = execute!(out, SetCursorStyle::DefaultUserShape);
+    let _ = execute!(out, DisableBracketedPaste);
     // Disable mouse capture unconditionally (harmless if it was never enabled)
     // so a panic mid-session never leaves the terminal emitting mouse escapes.
     let _ = execute!(out, DisableMouseCapture);
@@ -154,10 +165,10 @@ mod signals {
     static TERMIOS_SAVED: AtomicBool = AtomicBool::new(false);
     static INSTALLED: AtomicBool = AtomicBool::new(false);
 
-    /// Disable all mouse-reporting modes, then leave the alternate screen.
+    /// End synchronized updates, restore input/cursor modes, and leave the alternate screen.
     /// Written directly because `execute!`/`Stdout` are not async-signal-safe.
     pub(super) const RESTORE_TERMINAL: &[u8] =
-        b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1015l\x1b[?1006l\x1b[?1049l";
+        b"\x1b[?2026l\x1b[0 q\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1015l\x1b[?1006l\x1b[?1049l";
 
     /// Capture the current (cooked) termios and install the handlers.
     /// Idempotent and called before `enable_raw_mode`.
@@ -229,6 +240,12 @@ mod tests {
     const LEAVE_ALT_SCREEN: &[u8] = b"\x1b[?1049l";
     /// The disable-mouse-capture escape emitted by `restore_terminal`.
     const DISABLE_MOUSE: &[u8] = b"\x1b[?1000l";
+    /// The user-default cursor-shape escape emitted by every restore path.
+    const DEFAULT_CURSOR_SHAPE: &[u8] = b"\x1b[0 q";
+    /// The end-synchronized-update escape emitted defensively during cleanup.
+    const END_SYNCHRONIZED_UPDATE: &[u8] = b"\x1b[?2026l";
+    /// The bracketed-paste disable escape emitted by every restore path.
+    const DISABLE_BRACKETED_PASTE: &[u8] = b"\x1b[?2004l";
 
     fn contains(bytes: &[u8], needle: &[u8]) -> bool {
         bytes.windows(needle.len()).any(|w| w == needle)
@@ -248,6 +265,12 @@ mod tests {
             contains(&sink, DISABLE_MOUSE),
             "restore_terminal must disable mouse capture; got {sink:?}"
         );
+        assert!(
+            contains(&sink, DEFAULT_CURSOR_SHAPE),
+            "restore_terminal must restore the user's cursor shape; got {sink:?}"
+        );
+        assert!(contains(&sink, END_SYNCHRONIZED_UPDATE));
+        assert!(contains(&sink, DISABLE_BRACKETED_PASTE));
     }
 
     /// The production panic-hook composition runs the restore body *before*
@@ -281,8 +304,20 @@ mod tests {
     /// the alternate screen (NFR-5 panic-safety extension).
     #[cfg(unix)]
     #[test]
-    fn signal_restore_disables_mouse_before_leaving_alt_screen() {
+    fn signal_restore_resets_cursor_and_disables_mouse_before_leaving_alt_screen() {
         let bytes = signals::RESTORE_TERMINAL;
+        let cursor = bytes
+            .windows(DEFAULT_CURSOR_SHAPE.len())
+            .position(|w| w == DEFAULT_CURSOR_SHAPE)
+            .expect("signal restore resets the cursor shape");
+        let synchronized = bytes
+            .windows(END_SYNCHRONIZED_UPDATE.len())
+            .position(|w| w == END_SYNCHRONIZED_UPDATE)
+            .expect("signal restore ends synchronized updates");
+        let paste = bytes
+            .windows(DISABLE_BRACKETED_PASTE.len())
+            .position(|w| w == DISABLE_BRACKETED_PASTE)
+            .expect("signal restore disables bracketed paste");
         let mouse = bytes
             .windows(DISABLE_MOUSE.len())
             .position(|w| w == DISABLE_MOUSE)
@@ -292,8 +327,8 @@ mod tests {
             .position(|w| w == LEAVE_ALT_SCREEN)
             .expect("signal restore leaves alternate screen");
         assert!(
-            mouse < alt,
-            "mouse must be disabled before alt-screen leave"
+            synchronized < cursor && cursor < paste && paste < mouse && mouse < alt,
+            "synchronized update, cursor, paste, and mouse cleanup must precede alt-screen leave"
         );
     }
 }

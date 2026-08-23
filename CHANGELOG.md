@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added copyable rendered link-index rows in Normal and Select and configurable
+  mode-specific terminal cursor shapes.
+
+### Changed
+
+- Clarified and compacted command discovery, with consistently themed and
+  aligned command-palette rows and grouped Space-prefix hints.
+- Made rendered tables reflow to an 80-column floor and follow horizontal
+  cursor movement when their content exceeds the viewport.
+- Stabilized terminal presentation with changed-state-only redraws, resize
+  coalescing, and synchronized-update framing around complete frames.
+
 ## [0.5.0] - 2026-08-15
 
 ### Added

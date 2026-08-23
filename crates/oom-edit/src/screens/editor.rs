@@ -545,8 +545,24 @@ mod tests {
         let middle_end = 70 - status_bar::RULER_COLS as usize - spell_width;
         let middle = &row[middle_start..middle_end];
 
-        assert_eq!(middle.trim_end(), "v=character-wise selection");
+        assert_eq!(middle.trim_end(), "v=select  /=search  :=command");
         assert!(!middle.contains("Space w"));
+    }
+
+    #[test]
+    fn compact_palette_hint_is_visible_at_standard_width() {
+        let session = EditorSession::from_text("hello");
+        let terminal = render_session_status(&session, 80);
+        let row = buffer_row(&terminal, 0, 80);
+        let middle_start = status_bar::STATUS_CONTENT_OFFSET as usize;
+        let spell_width = ratatui::text::Line::from("🅂 0 ").width();
+        let middle_end = 80 - status_bar::RULER_COLS as usize - spell_width;
+        let middle = &row[middle_start..middle_end];
+
+        assert_eq!(
+            middle.trim_end(),
+            "v=select  /=search  :=command  Space+h=help"
+        );
     }
 
     #[test]
@@ -559,7 +575,10 @@ mod tests {
         let middle_end = 80 - status_bar::RULER_COLS as usize;
         let middle = &row[middle_start..middle_end];
 
-        assert_eq!(middle.trim_end(), "[spell off]  v=character-wise selection");
+        assert_eq!(
+            middle.trim_end(),
+            "[spell off]  v=select  /=search  :=command"
+        );
         assert!(!middle.contains("Space w"));
 
         feed(&mut session, "ix");
@@ -574,7 +593,7 @@ mod tests {
         let middle = &row[middle_start..middle_end];
         assert_eq!(
             middle.trim_end(),
-            "[+] [spell off]  v=character-wise selection"
+            "[+] [spell off]  v=select  /=search  :=command"
         );
         assert!(!middle.contains("Space w"));
     }

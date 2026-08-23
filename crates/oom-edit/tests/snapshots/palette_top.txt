@@ -3,21 +3,21 @@
    3  │ ┌ Command Palette ─────────────────────────────────────────────┐       │
    4  └─│>                                                             │───────┘
         │                                                              │
-   6  █ │▸ v                    character-wise selection            sel│
-        │  V                    line-wise selection                 sel│
-   8  So│  Ctrl-V               block-wise selection                sel│
-        │  Esc / Ctrl-C         cancel selection                    can│
-  10  ┃ │  "{register}          select register                     sel│
-        │  y                    yank selection                      sel│
-      ▏ │  d / x                delete selection                    sel│
-  13  ▏ │  c                    change selection                    sel│
-  14  ▏ │  >                    indent selection                    sel│
-  15  ▏ │  <                    outdent selection                   sel│
-      ▏ │  o                    swap selection endpoint             sel│
-        │  help                 help / command palette         Space h │
-  18  ──│  save                 save                           Space w │────────
-        │  quit                 quit                           Space q │
-  20  An│  cycle-theme          cycle theme                    Space t │
+   6  █ │▸ v              character-wise selection       select-charac…│
+        │· V              line-wise selection            select-line   │
+   8  So│· Ctrl-V         block-wise selection           select-block  │
+        │· Esc / Ctrl-C   cancel selection               cancel-select │
+  10  ┃ │· "{register}    select register                select-regist…│
+        │· y              yank selection                 select-yank   │
+      ▏ │· d / x          delete selection               select-delete │
+  13  ▏ │· c              change selection               select-change │
+  14  ▏ │· >              indent selection               select-indent │
+  15  ▏ │· <              outdent selection              select-outdent│
+      ▏ │· o              swap selection endpoint        select-swap-a…│
+        │· /              search rendered text           search        │
+  18  ──│· :              enter Command mode             command       │────────
+        │  help           command palette                Space h       │
+  20  An│  save           save                           Space w       │
         └──────────────────────────────────────────────────────────────┘
   22  More text here.
 

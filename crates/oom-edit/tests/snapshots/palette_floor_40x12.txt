@@ -1,12 +1,12 @@
 ┌ Command Palette ─────────────────────┐
 │>                                     │
 │                                      │
-│▸ v                    character-wise │
-│  V                    line-wise selec│
-│  Ctrl-V               block-wise sele│
-│  Esc / Ctrl-C         cancel selectio│
-│  "{register}          select register│
-│  y                    yank selection │
-│  d / x                delete selectio│
-│  c                    change selectio│
+│▸ v            character-w… select-ch…│
+│· V            line-wise s… select-li…│
+│· Ctrl-V       block-wise … select-bl…│
+│· Esc / Ctrl-C cancel sele… cancel-se…│
+│· "{register}  select regi… select-re…│
+│· y            yank select… select-ya…│
+│· d / x        delete sele… select-de…│
+│· c            change sele… select-ch…│
 └──────────────────────────────────────┘

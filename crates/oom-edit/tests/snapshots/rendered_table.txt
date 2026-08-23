@@ -1,11 +1,9 @@
-   1  █ Table
-
-      ┌───────┬────────┬───────┐
-   3  │ Left  │ Center │ Right │
-      ├───────┼────────┼───────┤
-   5  │ alpha │  beta  │    42 │
-   6  │ wide  │  東 京   │     7 │
-      └───────┴────────┴───────┘
+      ──────────────────────┬─────────────────────
+   1  nter naturally wide c │ Right naturally wide
+      umn                   │ umn
+      ──────────────────────┼─────────────────────
+   3   京 東 京 東 京 東 京 東 京    │   final repeated con
+      ──────────────────────┴─────────────────────
 
 
 
@@ -21,4 +19,6 @@
 
 
 
- NORMAL  v=character-wise selection  Space w=save               🅂 0 1:1  14% Top
+
+
+ NORMAL  v=select                🅂 0 1:78  25% Top

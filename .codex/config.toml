@@ -1,0 +1,17 @@
+model = "gpt-5.6-sol"
+model_reasoning_effort = "high"
+
+[agents]
+enabled = true
+
+# Excludes the primary thread, therefore this permits exactly
+# one simultaneously active subagent.
+max_concurrent_threads_per_session = 1
+
+# Any spawned agent defaults to the cheaper model unless
+# explicitly overridden.
+default_subagent_model = "gpt-5.6-terra"
+default_subagent_reasoning_effort = "medium"
+
+[features]
+hooks = true

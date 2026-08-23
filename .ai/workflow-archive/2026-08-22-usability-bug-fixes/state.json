@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "work_id": "2026-08-22-usability-bug-fixes",
+  "title": "Rendered-mode and shell usability refinements",
+  "phase": "DONE",
+  "baseline_sha": "4aa8308cfc80a40a8fef1886c85fde4b6a3d2a25",
+  "final_sha": "4aa8308cfc80a40a8fef1886c85fde4b6a3d2a25",
+  "plan_revision": 1,
+  "approved_plan_sha256": "3b7eb348aaaf934cba6cbfec40fce4c4b8041f4eb7d75acf0335d960491417f3",
+  "created_at": "2026-08-23T01:01:00Z",
+  "updated_at": "2026-08-23T15:51:10Z",
+  "approved_at": "2026-08-23T04:06:42Z",
+  "completed_at": "2026-08-23T15:50:33Z",
+  "current_task": null,
+  "archived_at": "2026-08-23T15:51:10Z",
+  "tasks": [
+    {
+      "id": "001",
+      "path": "tasks/001-command-discovery-surfaces.md",
+      "status": "COMPLETE",
+      "attempts": 2,
+      "implementation": "worker",
+      "evidence": "evidence/001.md"
+    },
+    {
+      "id": "002",
+      "path": "tasks/002-copyable-link-index.md",
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/002.md"
+    },
+    {
+      "id": "003",
+      "path": "tasks/003-responsive-table-floor.md",
+      "status": "COMPLETE",
+      "attempts": 2,
+      "implementation": "worker",
+      "evidence": "evidence/003.md"
+    },
+    {
+      "id": "004",
+      "path": "tasks/004-rendered-horizontal-follow.md",
+      "status": "COMPLETE",
+      "attempts": 3,
+      "implementation": "main",
+      "evidence": "evidence/004.md"
+    },
+    {
+      "id": "005",
+      "path": "tasks/005-mode-cursor-shapes.md",
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/005.md"
+    },
+    {
+      "id": "006",
+      "path": "tasks/006-stable-frame-presentation.md",
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/006.md"
+    }
+  ],
+  "task_retry_limit": 3,
+  "final_retry_limit": 2,
+  "final_attempts": 1,
+  "stop_continuations": 0,
+  "max_stop_continuations": 50,
+  "block_reason": null
+}

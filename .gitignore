@@ -23,3 +23,8 @@
 
 # local agent instructions
 .agent-context.local.md
+
+# Codex feature workflow runtime state
+.ai/workflow/state.json
+.ai/workflow/status.md
+.ai/workflow/evidence/

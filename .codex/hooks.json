@@ -1,0 +1,18 @@
+{
+  "description": "Autonomous continuation for the approved feature workflow.",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .codex/hooks/workflow_stop.py",
+            "commandWindows": "py -3 .codex\\hooks\\workflow_stop.py",
+            "timeout": 5,
+            "statusMessage": "Checking feature workflow state"
+          }
+        ]
+      }
+    ]
+  }
+}

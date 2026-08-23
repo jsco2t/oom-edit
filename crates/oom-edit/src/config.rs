@@ -248,17 +248,25 @@ pub struct EditorConfig {
     /// Whether long source lines wrap. Defaults to `true`.
     #[serde(default = "default_wrap")]
     pub wrap: bool,
+    /// Whether the terminal cursor shape follows the active mode.
+    #[serde(default = "default_cursor_shapes")]
+    pub cursor_shapes: bool,
 }
 
 impl Default for EditorConfig {
     fn default() -> Self {
         Self {
             wrap: default_wrap(),
+            cursor_shapes: default_cursor_shapes(),
         }
     }
 }
 
 fn default_wrap() -> bool {
+    true
+}
+
+fn default_cursor_shapes() -> bool {
     true
 }
 
@@ -488,6 +496,7 @@ mod tests {
         assert_eq!(config.theme.dark, "default-dark");
         assert_eq!(config.theme.light, "default-light");
         assert!(config.editor.wrap);
+        assert!(config.editor.cursor_shapes);
         assert!(config.spell.enabled);
         assert_eq!(config.spell.language, "en_US");
         assert!(config.spell.additional_dictionaries.is_empty());
@@ -524,18 +533,38 @@ additional_dictionaries = ["team.txt", "/opt/shared.txt"]
     #[test]
     fn config_editor_wrap_roundtrip() {
         let config = Config {
-            editor: EditorConfig { wrap: false },
+            editor: EditorConfig {
+                wrap: false,
+                cursor_shapes: false,
+            },
             ..Config::default()
         };
         let serialized = toml::to_string(&config).unwrap();
         let parsed: Config = toml::from_str(&serialized).unwrap();
         assert!(!parsed.editor.wrap);
+        assert!(!parsed.editor.cursor_shapes);
     }
 
     #[test]
     fn config_missing_editor_section_defaults_wrap_true() {
         let config: Config = toml::from_str("[theme]\nmode = \"dark\"\n").unwrap();
         assert!(config.editor.wrap);
+        assert!(config.editor.cursor_shapes);
+    }
+
+    #[test]
+    fn config_partial_editor_section_defaults_cursor_shapes_true() {
+        let config: Config = toml::from_str("[editor]\nwrap = false\n").unwrap();
+        assert!(config.editor.cursor_shapes);
+    }
+
+    #[test]
+    fn config_editor_cursor_shapes_explicit_false_roundtrips() {
+        let config: Config = toml::from_str("[editor]\ncursor_shapes = false\n").unwrap();
+        assert!(!config.editor.cursor_shapes);
+
+        let serialized = toml::to_string(&config).unwrap();
+        assert_eq!(toml::from_str::<Config>(&serialized).unwrap(), config);
     }
 
     /// Config round-trip: save and reload produces the same config.
@@ -548,7 +577,10 @@ additional_dictionaries = ["team.txt", "/opt/shared.txt"]
                 dark: "my-dark".to_string(),
                 light: "my-light".to_string(),
             },
-            editor: EditorConfig { wrap: false },
+            editor: EditorConfig {
+                wrap: false,
+                cursor_shapes: false,
+            },
             spell: SpellConfig {
                 enabled: false,
                 language: "en_AU".to_string(),

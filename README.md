@@ -62,6 +62,9 @@ relative_line_numbers = false
 
 [editor]
 wrap = true
+# Use a steady block in Normal, a steady bar in Insert and Command, and a
+# steady underscore in Select. Set false for a steady block in every mode.
+cursor_shapes = true
 
 [theme]
 # Omit mode to infer light or dark from COLORFGBG, with dark as the fallback.

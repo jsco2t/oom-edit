@@ -7,6 +7,7 @@
 mod fixtures;
 
 mod perf_assertions {
+    use std::sync::{Mutex, MutexGuard};
     use std::time::{Duration, Instant};
 
     use oom_edit_core::{EditorSession, KeyCode, KeyCodeKind, KeyInput, Mode, Modifiers, Viewport};
@@ -14,6 +15,13 @@ mod perf_assertions {
 
     const ONE_MIB: usize = 1024 * 1024;
     const FIXTURE_SEED: u64 = 0x00_0D_D1_7E;
+    static PERF_LOCK: Mutex<()> = Mutex::new(());
+
+    fn serial() -> MutexGuard<'static, ()> {
+        PERF_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn source_fixture_1mb() -> String {
         super::fixtures::seeded_markdown_fixture(ONE_MIB, FIXTURE_SEED)
@@ -70,6 +78,7 @@ mod perf_assertions {
 
     #[test]
     fn perf_smoke_nfr1_open_to_first_frame() {
+        let _serial = serial();
         let doc = source_fixture_1mb();
         let start = Instant::now();
         let mut session = EditorSession::from_text(&doc);
@@ -88,6 +97,7 @@ mod perf_assertions {
 
     #[test]
     fn perf_smoke_nfr2_insert_scroll_frame_1mb() {
+        let _serial = serial();
         let doc = source_fixture_1mb();
         let mut session = EditorSession::from_text(&doc);
         enter_insert(&mut session);
@@ -125,6 +135,7 @@ mod perf_assertions {
 
     #[test]
     fn perf_smoke_nfr3_insert_edit_1mb() {
+        let _serial = serial();
         let doc = source_fixture_1mb();
         let mut session = EditorSession::from_text(&doc);
         enter_insert(&mut session);
@@ -155,6 +166,7 @@ mod perf_assertions {
 
     #[test]
     fn perf_smoke_nfr2_edit_to_frame_1mb() {
+        let _serial = serial();
         let doc = source_fixture_1mb();
         let mut session = EditorSession::from_text(&doc);
         enter_insert(&mut session);
@@ -172,6 +184,7 @@ mod perf_assertions {
 
     #[test]
     fn perf_smoke_nfr4_rendered_build() {
+        let _serial = serial();
         let doc = rendered_5000_line_fixture();
         let mut session = EditorSession::from_text(&doc);
         assert_eq!(session.line_count(), 5_000);
@@ -188,6 +201,7 @@ mod perf_assertions {
 
     #[test]
     fn perf_smoke_nfr2_rendered_navigation_to_frame() {
+        let _serial = serial();
         let doc = rendered_5000_line_fixture();
         let mut session = EditorSession::from_text(&doc);
         session.render_layout(120);
@@ -210,6 +224,7 @@ mod perf_assertions {
 
     #[test]
     fn perf_smoke_spell_tick_and_full_scan_1mb() {
+        let _serial = serial();
         let engine = spell_engine();
         let document = spell_fixture_1mb();
         let mut session = EditorSession::from_text(&document);

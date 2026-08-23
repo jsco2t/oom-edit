@@ -882,8 +882,8 @@ use crate::spell::{
     TextPosition,
 };
 use crate::style::{
-    RenderedCursor, RenderedLayout, RenderedPoint, RenderedSearch, RenderedSelection,
-    RenderedSourceAtom, SearchDirection, SelectionShape, SourceDecoration,
+    LineKind, RenderedCursor, RenderedLayout, RenderedPoint, RenderedSearch, RenderedSelection,
+    RenderedSourceAtom, SearchDirection, SelectionShape, SourceDecoration, TargetKind,
 };
 use live_document::LiveDocument;
 use std::ops::Range;
@@ -2360,6 +2360,15 @@ impl EditorSession {
         if self.first_heading_bracket_is_pending(key) {
             return Vec::new();
         }
+        if key.mods == Modifiers::default()
+            && matches!(key.code.kind, KeyCodeKind::Char('y') | KeyCodeKind::Enter)
+        {
+            if let Some(destination) = self.focused_synthetic_link_destination() {
+                self.rendered_state.count = 0;
+                self.rendered_state.register_input = RegisterInput::Default;
+                return vec![Effect::ClipboardWrite(destination)];
+            }
+        }
         if key.mods.ctrl && matches!(key.code.kind, KeyCodeKind::Char('v' | 'V')) {
             return self.enter_select(SelectionShape::Block);
         }
@@ -2459,6 +2468,20 @@ impl EditorSession {
         if self.first_heading_bracket_is_pending(key) {
             return Vec::new();
         }
+        if key.mods == Modifiers::default()
+            && matches!(key.code.kind, KeyCodeKind::Char('y') | KeyCodeKind::Enter)
+        {
+            if let Some(destination) = self.focused_synthetic_link_destination() {
+                self.rendered_state.count = 0;
+                self.rendered_state.register_input = RegisterInput::Default;
+                let effects = vec![Effect::ClipboardWrite(destination)];
+                return if matches!(key.code.kind, KeyCodeKind::Char('y')) {
+                    self.finish_select(Mode::Normal, effects)
+                } else {
+                    effects
+                };
+            }
+        }
         if key.mods.ctrl && matches!(key.code.kind, KeyCodeKind::Char('c')) {
             return self.finish_select(Mode::Normal, Vec::new());
         }
@@ -2503,6 +2526,27 @@ impl EditorSession {
             }
         }
         self.handle_rendered_navigation_key(key)
+    }
+
+    fn focused_synthetic_link_destination(&self) -> Option<String> {
+        let layout = self.rendered_state.layout_cache.as_ref()?;
+        let line = self.rendered_state.cursor.line;
+        if layout.lines.get(line)?.kind != LineKind::Synthetic {
+            return None;
+        }
+        let index = layout.jump_targets.iter().find_map(|target| {
+            if target.line != line {
+                return None;
+            }
+            match target.kind {
+                TargetKind::Link(index) => Some(index),
+                TargetKind::Heading(_) | TargetKind::Footnote => None,
+            }
+        })?;
+        layout
+            .link_index
+            .get(index)
+            .map(|(_, destination)| destination.clone())
     }
 
     fn rendered_register(selector: char) -> Option<Register> {

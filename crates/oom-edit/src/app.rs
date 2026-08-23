@@ -31,7 +31,7 @@ use crate::lifecycle::{
 };
 use crate::overlay::{Overlay, SpellSuggestAction, TroubleAction, TroubleEntry, TroubleProgress};
 use crate::screens::editor::{render_editor, render_status_row, source_text_width, EditorViewport};
-use crate::screens::rendered::render_rendered;
+use crate::screens::rendered::{render_rendered, RenderedViewport};
 use crate::spell_host::SpellHost;
 use crate::theme::{self, ResolvedTheme, Theme, Tier};
 use crate::widgets::status_bar;
@@ -73,6 +73,35 @@ fn rendered_scroll_top(
     }
 }
 
+fn rendered_scroll_left(
+    cursor: usize,
+    cursor_width: usize,
+    viewport_width: usize,
+    row_width: usize,
+    current_left: usize,
+) -> usize {
+    if viewport_width == 0 || row_width <= viewport_width {
+        return 0;
+    }
+
+    let max_left = row_width.saturating_sub(viewport_width);
+    let mut left = current_left.min(max_left);
+    let cursor = cursor.min(row_width.saturating_sub(1));
+    let cursor_width = cursor_width.max(1).min(row_width.saturating_sub(cursor));
+    let cursor_end = cursor.saturating_add(cursor_width);
+    let margin = HSCROLLOFF.min(viewport_width.saturating_sub(cursor_width) / 2);
+
+    if cursor < left.saturating_add(margin) {
+        left = cursor.saturating_sub(margin);
+    } else if cursor_end.saturating_add(margin) > left.saturating_add(viewport_width) {
+        left = cursor_end
+            .saturating_add(margin)
+            .saturating_sub(viewport_width);
+    }
+
+    left.min(max_left)
+}
+
 /// A single tab entry: an [`EditorSession`] with per-tab UI state.
 pub(crate) struct TabEntry {
     /// The core editing session for this tab.
@@ -85,6 +114,8 @@ pub(crate) struct TabEntry {
     skip_rows: usize,
     /// The first visible rendered row (owned by the TUI for scroll-follow in rendered mode).
     rendered_top: usize,
+    /// First visible display column on rendered surfaces.
+    rendered_left_col: usize,
 }
 
 /// Explicit host-side services injected when constructing the TUI state.
@@ -116,6 +147,7 @@ impl TabEntry {
             left_col: 0,
             skip_rows: 0,
             rendered_top: 0,
+            rendered_left_col: 0,
         }
     }
 
@@ -180,6 +212,15 @@ pub struct App {
     clipboard_sink: Box<dyn ClipboardSink>,
     #[cfg(test)]
     scroll_follow_count: usize,
+}
+
+/// Result of advancing App-owned timers at one event-loop timestamp.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TickResult {
+    /// Next time-sensitive wake-up, if one remains pending.
+    pub(crate) deadline: Option<Instant>,
+    /// Whether a timer transition changed visible presentation state.
+    pub(crate) redraw: bool,
 }
 
 impl App {
@@ -278,17 +319,27 @@ impl App {
         self.active().map(|t| &t.session)
     }
 
+    /// Return the active project-owned editor mode for terminal presentation.
+    pub(crate) fn mode(&self) -> oom_edit_core::Mode {
+        self.session()
+            .map_or(oom_edit_core::Mode::Normal, EditorSession::mode)
+    }
+
     /// Get a mutable reference to the active session.
     #[cfg(test)]
     fn session_mut(&mut self) -> Option<&mut EditorSession> {
         self.active_mut().map(|t| &mut t.session)
     }
 
-    /// Advance internal timers. Returns the next poll deadline (if any).
+    /// Advance internal timers and report their presentation effect.
     ///
     /// Advances `self.now`, expires any TTL'd transient messages, and
     /// computes the minimum of transient expiry and which-key pending+150ms.
-    pub fn tick(&mut self, now: Instant) -> Option<Instant> {
+    pub(crate) fn tick(&mut self, now: Instant) -> TickResult {
+        let which_key_was_visible = match self.pending_input {
+            PendingAppInput::Space { since } => which_key::should_show(Some(since), self.now),
+            PendingAppInput::Idle => false,
+        };
         self.now = now;
 
         // Expire any TTL'd transient.
@@ -309,11 +360,20 @@ impl App {
             PendingAppInput::Idle => None,
         };
 
-        transient_deadline
+        let deadline = transient_deadline
             .into_iter()
             .chain(which_key_deadline)
             .min()
-            .filter(|deadline| *deadline >= now)
+            .filter(|deadline| *deadline >= now);
+        let which_key_is_visible = match self.pending_input {
+            PendingAppInput::Space { since } => which_key::should_show(Some(since), now),
+            PendingAppInput::Idle => false,
+        };
+
+        TickResult {
+            deadline,
+            redraw: expired || which_key_was_visible != which_key_is_visible,
+        }
     }
 
     /// Record the post-read timestamp for any terminal input event.
@@ -355,6 +415,15 @@ impl App {
     #[cfg(test)]
     pub(crate) fn spell_host_phase(&self) -> &'static str {
         self.spell_host.phase_name()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn event_loop_test_state(&self) -> (usize, usize, Instant) {
+        (
+            self.viewport_width,
+            self.scroll_follow_count,
+            self.last_input,
+        )
     }
 
     /// Number of open tabs.
@@ -444,7 +513,7 @@ impl App {
                 render_rendered(
                     frame,
                     &mut entry.session,
-                    entry.rendered_top,
+                    RenderedViewport::new(entry.rendered_top, entry.rendered_left_col),
                     self.relative_line_numbers,
                     body_area,
                     active_theme,
@@ -603,6 +672,14 @@ impl App {
         if let Some(entry) = self.tabs.get_mut(self.active_tab) {
             entry.rendered_top = val;
         }
+    }
+
+    /// Get the active tab's rendered horizontal offset.
+    #[cfg_attr(not(test), expect(dead_code))]
+    fn rendered_left_col(&self) -> usize {
+        self.active()
+            .map(|entry| entry.rendered_left_col)
+            .unwrap_or(0)
     }
 
     /// Handle a crossterm event, following arch §7.1 fixed order.
@@ -1341,6 +1418,7 @@ impl App {
                 entry.left_col = 0;
                 entry.skip_rows = 0;
                 entry.rendered_top = 0;
+                entry.rendered_left_col = 0;
                 self.pending_scroll_follow = true;
                 self.set_transient(
                     if reloading {
@@ -1412,7 +1490,7 @@ impl App {
                     );
                 } else {
                     self.set_transient(
-                        "yanked to register".to_string(),
+                        "copied to system clipboard".to_string(),
                         oom_edit_core::Severity::Info,
                     );
                 }
@@ -1506,10 +1584,33 @@ impl App {
                 // reading the rendered cursor so Escape can follow a cursor
                 // that moved beyond the current rendered viewport.
                 entry.session.render_layout(viewport_width);
-                let cursor_line = entry.session.rendered_cursor_line();
+                let cursor = entry.session.rendered_cursor();
+                let cursor_line = cursor.row;
                 let layout = entry.session.rendered_layout();
                 let layout_height = layout.map(|l| l.lines.len()).unwrap_or(0);
                 let rendered_top = entry.rendered_top;
+
+                let (row_width, cursor_width) = layout
+                    .and_then(|layout| layout.lines.get(cursor.row))
+                    .map(|line| {
+                        let row_width = line
+                            .atoms
+                            .iter()
+                            .map(|atom| atom.columns.end)
+                            .max()
+                            .unwrap_or(0);
+                        let cursor_width = line
+                            .atoms
+                            .iter()
+                            .find(|atom| {
+                                atom.columns.start <= cursor.column
+                                    && cursor.column < atom.columns.end
+                            })
+                            .map(|atom| atom.columns.end.saturating_sub(atom.columns.start))
+                            .unwrap_or(1);
+                        (row_width, cursor_width)
+                    })
+                    .unwrap_or((0, 1));
 
                 if layout_height == 0 || self.viewport_height == 0 {
                     return;
@@ -1521,7 +1622,15 @@ impl App {
                     layout_height,
                     rendered_top,
                 );
-                self.set_rendered_top(new_top);
+                let new_left = rendered_scroll_left(
+                    cursor.column,
+                    cursor_width,
+                    usize::from(viewport_width),
+                    row_width,
+                    entry.rendered_left_col,
+                );
+                entry.rendered_top = new_top;
+                entry.rendered_left_col = new_left;
             }
         } else {
             if let Some(entry) = self.active() {
@@ -2643,6 +2752,25 @@ mod tests {
         }
     }
 
+    fn session_focused_on_link_index() -> EditorSession {
+        let mut session = EditorSession::from_text("[guide](https://example.com/guide)\n");
+        let target = session
+            .render_layout(74)
+            .lines
+            .iter()
+            .position(|line| line.styled.text == "[0] https://example.com/guide")
+            .expect("link-index row should be rendered");
+        while session.rendered_cursor_line() < target {
+            session.handle_key(KeyInput {
+                code: KeyCode {
+                    kind: KeyCodeKind::Char('j'),
+                },
+                mods: Modifiers::default(),
+            });
+        }
+        session
+    }
+
     fn enter_insert(app: &mut App) {
         app.handle_event(&Event::Key(KeyEvent::new(
             CrosstermKeyCode::Char('i'),
@@ -2823,7 +2951,7 @@ mod tests {
             "expected clipboard error message, got: {}",
             transient.text
         );
-        assert!(!transient.text.contains("yanked to register"));
+        assert!(!transient.text.contains("copied to system clipboard"));
         assert_eq!(transient.severity, oom_edit_core::Severity::Warning);
     }
 
@@ -2834,8 +2962,40 @@ mod tests {
         yank_current_line_to_system_clipboard(&mut app);
 
         let transient = app.transient.as_ref().expect("transient should be set");
-        assert_eq!(transient.text, "yanked to register");
+        assert_eq!(transient.text, "copied to system clipboard");
         assert_eq!(transient.severity, oom_edit_core::Severity::Info);
+    }
+
+    #[test]
+    fn link_index_clipboard_feedback_uses_the_injected_sink_result() {
+        let original = "[guide](https://example.com/guide)\n";
+        let mut success = test_app(session_focused_on_link_index());
+        success.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        let transient = success.transient.as_ref().expect("success feedback");
+        assert_eq!(transient.text, "copied to system clipboard");
+        assert_eq!(transient.severity, oom_edit_core::Severity::Info);
+        assert_eq!(success.session().unwrap().document(), original);
+
+        let mut failure = App::new(
+            session_focused_on_link_index(),
+            theme::ResolvedTheme::injected("default-dark", false, Tier::TrueColor),
+            true,
+            false,
+            Box::new(FailingClipboardSink),
+            Box::new(crate::config::DisabledConfigStore),
+            std::time::Instant::now(),
+        );
+        failure.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        let transient = failure.transient.as_ref().expect("failure feedback");
+        assert!(transient.text.contains("Clipboard error"));
+        assert_eq!(transient.severity, oom_edit_core::Severity::Warning);
+        assert_eq!(failure.session().unwrap().document(), original);
     }
 
     /// App: typing 'i' enters Insert mode.
@@ -3147,6 +3307,140 @@ mod tests {
         press(&mut app, CrosstermKeyCode::End);
         press(&mut app, CrosstermKeyCode::Home);
         assert_eq!(app.left_col(), 0);
+    }
+
+    #[test]
+    fn rendered_horizontal_follow_moves_both_directions_and_resets_for_short_rows() {
+        let table = concat!(
+            "| first naturally wide column | second naturally wide column | third naturally wide column |\n",
+            "|---|---|---|\n",
+            "| repeated content repeated content | 東京東京東京東京東京東京 | final repeated content repeated content |",
+        );
+        let mut app = test_app(EditorSession::from_text(table));
+        app.viewport_width = 20;
+
+        for _ in 0..60 {
+            press(&mut app, CrosstermKeyCode::Right);
+        }
+        let right_offset = app.rendered_left_col();
+        let cursor = app.session().unwrap().rendered_cursor();
+        assert!(right_offset > 0);
+        assert!(cursor.column >= right_offset);
+        assert!(cursor.column < right_offset + app.viewport_width);
+
+        for _ in 0..60 {
+            press(&mut app, CrosstermKeyCode::Left);
+        }
+        assert_eq!(app.rendered_left_col(), 0);
+
+        app.tabs[0].rendered_left_col = 12;
+        app.tabs[0].session = EditorSession::from_text("short prose");
+        app.scroll_follow();
+        assert_eq!(app.rendered_left_col(), 0);
+    }
+
+    #[test]
+    fn rendered_horizontal_follow_keeps_a_wide_cursor_group_fully_visible() {
+        let left = rendered_scroll_left(19, 2, 20, 80, 0);
+        assert_eq!(left, 6);
+        assert!(19 >= left);
+        assert!(19 + 2 <= left + 20);
+
+        let restored = rendered_scroll_left(3, 2, 20, 80, left);
+        assert_eq!(restored, 0);
+    }
+
+    #[test]
+    fn rendered_horizontal_follow_uses_the_active_cjk_atom_width() {
+        let table = concat!(
+            "| first naturally wide column | second naturally wide column | third naturally wide column |\n",
+            "|---|---|---|\n",
+            "| abcdefghijklmnop東京東京東京 | repeated content | final repeated content |",
+        );
+        let mut app = test_app(EditorSession::from_text(table));
+        app.viewport_width = 12;
+        for _ in 0..3 {
+            press(&mut app, CrosstermKeyCode::Down);
+        }
+
+        let mut found_wide_cursor = false;
+        for _ in 0..80 {
+            press(&mut app, CrosstermKeyCode::Right);
+            let cursor = app.session().unwrap().rendered_cursor();
+            let cursor_width = app
+                .session()
+                .unwrap()
+                .rendered_layout()
+                .and_then(|layout| layout.lines.get(cursor.row))
+                .and_then(|line| {
+                    line.atoms.iter().find(|atom| {
+                        atom.columns.start <= cursor.column && cursor.column < atom.columns.end
+                    })
+                })
+                .map(|atom| atom.columns.end - atom.columns.start)
+                .unwrap_or(1);
+            if cursor_width == 2 {
+                let left = app.rendered_left_col();
+                assert!(cursor.column >= left);
+                assert!(cursor.column + cursor_width <= left + app.viewport_width);
+                found_wide_cursor = true;
+                break;
+            }
+        }
+        assert!(found_wide_cursor, "cursor never reached a CJK display atom");
+    }
+
+    #[test]
+    fn rendered_horizontal_offsets_are_independent_per_tab() {
+        let table = concat!(
+            "| first naturally wide column | second naturally wide column | third naturally wide column |\n",
+            "|---|---|---|\n",
+            "| repeated content repeated content | repeated content repeated content | repeated content repeated content |",
+        );
+        let mut app = test_app(EditorSession::from_text(table));
+        app.tabs
+            .push(TabEntry::new(EditorSession::from_text(table)));
+        app.viewport_width = 20;
+
+        for _ in 0..55 {
+            press(&mut app, CrosstermKeyCode::Right);
+        }
+        let first_offset = app.tabs[0].rendered_left_col;
+        assert!(first_offset > 0);
+
+        app.active_tab = 1;
+        for _ in 0..35 {
+            press(&mut app, CrosstermKeyCode::Right);
+        }
+        let second_offset = app.tabs[1].rendered_left_col;
+        assert!(second_offset > 0);
+        assert_ne!(first_offset, second_offset);
+
+        app.active_tab = 0;
+        app.scroll_follow();
+        assert_eq!(app.rendered_left_col(), first_offset);
+        assert_eq!(app.tabs[1].rendered_left_col, second_offset);
+    }
+
+    #[test]
+    fn rendered_resize_clamps_offset_without_changing_canonical_focus() {
+        let table = concat!(
+            "| first naturally wide column | second naturally wide column | third naturally wide column |\n",
+            "|---|---|---|\n",
+            "| repeated content repeated content | 東京東京東京東京東京東京 | final repeated content repeated content |",
+        );
+        let mut app = test_app(EditorSession::from_text(table));
+        app.viewport_width = 20;
+        for _ in 0..55 {
+            press(&mut app, CrosstermKeyCode::Right);
+        }
+        assert!(app.rendered_left_col() > 0);
+        let canonical_cursor = app.session().unwrap().cursor();
+
+        app.handle_event(&Event::Resize(120, 20));
+
+        assert_eq!(app.rendered_left_col(), 0);
+        assert_eq!(app.session().unwrap().cursor(), canonical_cursor);
     }
 
     #[test]
@@ -3743,18 +4037,51 @@ mod tests {
         )));
         assert_eq!(
             app.tick(initial),
-            Some(initial + std::time::Duration::from_millis(150))
+            TickResult {
+                deadline: Some(initial + std::time::Duration::from_millis(150)),
+                redraw: false,
+            }
         );
         assert_eq!(
             app.tick(initial + std::time::Duration::from_millis(150)),
-            Some(initial + std::time::Duration::from_millis(150)),
+            TickResult {
+                deadline: Some(initial + std::time::Duration::from_millis(150)),
+                redraw: true,
+            },
             "a due deadline must remain observable by the post-poll idle gate"
         );
         assert_eq!(
             app.tick(initial + std::time::Duration::from_millis(151)),
-            None,
+            TickResult {
+                deadline: None,
+                redraw: false,
+            },
             "a previously-observed deadline must not create a busy loop"
         );
+    }
+
+    #[test]
+    fn tick_requests_redraw_when_a_transient_expires() {
+        let initial = Instant::now();
+        let mut app = test_app_at(EditorSession::from_text("hello"), initial);
+        app.set_transient("saved".to_string(), oom_edit_core::Severity::Info);
+        let expires_at = initial + crate::widgets::status_bar::TRANSIENT_TTL;
+
+        assert_eq!(
+            app.tick(expires_at - std::time::Duration::from_nanos(1)),
+            TickResult {
+                deadline: Some(expires_at),
+                redraw: false,
+            }
+        );
+        assert_eq!(
+            app.tick(expires_at),
+            TickResult {
+                deadline: None,
+                redraw: true,
+            }
+        );
+        assert!(app.transient.is_none());
     }
 
     #[test]
@@ -4627,6 +4954,7 @@ mod tests {
         app.tabs[0].left_col = 5;
         app.tabs[0].skip_rows = 6;
         app.tabs[0].rendered_top = 7;
+        app.tabs[0].rendered_left_col = 8;
         dirty_tab(&mut app, 0, "dirty ");
         app.handle_effect(Effect::OpenRequested {
             path: dir.path().join("new.md"),
@@ -4639,9 +4967,10 @@ mod tests {
                 app.tabs[0].top_line,
                 app.tabs[0].left_col,
                 app.tabs[0].skip_rows,
-                app.tabs[0].rendered_top
+                app.tabs[0].rendered_top,
+                app.tabs[0].rendered_left_col
             ),
-            (0, 0, 0, 0)
+            (0, 0, 0, 0, 0)
         );
 
         let mut clean = file_backed_app(
@@ -4652,6 +4981,7 @@ mod tests {
         clean.tabs[0].left_col = 8;
         clean.tabs[0].skip_rows = 7;
         clean.tabs[0].rendered_top = 6;
+        clean.tabs[0].rendered_left_col = 5;
         clean.handle_effect(Effect::OpenRequested {
             path: dir.path().join("new.md"),
             force: false,
@@ -4663,9 +4993,10 @@ mod tests {
                 clean.tabs[0].top_line,
                 clean.tabs[0].left_col,
                 clean.tabs[0].skip_rows,
-                clean.tabs[0].rendered_top
+                clean.tabs[0].rendered_top,
+                clean.tabs[0].rendered_left_col
             ),
-            (0, 0, 0, 0)
+            (0, 0, 0, 0, 0)
         );
     }
 
@@ -4709,7 +5040,15 @@ mod tests {
                     .map(|message| (message.text.clone(), message.severity)),
                 app.tabs
                     .iter()
-                    .map(|tab| (tab.top_line, tab.left_col, tab.skip_rows, tab.rendered_top))
+                    .map(|tab| {
+                        (
+                            tab.top_line,
+                            tab.left_col,
+                            tab.skip_rows,
+                            tab.rendered_top,
+                            tab.rendered_left_col,
+                        )
+                    })
                     .collect::<Vec<_>>(),
             )
         };
@@ -4845,6 +5184,7 @@ mod tests {
         app.tabs[0].left_col = 3;
         app.tabs[0].skip_rows = 4;
         app.tabs[0].rendered_top = 5;
+        app.tabs[0].rendered_left_col = 6;
         std::fs::write(&target, "external replacement that is longer\n").unwrap();
         app.execute_lifecycle(LifecycleAction::Save(SaveRequest {
             target: 0,
@@ -4865,9 +5205,10 @@ mod tests {
                 app.tabs[0].top_line,
                 app.tabs[0].left_col,
                 app.tabs[0].skip_rows,
-                app.tabs[0].rendered_top
+                app.tabs[0].rendered_top,
+                app.tabs[0].rendered_left_col
             ),
-            (0, 0, 0, 0)
+            (0, 0, 0, 0, 0)
         );
         assert_eq!(app.tabs[1].session.document(), "active\n");
     }

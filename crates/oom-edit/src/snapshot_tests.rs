@@ -478,7 +478,7 @@ fn golden_spell_decoration_does_not_change_layout_glyphs() {
         crate::screens::rendered::render_rendered(
             frame,
             &mut session,
-            0,
+            crate::screens::rendered::RenderedViewport::new(0, 0),
             false,
             frame.area(),
             get_theme("default-dark"),
@@ -601,9 +601,13 @@ fn golden_rendered_top() {
 /// rendered mode — table rendering.
 #[test]
 fn golden_rendered_table() {
-    let table = "# Table\n\n| Left | Center | Right |\n|:-----|:------:|------:|\n| alpha | beta | 42 |\n| wide | 東京 | 7 |\n";
+    let table = concat!(
+        "| First naturally wide column | Center naturally wide column | Right naturally wide column |\n",
+        "|:-----|:------:|------:|\n",
+        "| alpha repeated content | 東京東京東京東京東京 | final repeated content |\n",
+    );
     let mut probe = EditorSession::from_text(table);
-    let layout = probe.render_layout(74);
+    let layout = probe.render_layout(46);
     let mapped_source = layout
         .lines
         .iter()
@@ -611,7 +615,7 @@ fn golden_rendered_table() {
         .filter_map(|atom| atom.source.as_ref())
         .map(|range| &table[range.clone()])
         .collect::<String>();
-    for token in ["alpha", "beta", "42", "東京"] {
+    for token in ["alpha", "Center", "final", "東京"] {
         assert!(
             mapped_source.contains(token),
             "missing table source mapping for {token}"
@@ -619,11 +623,19 @@ fn golden_rendered_table() {
     }
 
     let mut app = test_app(table);
-    let lines = render_app_lines(80, 24, |frame| {
+    for _ in 0..60 {
+        app.handle_event(&crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Right,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        ));
+    }
+    let lines = render_app_lines(50, 24, |frame| {
         app.render(frame);
     });
     let rendered = lines.join("\n");
-    for token in ["┌", "┬", "┐", "Left", "Center", "Right", "alpha", "beta"] {
+    for token in ["Right", "final"] {
         assert!(
             rendered.contains(token),
             "missing rendered table token {token:?}"
@@ -1323,19 +1335,40 @@ fn drift_hint_bar_matches_registry() {
     for ctx in Contexts::each_bit() {
         let cells = crate::widgets::hint_bar::build_hints(ctx);
         let commands = commands_for(ctx);
+        let space_count = commands
+            .iter()
+            .filter(|command| {
+                matches!(
+                    command.binding,
+                    crate::command::BindingRole::AppChord { .. }
+                )
+            })
+            .count();
         assert_eq!(
             cells.len(),
-            commands.len(),
-            "context {ctx:?} must have one hint per eligible command"
+            commands
+                .len()
+                .saturating_sub(space_count)
+                .saturating_add(usize::from(space_count > 0)),
+            "context {ctx:?} must group eligible Space commands into one hint"
         );
         for command in commands {
-            let suffix = format!("={}", command.desc);
+            let label = command.quick_label.unwrap_or(command.desc);
+            let matching_cells = match command.binding {
+                crate::command::BindingRole::AppChord { continuation, .. } => {
+                    let item = format!("{continuation}={label}");
+                    cells
+                        .iter()
+                        .filter(|cell| cell.text.contains(&item))
+                        .count()
+                }
+                _ => {
+                    let item = format!("{}={label}", crate::command::rendered_binding(command));
+                    cells.iter().filter(|cell| cell.text == item).count()
+                }
+            };
             assert_eq!(
-                cells
-                    .iter()
-                    .filter(|cell| cell.text.ends_with(&suffix))
-                    .count(),
-                1,
+                matching_cells, 1,
                 "context {ctx:?} command {:?} must appear exactly once",
                 command.id
             );
