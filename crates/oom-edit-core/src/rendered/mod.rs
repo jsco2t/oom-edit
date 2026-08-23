@@ -667,7 +667,8 @@ impl<'a> RenderedLayoutBuilder<'a> {
         source: &Range<usize>,
     ) {
         let row_spans = markdown_table_row_spans(self.highlighter.text(), source, rows.len());
-        let table_lines = table::render_table_with_rows(alignments, header, rows, source.clone());
+        let table_lines =
+            table::render_table_with_rows(alignments, header, rows, source.clone(), self.width);
 
         for (index, line) in table_lines.into_iter().enumerate() {
             let logical_row = line.logical_row;
@@ -832,7 +833,8 @@ impl<'a> RenderedLayoutBuilder<'a> {
         );
 
         let link_index = self.link_index.clone();
-        for (marker, dest) in &link_index {
+        for (index, (marker, dest)) in link_index.iter().enumerate() {
+            let line = self.lines.len();
             let line_text = format!("[{}] {}", marker, dest);
             let marker_end = format!("[{}]", marker).chars().count();
             let destination_start = marker_end + 1;
@@ -854,6 +856,10 @@ impl<'a> RenderedLayoutBuilder<'a> {
                 },
                 Range { start: 0, end: 0 },
             );
+            self.jump_targets.push(JumpTarget {
+                line,
+                kind: TargetKind::Link(index),
+            });
         }
     }
 

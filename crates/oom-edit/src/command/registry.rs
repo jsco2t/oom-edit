@@ -14,6 +14,8 @@ pub enum RegistryEntryId {
     SelectIndent,
     SelectOutdent,
     SelectSwapAnchor,
+    Search,
+    CommandMode,
     Help,
     Save,
     Quit,
@@ -108,12 +110,14 @@ pub struct CommandSpec {
     pub conformance_id: Option<&'static str>,
     /// Purpose-specific order for the compact hint bar only.
     pub quick_bar_order: Option<i16>,
+    /// Compact, context-specific wording for the quick hint bar.
+    pub quick_label: Option<&'static str>,
 }
 
 const RENDERED: Contexts = Contexts::NORMAL.or(Contexts::SELECT);
 
 macro_rules! row {
-    ($id:ident, $name:literal, $desc:literal, $contexts:expr, $binding:expr, $quick:expr) => {
+    ($id:ident, $name:literal, $desc:literal, $contexts:expr, $binding:expr, $quick:expr, $quick_label:expr) => {
         CommandSpec {
             id: RegistryEntryId::$id,
             name: $name,
@@ -122,7 +126,11 @@ macro_rules! row {
             binding: $binding,
             conformance_id: None,
             quick_bar_order: $quick,
+            quick_label: $quick_label,
         }
+    };
+    ($id:ident, $name:literal, $desc:literal, $contexts:expr, $binding:expr, $quick:expr) => {
+        row!($id, $name, $desc, $contexts, $binding, $quick, None)
     };
 }
 
@@ -136,6 +144,7 @@ macro_rules! conformance_row {
             binding: $binding,
             conformance_id: Some($conformance),
             quick_bar_order: None,
+            quick_label: None,
         }
     };
 }
@@ -148,7 +157,8 @@ pub static COMMANDS: &[CommandSpec] = &[
         "character-wise selection",
         Contexts::NORMAL,
         BindingRole::CoreKey { display: "v" },
-        Some(0)
+        Some(0),
+        Some("select")
     ),
     row!(
         EnterLineSelect,
@@ -234,16 +244,37 @@ pub static COMMANDS: &[CommandSpec] = &[
         BindingRole::CoreKey { display: "o" },
         None
     ),
+    CommandSpec {
+        id: RegistryEntryId::Search,
+        name: "search",
+        desc: "search rendered text",
+        contexts: Contexts::NORMAL,
+        binding: BindingRole::CoreKey { display: "/" },
+        conformance_id: None,
+        quick_bar_order: Some(5),
+        quick_label: Some("search"),
+    },
+    CommandSpec {
+        id: RegistryEntryId::CommandMode,
+        name: "command",
+        desc: "enter Command mode",
+        contexts: Contexts::NORMAL,
+        binding: BindingRole::CoreKey { display: ":" },
+        conformance_id: None,
+        quick_bar_order: Some(6),
+        quick_label: Some("command"),
+    },
     row!(
         Help,
         "help",
-        "help / command palette",
+        "command palette",
         RENDERED,
         BindingRole::AppChord {
             continuation: 'h',
             command: AppCommand::Help
         },
-        Some(10)
+        Some(10),
+        Some("commands")
     ),
     row!(
         Save,
@@ -471,7 +502,7 @@ mod tests {
             assert!(!spec.contexts.is_empty());
             assert!(!rendered_binding(spec).is_empty());
         }
-        assert_eq!(COMMANDS.len(), 29);
+        assert_eq!(COMMANDS.len(), 31);
     }
 
     #[test]
@@ -666,9 +697,25 @@ mod tests {
                 None,
             ),
             (
+                RegistryEntryId::Search,
+                "search",
+                "search rendered text",
+                Contexts::NORMAL,
+                BindingRole::CoreKey { display: "/" },
+                Some(5),
+            ),
+            (
+                RegistryEntryId::CommandMode,
+                "command",
+                "enter Command mode",
+                Contexts::NORMAL,
+                BindingRole::CoreKey { display: ":" },
+                Some(6),
+            ),
+            (
                 RegistryEntryId::Help,
                 "help",
-                "help / command palette",
+                "command palette",
                 RENDERED,
                 BindingRole::AppChord {
                     continuation: 'h',

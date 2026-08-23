@@ -141,7 +141,7 @@ fn make_audit_and_check_promote_warnings() {
 #[test]
 fn make_build_release_builds_only_the_locked_offline_binary() {
     let output = Command::new("make")
-        .args(["--dry-run", "build-release"])
+        .args(["--no-print-directory", "--dry-run", "build-release"])
         .current_dir(workspace_root())
         .output()
         .expect("make --dry-run build-release should run");

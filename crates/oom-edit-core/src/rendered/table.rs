@@ -15,6 +15,7 @@ use crate::style::{SemanticStyle, StyledLine};
 
 /// Maximum display width of a single table cell before wrapping kicks in.
 const CELL_CAP: usize = 40;
+const TABLE_WIDTH_FLOOR: usize = 80;
 
 /// Render a table block into a sequence of styled lines with box-drawing
 /// borders.
@@ -29,10 +30,16 @@ pub fn render_table(
     rows: &[Vec<Vec<Inline>>],
     source_span: std::ops::Range<usize>,
 ) -> Vec<StyledLine> {
-    render_table_with_rows(alignments, header, rows, source_span)
-        .into_iter()
-        .map(|line| line.into_parts().0)
-        .collect()
+    render_table_with_rows(
+        alignments,
+        header,
+        rows,
+        source_span,
+        TABLE_WIDTH_FLOOR as u16,
+    )
+    .into_iter()
+    .map(|line| line.into_parts().0)
+    .collect()
 }
 
 /// One rendered table line plus its logical Markdown row (header is zero).
@@ -53,6 +60,7 @@ pub(super) fn render_table_with_rows(
     header: &[Vec<Inline>],
     rows: &[Vec<Vec<Inline>>],
     source_span: std::ops::Range<usize>,
+    available_width: u16,
 ) -> Vec<RenderedTableLine> {
     if header.is_empty() || alignments.is_empty() {
         return Vec::new();
@@ -78,6 +86,17 @@ pub(super) fn render_table_with_rows(
             col_widths[ci] = col_widths[ci].max(w.min(CELL_CAP));
         }
     }
+    for width in &mut col_widths {
+        *width = (*width).max(1);
+    }
+
+    // Borders take one cell at either edge and between columns; each cell has
+    // one generated padding cell on each side. Every column retains one content
+    // cell, so a table overflows only when that minimum structure cannot fit.
+    let target_width = usize::from(available_width).max(TABLE_WIDTH_FLOOR);
+    let structural_width = num_cols * 3 + 1;
+    let content_budget = target_width.saturating_sub(structural_width);
+    shrink_columns_to_fit(&mut col_widths, content_budget);
 
     // Step 3: Build the table lines
     let mut lines = Vec::with_capacity(total_rows * 2); // Some rows may wrap
@@ -128,6 +147,21 @@ pub(super) fn render_table_with_rows(
     });
 
     lines
+}
+
+/// Reduce widest columns first, retaining one content cell per column.
+fn shrink_columns_to_fit(widths: &mut [usize], content_budget: usize) {
+    while widths.iter().sum::<usize>() > content_budget {
+        let Some((index, _)) = widths
+            .iter()
+            .enumerate()
+            .filter(|(_, width)| **width > 1)
+            .max_by_key(|(index, width)| (**width, std::cmp::Reverse(*index)))
+        else {
+            break;
+        };
+        widths[index] -= 1;
+    }
 }
 
 /// Compute cell text and display width for a row of inlines.
@@ -376,6 +410,70 @@ mod tests {
             .iter()
             .map(|text| vec![Inline::Text(make_leaf(text))])
             .collect()
+    }
+
+    #[test]
+    fn wide_tables_shrink_to_the_eighty_cell_floor_with_equal_row_widths() {
+        let header = make_row(&["first column", "second column", "third column"]);
+        let rows = vec![make_row(&[
+            "a long value that needs wrapping after allocation",
+            "another long value that needs wrapping after allocation",
+            "the final long value that needs wrapping after allocation",
+        ])];
+        let alignments = vec![
+            TableAlignment::Left,
+            TableAlignment::Center,
+            TableAlignment::Right,
+        ];
+        let lines = render_table_with_rows(&alignments, &header, &rows, 0..100, 40);
+        assert!(lines
+            .iter()
+            .all(|line| line.mapped.width() <= TABLE_WIDTH_FLOOR));
+        let widths = lines
+            .iter()
+            .map(|line| line.mapped.width())
+            .collect::<Vec<_>>();
+        assert!(widths.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    #[test]
+    fn allocator_uses_floor_then_wider_available_width_deterministically() {
+        let allocate = |available_width: usize| {
+            let mut widths = vec![CELL_CAP; 3];
+            let target = available_width.max(TABLE_WIDTH_FLOOR);
+            shrink_columns_to_fit(&mut widths, target - 10);
+            widths
+        };
+
+        assert_eq!(allocate(40), vec![23, 23, 24]);
+        assert_eq!(allocate(79), vec![23, 23, 24]);
+        assert_eq!(allocate(80), vec![23, 23, 24]);
+        assert_eq!(allocate(81), vec![23, 24, 24]);
+        assert_eq!(allocate(120), vec![36, 37, 37]);
+    }
+
+    #[test]
+    fn allocator_does_not_inflate_natural_columns() {
+        let mut widths = vec![3, 7, 2];
+        shrink_columns_to_fit(&mut widths, 70);
+        assert_eq!(widths, vec![3, 7, 2]);
+    }
+
+    #[test]
+    fn empty_columns_retain_one_content_cell() {
+        let header = vec![Vec::new(), Vec::new()];
+        let alignments = vec![TableAlignment::Left, TableAlignment::Left];
+        let lines = render_table_with_rows(&alignments, &header, &[], 0..10, 80);
+
+        assert!(lines.iter().all(|line| line.mapped.width() == 9));
+    }
+
+    #[test]
+    fn allocator_keeps_one_cell_per_column_when_structure_alone_exceeds_floor() {
+        let mut widths = vec![CELL_CAP; 27];
+        shrink_columns_to_fit(&mut widths, 0);
+        assert!(widths.iter().all(|width| *width == 1));
+        assert_eq!(27 * 3 + 1, 82);
     }
 
     #[test]

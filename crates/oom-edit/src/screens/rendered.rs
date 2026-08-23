@@ -26,11 +26,26 @@ fn line_surface(theme: &Theme, tier: Tier, role: RenderedLineRole) -> Option<Sty
     }
 }
 
+/// App-owned viewport coordinates for a rendered surface.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RenderedViewport {
+    /// First visible rendered row.
+    pub(crate) top: usize,
+    /// First visible rendered display column.
+    pub(crate) left: usize,
+}
+
+impl RenderedViewport {
+    pub(crate) const fn new(top: usize, left: usize) -> Self {
+        Self { top, left }
+    }
+}
+
 /// Render Normal, Select, or Command into the body area.
 pub fn render_rendered(
     frame: &mut Frame<'_>,
     session: &mut EditorSession,
-    rendered_top: usize,
+    viewport: RenderedViewport,
     relative_line_numbers: bool,
     area: Rect,
     theme: &Theme,
@@ -43,6 +58,10 @@ pub fn render_rendered(
         .max(4)
         .min(area.width);
     let text_width = area.width.saturating_sub(gutter_width);
+    let surface_width = viewport
+        .left
+        .saturating_add(usize::from(text_width))
+        .min(usize::from(u16::MAX)) as u16;
     session.render_layout(text_width);
     let cursor = session.rendered_cursor();
     let cursor_line = cursor.row;
@@ -58,7 +77,7 @@ pub fn render_rendered(
     }
 
     // Compute visible line range.
-    let rendered_top = rendered_top.min(max_lines.saturating_sub(1));
+    let rendered_top = viewport.top.min(max_lines.saturating_sub(1));
     let rendered_bottom = (rendered_top + height).min(max_lines);
     let decorations = session.diagnostic_decoration_rows(rendered_top..rendered_bottom);
     let layout = session
@@ -96,7 +115,7 @@ pub fn render_rendered(
         );
         let base_surface = line_surface(theme, tier, rendered_line.role);
         if let Some(style) = base_surface {
-            spans = build_highlighted_line(spans, text_width, style).spans;
+            spans = build_highlighted_line(spans, surface_width, style).spans;
         }
         for decoration in decorations.iter().filter(|decoration| decoration.row == i) {
             let style = theme.decoration_style(tier, decoration.kind);
@@ -135,7 +154,7 @@ pub fn render_rendered(
             if rendered_line.role == oom_edit_core::RenderedLineRole::Metadata {
                 style = style.add_modifier(ratatui::style::Modifier::UNDERLINED);
             }
-            build_highlighted_line(spans, text_width, style)
+            build_highlighted_line(spans, surface_width, style)
         } else {
             Line::from(spans)
         };
@@ -148,7 +167,7 @@ pub fn render_rendered(
                 None,
             );
         }
-        lines.push(line);
+        lines.push(crop_line(line, viewport.left, usize::from(text_width)));
     }
 
     // Fill remaining lines with blanks.
@@ -161,6 +180,45 @@ pub fn render_rendered(
 
     let paragraph = Paragraph::new(lines).block(Block::default().borders(Borders::NONE));
     frame.render_widget(paragraph, text_area);
+
+    let cursor_row_visible = cursor.row >= rendered_top && cursor.row < rendered_bottom;
+    let cursor_column_visible = cursor.column >= viewport.left
+        && cursor.column < viewport.left.saturating_add(usize::from(text_width));
+    if text_area.width > 0 && text_area.height > 0 && cursor_row_visible && cursor_column_visible {
+        let row = text_area.y + (cursor.row - rendered_top) as u16;
+        let column = text_area.x + (cursor.column - viewport.left) as u16;
+        frame.set_cursor_position(ratatui::layout::Position::new(column, row));
+    }
+}
+
+/// Crop one styled line in display cells without rendering partial glyphs.
+fn crop_line<'a>(line: Line<'a>, left: usize, width: usize) -> Line<'a> {
+    if width == 0 {
+        return Line::default();
+    }
+
+    let right = left.saturating_add(width);
+    let mut column = 0usize;
+    let mut visible = Vec::new();
+    for span in line.spans {
+        for grapheme in span.styled_graphemes(Style::default()) {
+            let grapheme_width = usize::from(grapheme.symbol.cell_width());
+            let columns = column..column.saturating_add(grapheme_width);
+            column = columns.end;
+
+            if grapheme_width == 0 || columns.end <= left || columns.start >= right {
+                continue;
+            }
+
+            if columns.start >= left && columns.end <= right {
+                visible.push(Span::styled(grapheme.symbol.to_string(), grapheme.style));
+            } else {
+                let clipped_width = columns.end.min(right) - columns.start.max(left);
+                visible.push(Span::styled(" ".repeat(clipped_width), grapheme.style));
+            }
+        }
+    }
+    Line::from(visible)
 }
 
 /// Apply a carrier only to display groups intersecting `columns`.
@@ -244,7 +302,10 @@ fn build_highlighted_line<'a>(mut spans: Vec<Span<'a>>, width: u16, style: Style
 mod tests {
     use super::*;
     use crate::theme::{get_theme, Tier, DEFAULT_DARK, DEFAULT_LIGHT};
-    use oom_edit_core::{KeyCode, KeyCodeKind, KeyInput, Modifiers, SemanticStyle};
+    use oom_edit_core::{
+        DecorationKind, DiagnosticProvider, DiagnosticSeverity, KeyCode, KeyCodeKind, KeyInput,
+        Modifiers, SemanticStyle,
+    };
     use oom_spell::{BuildProgress, SpellEngine, SpellEngineBuilder};
     use ratatui::backend::TestBackend;
     use ratatui::style::Modifier;
@@ -293,6 +354,175 @@ mod tests {
     }
 
     #[test]
+    fn display_cell_crop_preserves_styles_and_never_draws_half_a_wide_glyph() {
+        let wide_style = Style::default().add_modifier(Modifier::BOLD);
+        let combining_style = Style::default().add_modifier(Modifier::ITALIC);
+        let line = Line::from(vec![
+            Span::raw("ab"),
+            Span::styled("東京", wide_style),
+            Span::styled("e\u{301}z", combining_style),
+        ]);
+
+        let cropped = crop_line(line, 3, 4);
+        let text = cropped
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(text, " 京e\u{301}");
+        assert_eq!(Line::from(cropped.spans.clone()).width(), 4);
+        assert!(!text.contains('東'));
+        assert!(cropped.spans[1].style.add_modifier.contains(Modifier::BOLD));
+        assert!(cropped.spans[2]
+            .style
+            .add_modifier
+            .contains(Modifier::ITALIC));
+
+        let right_clipped = crop_line(Line::from("a東"), 0, 2);
+        assert_eq!(
+            right_clipped
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "a "
+        );
+    }
+
+    #[test]
+    fn crop_preserves_every_composited_rendered_style_layer() {
+        let theme = &DEFAULT_DARK;
+        let tier = Tier::TrueColor;
+        let expected = vec![
+            theme.style(tier, SemanticStyle::Link),
+            theme.decoration_style(
+                tier,
+                DecorationKind::Diagnostic {
+                    provider: DiagnosticProvider::Spell,
+                    severity: DiagnosticSeverity::Warning,
+                },
+            ),
+            theme.style(tier, SemanticStyle::Match),
+            theme.style(tier, SemanticStyle::Selection),
+            theme.ui_style(tier, UiSlot::CursorLine),
+            theme.ui_style(tier, UiSlot::NormalCursor),
+        ];
+        let mut spans = vec![Span::raw("prefix")];
+        spans.extend(
+            expected
+                .iter()
+                .copied()
+                .map(|style| Span::styled("x", style)),
+        );
+
+        let cropped = crop_line(Line::from(spans), 6, expected.len());
+        assert_eq!(
+            cropped
+                .spans
+                .iter()
+                .map(|span| span.style)
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn rendered_horizontal_crop_keeps_the_gutter_fixed() {
+        let text = concat!(
+            "| first naturally wide column | second naturally wide column | third naturally wide column |\n",
+            "|---|---|---|\n",
+            "| repeated content repeated content | 東京東京東京東京 | final repeated content repeated content |",
+        );
+        let render = |left| {
+            let mut session = EditorSession::from_text(text);
+            let mut terminal = Terminal::new(TestBackend::new(36, 8)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_rendered(
+                        frame,
+                        &mut session,
+                        RenderedViewport::new(0, left),
+                        false,
+                        frame.area(),
+                        &DEFAULT_DARK,
+                        Tier::TrueColor,
+                    );
+                })
+                .unwrap();
+            terminal.backend().buffer().clone()
+        };
+
+        let unscrolled = render(0);
+        let scrolled = render(12);
+        let gutter_width = 4;
+        for y in 0..8 {
+            for x in 0..gutter_width {
+                assert_eq!(unscrolled[(x, y)], scrolled[(x, y)]);
+            }
+        }
+        let content = |buffer: &ratatui::buffer::Buffer| {
+            (0..8)
+                .flat_map(|y| (gutter_width..36).map(move |x| buffer[(x, y)].symbol().to_string()))
+                .collect::<Vec<_>>()
+        };
+        assert_ne!(content(&unscrolled), content(&scrolled));
+    }
+
+    #[test]
+    fn rendered_normal_and_select_place_real_cursor_and_keep_painted_carriers() {
+        for select in [false, true] {
+            let mut session = EditorSession::from_text("abcdefghij");
+            session.render_layout(16);
+            for _ in 0..6 {
+                session.handle_key(key('l'));
+            }
+            if select {
+                session.handle_key(key('v'));
+            }
+            let mut terminal = Terminal::new(TestBackend::new(20, 2)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_rendered(
+                        frame,
+                        &mut session,
+                        RenderedViewport::new(0, 4),
+                        false,
+                        frame.area(),
+                        &DEFAULT_DARK,
+                        Tier::TrueColor,
+                    );
+                })
+                .unwrap();
+
+            let active = session.rendered_cursor();
+            assert_eq!(active.row, 0);
+            assert!(active.column >= 4);
+            let gutter = (status_bar::gutter_width(session.line_count()) as u16).max(4);
+            let position = ratatui::layout::Position::new(
+                gutter + (active.column - 4) as u16,
+                active.row as u16,
+            );
+            assert_eq!(
+                terminal.backend().cursor_position(),
+                position,
+                "select={select}, active={active:?}, selection={:?}",
+                session.rendered_selection()
+            );
+            let cell = terminal.backend().buffer().cell(position).unwrap();
+            if select {
+                assert!(cell.modifier.contains(Modifier::REVERSED));
+            } else {
+                assert_eq!(
+                    Some(cell.bg),
+                    DEFAULT_DARK
+                        .ui_style(Tier::TrueColor, UiSlot::NormalCursor)
+                        .bg
+                );
+            }
+        }
+    }
+
+    #[test]
     fn spell_decorations_reach_every_rendered_theme_tier_and_public_mode_path() {
         for name in crate::theme::built_in_themes() {
             for tier in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
@@ -303,7 +533,15 @@ mod tests {
                 let mut terminal = Terminal::new(TestBackend::new(40, 2)).unwrap();
                 terminal
                     .draw(|frame| {
-                        render_rendered(frame, &mut session, 0, false, frame.area(), theme, tier);
+                        render_rendered(
+                            frame,
+                            &mut session,
+                            RenderedViewport::new(0, 0),
+                            false,
+                            frame.area(),
+                            theme,
+                            tier,
+                        );
                     })
                     .unwrap();
                 let gutter = (status_bar::gutter_width(session.line_count()) as u16).max(4);
@@ -357,7 +595,7 @@ mod tests {
                     render_rendered(
                         frame,
                         &mut session,
-                        0,
+                        RenderedViewport::new(0, 0),
                         false,
                         frame.area(),
                         &DEFAULT_DARK,
@@ -411,7 +649,7 @@ mod tests {
                 render_rendered(
                     frame,
                     &mut wide,
-                    0,
+                    RenderedViewport::new(0, 0),
                     false,
                     frame.area(),
                     &DEFAULT_DARK,
@@ -445,7 +683,7 @@ mod tests {
                 render_rendered(
                     frame,
                     &mut wrapped,
-                    0,
+                    RenderedViewport::new(0, 0),
                     false,
                     frame.area(),
                     &DEFAULT_DARK,
@@ -559,7 +797,7 @@ mod tests {
                 render_rendered(
                     frame,
                     &mut normal,
-                    0,
+                    RenderedViewport::new(0, 0),
                     false,
                     frame.area(),
                     &DEFAULT_DARK,
@@ -577,7 +815,7 @@ mod tests {
                 render_rendered(
                     frame,
                     &mut select,
-                    0,
+                    RenderedViewport::new(0, 0),
                     false,
                     frame.area(),
                     &DEFAULT_DARK,
@@ -638,7 +876,15 @@ mod tests {
                 let mut terminal = Terminal::new(TestBackend::new(40, 3)).unwrap();
                 terminal
                     .draw(|frame| {
-                        render_rendered(frame, &mut session, 0, false, frame.area(), theme, tier);
+                        render_rendered(
+                            frame,
+                            &mut session,
+                            RenderedViewport::new(0, 0),
+                            false,
+                            frame.area(),
+                            theme,
+                            tier,
+                        );
                     })
                     .unwrap();
 
@@ -691,7 +937,7 @@ mod tests {
                 render_rendered(
                     frame,
                     &mut session,
-                    0,
+                    RenderedViewport::new(0, 0),
                     false,
                     frame.area(),
                     &DEFAULT_DARK,
@@ -736,7 +982,7 @@ mod tests {
                 render_rendered(
                     frame,
                     &mut session,
-                    0,
+                    RenderedViewport::new(0, 0),
                     false,
                     frame.area(),
                     &DEFAULT_DARK,
@@ -783,7 +1029,7 @@ mod tests {
                 render_rendered(
                     frame,
                     &mut session,
-                    0,
+                    RenderedViewport::new(0, 0),
                     false,
                     frame.area(),
                     &DEFAULT_DARK,
@@ -841,7 +1087,7 @@ mod tests {
                 render_rendered(
                     frame,
                     &mut session,
-                    0,
+                    RenderedViewport::new(0, 0),
                     false,
                     frame.area(),
                     &DEFAULT_DARK,
@@ -878,7 +1124,7 @@ mod tests {
                 render_rendered(
                     frame,
                     &mut session,
-                    0,
+                    RenderedViewport::new(0, 0),
                     false,
                     frame.area(),
                     &DEFAULT_DARK,
@@ -930,7 +1176,7 @@ mod tests {
                 render_rendered(
                     frame,
                     &mut non_cursor_session,
-                    0,
+                    RenderedViewport::new(0, 0),
                     false,
                     frame.area(),
                     &DEFAULT_DARK,
@@ -1001,7 +1247,7 @@ mod tests {
                     render_rendered(
                         frame,
                         &mut session,
-                        0,
+                        RenderedViewport::new(0, 0),
                         false,
                         frame.area(),
                         theme,
@@ -1118,7 +1364,7 @@ mod tests {
                 render_rendered(
                     frame,
                     &mut session,
-                    0,
+                    RenderedViewport::new(0, 0),
                     false,
                     frame.area(),
                     &DEFAULT_DARK,
@@ -1157,7 +1403,7 @@ mod tests {
                 render_rendered(
                     frame,
                     &mut session,
-                    0,
+                    RenderedViewport::new(0, 0),
                     false,
                     frame.area(),
                     &DEFAULT_DARK,
@@ -1193,7 +1439,7 @@ mod tests {
                 render_rendered(
                     frame,
                     &mut session,
-                    0,
+                    RenderedViewport::new(0, 0),
                     false,
                     frame.area(),
                     &DEFAULT_DARK,
@@ -1219,7 +1465,7 @@ mod tests {
                 render_rendered(
                     frame,
                     &mut session,
-                    0,
+                    RenderedViewport::new(0, 0),
                     false,
                     frame.area(),
                     &DEFAULT_DARK,

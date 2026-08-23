@@ -330,6 +330,83 @@ fn synthetic_cells_never_enter_source_ranges() {
 }
 
 #[test]
+fn link_index_normal_y_and_enter_copy_only_the_focused_destination() {
+    let destination = "https://example.com/東京?q=é";
+    let mut session = EditorSession::from_text(&format!(
+        "[first](https://example.com/first) and [second]({destination})\n"
+    ));
+    render_and_move_to(&mut session, &format!("[1] {destination}"), 80);
+
+    for input in [key('y'), special(KeyCodeKind::Enter)] {
+        let effects = session.handle_key(input);
+        assert_eq!(
+            effects,
+            vec![Effect::ClipboardWrite(destination.to_string())]
+        );
+        assert_eq!(session.mode(), Mode::Normal);
+    }
+}
+
+#[test]
+fn link_index_select_y_exits_and_enter_stays_without_source_ranges() {
+    let destination = "https://example.com/repeated";
+    let mut session = EditorSession::from_text(&format!(
+        "[first]({destination}) and [second]({destination})\n"
+    ));
+    render_and_move_to(&mut session, &format!("[1] {destination}"), 80);
+
+    session.handle_key(key('v'));
+    assert_eq!(session.mode(), Mode::Select);
+    assert!(session
+        .rendered_selection()
+        .expect("selection should be visible on the synthetic row")
+        .source_ranges
+        .is_empty());
+    assert_eq!(
+        session.handle_key(key('y')),
+        vec![
+            Effect::ClipboardWrite(destination.to_string()),
+            Effect::ModeChanged(Mode::Normal),
+        ]
+    );
+    assert_eq!(session.mode(), Mode::Normal);
+
+    session.handle_key(key('v'));
+    assert_eq!(
+        session.handle_key(special(KeyCodeKind::Enter)),
+        vec![Effect::ClipboardWrite(destination.to_string())]
+    );
+    assert_eq!(session.mode(), Mode::Select);
+}
+
+#[test]
+fn link_index_select_y_preserves_source_backed_yank_semantics() {
+    let destination = "https://example.com/source-backed";
+    let source = format!("[label]({destination})\n");
+    let mut session = EditorSession::from_text(&source);
+    session.render_layout(80);
+
+    session.handle_key(key('V'));
+    session.handle_key(key('G'));
+    assert_eq!(
+        session
+            .rendered_selection()
+            .expect("selection should span the source and synthetic link row")
+            .source_ranges,
+        vec![0..source.len()]
+    );
+
+    let effects = session.handle_key(key('y'));
+    assert!(effects.iter().all(
+        |effect| !matches!(effect, Effect::ClipboardWrite(payload) if payload == destination)
+    ));
+    assert_eq!(session.mode(), Mode::Normal);
+
+    session.handle_key(key('p'));
+    assert_eq!(session.document(), format!("{source}{source}"));
+}
+
+#[test]
 fn unicode_selection_atoms_stay_utf8_safe() {
     let text = "e\u{301} 東京\n大阪\n";
     let mut session = EditorSession::from_text(text);

@@ -1,24 +1,25 @@
-//! Event-loop driver: tick → draw → poll-with-deadline → dispatch (~20 FPS).
+//! Event-loop driver: tick → conditional draw → poll-with-deadline → dispatch.
 //!
 //! The poll deadline is `min(FRAME_BUDGET, deadline)` where `deadline` is
-//! computed from transient TTL expiry and which-key pending+150ms (T13).
+//! computed from transient TTL expiry and which-key pending+150ms.
 //! Key events with `kind == Press` only are dispatched; resize events are
-//! forwarded so Rendered-mode layout and cursor state can be remapped.
-//!
-//! T16: Bracketed paste is enabled on startup via crossterm.
+//! coalesced in bounded batches before rendered layout and cursor remapping.
 
-use std::io::Stdout;
+use std::io::{Stdout, Write};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, EnableBracketedPaste, Event, KeyEventKind};
+use crossterm::cursor::SetCursorStyle;
+use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::execute;
+use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
+use oom_edit_core::Mode;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::app::App;
 
-/// Maximum idle interval between redraws (~20 FPS) so the screen stays live
-/// without busy-spinning.
+/// Maximum idle poll interval, preserving timer and background-work cadence
+/// without requesting unchanged frames.
 pub const FRAME_BUDGET: Duration = Duration::from_millis(50);
 /// Required pause after the most recently observed input before spell work.
 pub const SPELL_IDLE_DELAY: Duration = Duration::from_millis(150);
@@ -26,6 +27,8 @@ pub const SPELL_IDLE_DELAY: Duration = Duration::from_millis(150);
 pub const SPELL_SLICE_BUDGET: Duration = Duration::from_millis(8);
 /// Deterministic byte unit shared by file loading, engine building, and scans.
 pub const SPELL_WORK_UNIT_BYTES: usize = 4 * 1024;
+/// Maximum ready events handled before presentation gets another opportunity.
+const MAX_EVENT_BATCH: usize = 32;
 
 fn poll_duration(now: Instant, deadline: Option<Instant>) -> Duration {
     deadline
@@ -35,38 +38,123 @@ fn poll_duration(now: Instant, deadline: Option<Instant>) -> Duration {
 
 #[cfg(test)]
 fn tick_and_poll_duration(app: &mut App, now: Instant) -> Duration {
-    poll_duration(now, app.tick(now))
+    poll_duration(now, app.tick(now).deadline)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RedrawScheduler {
+    pending: bool,
+}
+
+impl RedrawScheduler {
+    const fn initial() -> Self {
+        Self { pending: true }
+    }
+
+    fn request(&mut self, redraw: bool) {
+        self.pending |= redraw;
+    }
+
+    fn take(&mut self) -> bool {
+        std::mem::take(&mut self.pending)
+    }
+
+    fn draw_if_requested(
+        &mut self,
+        draw: impl FnOnce() -> std::io::Result<()>,
+    ) -> std::io::Result<bool> {
+        if !self.take() {
+            return Ok(false);
+        }
+        draw()?;
+        Ok(true)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PollOutcome {
+    redraw: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModeCursorShape {
+    Block,
+    Bar,
+    Underscore,
+}
+
+fn cursor_shape(mode: Mode, cursor_shapes: bool) -> ModeCursorShape {
+    if !cursor_shapes {
+        return ModeCursorShape::Block;
+    }
+    match mode {
+        Mode::Normal => ModeCursorShape::Block,
+        Mode::Insert | Mode::Command => ModeCursorShape::Bar,
+        Mode::Select => ModeCursorShape::Underscore,
+    }
+}
+
+impl ModeCursorShape {
+    const fn command(self) -> SetCursorStyle {
+        match self {
+            Self::Block => SetCursorStyle::SteadyBlock,
+            Self::Bar => SetCursorStyle::SteadyBar,
+            Self::Underscore => SetCursorStyle::SteadyUnderScore,
+        }
+    }
+}
+
+fn apply_cursor_shape(
+    out: &mut impl Write,
+    mode: Mode,
+    cursor_shapes: bool,
+    last_shape: &mut Option<ModeCursorShape>,
+) -> std::io::Result<bool> {
+    let shape = cursor_shape(mode, cursor_shapes);
+    if *last_shape == Some(shape) {
+        return Ok(false);
+    }
+    execute!(out, shape.command())?;
+    *last_shape = Some(shape);
+    Ok(true)
+}
+
+fn synchronized_update<W: Write>(
+    out: &mut W,
+    operation: impl FnOnce(&mut W) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    execute!(out, BeginSynchronizedUpdate)?;
+    let operation_result = operation(out);
+    let end_result = execute!(out, EndSynchronizedUpdate);
+    operation_result.and(end_result)
 }
 
 /// Run the main event loop until [`App::should_quit`] is set.
 ///
-/// The loop shape:
-/// 1. `app.tick(now)` — advance internal timers, compute deadline
-/// 2. `terminal.draw(...)` — render the current frame
-/// 3. `event::poll(min(FRAME_BUDGET, deadline))` — wait for input
-/// 4. On event: dispatch to `app.handle_event`
-///
-/// T16: Bracketed paste is enabled before the loop starts.
+/// The loop paints one initial frame, then only paints after an explicit
+/// input, timer, resize, or idle-work invalidation.
 pub fn run_event_loop(
     mut app: App,
     mut terminal: Terminal<CrosstermBackend<Stdout>>,
+    cursor_shapes: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // T16: Enable bracketed paste mode.
-    // If this fails, we continue without it (some terminals don't support it).
-    let stdout = std::io::stdout();
-    if let Err(e) = execute!(stdout.lock(), EnableBracketedPaste) {
-        eprintln!("oom-edit: warning: failed to enable bracketed paste: {e}");
-    }
-
+    let mut stdout = std::io::stdout();
+    let mut last_cursor_shape = None;
+    let mut redraw = RedrawScheduler::initial();
     loop {
         let now = Instant::now();
-        let deadline = app.tick(now);
+        let tick = app.tick(now);
+        let deadline = tick.deadline;
+        redraw.request(tick.redraw);
         let poll_duration = poll_duration(now, deadline);
-        terminal.draw(|frame| app.render(frame))?;
+        redraw.draw_if_requested(|| {
+            synchronized_update(&mut stdout, |out| {
+                apply_cursor_shape(out, app.mode(), cursor_shapes, &mut last_cursor_shape)?;
+                terminal.draw(|frame| app.render(frame)).map(|_| ())
+            })
+        })?;
 
         if app.should_quit {
-            // T16: Disable bracketed paste on clean exit.
-            let _ = execute!(stdout.lock(), crossterm::event::DisableBracketedPaste);
             return Ok(());
         }
 
@@ -74,7 +162,7 @@ pub fn run_event_loop(
         // immediately after poll and retain the exact pre-poll app deadline.
         let event_ready = event::poll(poll_duration)?;
         let wake_now = Instant::now();
-        handle_poll_outcome(
+        let outcome = handle_poll_outcome(
             &mut app,
             event_ready,
             deadline,
@@ -83,6 +171,7 @@ pub fn run_event_loop(
             || event::poll(Duration::ZERO),
             Instant::now,
         )?;
+        redraw.request(outcome.redraw);
     }
 }
 
@@ -100,31 +189,54 @@ fn handle_poll_outcome<ReadEvent, PendingInput, Sample>(
     mut read_event: ReadEvent,
     mut pending_input: PendingInput,
     mut sample: Sample,
-) -> std::io::Result<()>
+) -> std::io::Result<PollOutcome>
 where
     ReadEvent: FnMut() -> std::io::Result<Event>,
     PendingInput: FnMut() -> std::io::Result<bool>,
     Sample: FnMut() -> Instant,
 {
     if event_ready {
-        let event = read_event()?;
-        let event_now = sample();
-        app.record_input(event_now);
-        dispatch_event_at(app, event, event_now);
-        return Ok(());
+        let mut redraw = false;
+        let mut pending_resize = None;
+        for index in 0..MAX_EVENT_BATCH {
+            let event = read_event()?;
+            let event_now = sample();
+            app.record_input(event_now);
+            if matches!(event, Event::Resize(_, _)) {
+                pending_resize = Some((event, event_now));
+            } else {
+                if let Some((resize, resize_now)) = pending_resize.take() {
+                    redraw |= dispatch_event_at(app, resize, resize_now);
+                }
+                redraw |= dispatch_event_at(app, event, event_now);
+            }
+
+            if app.should_quit {
+                break;
+            }
+            if index + 1 == MAX_EVENT_BATCH || !pending_input()? {
+                break;
+            }
+        }
+        if let Some((resize, resize_now)) = pending_resize {
+            redraw |= dispatch_event_at(app, resize, resize_now);
+        }
+        return Ok(PollOutcome { redraw });
     }
 
     if !app.input_idle_for(wake_now, SPELL_IDLE_DELAY)
         || !deadline_has_slice_slack(prior_deadline, wake_now)
     {
-        return Ok(());
+        return Ok(PollOutcome::default());
     }
 
     let slice_end = wake_now + SPELL_SLICE_BUDGET;
+    let mut redraw = false;
     loop {
         if !app.on_idle_unit(SPELL_WORK_UNIT_BYTES) {
             break;
         }
+        redraw = true;
         if pending_input()? {
             break;
         }
@@ -133,29 +245,33 @@ where
             break;
         }
     }
-    Ok(())
+    Ok(PollOutcome { redraw })
 }
 
 /// Dispatch one terminal event through the same path used by the event loop.
-fn dispatch_event_at(app: &mut App, ev: Event, now: Instant) {
+fn dispatch_event_at(app: &mut App, ev: Event, now: Instant) -> bool {
     match &ev {
         // Key press events only (ignore release/repeat).
         Event::Key(key) if key.kind == KeyEventKind::Press => {
             app.handle_event_at(&ev, now);
+            true
         }
-        // T16: Bracketed paste — paste event.
+        // Bracketed paste event.
         Event::Paste(_) => {
             app.handle_event_at(&ev, now);
+            true
         }
-        // Mouse events: absorb (T16 adds wheel scroll).
+        // Mouse events are routed for wheel scrolling and modal ownership.
         Event::Mouse(_) => {
             app.handle_event_at(&ev, now);
+            true
         }
-        // Resize: forward to app for Rendered-mode cursor remap (FR-3.1).
+        // Resize: forward the coalesced final dimensions for rendered remap.
         Event::Resize(_, _) => {
             app.handle_event_at(&ev, now);
+            true
         }
-        _ => {}
+        _ => false,
     }
 }
 
@@ -198,6 +314,98 @@ mod tests {
     use crate::theme::Tier;
 
     const RESIZE_DOCUMENT: &str = "# Intro\n\nThis opening paragraph is deliberately long enough to wrap at forty columns but not at eighty columns.\n\n## Target heading\n\nThis trailing paragraph is also deliberately long enough to make the narrow layout visibly different.\n";
+
+    #[test]
+    fn cursor_shapes_map_every_public_mode_and_disabled_uses_block() {
+        assert_eq!(cursor_shape(Mode::Normal, true), ModeCursorShape::Block);
+        assert_eq!(cursor_shape(Mode::Insert, true), ModeCursorShape::Bar);
+        assert_eq!(
+            cursor_shape(Mode::Select, true),
+            ModeCursorShape::Underscore
+        );
+        assert_eq!(cursor_shape(Mode::Command, true), ModeCursorShape::Bar);
+
+        for mode in [Mode::Normal, Mode::Insert, Mode::Select, Mode::Command] {
+            assert_eq!(cursor_shape(mode, false), ModeCursorShape::Block);
+        }
+    }
+
+    #[test]
+    fn cursor_shape_command_is_emitted_once_per_mapped_shape_change() {
+        let mut sink = Vec::new();
+        let mut last_shape = None;
+
+        assert!(apply_cursor_shape(&mut sink, Mode::Normal, true, &mut last_shape).unwrap());
+        assert_eq!(sink, b"\x1b[2 q");
+        assert!(!apply_cursor_shape(&mut sink, Mode::Normal, true, &mut last_shape).unwrap());
+        assert_eq!(sink, b"\x1b[2 q");
+
+        assert!(apply_cursor_shape(&mut sink, Mode::Insert, true, &mut last_shape).unwrap());
+        assert_eq!(sink, b"\x1b[2 q\x1b[6 q");
+        assert!(!apply_cursor_shape(&mut sink, Mode::Command, true, &mut last_shape).unwrap());
+        assert_eq!(sink, b"\x1b[2 q\x1b[6 q");
+
+        assert!(apply_cursor_shape(&mut sink, Mode::Select, true, &mut last_shape).unwrap());
+        assert_eq!(sink, b"\x1b[2 q\x1b[6 q\x1b[4 q");
+    }
+
+    #[test]
+    fn redraw_scheduler_paints_initial_frame_once_and_skips_unchanged_idle_polls() {
+        let initial = Instant::now();
+        let mut app = test_app();
+        let mut scheduler = RedrawScheduler::initial();
+        let mut draws = 0;
+
+        scheduler
+            .draw_if_requested(|| {
+                draws += 1;
+                Ok(())
+            })
+            .unwrap();
+        for offset in [0, 50, 100] {
+            let now = initial + Duration::from_millis(offset);
+            let tick = app.tick(now);
+            scheduler.request(tick.redraw);
+            let outcome = handle_poll_outcome(
+                &mut app,
+                false,
+                tick.deadline,
+                now,
+                || panic!("idle poll must not read an event"),
+                || Ok(false),
+                || now,
+            )
+            .unwrap();
+            scheduler.request(outcome.redraw);
+            scheduler
+                .draw_if_requested(|| {
+                    draws += 1;
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        assert_eq!(draws, 1);
+    }
+
+    #[test]
+    fn synchronized_update_encloses_success_and_error_paths() {
+        const BEGIN: &[u8] = b"\x1b[?2026h";
+        const END: &[u8] = b"\x1b[?2026l";
+
+        let mut success = Vec::new();
+        synchronized_update(&mut success, |out| out.write_all(b"frame")).unwrap();
+        assert_eq!(success, [BEGIN, b"frame", END].concat());
+
+        let mut failure = Vec::new();
+        let error = synchronized_update(&mut failure, |out| {
+            out.write_all(b"partial")?;
+            Err(std::io::Error::other("forced draw failure"))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "forced draw failure");
+        assert_eq!(failure, [BEGIN, b"partial", END].concat());
+    }
 
     #[test]
     fn event_timestamp_is_sampled_after_read_before_dispatch() {
@@ -306,7 +514,7 @@ mod tests {
         let mut app = test_app_with_spell_at("misspelledd\n", "known\n".to_string(), true, initial);
         let mut probed = false;
 
-        handle_poll_outcome(
+        let outcome = handle_poll_outcome(
             &mut app,
             true,
             None,
@@ -326,11 +534,144 @@ mod tests {
         .unwrap();
 
         assert_eq!(app.spell_host_phase(), "Unbuilt");
-        assert!(!probed, "event branch must never enter the idle probe loop");
+        assert!(probed, "event branch must probe for a queued event batch");
+        assert!(outcome.redraw);
         assert!(!app.input_idle_for(
             event_time + SPELL_IDLE_DELAY - Duration::from_nanos(1),
             SPELL_IDLE_DELAY
         ));
+    }
+
+    #[test]
+    fn queued_resize_burst_dispatches_only_the_final_dimensions() {
+        use std::collections::VecDeque;
+
+        let initial = Instant::now();
+        let mut app = test_app();
+        let mut events = VecDeque::from([
+            Event::Resize(40, 10),
+            Event::Resize(60, 12),
+            Event::Resize(100, 20),
+        ]);
+        let mut pending = VecDeque::from([true, true, false]);
+        let mut sample_count = 0;
+
+        let mut scheduler = RedrawScheduler::initial();
+        let mut draws = 0;
+        scheduler
+            .draw_if_requested(|| {
+                draws += 1;
+                Ok(())
+            })
+            .unwrap();
+        let outcome = handle_poll_outcome(
+            &mut app,
+            true,
+            None,
+            initial,
+            || Ok(events.pop_front().expect("scripted resize")),
+            || Ok(pending.pop_front().expect("scripted pending probe")),
+            || {
+                sample_count += 1;
+                initial + Duration::from_millis(sample_count)
+            },
+        )
+        .unwrap();
+
+        let (viewport_width, scroll_follows, last_input) = app.event_loop_test_state();
+        assert!(outcome.redraw);
+        assert_eq!(sample_count, 3);
+        assert_eq!(scroll_follows, 1);
+        assert_eq!(viewport_width, 94);
+        assert_eq!(last_input, initial + Duration::from_millis(3));
+        scheduler.request(outcome.redraw);
+        scheduler
+            .draw_if_requested(|| {
+                draws += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(draws, 2, "the resize burst requests one subsequent paint");
+    }
+
+    #[test]
+    fn queued_non_resize_events_preserve_order_and_each_post_read_sample() {
+        use std::collections::VecDeque;
+
+        let initial = Instant::now();
+        let mut app = test_app();
+        let mut events = VecDeque::from([
+            Event::Key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)),
+            Event::Paste("typed".to_string()),
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        ]);
+        let mut pending = VecDeque::from([true, true, false]);
+        let mut sample_count = 0;
+
+        let outcome = handle_poll_outcome(
+            &mut app,
+            true,
+            None,
+            initial,
+            || Ok(events.pop_front().expect("scripted event")),
+            || Ok(pending.pop_front().expect("scripted pending probe")),
+            || {
+                sample_count += 1;
+                initial + Duration::from_millis(sample_count)
+            },
+        )
+        .unwrap();
+
+        assert!(outcome.redraw);
+        assert_eq!(sample_count, 3);
+        assert_eq!(app.mode(), Mode::Normal);
+        assert!(app
+            .active_mut()
+            .unwrap()
+            .session_mut()
+            .document()
+            .contains("typed"));
+        assert_eq!(
+            app.event_loop_test_state().2,
+            initial + Duration::from_millis(3)
+        );
+    }
+
+    #[test]
+    fn ready_event_batch_is_bounded_before_the_next_paint() {
+        let initial = Instant::now();
+        let mut app = test_app();
+        let mut reads = 0;
+        let mut probes = 0;
+        let mut samples = 0usize;
+
+        let outcome = handle_poll_outcome(
+            &mut app,
+            true,
+            None,
+            initial,
+            || {
+                reads += 1;
+                Ok(Event::Key(KeyEvent::new(
+                    KeyCode::Char('x'),
+                    KeyModifiers::NONE,
+                )))
+            },
+            || {
+                probes += 1;
+                Ok(true)
+            },
+            || {
+                samples += 1;
+                initial + Duration::from_millis(samples as u64)
+            },
+        )
+        .unwrap();
+
+        assert!(outcome.redraw);
+        assert_eq!(reads, MAX_EVENT_BATCH);
+        assert_eq!(samples, MAX_EVENT_BATCH);
+        assert_eq!(probes, MAX_EVENT_BATCH - 1);
     }
 
     #[test]
@@ -393,7 +734,7 @@ mod tests {
 
         let mut allowed =
             test_app_with_spell_at("misspelledd\n", "known\n".to_string(), true, initial);
-        handle_poll_outcome(
+        let outcome = handle_poll_outcome(
             &mut allowed,
             false,
             Some(wake + SPELL_SLICE_BUDGET + Duration::from_nanos(1)),
@@ -404,6 +745,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(allowed.spell_host_phase(), "Loading");
+        assert!(outcome.redraw, "idle spell progress must request a paint");
     }
 
     #[test]

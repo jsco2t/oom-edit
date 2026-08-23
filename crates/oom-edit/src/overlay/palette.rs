@@ -8,14 +8,13 @@
 
 use ratatui::{
     layout::{Constraint, Layout, Rect},
-    style::Style,
     text::Line,
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
 
 use crate::command::{rendered_binding, AppCommand, BindingRole, Contexts};
-use crate::theme::{Theme, Tier};
+use crate::theme::{Theme, Tier, UiSlot};
 
 // ── Vim reference table ─────────────────────────────────────────────────────
 
@@ -57,7 +56,7 @@ pub static VIM_REFERENCE: &[(&str, &str, &str)] = &[
     (":s/pat/rep/g", "Substitute all on current line.", "V-X7"),
     (":%s/pat/rep/g", "Substitute all in document.", "V-X7"),
     (":noh", "Clear search-match highlighting.", "V-X8"),
-    (":help", "Open help / command palette.", "V-X8"),
+    (":help", "Open the command palette.", "V-X8"),
 ];
 
 // ── Palette state ───────────────────────────────────────────────────────────
@@ -255,9 +254,11 @@ impl PaletteState {
         let area = palette_area(frame.area());
         frame.render_widget(Clear, area);
 
+        let surface = theme.ui_style(tier, UiSlot::PaletteSurface);
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(" Command Palette ");
+            .title(" Command Palette ")
+            .style(surface);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -272,7 +273,11 @@ impl PaletteState {
         ])
         .areas(inner);
 
-        frame.render_widget(Paragraph::new(format!("> {}", self.filter)), filter_area);
+        frame.render_widget(
+            Paragraph::new(format!("> {}", self.filter))
+                .style(theme.ui_style(tier, UiSlot::PaletteText)),
+            filter_area,
+        );
 
         // Build rows.
         let all_rows = self.build_rows(self.context);
@@ -283,35 +288,17 @@ impl PaletteState {
 
         for (idx, &row_idx) in visible_indices.iter().enumerate() {
             let row = &all_rows[row_idx];
-            let line = match row {
-                PaletteRow::Command {
-                    name,
-                    desc,
-                    keys,
-                    disabled,
-                    ..
-                } => {
-                    let style = if *disabled {
-                        theme.style(tier, oom_edit_core::SemanticStyle::Muted)
-                    } else {
-                        Style::default()
-                    };
-                    let is_selected = idx == self.selected;
-                    let prefix = if is_selected { "▸ " } else { "  " };
-                    Line::styled(
-                        format!("{}{:<20} {:<30} {}", prefix, name, desc, keys),
-                        style,
-                    )
-                }
-                PaletteRow::Reference { keys, desc, row_id } => {
-                    let is_selected = idx == self.selected;
-                    let prefix = if is_selected { "▸ " } else { "  " };
-                    Line::styled(
-                        format!("{}{:<20} {:<35} {}", prefix, keys, desc, row_id),
-                        theme.style(tier, oom_edit_core::SemanticStyle::Muted),
-                    )
-                }
+            let selected = idx == self.selected;
+            let style = if selected {
+                theme.ui_style(tier, UiSlot::PaletteSelected)
+            } else if matches!(row, PaletteRow::Reference { .. })
+                || matches!(row, PaletteRow::Command { disabled: true, .. })
+            {
+                theme.ui_style(tier, UiSlot::PaletteSecondary)
+            } else {
+                theme.ui_style(tier, UiSlot::PaletteText)
             };
+            let line = Line::styled(palette_line(row, selected, list_area.width), style);
             lines.push(line);
         }
 
@@ -342,6 +329,100 @@ impl PaletteState {
         }
         None
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PaletteColumns {
+    primary: usize,
+    description: usize,
+    tail: usize,
+}
+
+fn palette_columns(width: u16) -> PaletteColumns {
+    let available = usize::from(width).saturating_sub(2);
+    if available < 12 {
+        return PaletteColumns {
+            primary: available,
+            description: 0,
+            tail: 0,
+        };
+    }
+    let tail = (available.saturating_sub(26)).min(14);
+    let description = (available.saturating_sub(tail + 14)).min(30);
+    let separators = usize::from(description > 0) + usize::from(tail > 0);
+    let content = available.saturating_sub(separators);
+    PaletteColumns {
+        primary: content.saturating_sub(description + tail),
+        description,
+        tail,
+    }
+}
+
+fn clip(text: &str, width: usize) -> String {
+    if Line::from(text).width() <= width {
+        return text.to_string();
+    }
+    if width <= 1 {
+        return "…".chars().take(width).collect();
+    }
+    let mut result = String::new();
+    for ch in text.chars() {
+        let next = format!("{result}{ch}");
+        if Line::from(format!("{next}…")).width() > width {
+            break;
+        }
+        result.push(ch);
+    }
+    format!("{result}…")
+}
+
+fn pad(text: &str, width: usize) -> String {
+    let clipped = clip(text, width);
+    format!(
+        "{clipped}{}",
+        " ".repeat(width.saturating_sub(Line::from(clipped.as_str()).width()))
+    )
+}
+
+/// One display-width-aware layout shared by executable and reference rows.
+fn palette_line(row: &PaletteRow, selected: bool, width: u16) -> String {
+    let (marker, primary, description, tail) = match row {
+        PaletteRow::Command {
+            name,
+            desc,
+            keys,
+            disabled,
+            ..
+        } => (
+            if selected {
+                "▸ "
+            } else if *disabled {
+                "× "
+            } else {
+                "  "
+            },
+            name.as_str(),
+            desc.as_str(),
+            keys.as_str(),
+        ),
+        PaletteRow::Reference { keys, desc, row_id } => (
+            if selected { "▸ " } else { "· " },
+            keys.as_str(),
+            desc.as_str(),
+            row_id.as_str(),
+        ),
+    };
+    let columns = palette_columns(width);
+    let mut result = format!("{marker}{}", pad(primary, columns.primary));
+    if columns.description > 0 {
+        result.push(' ');
+        result.push_str(&pad(description, columns.description));
+    }
+    if columns.tail > 0 {
+        result.push(' ');
+        result.push_str(&pad(tail, columns.tail));
+    }
+    result
 }
 
 /// Check if `pattern` is a fuzzy subsequence of `text`.
@@ -478,6 +559,42 @@ mod tests {
             assert!(actual.y >= parent.y);
             assert!(actual.right() <= parent.right());
             assert!(actual.bottom() <= parent.bottom());
+        }
+    }
+
+    #[test]
+    fn palette_rows_share_exact_display_columns_at_wide_and_floor_widths() {
+        let command = PaletteRow::Command {
+            id: AppCommand::Help,
+            name: "help".to_string(),
+            desc: "command palette".to_string(),
+            keys: "Space h".to_string(),
+            disabled: false,
+        };
+        let reference = PaletteRow::Reference {
+            keys: "/pattern⏎".to_string(),
+            desc: "Search rendered text forward.".to_string(),
+            row_id: "R-N4".to_string(),
+        };
+        for width in [40, 80] {
+            let command = palette_line(&command, false, width);
+            let reference = palette_line(&reference, false, width);
+            assert_eq!(Line::from(command.as_str()).width(), usize::from(width));
+            assert_eq!(Line::from(reference.as_str()).width(), usize::from(width));
+
+            let command_description = command.find("command").expect("command description");
+            let reference_description = reference.find("Search").expect("reference description");
+            assert_eq!(
+                Line::from(&command[..command_description]).width(),
+                Line::from(&reference[..reference_description]).width()
+            );
+
+            let command_tail = command.find("Space h").expect("command binding");
+            let reference_tail = reference.find("R-N4").expect("reference row id");
+            assert_eq!(
+                Line::from(&command[..command_tail]).width(),
+                Line::from(&reference[..reference_tail]).width()
+            );
         }
     }
 

@@ -304,14 +304,33 @@ fn rendered_provenance_is_width_invariant() {
 
 #[test]
 fn table_provenance_is_width_invariant() {
-    let text = "| first | second |\n|---|---|\n| same | same |\n| 東京東京東京東京 | same |";
-    let baseline = source_backed_ranges(&rendered_layout_at_width(text, 80), text);
-    for width in [18, 27, 43] {
+    let text = concat!(
+        "| first | second | third |\n",
+        "|:---|:---:|---:|\n",
+        "| repeat repeat 東京東京 cafe\u{301} | &amp; \\* | `left\\|right` [repeat](dest) |\n",
+        "| repeated repeated text | 東京東京東京東京 | same same same |",
+    );
+    let baseline = source_backed_ranges(&rendered_layout_at_width(text, 120), text);
+    for width in [40, 79, 80, 81] {
+        let layout = rendered_layout_at_width(text, width);
         assert_eq!(
-            source_backed_ranges(&rendered_layout_at_width(text, width), text),
+            source_backed_ranges(&layout, text),
             baseline,
             "table source ownership changed at width {width}"
         );
+
+        let row_widths = layout
+            .lines
+            .iter()
+            .filter(|line| {
+                matches!(line.styled.text.chars().next(), Some('┌' | '├' | '└' | '│'))
+                    && matches!(line.styled.text.chars().last(), Some('┐' | '┤' | '┘' | '│'))
+            })
+            .map(|line| unicode_width::UnicodeWidthStr::width(line.styled.text.as_str()))
+            .collect::<Vec<_>>();
+        assert!(!row_widths.is_empty());
+        assert!(row_widths.windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(row_widths[0] <= usize::from(width.max(80)));
     }
 }
 
@@ -1256,6 +1275,33 @@ fn nested_link_markers_sequential() {
 }
 
 #[test]
+fn link_index_rows_have_indexed_targets_and_no_source_ownership() {
+    let destination = "https://example.com/東京?q=é";
+    let text = format!("[first]({destination}) and [second]({destination})");
+    let layout = rendered_layout(&text);
+
+    assert_eq!(
+        layout.link_index,
+        vec![(0, destination.to_string()), (1, destination.to_string())]
+    );
+    let index_targets: Vec<_> = layout
+        .jump_targets
+        .iter()
+        .filter(|target| layout.lines[target.line].kind == LineKind::Synthetic)
+        .collect();
+    assert_eq!(index_targets.len(), 2);
+    for (expected_index, target) in index_targets.into_iter().enumerate() {
+        assert_eq!(target.kind, TargetKind::Link(expected_index));
+        let line = &layout.lines[target.line];
+        assert_eq!(
+            line.styled.text,
+            format!("[{expected_index}] {destination}")
+        );
+        assert!(line.atoms.iter().all(|atom| atom.source.is_none()));
+    }
+}
+
+#[test]
 fn nested_container_metadata_is_preserved_recursively() {
     let layout = rendered_layout("> - [deep link](https://example.com/deep)\n>   > # Deep heading");
 
@@ -1267,7 +1313,7 @@ fn nested_container_metadata_is_preserved_recursively() {
         .lines
         .iter()
         .any(|line| line.styled.text == "┃ • deep link [0]"));
-    assert_eq!(layout.jump_targets.len(), 2);
+    assert_eq!(layout.jump_targets.len(), 3);
     let link = layout
         .jump_targets
         .iter()

@@ -74,6 +74,14 @@ pub enum UiSlot {
     TabInactive,
     /// Separator between tab labels.
     TabSeparator,
+    /// Command-palette background and border surface.
+    PaletteSurface,
+    /// Primary executable command-palette text.
+    PaletteText,
+    /// Reference and disabled command-palette text.
+    PaletteSecondary,
+    /// Active command-palette row.
+    PaletteSelected,
 }
 
 // ── Palette tiers ───────────────────────────────────────────────────────────
@@ -145,7 +153,7 @@ impl Palette {
                         return s;
                     }
                 }
-                Style::default().add_modifier(Modifier::BOLD)
+                palette_fallback(slot)
             }
             Palette::Monochrome { ui, .. } => {
                 for &(s, modif) in ui.iter() {
@@ -153,9 +161,7 @@ impl Palette {
                         return Style::default().fg(Color::Reset).add_modifier(modif);
                     }
                 }
-                Style::default()
-                    .fg(Color::Reset)
-                    .add_modifier(Modifier::BOLD)
+                palette_fallback(slot).fg(Color::Reset)
             }
         }
     }
@@ -169,6 +175,17 @@ impl Palette {
                     || ui.iter().any(|&(_, fg, _, _)| fg != Color::Reset)
             }
         }
+    }
+}
+
+fn palette_fallback(slot: UiSlot) -> Style {
+    let reset = Style::default().remove_modifier(Modifier::all());
+    match slot {
+        UiSlot::PaletteSurface => reset.add_modifier(Modifier::DIM),
+        UiSlot::PaletteText => reset,
+        UiSlot::PaletteSecondary => reset.add_modifier(Modifier::DIM),
+        UiSlot::PaletteSelected => reset.add_modifier(Modifier::REVERSED),
+        _ => Style::default().add_modifier(Modifier::BOLD),
     }
 }
 
@@ -915,6 +932,30 @@ pub static DEFAULT_DARK: Theme = Theme {
                 None,
                 Modifier::DIM,
             ),
+            (
+                UiSlot::PaletteSurface,
+                Color::Rgb(200, 204, 212),
+                None,
+                Modifier::DIM,
+            ),
+            (
+                UiSlot::PaletteText,
+                Color::Rgb(200, 204, 212),
+                None,
+                Modifier::empty(),
+            ),
+            (
+                UiSlot::PaletteSecondary,
+                Color::Rgb(148, 152, 160),
+                None,
+                Modifier::DIM,
+            ),
+            (
+                UiSlot::PaletteSelected,
+                Color::Rgb(200, 204, 212),
+                Some(Color::Rgb(68, 75, 90)),
+                Modifier::REVERSED,
+            ),
         ],
     },
     color16: Palette::Color16 {
@@ -1030,6 +1071,15 @@ pub static DEFAULT_DARK: Theme = Theme {
                 Modifier::DIM,
             ),
             (UiSlot::TabSeparator, Color::DarkGray, None, Modifier::DIM),
+            (UiSlot::PaletteSurface, Color::White, None, Modifier::DIM),
+            (UiSlot::PaletteText, Color::White, None, Modifier::empty()),
+            (UiSlot::PaletteSecondary, Color::Gray, None, Modifier::DIM),
+            (
+                UiSlot::PaletteSelected,
+                Color::White,
+                Some(Color::DarkGray),
+                Modifier::REVERSED,
+            ),
         ],
     },
     monochrome: Palette::Monochrome {
@@ -1091,6 +1141,10 @@ pub static DEFAULT_DARK: Theme = Theme {
             (UiSlot::TabInactive, Modifier::DIM),
             (UiSlot::MetadataPanel, Modifier::DIM),
             (UiSlot::TabSeparator, Modifier::DIM),
+            (UiSlot::PaletteSurface, Modifier::DIM),
+            (UiSlot::PaletteText, Modifier::empty()),
+            (UiSlot::PaletteSecondary, Modifier::DIM),
+            (UiSlot::PaletteSelected, Modifier::REVERSED),
         ],
     },
 };
@@ -1208,6 +1262,20 @@ pub static DEFAULT_LIGHT: Theme = Theme {
                 Modifier::DIM,
             ),
             (UiSlot::TabSeparator, Color::Gray, None, Modifier::DIM),
+            (UiSlot::PaletteSurface, Color::Black, None, Modifier::DIM),
+            (UiSlot::PaletteText, Color::Black, None, Modifier::empty()),
+            (
+                UiSlot::PaletteSecondary,
+                Color::DarkGray,
+                None,
+                Modifier::DIM,
+            ),
+            (
+                UiSlot::PaletteSelected,
+                Color::Black,
+                Some(Color::Gray),
+                Modifier::REVERSED,
+            ),
         ],
     },
     color16: Palette::Color16 {
@@ -1319,6 +1387,20 @@ pub static DEFAULT_LIGHT: Theme = Theme {
                 Modifier::DIM,
             ),
             (UiSlot::TabSeparator, Color::Gray, None, Modifier::DIM),
+            (UiSlot::PaletteSurface, Color::Black, None, Modifier::DIM),
+            (UiSlot::PaletteText, Color::Black, None, Modifier::empty()),
+            (
+                UiSlot::PaletteSecondary,
+                Color::DarkGray,
+                None,
+                Modifier::DIM,
+            ),
+            (
+                UiSlot::PaletteSelected,
+                Color::Black,
+                Some(Color::Gray),
+                Modifier::REVERSED,
+            ),
         ],
     },
     monochrome: Palette::Monochrome {
@@ -1380,6 +1462,10 @@ pub static DEFAULT_LIGHT: Theme = Theme {
             (UiSlot::TabInactive, Modifier::DIM),
             (UiSlot::MetadataPanel, Modifier::DIM),
             (UiSlot::TabSeparator, Modifier::DIM),
+            (UiSlot::PaletteSurface, Modifier::DIM),
+            (UiSlot::PaletteText, Modifier::empty()),
+            (UiSlot::PaletteSecondary, Modifier::DIM),
+            (UiSlot::PaletteSelected, Modifier::REVERSED),
         ],
     },
 };
@@ -1447,6 +1533,10 @@ pub static ACCESSIBLE: Theme = Theme {
             (UiSlot::TabInactive, Modifier::DIM),
             (UiSlot::MetadataPanel, Modifier::DIM),
             (UiSlot::TabSeparator, Modifier::DIM),
+            (UiSlot::PaletteSurface, Modifier::DIM),
+            (UiSlot::PaletteText, Modifier::empty()),
+            (UiSlot::PaletteSecondary, Modifier::DIM),
+            (UiSlot::PaletteSelected, Modifier::REVERSED),
         ],
     },
     color16: Palette::Monochrome {
@@ -1508,6 +1598,10 @@ pub static ACCESSIBLE: Theme = Theme {
             (UiSlot::TabInactive, Modifier::DIM),
             (UiSlot::MetadataPanel, Modifier::DIM),
             (UiSlot::TabSeparator, Modifier::DIM),
+            (UiSlot::PaletteSurface, Modifier::DIM),
+            (UiSlot::PaletteText, Modifier::empty()),
+            (UiSlot::PaletteSecondary, Modifier::DIM),
+            (UiSlot::PaletteSelected, Modifier::REVERSED),
         ],
     },
     monochrome: Palette::Monochrome {
@@ -1569,6 +1663,10 @@ pub static ACCESSIBLE: Theme = Theme {
             (UiSlot::TabInactive, Modifier::DIM),
             (UiSlot::MetadataPanel, Modifier::DIM),
             (UiSlot::TabSeparator, Modifier::DIM),
+            (UiSlot::PaletteSurface, Modifier::DIM),
+            (UiSlot::PaletteText, Modifier::empty()),
+            (UiSlot::PaletteSecondary, Modifier::DIM),
+            (UiSlot::PaletteSelected, Modifier::REVERSED),
         ],
     },
 };
@@ -1839,6 +1937,10 @@ mod tests {
             UiSlot::TabInactive,
             UiSlot::MetadataPanel,
             UiSlot::TabSeparator,
+            UiSlot::PaletteSurface,
+            UiSlot::PaletteText,
+            UiSlot::PaletteSecondary,
+            UiSlot::PaletteSelected,
         ];
 
         for (name, theme) in &themes {
@@ -2817,6 +2919,10 @@ mod tests {
             UiSlot::TabInactive,
             UiSlot::MetadataPanel,
             UiSlot::TabSeparator,
+            UiSlot::PaletteSurface,
+            UiSlot::PaletteText,
+            UiSlot::PaletteSecondary,
+            UiSlot::PaletteSelected,
         ];
 
         for (name, theme) in &themes {
@@ -2826,18 +2932,20 @@ mod tests {
                     Palette::TrueColor { ui, .. } | Palette::Color16 { ui, .. } => {
                         let ui_slots: Vec<UiSlot> = ui.iter().map(|(s, _, _, _)| *s).collect();
                         for slot in &slots {
-                            assert!(
-                                ui_slots.contains(slot),
-                                "Theme {name} tier {tier:?} missing UI slot {slot:?}"
+                            assert_eq!(
+                                ui_slots.iter().filter(|candidate| *candidate == slot).count(),
+                                1,
+                                "Theme {name} tier {tier:?} must define UI slot {slot:?} exactly once"
                             );
                         }
                     }
                     Palette::Monochrome { ui, .. } => {
                         let ui_slots: Vec<UiSlot> = ui.iter().map(|(s, _)| *s).collect();
                         for slot in &slots {
-                            assert!(
-                                ui_slots.contains(slot),
-                                "Theme {name} tier {tier:?} missing UI slot {slot:?}"
+                            assert_eq!(
+                                ui_slots.iter().filter(|candidate| *candidate == slot).count(),
+                                1,
+                                "Theme {name} tier {tier:?} must define UI slot {slot:?} exactly once"
                             );
                         }
                     }

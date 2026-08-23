@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "work_id": "2026-08-22-usability-bug-fixes",
+  "title": "Rendered-mode and shell usability refinements",
+  "created_at": "2026-08-23T01:01:00Z",
+  "approved_at": "2026-08-23T04:06:42Z",
+  "completed_at": "2026-08-23T15:50:33Z",
+  "archived_at": "2026-08-23T15:51:10Z",
+  "baseline_sha": "4aa8308cfc80a40a8fef1886c85fde4b6a3d2a25",
+  "final_sha": "4aa8308cfc80a40a8fef1886c85fde4b6a3d2a25",
+  "approved_plan_sha256": "3b7eb348aaaf934cba6cbfec40fce4c4b8041f4eb7d75acf0335d960491417f3",
+  "task_count": 6,
+  "tasks_completed": 6,
+  "result": "DONE",
+  "final_evidence": "evidence/final.md"
+}

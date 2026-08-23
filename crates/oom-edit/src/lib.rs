@@ -138,7 +138,7 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Run the event loop.
-    event::run_event_loop(app, terminal)
+    event::run_event_loop(app, terminal, config.editor.cursor_shapes)
 }
 
 #[cfg(test)]
@@ -150,7 +150,10 @@ mod startup_tests {
     #[test]
     fn production_resolver_reports_partial_config_slot_as_fallback() {
         let config = Config {
-            editor: EditorConfig { wrap: false },
+            editor: EditorConfig {
+                wrap: false,
+                ..EditorConfig::default()
+            },
             ..Config::default()
         };
         let env = EnvParts {

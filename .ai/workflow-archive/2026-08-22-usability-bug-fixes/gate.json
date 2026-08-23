@@ -1,0 +1,17 @@
+{
+  "standard_commands": [
+    "make fmt-check",
+    "make lint",
+    "make build",
+    "make test",
+    "make check"
+  ],
+  "final_commands": [
+    "make fmt-check",
+    "make lint",
+    "make build",
+    "make build-release",
+    "make test",
+    "make check"
+  ]
+}
