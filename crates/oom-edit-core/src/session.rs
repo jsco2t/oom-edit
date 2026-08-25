@@ -779,8 +779,8 @@ pub enum Effect {
         /// Force open (ignore unsaved changes).
         force: bool,
     },
-    /// Yanked text to the system clipboard (e.g. `"+y`).
-    ClipboardWrite(String),
+    /// Markdown and plain-text forms to write to the system clipboard.
+    ClipboardWrite(crate::clipboard::ClipboardContent),
     /// Mode changed.
     ModeChanged(Mode),
     /// A status message to display.
@@ -2370,7 +2370,9 @@ impl EditorSession {
             if let Some(destination) = self.focused_synthetic_link_destination() {
                 self.rendered_state.count = 0;
                 self.rendered_state.register_input = RegisterInput::Default;
-                return vec![Effect::ClipboardWrite(destination)];
+                return vec![Effect::ClipboardWrite(
+                    crate::clipboard::ClipboardContent::invariant(destination),
+                )];
             }
         }
         if key.mods.ctrl && matches!(key.code.kind, KeyCodeKind::Char('v' | 'V')) {
@@ -2484,7 +2486,9 @@ impl EditorSession {
             {
                 self.rendered_state.count = 0;
                 self.rendered_state.register_input = RegisterInput::Default;
-                let effects = vec![Effect::ClipboardWrite(destination)];
+                let effects = vec![Effect::ClipboardWrite(
+                    crate::clipboard::ClipboardContent::invariant(destination),
+                )];
                 return if matches!(key.code.kind, KeyCodeKind::Char('y')) {
                     self.finish_select(Mode::Normal, effects)
                 } else {
@@ -2942,10 +2946,13 @@ impl EditorSession {
         if selection.source_ranges.is_empty() {
             return Vec::new();
         }
+        let clipboard_content =
+            crate::clipboard::rendered_selection_content(&selection, layout, &self.live.text());
         let register = self.rendered_state.register_input.take();
         let projected = project_selection_for_vim(selection);
         let vim_effects = self.live.apply_selection(projected, operator, register);
-        let effects = self.translate_vim_effects(vim_effects);
+        let effects =
+            self.translate_vim_effects_with_clipboard(vim_effects, Some(&clipboard_content));
         self.remap_active_cursor_from_canonical();
         let target_mode = if operator == RangeOperator::Change {
             Mode::Insert
@@ -3026,6 +3033,14 @@ impl EditorSession {
         &mut self,
         vim_effects: impl IntoIterator<Item = VimEffect>,
     ) -> Vec<Effect> {
+        self.translate_vim_effects_with_clipboard(vim_effects, None)
+    }
+
+    fn translate_vim_effects_with_clipboard(
+        &mut self,
+        vim_effects: impl IntoIterator<Item = VimEffect>,
+        clipboard_override: Option<&crate::clipboard::ClipboardContent>,
+    ) -> Vec<Effect> {
         let mut effects = Vec::new();
         let mut left_insert = false;
         for effect in vim_effects {
@@ -3048,7 +3063,11 @@ impl EditorSession {
                     effects.extend(self.process_ex_command(&command))
                 }
                 VimEffect::CommandCancelled => {}
-                VimEffect::ClipboardYank(text) => effects.push(Effect::ClipboardWrite(text)),
+                VimEffect::ClipboardYank(text) => effects.push(Effect::ClipboardWrite(
+                    clipboard_override
+                        .cloned()
+                        .unwrap_or_else(|| crate::clipboard::ClipboardContent::from_markdown(text)),
+                )),
                 VimEffect::SearchWrapped => effects.push(Effect::Message {
                     text: "Search wrapped around buffer".to_string(),
                     severity: Severity::Info,

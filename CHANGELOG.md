@@ -11,9 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Added copyable rendered link-index rows in Normal and Select and configurable
   mode-specific terminal cursor shapes.
+- Added a `[clipboard] copy_format` setting that defaults to exact Markdown and
+  supports syntax-free `plain-text` clipboard output.
 
 ### Changed
 
+- Made plain `y` in rendered Select preserve its internal yank while sending
+  the actual Markdown source, including hidden inline delimiters, to the system
+  clipboard via canonical, padded OSC 52 output.
 - Clarified and compacted command discovery, with consistently themed and
   aligned command-palette rows and grouped Space-prefix hints.
 - Made rendered tables reflow to an 80-column floor and follow horizontal

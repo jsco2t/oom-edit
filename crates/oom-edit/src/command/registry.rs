@@ -199,7 +199,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     row!(
         SelectYank,
         "select-yank",
-        "yank selection",
+        "yank and send to clipboard",
         Contexts::SELECT,
         BindingRole::CoreKey { display: "y" },
         Some(2)
@@ -651,7 +651,7 @@ mod tests {
             (
                 RegistryEntryId::SelectYank,
                 "select-yank",
-                "yank selection",
+                "yank and send to clipboard",
                 Contexts::SELECT,
                 BindingRole::CoreKey { display: "y" },
                 Some(2),

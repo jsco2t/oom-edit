@@ -495,14 +495,17 @@ mod tests {
         App::new_with_spell(
             EditorSession::from_text(document),
             crate::theme::ResolvedTheme::injected("default-dark", false, Tier::TrueColor),
-            true,
-            false,
+            crate::app::AppStartupOptions::new(
+                true,
+                false,
+                crate::config::ClipboardCopyFormat::Markdown,
+                enabled,
+            ),
             crate::app::AppServices::new(
                 Box::new(RecordingClipboardSink::default()),
                 Box::new(crate::config::DisabledConfigStore),
                 crate::spell_host::SpellHost::testing(words),
             ),
-            enabled,
             initial,
         )
     }

@@ -42,10 +42,36 @@ points are:
 | `i` | Enter source Insert mode |
 | `Esc` | Return to rendered Normal mode |
 | `v`, `V`, `Ctrl-V` | Start character, line, or block Select mode |
+| `y` (in Select) | Yank the selection and send its exact Markdown source to the system clipboard |
 | `:` | Enter Command mode |
 | `Space h` | Open help and the command palette |
 | `Space w` | Save |
 | `Space q` | Quit |
+
+## Clipboard
+
+In rendered Select, plain `y` preserves the normal in-process yank and also
+sends the selection's exact Markdown source—including inline delimiters such as
+backticks—to the system clipboard. This Markdown-preserving behavior is the
+default. Set `clipboard.copy_format` to `"plain-text"` to strip Markdown syntax,
+decode escapes and entities, and copy the rendered text instead. Explicit `"+y`
+and `"*y` remain available as alternatives. Automatic clipboard publication
+applies only to rendered Select yanks; deletes, changes, and yanks from source
+Normal mode do not publish implicitly.
+
+Clipboard output uses OSC 52 and is best effort. It requires OSC 52 support to
+be enabled in the terminal and, when applicable, in tmux. The success message
+only confirms that oom-edit emitted the sequence; terminals do not acknowledge
+whether they applied it. Outgoing text over 100 KiB and terminal output errors
+produce a visible warning. The size limit is applied after the configured copy
+format is selected.
+
+To paste the desktop clipboard, enter Insert mode and use the terminal's native
+paste action. Bracketed paste is inserted as one operation. `"+p` uses
+oom-edit's cached in-process system-register value, including a preceding
+rendered Select yank, and does not read the desktop clipboard. The copy-format
+setting changes only outgoing system-clipboard text; it does not sanitize or
+reshape internal registers or `p`/`P` operations.
 
 ## Configuration
 
@@ -65,6 +91,11 @@ wrap = true
 # Use a steady block in Normal, a steady bar in Insert and Command, and a
 # steady underscore in Select. Set false for a steady block in every mode.
 cursor_shapes = true
+
+[clipboard]
+# Preserve Markdown source by default. Use "plain-text" to copy rendered text
+# without Markdown syntax.
+copy_format = "markdown"
 
 [theme]
 # Omit mode to infer light or dark from COLORFGBG, with dark as the fallback.

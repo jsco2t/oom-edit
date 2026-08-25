@@ -115,14 +115,17 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let app = App::new_with_spell(
         session,
         resolved_theme,
-        config.editor.wrap,
-        config.relative_line_numbers,
+        app::AppStartupOptions::new(
+            config.editor.wrap,
+            config.relative_line_numbers,
+            config.clipboard.copy_format,
+            config.spell.enabled,
+        ),
         AppServices::new(
             Box::new(crate::clipboard::Osc52Clipboard::stdout()),
             Box::new(crate::config::FileConfigStore::production()),
             spell_host,
         ),
-        config.spell.enabled,
         std::time::Instant::now(),
     );
 

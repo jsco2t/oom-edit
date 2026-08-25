@@ -1,10 +1,10 @@
 //! Downstream-style guards for the curated root facade.
 
 use oom_edit_core::{
-    ClipboardError, ClipboardSink, DecorationKind, Diagnostic, DiagnosticDecorationRow,
-    DiagnosticProvider, DiagnosticSeverity, EditorSession, Effect, FmError, FrontMatter,
-    JumpTarget, KeyCode, KeyCodeKind, KeyInput, LineEnding, LineKind, Mode, Modifiers, Num,
-    OpenError, PositionError, RecordingClipboardSink, RenderedLayout, RenderedLine,
+    ClipboardContent, ClipboardError, ClipboardSink, DecorationKind, Diagnostic,
+    DiagnosticDecorationRow, DiagnosticProvider, DiagnosticSeverity, EditorSession, Effect,
+    FmError, FrontMatter, JumpTarget, KeyCode, KeyCodeKind, KeyInput, LineEnding, LineKind, Mode,
+    Modifiers, Num, OpenError, PositionError, RecordingClipboardSink, RenderedLayout, RenderedLine,
     RenderedLineRole, RenderedPoint, RenderedSearch, RenderedSelection, RenderedSelectionRow,
     RenderedSourceAtom, SaveError, SearchDirection, SelectionShape, SemanticStyle, Severity,
     SourceDecoration, SourceFrame, Span, StyledLine, TargetKind, TextPosition, Value, Viewport,
@@ -82,7 +82,12 @@ fn public_facade_types_are_available_at_crate_root() {
     let mut clipboard = RecordingClipboardSink::default();
     ClipboardSink::copy(&mut clipboard, "root").unwrap();
 
+    let content = ClipboardContent::from_markdown("`root`".to_string());
+    assert_eq!(content.markdown(), "`root`");
+    assert_eq!(content.plain_text(), "root");
+
     let _nameable = std::any::TypeId::of::<(
+        ClipboardContent,
         ClipboardError,
         DecorationKind,
         Diagnostic,
@@ -126,7 +131,7 @@ fn public_facade_remains_curated_without_partial_spell_reexports() {
     assert_eq!(
         declarations,
         [
-            "pub use clipboard::{ClipboardError, ClipboardSink, RecordingClipboardSink};",
+            "pub use clipboard::{ClipboardContent, ClipboardError, ClipboardSink, RecordingClipboardSink};",
             "pub use document::LineEnding;",
             "pub use error::{FmError, OpenError, SaveError};",
             "pub use frontmatter::{FrontMatter, Num, Value};",

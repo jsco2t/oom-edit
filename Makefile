@@ -41,16 +41,19 @@ build-examples: ## Build all examples with locked offline dependencies
 # Test
 # ---------------------------------------------------------------------------
 .PHONY: test
-test: ## Run the full test suite
+test: feature-workflow-test ## Run the full test suite
 	bash scripts/with-isolated-config.sh cargo test --workspace --offline --locked
+
+.PHONY: feature-workflow-test
+feature-workflow-test: ## Test feature-workflow helper scripts
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .agents/skills/feature-workflow/tests -p 'test_*.py'
 
 .PHONY: test-update-snapshots
 test-update-snapshots: ## Re-run tests with OOM_UPDATE_SNAPSHOTS=1 to (re)write golden files
 	OOM_UPDATE_SNAPSHOTS=1 bash scripts/with-isolated-config.sh cargo test --workspace --offline --locked
 
 .PHONY: test-all
-test-all: ## Tests + example builds
-	bash scripts/with-isolated-config.sh cargo test --workspace --offline --locked
+test-all: test ## Tests + example builds
 	cargo build --examples --offline --locked
 
 # ---------------------------------------------------------------------------
@@ -112,7 +115,8 @@ check: ## Run fmt-check + lint + build + test + deny + audit + data-license-chec
 	fi; \
 	echo ""; \
 	echo "test"; \
-	if bash scripts/with-isolated-config.sh cargo test --workspace --offline --locked 2>&1; then \
+	if PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .agents/skills/feature-workflow/tests -p 'test_*.py' 2>&1 \
+		&& bash scripts/with-isolated-config.sh cargo test --workspace --offline --locked 2>&1; then \
 		echo "[PASS] test"; PASS=$$((PASS + 1)); \
 	else \
 		echo "[FAIL] test"; FAIL=$$((FAIL + 1)); test_ok=false; \

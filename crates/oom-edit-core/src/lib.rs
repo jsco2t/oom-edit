@@ -70,7 +70,7 @@ mod vim;
 // These re-exports form the public API of `oom-edit-core`. Nothing more
 // is exported publicly; this `pub use` list *is* the API contract (FR-8.3).
 
-pub use clipboard::{ClipboardError, ClipboardSink, RecordingClipboardSink};
+pub use clipboard::{ClipboardContent, ClipboardError, ClipboardSink, RecordingClipboardSink};
 pub use document::LineEnding;
 pub use error::{FmError, OpenError, SaveError};
 pub use frontmatter::{FrontMatter, Num, Value};

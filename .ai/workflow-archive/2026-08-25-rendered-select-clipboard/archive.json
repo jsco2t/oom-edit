@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "work_id": "2026-08-25-rendered-select-clipboard",
+  "title": "Rendered Select Clipboard",
+  "created_at": "2026-08-25T17:32:48Z",
+  "approved_at": "2026-08-25T17:54:56Z",
+  "completed_at": "2026-08-25T18:14:59Z",
+  "archived_at": "2026-08-25T18:25:59Z",
+  "baseline_sha": "6bf7c7aee91601e2d9cad201d0db3777e47561b5",
+  "final_sha": "6bf7c7aee91601e2d9cad201d0db3777e47561b5",
+  "approved_plan_sha256": "16a86a3401be15bb294415e875e051b552d458eec7049facc8b96499ac6726ae",
+  "task_count": 3,
+  "tasks_completed": 3,
+  "result": "DONE",
+  "final_evidence": "evidence/final.md"
+}

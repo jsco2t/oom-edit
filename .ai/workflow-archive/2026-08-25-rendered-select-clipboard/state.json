@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "work_id": "2026-08-25-rendered-select-clipboard",
+  "title": "Rendered Select Clipboard",
+  "phase": "DONE",
+  "created_at": "2026-08-25T17:32:48Z",
+  "updated_at": "2026-08-25T18:25:59Z",
+  "approved_at": "2026-08-25T17:54:56Z",
+  "completed_at": "2026-08-25T18:14:59Z",
+  "archived_at": "2026-08-25T18:25:59Z",
+  "baseline_sha": "6bf7c7aee91601e2d9cad201d0db3777e47561b5",
+  "final_sha": "6bf7c7aee91601e2d9cad201d0db3777e47561b5",
+  "plan_revision": 1,
+  "approved_plan_sha256": "16a86a3401be15bb294415e875e051b552d458eec7049facc8b96499ac6726ae",
+  "current_task": null,
+  "tasks": [
+    {
+      "id": "001",
+      "path": "tasks/001-mirror-rendered-select-yanks.md",
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/001.md"
+    },
+    {
+      "id": "002",
+      "path": "tasks/002-canonicalize-osc52-output.md",
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/002.md"
+    },
+    {
+      "id": "003",
+      "path": "tasks/003-update-clipboard-ux-and-docs.md",
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/003.md"
+    }
+  ],
+  "task_retry_limit": 3,
+  "final_retry_limit": 2,
+  "final_attempts": 1,
+  "stop_continuations": 0,
+  "max_stop_continuations": 50,
+  "block_reason": null
+}

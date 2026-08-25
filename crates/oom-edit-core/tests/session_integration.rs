@@ -1,8 +1,8 @@
 //! Integration coverage for the four-mode rendered-first session contract.
 
 use oom_edit_core::{
-    EditorSession, Effect, KeyCode, KeyCodeKind, KeyInput, Mode, Modifiers, RenderedLineRole,
-    SelectionShape, SemanticStyle, Viewport,
+    ClipboardContent, EditorSession, Effect, KeyCode, KeyCodeKind, KeyInput, Mode, Modifiers,
+    RenderedLineRole, SelectionShape, SemanticStyle, Viewport,
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -34,6 +34,26 @@ fn ctrl(ch: char) -> KeyInput {
     }
 }
 
+fn clipboard_writes(effects: &[Effect]) -> Vec<&str> {
+    effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::ClipboardWrite(content) => Some(content.markdown()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn clipboard_contents(effects: &[Effect]) -> Vec<&ClipboardContent> {
+    effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::ClipboardWrite(content) => Some(content),
+            _ => None,
+        })
+        .collect()
+}
+
 fn render_and_move_to(session: &mut EditorSession, needle: &str, width: u16) -> usize {
     let target = session
         .render_layout(width)
@@ -56,6 +76,93 @@ fn session_starts_in_rendered_normal() {
     assert_eq!(session.mode(), Mode::Normal);
     assert_eq!(session.cursor(), (0, 0));
     assert!(!session.render_layout(37).lines.is_empty());
+}
+
+#[test]
+fn rendered_copy_preserves_markdown_and_prepares_sanitized_plain_text() {
+    let source = "`App` consumes `Effect::ClipboardWrite` through an injected `ClipboardSink`.\n";
+    let expected_markdown =
+        "`App` consumes `Effect::ClipboardWrite` through an injected `ClipboardSink`.";
+    let expected_plain = "App consumes Effect::ClipboardWrite through an injected ClipboardSink.";
+    let mut session = EditorSession::from_text(source);
+    let atom_count = session.render_layout(120).lines[0]
+        .atoms
+        .iter()
+        .filter(|atom| atom.source.is_some())
+        .count();
+
+    session.handle_key(key('v'));
+    for _ in 1..atom_count {
+        session.handle_key(key('l'));
+    }
+    let effects = session.handle_key(key('y'));
+    let contents = clipboard_contents(&effects);
+
+    assert_eq!(contents.len(), 1);
+    assert_eq!(contents[0].markdown(), expected_markdown);
+    assert_eq!(contents[0].plain_text(), expected_plain);
+    assert_eq!(session.document(), source);
+    assert_eq!(session.mode(), Mode::Normal);
+}
+
+#[test]
+fn rendered_copy_preserves_multi_backtick_code_span_boundaries() {
+    let source = "backtick escaping: `` `backticks` inside code ``\n";
+    let expected_markdown = "backtick escaping: `` `backticks` inside code ``";
+    let expected_plain = "backtick escaping: `backticks` inside code";
+    let mut session = EditorSession::from_text(source);
+    let atom_count = session.render_layout(120).lines[0]
+        .atoms
+        .iter()
+        .filter(|atom| atom.source.is_some())
+        .count();
+
+    session.handle_key(key('v'));
+    for _ in 1..atom_count {
+        session.handle_key(key('l'));
+    }
+    let effects = session.handle_key(key('y'));
+    let contents = clipboard_contents(&effects);
+
+    assert_eq!(contents.len(), 1);
+    assert_eq!(contents[0].markdown(), expected_markdown);
+    assert_eq!(contents[0].plain_text(), expected_plain);
+    assert_eq!(session.document(), source);
+
+    let mut partial = EditorSession::from_text(source);
+    partial.render_layout(120);
+    for _ in 0.."backtick escaping: ".len() {
+        partial.handle_key(key('l'));
+    }
+    partial.handle_key(key('v'));
+    for _ in 1.."`backticks`".len() {
+        partial.handle_key(key('l'));
+    }
+    let partial_effects = partial.handle_key(key('y'));
+    let partial_contents = clipboard_contents(&partial_effects);
+    assert_eq!(partial_contents.len(), 1);
+    assert_eq!(partial_contents[0].markdown(), "`backticks`");
+
+    let mut line = EditorSession::from_text(source);
+    line.render_layout(120);
+    line.handle_key(key('V'));
+    assert_eq!(clipboard_writes(&line.handle_key(key('y'))), [source]);
+
+    let mut block = EditorSession::from_text(source);
+    let block_atom_count = block.render_layout(120).lines[0]
+        .atoms
+        .iter()
+        .filter(|atom| atom.source.is_some())
+        .count();
+    block.handle_key(ctrl('v'));
+    for _ in 1..block_atom_count {
+        block.handle_key(key('l'));
+    }
+    let block_effects = block.handle_key(key('y'));
+    let block_contents = clipboard_contents(&block_effects);
+    assert_eq!(block_contents.len(), 1);
+    assert_eq!(block_contents[0].markdown(), expected_markdown);
+    assert_eq!(block_contents[0].plain_text(), expected_plain);
 }
 
 #[test]
@@ -325,12 +432,8 @@ fn wrapped_table_character_selection_is_source_driven_and_operator_exact() {
         .map(|range| &text[range.clone()])
         .collect::<String>();
     let mut yank = select_cell();
-    yank.handle_key(key('"'));
-    yank.handle_key(key('+'));
     let effects = yank.handle_key(key('y'));
-    assert!(effects.iter().any(
-        |effect| matches!(effect, Effect::ClipboardWrite(payload) if payload == &selected_text)
-    ));
+    assert_eq!(clipboard_writes(&effects), [selected_text.as_str()]);
 
     let mut expected_after_removal = text.to_string();
     for range in before_resize.source_ranges.iter().rev() {
@@ -394,12 +497,10 @@ fn table_body_boundaries_never_enter_selection_shapes_or_operator_payloads() {
             .iter()
             .all(|range| !text[range.clone()].contains("---")));
 
-        session.handle_key(key('"'));
-        session.handle_key(key('+'));
         let effects = session.handle_key(key('y'));
-        assert!(effects.iter().any(|effect| {
-            matches!(effect, Effect::ClipboardWrite(payload) if !payload.contains("---"))
-        }));
+        let writes = clipboard_writes(&effects);
+        assert_eq!(writes.len(), 1);
+        assert!(!writes[0].contains("---"));
     }
 }
 
@@ -477,7 +578,9 @@ fn link_index_normal_y_and_enter_copy_only_the_focused_destination() {
         let effects = session.handle_key(input);
         assert_eq!(
             effects,
-            vec![Effect::ClipboardWrite(destination.to_string())]
+            vec![Effect::ClipboardWrite(ClipboardContent::invariant(
+                destination.to_string()
+            ))]
         );
         assert_eq!(session.mode(), Mode::Normal);
     }
@@ -501,7 +604,7 @@ fn link_index_select_y_exits_and_enter_stays_without_source_ranges() {
     assert_eq!(
         session.handle_key(key('y')),
         vec![
-            Effect::ClipboardWrite(destination.to_string()),
+            Effect::ClipboardWrite(ClipboardContent::invariant(destination.to_string())),
             Effect::ModeChanged(Mode::Normal),
         ]
     );
@@ -510,7 +613,9 @@ fn link_index_select_y_exits_and_enter_stays_without_source_ranges() {
     session.handle_key(key('v'));
     assert_eq!(
         session.handle_key(special(KeyCodeKind::Enter)),
-        vec![Effect::ClipboardWrite(destination.to_string())]
+        vec![Effect::ClipboardWrite(ClipboardContent::invariant(
+            destination.to_string()
+        ))]
     );
     assert_eq!(session.mode(), Mode::Select);
 }
@@ -533,9 +638,7 @@ fn link_index_select_y_preserves_source_backed_yank_semantics() {
     );
 
     let effects = session.handle_key(key('y'));
-    assert!(effects.iter().all(
-        |effect| !matches!(effect, Effect::ClipboardWrite(payload) if payload == destination)
-    ));
+    assert_eq!(clipboard_writes(&effects), [source.as_str()]);
     assert_eq!(session.mode(), Mode::Normal);
 
     session.handle_key(key('p'));
@@ -578,12 +681,8 @@ fn unicode_selection_atoms_stay_utf8_safe() {
     let selection = session.rendered_selection().unwrap();
     assert_eq!(selection.source_ranges, vec![0..7]);
     assert_eq!(selection.rows[0].columns, vec![0..4]);
-    session.handle_key(key('"'));
-    session.handle_key(key('+'));
     let effects = session.handle_key(key('y'));
-    assert!(effects.iter().any(
-        |effect| matches!(effect, Effect::ClipboardWrite(payload) if payload == "e\u{301} 東")
-    ));
+    assert_eq!(clipboard_writes(&effects), ["e\u{301} 東"]);
 
     let mut block = EditorSession::from_text("東京\n\n大阪\n");
     block.render_layout(40);
@@ -607,7 +706,12 @@ fn unicode_selection_atoms_stay_utf8_safe() {
 
 #[test]
 fn entity_selection_yanks_and_deletes_the_complete_markdown_source() {
-    for entity in ["&amp;", "&#38;", "&#x26;", "&fjlig;"] {
+    for (entity, plain_text) in [
+        ("&amp;", "&"),
+        ("&#38;", "&"),
+        ("&#x26;", "&"),
+        ("&fjlig;", "fj"),
+    ] {
         let text = format!("A {entity} B\n");
         let entity_start = text.find(entity).unwrap();
 
@@ -620,12 +724,11 @@ fn entity_selection_yanks_and_deletes_the_complete_markdown_source() {
             yank.rendered_selection().unwrap().source_ranges,
             vec![entity_start..entity_start + entity.len()]
         );
-        yank.handle_key(key('"'));
-        yank.handle_key(key('+'));
         let effects = yank.handle_key(key('y'));
-        assert!(effects
-            .iter()
-            .any(|effect| matches!(effect, Effect::ClipboardWrite(payload) if payload == entity)));
+        let contents = clipboard_contents(&effects);
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0].markdown(), entity);
+        assert_eq!(contents[0].plain_text(), plain_text);
 
         let mut delete = EditorSession::from_text(&text);
         delete.render_layout(40);
@@ -636,6 +739,22 @@ fn entity_selection_yanks_and_deletes_the_complete_markdown_source() {
         assert_eq!(delete.document(), "A  B\n");
         assert!(!delete.render_layout(40).lines.is_empty());
     }
+}
+
+#[test]
+fn partial_inline_selection_does_not_add_unselected_delimiters() {
+    let mut session = EditorSession::from_text("*emphasis* and [label](target)\n");
+    session.render_layout(80);
+    session.handle_key(key('v'));
+    for _ in 0..3 {
+        session.handle_key(key('l'));
+    }
+
+    let effects = session.handle_key(key('y'));
+    let contents = clipboard_contents(&effects);
+    assert_eq!(contents.len(), 1);
+    assert_eq!(contents[0].markdown(), "emph");
+    assert_eq!(contents[0].plain_text(), "emph");
 }
 
 #[test]
@@ -688,7 +807,8 @@ fn select_yank_and_escape_are_non_destructive() {
     let mut session = EditorSession::from_text(text);
     session.render_layout(40);
     session.handle_key(key('v'));
-    session.handle_key(key('y'));
+    let effects = session.handle_key(key('y'));
+    assert_eq!(clipboard_writes(&effects), ["o"]);
     assert_eq!(
         (session.mode(), session.document()),
         (Mode::Normal, text.into())
@@ -771,17 +891,20 @@ fn select_anchor_and_active_source_survive_resize() {
 }
 
 #[test]
-fn select_system_yank_emits_exact_payload() {
-    let mut session = EditorSession::from_text("# one\n# two\n");
-    session.render_layout(40);
-    session.handle_key(key('V'));
-    session.handle_key(key('"'));
-    session.handle_key(key('+'));
-    let effects = session.handle_key(key('y'));
-    assert!(effects
-        .iter()
-        .any(|effect| matches!(effect, Effect::ClipboardWrite(text) if text == "# one\n")));
-    assert_eq!(session.document(), "# one\n# two\n");
+fn select_default_and_explicit_system_yanks_emit_exact_payload_once() {
+    for register in [None, Some('+'), Some('*')] {
+        let mut session = EditorSession::from_text("# one\n# two\n");
+        session.render_layout(40);
+        session.handle_key(key('V'));
+        if let Some(register) = register {
+            session.handle_key(key('"'));
+            session.handle_key(key(register));
+        }
+        let effects = session.handle_key(key('y'));
+        assert_eq!(clipboard_writes(&effects), ["# one\n"]);
+        assert_eq!(session.document(), "# one\n# two\n");
+        assert_eq!(session.mode(), Mode::Normal);
+    }
 }
 
 #[test]

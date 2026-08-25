@@ -1,6 +1,6 @@
 interface:
   display_name: "Feature Workflow"
-  short_description: "Plan, approve, execute, and archive a work package"
+  short_description: "Plan, approve, execute, iterate, and archive work"
 
 policy:
   allow_implicit_invocation: false

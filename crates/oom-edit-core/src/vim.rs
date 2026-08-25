@@ -1039,8 +1039,13 @@ impl VimCore {
                         target,
                     );
                 }
+                if matches!(register, Register::Unnamed) {
+                    self.editor.with_registers_mut(|registers| {
+                        registers.clip = registers.unnamed.clone();
+                    });
+                }
                 let mut effects = vec![VimEffect::CursorMoved];
-                if matches!(register, Register::System) {
+                if matches!(register, Register::Unnamed | Register::System) {
                     effects.push(VimEffect::ClipboardYank(payload));
                 }
                 return effects;
@@ -1531,11 +1536,32 @@ fn replacement_text_from_final_buffer<'a>(
 mod projected_selection_tests {
     use super::*;
 
-    fn clipboard_payload(effects: &[VimEffect]) -> Option<&str> {
-        effects.iter().find_map(|effect| match effect {
-            VimEffect::ClipboardYank(text) => Some(text.as_str()),
-            _ => None,
+    fn clipboard_payloads(effects: &[VimEffect]) -> Vec<&str> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                VimEffect::ClipboardYank(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn register_state(vim: &VimCore, selector: char) -> (String, bool, bool, usize) {
+        vim.editor.with_registers(|registers| {
+            let slot = registers.read(selector).expect("register should exist");
+            (
+                slot.text.clone(),
+                slot.linewise,
+                slot.blockwise,
+                slot.block_width,
+            )
         })
+    }
+
+    fn feed_plain(vim: &mut VimCore, keys: &str) {
+        for key in keys.chars() {
+            vim.handle_key(VimCore::plain_key(KeyCodeKind::Char(key)));
+        }
     }
 
     #[test]
@@ -1594,26 +1620,39 @@ mod projected_selection_tests {
                 ranges: std::iter::once(6..14).collect(),
             },
             RangeOperator::Yank,
-            Register::System,
+            Register::Unnamed,
         );
 
-        assert_eq!(clipboard_payload(&effects), Some("**beta**"));
+        assert_eq!(clipboard_payloads(&effects), ["**beta**"]);
+        let expected = ("**beta**".to_string(), false, false, 0);
+        assert_eq!(register_state(&vim, '"'), expected);
+        assert_eq!(register_state(&vim, '0'), expected);
+        assert_eq!(register_state(&vim, '+'), expected);
         assert_eq!(vim.text(), "alpha **beta** omega");
     }
 
     #[test]
     fn projected_line_selection_preserves_linewise_register_semantics() {
         let mut vim = VimCore::new("one\ntwo\nthree\n");
-        vim.apply_selection(
+        let effects = vim.apply_selection(
             ProjectedSelection::Line {
                 ranges: std::iter::once(4..8).collect(),
             },
             RangeOperator::Yank,
             Register::Unnamed,
         );
+        assert_eq!(clipboard_payloads(&effects), ["two\n"]);
+        let expected = ("two\n".to_string(), true, false, 0);
+        assert_eq!(register_state(&vim, '"'), expected);
+        assert_eq!(register_state(&vim, '0'), expected);
+        assert_eq!(register_state(&vim, '*'), expected);
+
         vim.jump_to(2, 0);
         vim.handle_key(VimCore::plain_key(KeyCodeKind::Char('p')));
+        assert_eq!(vim.text(), "one\ntwo\nthree\ntwo\n");
 
+        vim.handle_key(VimCore::plain_key(KeyCodeKind::Char('u')));
+        feed_plain(&mut vim, "\"+p");
         assert_eq!(vim.text(), "one\ntwo\nthree\ntwo\n");
     }
 
@@ -1639,10 +1678,39 @@ mod projected_selection_tests {
                 ],
             },
             RangeOperator::Yank,
-            Register::System,
+            Register::Unnamed,
         );
 
-        assert_eq!(clipboard_payload(&effects), Some("ab \n   \ncd "));
+        assert_eq!(clipboard_payloads(&effects), ["ab \n   \ncd "]);
+        let expected = ("ab \n   \ncd ".to_string(), false, true, 3);
+        assert_eq!(register_state(&vim, '"'), expected);
+        assert_eq!(register_state(&vim, '0'), expected);
+        assert_eq!(register_state(&vim, '+'), expected);
+    }
+
+    #[test]
+    fn projected_named_and_black_hole_yanks_leave_the_mirrored_system_slot_unchanged() {
+        let selection = |range| ProjectedSelection::Character {
+            ranges: std::iter::once(range).collect(),
+        };
+        let mut vim = VimCore::new("one two three");
+
+        let default_effects =
+            vim.apply_selection(selection(0..3), RangeOperator::Yank, Register::Unnamed);
+        assert_eq!(clipboard_payloads(&default_effects), ["one"]);
+
+        let named_effects =
+            vim.apply_selection(selection(4..7), RangeOperator::Yank, Register::Named('a'));
+        assert!(clipboard_payloads(&named_effects).is_empty());
+        assert_eq!(register_state(&vim, '+').0, "one");
+        assert_eq!(register_state(&vim, '0').0, "one");
+        assert_eq!(register_state(&vim, 'a').0, "two");
+
+        let black_hole_effects =
+            vim.apply_selection(selection(8..13), RangeOperator::Yank, Register::BlackHole);
+        assert!(clipboard_payloads(&black_hole_effects).is_empty());
+        assert_eq!(register_state(&vim, '+').0, "one");
+        assert_eq!(register_state(&vim, '"').0, "two");
     }
 
     #[test]
@@ -1684,15 +1752,17 @@ mod projected_selection_tests {
 
         let mut yank = VimCore::new("one two");
         let effects = yank.apply_selection(selection(), RangeOperator::Yank, Register::System);
-        assert_eq!(clipboard_payload(&effects), Some("one"));
+        assert_eq!(clipboard_payloads(&effects), ["one"]);
         assert_eq!(yank.text(), "one two");
 
         let mut delete = VimCore::new("one two");
-        delete.apply_selection(selection(), RangeOperator::Delete, Register::Unnamed);
+        let effects = delete.apply_selection(selection(), RangeOperator::Delete, Register::Unnamed);
+        assert!(clipboard_payloads(&effects).is_empty());
         assert_eq!(delete.text(), " two");
 
         let mut change = VimCore::new("one two");
-        change.apply_selection(selection(), RangeOperator::Change, Register::Unnamed);
+        let effects = change.apply_selection(selection(), RangeOperator::Change, Register::Unnamed);
+        assert!(clipboard_payloads(&effects).is_empty());
         assert_eq!(change.text(), " two");
         assert_eq!(change.mode(), Mode::Insert);
 

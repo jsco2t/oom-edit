@@ -1,7 +1,7 @@
 //! Configuration — `$XDG_CONFIG_HOME/oom-edit/config.toml` (fallback
 //! `~/.config/oom-edit/config.toml`).
 //!
-//! `[theme]`, `[editor]`, and `[spell]` sections.
+//! `[theme]`, `[editor]`, `[clipboard]`, and `[spell]` sections.
 //! Load-with-defaults on missing/partial config. Atomic write on change.
 //! Never fail startup on malformed config (warn to stderr, use defaults).
 
@@ -207,7 +207,28 @@ pub struct Config {
     #[serde(default)]
     pub editor: EditorConfig,
     #[serde(default)]
+    pub clipboard: ClipboardConfig,
+    #[serde(default)]
     pub spell: SpellConfig,
+}
+
+/// Clipboard representation written to the host system clipboard.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClipboardCopyFormat {
+    /// Preserve exact Markdown source syntax.
+    #[default]
+    Markdown,
+    /// Write rendered text with Markdown syntax removed.
+    PlainText,
+}
+
+/// The `[clipboard]` section of the config.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardConfig {
+    /// Representation used for outgoing system-clipboard writes.
+    #[serde(default)]
+    pub copy_format: ClipboardCopyFormat,
 }
 
 /// The `[spell]` section of the config.
@@ -497,9 +518,32 @@ mod tests {
         assert_eq!(config.theme.light, "default-light");
         assert!(config.editor.wrap);
         assert!(config.editor.cursor_shapes);
+        assert_eq!(config.clipboard.copy_format, ClipboardCopyFormat::Markdown);
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(serialized.contains("copy_format = \"markdown\""));
         assert!(config.spell.enabled);
         assert_eq!(config.spell.language, "en_US");
         assert!(config.spell.additional_dictionaries.is_empty());
+    }
+
+    #[test]
+    fn config_clipboard_copy_format_defaults_validates_and_roundtrips() {
+        let missing: Config = toml::from_str("[editor]\nwrap = false\n").unwrap();
+        assert_eq!(missing.clipboard.copy_format, ClipboardCopyFormat::Markdown);
+
+        let markdown: Config = toml::from_str("[clipboard]\ncopy_format = \"markdown\"\n").unwrap();
+        assert_eq!(
+            markdown.clipboard.copy_format,
+            ClipboardCopyFormat::Markdown
+        );
+
+        let plain: Config = toml::from_str("[clipboard]\ncopy_format = \"plain-text\"\n").unwrap();
+        assert_eq!(plain.clipboard.copy_format, ClipboardCopyFormat::PlainText);
+        let serialized = toml::to_string(&plain).unwrap();
+        assert!(serialized.contains("copy_format = \"plain-text\""));
+        assert_eq!(toml::from_str::<Config>(&serialized).unwrap(), plain);
+
+        assert!(toml::from_str::<Config>("[clipboard]\ncopy_format = \"rendered\"\n").is_err());
     }
 
     #[test]
@@ -591,6 +635,9 @@ additional_dictionaries = ["team.txt", "/opt/shared.txt"]
                 wrap: false,
                 cursor_shapes: false,
             },
+            clipboard: ClipboardConfig {
+                copy_format: ClipboardCopyFormat::PlainText,
+            },
             spell: SpellConfig {
                 enabled: false,
                 language: "en_AU".to_string(),
@@ -611,6 +658,10 @@ additional_dictionaries = ["team.txt", "/opt/shared.txt"]
 
         assert_eq!(config, config2);
         assert!(config2.relative_line_numbers);
+        assert_eq!(
+            config2.clipboard.copy_format,
+            ClipboardCopyFormat::PlainText
+        );
     }
 
     /// Malformed TOML falls back to defaults (warns to stderr).
@@ -628,6 +679,22 @@ additional_dictionaries = ["team.txt", "/opt/shared.txt"]
         assert_eq!(present, ConfigPresence::default());
         assert_eq!(config.theme.dark, "default-dark");
         assert_eq!(config.theme.light, "default-light");
+    }
+
+    #[test]
+    fn invalid_clipboard_copy_format_uses_existing_config_fallback() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_file = temp_dir.path().join("config.toml");
+        std::fs::write(
+            &config_file,
+            "[clipboard]\ncopy_format = \"rendered-html\"\n",
+        )
+        .unwrap();
+
+        let (config, present) = Config::load_from_path_with_presence(&config_file);
+        assert_eq!(present, ConfigPresence::default());
+        assert_eq!(config, Config::default());
+        assert_eq!(config.clipboard.copy_format, ClipboardCopyFormat::Markdown);
     }
 
     /// Partial config (missing keys) uses defaults via serde.

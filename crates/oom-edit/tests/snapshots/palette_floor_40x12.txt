@@ -6,7 +6,7 @@
 │· Ctrl-V       block-wise … select-bl…│
 │· Esc / Ctrl-C cancel sele… cancel-se…│
 │· "{register}  select regi… select-re…│
-│· y            yank select… select-ya…│
+│· y            yank and se… select-ya…│
 │· d / x        delete sele… select-de…│
 │· c            change sele… select-ch…│
 └──────────────────────────────────────┘

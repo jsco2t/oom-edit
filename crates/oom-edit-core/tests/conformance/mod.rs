@@ -62,6 +62,7 @@ const REQUIRED_PUBLIC_BEHAVIORS: &[&str] = &[
     "SEL-6:black-hole",
     "SEL-6:numbered-small-delete",
     "SEL-6:system-clipboard",
+    "SEL-6:default-system-clipboard",
     "SEL-7:block-undo",
     "SEL-7:block-redo",
     "SEL-7:put-shape",
@@ -192,6 +193,7 @@ const COVERAGE_CASES: &[ConformanceCase] = &[
             "SEL-6:black-hole",
             "SEL-6:numbered-small-delete",
             "SEL-6:system-clipboard",
+            "SEL-6:default-system-clipboard",
             "SEL-7:put-shape",
         ],
         select_operators_registers_put_and_history_conform,
@@ -317,6 +319,26 @@ fn ctrl(ch: char) -> KeyInput {
             ..Modifiers::default()
         },
     }
+}
+
+fn clipboard_writes(effects: &[Effect]) -> Vec<&str> {
+    effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::ClipboardWrite(content) => Some(content.markdown()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn clipboard_contents(effects: &[Effect]) -> Vec<&oom_edit_core::ClipboardContent> {
+    effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::ClipboardWrite(content) => Some(content),
+            _ => None,
+        })
+        .collect()
 }
 
 fn move_to_text(session: &mut EditorSession, needle: &str, width: u16) {
@@ -843,12 +865,18 @@ fn select_operators_registers_put_and_history_conform() {
     let mut session = EditorSession::from_text("# one\n# two\n# three\n");
     session.render_layout(40);
     session.handle_key(key('V'));
-    session.handle_key(key('"'));
-    session.handle_key(key('+'));
     let effects = session.handle_key(key('y'));
-    assert!(effects
-        .iter()
-        .any(|effect| matches!(effect, Effect::ClipboardWrite(text) if text == "# one\n")));
+    assert_eq!(clipboard_writes(&effects), ["# one\n"]);
+
+    for register in ['+', '*'] {
+        let mut explicit = EditorSession::from_text("# one\n# two\n");
+        explicit.render_layout(40);
+        explicit.handle_key(key('V'));
+        explicit.handle_key(key('"'));
+        explicit.handle_key(key(register));
+        let effects = explicit.handle_key(key('y'));
+        assert_eq!(clipboard_writes(&effects), ["# one\n"]);
+    }
 
     session.handle_key(key('V'));
     session.handle_key(key('d'));
@@ -867,7 +895,8 @@ fn select_operators_registers_put_and_history_conform() {
     named.handle_key(key('l'));
     named.handle_key(key('"'));
     named.handle_key(key('a'));
-    named.handle_key(key('y'));
+    let effects = named.handle_key(key('y'));
+    assert!(clipboard_writes(&effects).is_empty());
     named.handle_key(key('"'));
     named.handle_key(key('a'));
     named.handle_key(key('p'));
@@ -980,10 +1009,10 @@ fn select_shape_operator_matrix_conforms() {
         SelectionShape::Block,
     ] {
         for operator in ['y', 'd', 'x', 'c'] {
-            let (text, payload, deleted) = match shape {
-                SelectionShape::Character => ("abcd\n", "ab", "cd\n"),
-                SelectionShape::Line => ("# one\n# two\n", "# one\n", "# two\n"),
-                SelectionShape::Block => ("abcd\n\nwxyz\n", "ab\n\nwx", "cd\n\nyz\n"),
+            let (text, markdown, plain_text, deleted) = match shape {
+                SelectionShape::Character => ("abcd\n", "ab", "ab", "cd\n"),
+                SelectionShape::Line => ("# one\n# two\n", "# one\n", "one\n", "# two\n"),
+                SelectionShape::Block => ("abcd\n\nwxyz\n", "ab\n\nwx", "ab\n\nwx", "cd\n\nyz\n"),
             };
             let mut session = EditorSession::from_text(text);
             session.render_layout(40);
@@ -1002,12 +1031,15 @@ fn select_shape_operator_matrix_conforms() {
                     session.handle_key(key('j'));
                 }
             }
-            session.handle_key(key('"'));
-            session.handle_key(key('+'));
+            if operator != 'y' {
+                session.handle_key(key('"'));
+                session.handle_key(key('+'));
+            }
             let effects = session.handle_key(key(operator));
-            assert!(effects.iter().any(
-                |effect| matches!(effect, Effect::ClipboardWrite(actual) if actual == payload)
-            ));
+            let contents = clipboard_contents(&effects);
+            assert_eq!(contents.len(), 1, "{shape:?}/{operator}");
+            assert_eq!(contents[0].markdown(), markdown, "{shape:?}/{operator}");
+            assert_eq!(contents[0].plain_text(), plain_text, "{shape:?}/{operator}");
             if operator == 'y' {
                 assert_eq!(session.document(), text, "{shape:?}/{operator}");
                 assert_eq!(session.mode(), Mode::Normal, "{shape:?}/{operator}");
@@ -1066,6 +1098,17 @@ fn select_shape_operator_matrix_conforms() {
         assert_eq!(session.document(), expected, "{shape:?} put shape");
         session.handle_key(key('u'));
         assert_eq!(session.document(), text, "{shape:?} put undo");
+
+        session.render_layout(40);
+        session.handle_key(key('g'));
+        session.handle_key(key('g'));
+        session.handle_key(key('0'));
+        session.handle_key(key('"'));
+        session.handle_key(key('+'));
+        session.handle_key(key('P'));
+        assert_eq!(session.document(), expected, "{shape:?} system put shape");
+        session.handle_key(key('u'));
+        assert_eq!(session.document(), text, "{shape:?} system put undo");
     }
 
     let mut block = EditorSession::from_text("abcd\n\nwxyz\n");
@@ -1085,20 +1128,36 @@ fn select_shape_operator_matrix_conforms() {
 #[test]
 fn rendered_character_operators_preserve_unselected_markdown_syntax() {
     let cases = [
-        ("\\*escaped\\*\n", 8, "\\*escaped\\*", "\n"),
-        ("*emphasis*\n", 7, "emphasis", "**\n"),
-        ("`code`\n", 3, "code", "``\n"),
+        ("\\*escaped\\*\n", 8, "\\*escaped\\*", "*escaped*", "\n"),
+        ("*emphasis*\n", 7, "*emphasis*", "emphasis", "**\n"),
+        ("**strong**\n", 5, "**strong**", "strong", "****\n"),
+        ("~~strike~~\n", 5, "~~strike~~", "strike", "~~~~\n"),
+        ("`code`\n", 3, "`code`", "code", "``\n"),
         (
             "[label](https://example.test)\n",
             4,
+            "[label](https://example.test)",
             "label",
             "[](https://example.test)\n",
         ),
-        ("![alt](image.png)\n", 2, "alt", "![](image.png)\n"),
-        ("**[nested](target)**\n", 5, "nested", "**[](target)**\n"),
+        (
+            "![alt](image.png)\n",
+            2,
+            "![alt](image.png)",
+            "alt",
+            "![](image.png)\n",
+        ),
+        (
+            "**[nested](target)**\n",
+            5,
+            "**[nested](target)**",
+            "nested",
+            "**[](target)**\n",
+        ),
+        ("A &amp; B\n", 4, "A &amp; B", "A & B", "\n"),
     ];
 
-    for (source, right_moves, payload, deleted) in cases {
+    for (source, right_moves, markdown, plain_text, deleted) in cases {
         for operator in ['y', 'd', 'c'] {
             let mut session = EditorSession::from_text(source);
             session.render_layout(80);
@@ -1106,12 +1165,19 @@ fn rendered_character_operators_preserve_unselected_markdown_syntax() {
             for _ in 0..right_moves {
                 session.handle_key(key('l'));
             }
-            session.handle_key(key('"'));
-            session.handle_key(key('+'));
+            if operator != 'y' {
+                session.handle_key(key('"'));
+                session.handle_key(key('+'));
+            }
             let effects = session.handle_key(key(operator));
-            assert!(effects.iter().any(
-                |effect| matches!(effect, Effect::ClipboardWrite(actual) if actual == payload)
-            ));
+            let contents = clipboard_contents(&effects);
+            assert_eq!(contents.len(), 1, "{source:?}/{operator}");
+            assert_eq!(contents[0].markdown(), markdown, "{source:?}/{operator}");
+            assert_eq!(
+                contents[0].plain_text(),
+                plain_text,
+                "{source:?}/{operator}"
+            );
             assert_eq!(
                 session.document(),
                 if operator == 'y' { source } else { deleted },
@@ -1396,12 +1462,8 @@ fn resized_block_uses_one_coherent_projection_for_payload_and_delete() {
             ),
         ]
     );
-    yank.handle_key(key('"'));
-    yank.handle_key(key('+'));
     let effects = yank.handle_key(key('y'));
-    assert!(effects.iter().any(
-        |effect| matches!(effect, Effect::ClipboardWrite(actual) if actual == "abc\nghi\n\nuvw")
-    ));
+    assert_eq!(clipboard_writes(&effects), ["abc\nghi\n\nuvw"]);
     assert_eq!(yank.document(), text);
 
     let mut delete = selected();
@@ -1409,7 +1471,7 @@ fn resized_block_uses_one_coherent_projection_for_payload_and_delete() {
     delete.handle_key(key('+'));
     let effects = delete.handle_key(key('d'));
     assert!(effects.iter().any(
-        |effect| matches!(effect, Effect::ClipboardWrite(actual) if actual == "abc\nghi\n\nuvw")
+        |effect| matches!(effect, Effect::ClipboardWrite(actual) if actual.markdown() == "abc\nghi\n\nuvw")
     ));
     assert_eq!(delete.document(), "def jkl\n\nxyz 123456\n");
 }

@@ -1,0 +1,67 @@
+{
+  "schema_version": 2,
+  "work_id": "2026-08-25-markdown-clipboard-copy-policy",
+  "title": "Markdown Clipboard Copy Policy",
+  "phase": "DONE",
+  "created_at": "2026-08-25T18:28:46Z",
+  "updated_at": "2026-08-25T20:08:44Z",
+  "approved_at": "2026-08-25T19:58:43Z",
+  "completed_at": "2026-08-25T20:08:44Z",
+  "archived_at": "2026-08-25T21:29:51Z",
+  "baseline_sha": "6bf7c7aee91601e2d9cad201d0db3777e47561b5",
+  "final_sha": "6bf7c7aee91601e2d9cad201d0db3777e47561b5",
+  "plan_revision": 2,
+  "approved_plan_sha256": "57ab41e95778a1574f076db8445596774fd4314c1b70484397ff23a39d8652a4",
+  "current_task": null,
+  "tasks": [
+    {
+      "id": "001",
+      "path": "tasks/001-build-dual-format-clipboard-projection.md",
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/001.md",
+      "round": 1
+    },
+    {
+      "id": "002",
+      "path": "tasks/002-wire-clipboard-format-configuration.md",
+      "status": "COMPLETE",
+      "attempts": 2,
+      "implementation": "main",
+      "evidence": "evidence/002.md",
+      "round": 1
+    },
+    {
+      "id": "003",
+      "path": "tasks/003-fix-multi-backtick-code-span-copy.md",
+      "round": 2,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/003.md"
+    }
+  ],
+  "task_retry_limit": 3,
+  "final_retry_limit": 2,
+  "final_attempts": 1,
+  "stop_continuations": 0,
+  "max_stop_continuations": 50,
+  "block_reason": null,
+  "acceptance_round": 2,
+  "completed_rounds": [
+    {
+      "round": 1,
+      "plan_revision": 1,
+      "approved_at": "2026-08-25T18:41:31Z",
+      "completed_at": "2026-08-25T19:16:45Z",
+      "approved_plan_sha256": "abec224ba094e086cdb708d2ecccdc305bef9b355fdb99c72b96a38410e4fd49",
+      "final_sha": "6bf7c7aee91601e2d9cad201d0db3777e47561b5",
+      "task_ids": [
+        "001",
+        "002"
+      ],
+      "final_evidence": "evidence/final-round-001.md"
+    }
+  ]
+}

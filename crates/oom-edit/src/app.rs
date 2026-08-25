@@ -25,7 +25,7 @@ use crate::command::keymap::{
     resolve as resolve_app_input, AppInputTransition, PendingAppInput, TabAction,
 };
 use crate::command::AppCommand;
-use crate::config::ConfigStore;
+use crate::config::{ClipboardCopyFormat, ConfigStore};
 use crate::lifecycle::{
     CloseTabRequest, DirtyClosePolicy, LifecycleAction, SaveContinuation, SaveRequest,
 };
@@ -139,6 +139,31 @@ impl AppServices {
     }
 }
 
+/// Configured defaults injected when constructing the TUI state.
+#[derive(Clone, Copy)]
+pub(crate) struct AppStartupOptions {
+    wrap_enabled: bool,
+    relative_line_numbers: bool,
+    clipboard_copy_format: ClipboardCopyFormat,
+    spell_enabled: bool,
+}
+
+impl AppStartupOptions {
+    pub(crate) fn new(
+        wrap_enabled: bool,
+        relative_line_numbers: bool,
+        clipboard_copy_format: ClipboardCopyFormat,
+        spell_enabled: bool,
+    ) -> Self {
+        Self {
+            wrap_enabled,
+            relative_line_numbers,
+            clipboard_copy_format,
+            spell_enabled,
+        }
+    }
+}
+
 impl TabEntry {
     fn new(session: EditorSession) -> Self {
         Self {
@@ -208,8 +233,10 @@ pub struct App {
     last_input: Instant,
     /// Active capability tier.
     tier: Tier,
-    /// Clipboard sink for OSC 52 clipboard writes (T16).
+    /// Clipboard sink for OSC 52 clipboard writes.
     clipboard_sink: Box<dyn ClipboardSink>,
+    /// Configured representation for outgoing clipboard writes.
+    clipboard_copy_format: ClipboardCopyFormat,
     #[cfg(test)]
     scroll_follow_count: usize,
 }
@@ -238,14 +265,17 @@ impl App {
         Self::new_with_spell(
             session,
             resolved_theme,
-            wrap_enabled,
-            relative_line_numbers,
+            AppStartupOptions::new(
+                wrap_enabled,
+                relative_line_numbers,
+                ClipboardCopyFormat::Markdown,
+                true,
+            ),
             AppServices::new(
                 clipboard_sink,
                 config_store,
                 SpellHost::testing("a\nan\nand\nknown\nspell\ntext\nthe\nword\n"),
             ),
-            true,
             initial_time,
         )
     }
@@ -254,12 +284,16 @@ impl App {
     pub(crate) fn new_with_spell(
         session: EditorSession,
         resolved_theme: ResolvedTheme,
-        wrap_enabled: bool,
-        relative_line_numbers: bool,
+        options: AppStartupOptions,
         services: AppServices,
-        spell_enabled_default: bool,
         initial_time: Instant,
     ) -> Self {
+        let AppStartupOptions {
+            wrap_enabled,
+            relative_line_numbers,
+            clipboard_copy_format,
+            spell_enabled: spell_enabled_default,
+        } = options;
         let is_light = resolved_theme.is_light();
         let tier = resolved_theme.capability;
         let theme_name = resolved_theme.name;
@@ -287,6 +321,7 @@ impl App {
             last_input: initial_time,
             tier,
             clipboard_sink: services.clipboard_sink,
+            clipboard_copy_format,
             #[cfg(test)]
             scroll_follow_count: 0,
         }
@@ -1484,16 +1519,19 @@ impl App {
                     force,
                 });
             }
-            Effect::ClipboardWrite(text) => {
-                // T16: route to OSC 52 clipboard sink.
-                if let Err(e) = self.clipboard_sink.copy(&text) {
+            Effect::ClipboardWrite(content) => {
+                let text = match self.clipboard_copy_format {
+                    ClipboardCopyFormat::Markdown => content.markdown(),
+                    ClipboardCopyFormat::PlainText => content.plain_text(),
+                };
+                if let Err(e) = self.clipboard_sink.copy(text) {
                     self.set_transient(
                         format!("Clipboard error: {e}"),
                         oom_edit_core::Severity::Warning,
                     );
                 } else {
                     self.set_transient(
-                        "copied to system clipboard".to_string(),
+                        "sent text to system clipboard".to_string(),
                         oom_edit_core::Severity::Info,
                     );
                 }
@@ -1946,14 +1984,33 @@ mod tests {
     use super::*;
     use crate::command::Contexts;
     use crossterm::event::{MediaKeyCode, ModifierKeyCode};
-    use oom_edit_core::Mode;
+    use oom_edit_core::{ClipboardContent, Mode};
     use oom_edit_core::{ClipboardError, ClipboardSink, RecordingClipboardSink};
+    use std::sync::{Arc, Mutex};
 
     struct FailingClipboardSink;
 
     impl ClipboardSink for FailingClipboardSink {
         fn copy(&mut self, _text: &str) -> Result<(), ClipboardError> {
             Err(ClipboardError::NotSupported)
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedClipboardSink {
+        captures: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl SharedClipboardSink {
+        fn captures(&self) -> Vec<String> {
+            self.captures.lock().unwrap().clone()
+        }
+    }
+
+    impl ClipboardSink for SharedClipboardSink {
+        fn copy(&mut self, text: &str) -> Result<(), ClipboardError> {
+            self.captures.lock().unwrap().push(text.to_string());
+            Ok(())
         }
     }
 
@@ -1975,6 +2032,25 @@ mod tests {
         )
     }
 
+    fn test_app_with_clipboard_format(
+        mut session: EditorSession,
+        copy_format: ClipboardCopyFormat,
+        clipboard_sink: Box<dyn ClipboardSink>,
+    ) -> App {
+        session.render_layout(74);
+        App::new_with_spell(
+            session,
+            theme::ResolvedTheme::injected("default-dark", false, Tier::TrueColor),
+            AppStartupOptions::new(true, false, copy_format, true),
+            AppServices::new(
+                clipboard_sink,
+                Box::new(crate::config::DisabledConfigStore),
+                SpellHost::testing("a\nan\nand\nknown\nspell\ntext\nthe\nword\n"),
+            ),
+            Instant::now(),
+        )
+    }
+
     fn test_app_with_spell_default(session: EditorSession, enabled: bool) -> App {
         test_app_with_spell_host(
             session,
@@ -1991,14 +2067,12 @@ mod tests {
         App::new_with_spell(
             session,
             theme::ResolvedTheme::injected("default-dark", false, Tier::TrueColor),
-            true,
-            false,
+            AppStartupOptions::new(true, false, ClipboardCopyFormat::Markdown, enabled),
             AppServices::new(
                 Box::new(RecordingClipboardSink::default()),
                 Box::new(crate::config::DisabledConfigStore),
                 spell_host,
             ),
-            enabled,
             Instant::now(),
         )
     }
@@ -2772,14 +2846,12 @@ mod tests {
         let mut app = App::new_with_spell(
             EditorSession::from_text("text\n"),
             theme::ResolvedTheme::injected("default-dark", false, Tier::TrueColor),
-            true,
-            false,
+            AppStartupOptions::new(true, false, ClipboardCopyFormat::Markdown, true),
             AppServices::new(
                 Box::new(RecordingClipboardSink::default()),
                 Box::new(crate::config::DisabledConfigStore),
                 crate::spell_host::SpellHost::testing_unavailable("configured list failed"),
             ),
-            true,
             initial,
         );
 
@@ -2810,8 +2882,8 @@ mod tests {
         text
     }
 
-    fn yank_current_line_to_system_clipboard(app: &mut App) {
-        for ch in ['v', '"', '+', 'y'] {
+    fn yank_rendered_selection_to_system_clipboard(app: &mut App) {
+        for ch in ['v', 'y'] {
             let key = KeyEvent::new(CrosstermKeyCode::Char(ch), KeyModifiers::NONE);
             app.handle_event(&Event::Key(key));
         }
@@ -3008,7 +3080,7 @@ mod tests {
             std::time::Instant::now(),
         );
 
-        yank_current_line_to_system_clipboard(&mut app);
+        yank_rendered_selection_to_system_clipboard(&mut app);
 
         let transient = app.transient.as_ref().expect("transient should be set");
         assert!(
@@ -3016,7 +3088,7 @@ mod tests {
             "expected clipboard error message, got: {}",
             transient.text
         );
-        assert!(!transient.text.contains("copied to system clipboard"));
+        assert!(!transient.text.contains("sent text to system clipboard"));
         assert_eq!(transient.severity, oom_edit_core::Severity::Warning);
     }
 
@@ -3024,11 +3096,162 @@ mod tests {
     fn clipboard_success_sets_success_transient() {
         let mut app = test_app(EditorSession::from_text("hello\n"));
 
-        yank_current_line_to_system_clipboard(&mut app);
+        yank_rendered_selection_to_system_clipboard(&mut app);
 
         let transient = app.transient.as_ref().expect("transient should be set");
-        assert_eq!(transient.text, "copied to system clipboard");
+        assert_eq!(transient.text, "sent text to system clipboard");
         assert_eq!(transient.severity, oom_edit_core::Severity::Info);
+    }
+
+    #[test]
+    fn clipboard_copy_format_selects_exact_markdown_or_plain_text_once() {
+        let examples = [
+            (
+                "`App` consumes `Effect::ClipboardWrite` through an injected `ClipboardSink`.\n",
+                "`App` consumes `Effect::ClipboardWrite` through an injected `ClipboardSink`.",
+                "App consumes Effect::ClipboardWrite through an injected ClipboardSink.",
+            ),
+            (
+                "backtick escaping: `` `backticks` inside code ``\n",
+                "backtick escaping: `` `backticks` inside code ``",
+                "backtick escaping: `backticks` inside code",
+            ),
+        ];
+
+        for (source, expected_markdown, expected_plain) in examples {
+            for (copy_format, expected) in [
+                (ClipboardCopyFormat::Markdown, expected_markdown),
+                (ClipboardCopyFormat::PlainText, expected_plain),
+            ] {
+                let sink = SharedClipboardSink::default();
+                let mut app = test_app_with_clipboard_format(
+                    EditorSession::from_text(source),
+                    copy_format,
+                    Box::new(sink.clone()),
+                );
+                let atom_count = app
+                    .session()
+                    .unwrap()
+                    .rendered_layout()
+                    .unwrap()
+                    .lines
+                    .iter()
+                    .flat_map(|line| &line.atoms)
+                    .filter(|atom| atom.source.is_some())
+                    .count();
+
+                type_chars(
+                    &mut app,
+                    std::iter::once('v')
+                        .chain(std::iter::repeat_n('l', atom_count.saturating_sub(1)))
+                        .chain(std::iter::once('y')),
+                );
+
+                assert_eq!(sink.captures(), [expected]);
+                assert_eq!(app.session().unwrap().document(), source);
+            }
+        }
+    }
+
+    #[test]
+    fn clipboard_size_limit_applies_to_the_configured_representation() {
+        let markdown_oversized =
+            ClipboardContent::new("m".repeat(100 * 1024 + 1), "p".repeat(100 * 1024));
+
+        let (markdown_sink, markdown_capture) = crate::clipboard::Osc52Clipboard::for_test();
+        let mut markdown = test_app_with_clipboard_format(
+            EditorSession::from_text(""),
+            ClipboardCopyFormat::Markdown,
+            Box::new(markdown_sink),
+        );
+        markdown.handle_effect(Effect::ClipboardWrite(markdown_oversized.clone()));
+        assert!(markdown_capture.contents().is_empty());
+        assert!(markdown
+            .transient
+            .as_ref()
+            .is_some_and(|transient| transient.text.contains("100 KiB")));
+
+        let (plain_sink, plain_capture) = crate::clipboard::Osc52Clipboard::for_test();
+        let mut plain = test_app_with_clipboard_format(
+            EditorSession::from_text(""),
+            ClipboardCopyFormat::PlainText,
+            Box::new(plain_sink),
+        );
+        plain.handle_effect(Effect::ClipboardWrite(markdown_oversized));
+        assert!(!plain_capture.contents().is_empty());
+        assert_eq!(
+            plain.transient.as_ref().unwrap().text,
+            "sent text to system clipboard"
+        );
+
+        let plain_oversized =
+            ClipboardContent::new("m".repeat(100 * 1024), "p".repeat(100 * 1024 + 1));
+
+        let (markdown_sink, markdown_capture) = crate::clipboard::Osc52Clipboard::for_test();
+        let mut markdown = test_app_with_clipboard_format(
+            EditorSession::from_text(""),
+            ClipboardCopyFormat::Markdown,
+            Box::new(markdown_sink),
+        );
+        markdown.handle_effect(Effect::ClipboardWrite(plain_oversized.clone()));
+        assert!(!markdown_capture.contents().is_empty());
+        assert_eq!(
+            markdown.transient.as_ref().unwrap().text,
+            "sent text to system clipboard"
+        );
+
+        let (plain_sink, plain_capture) = crate::clipboard::Osc52Clipboard::for_test();
+        let mut plain = test_app_with_clipboard_format(
+            EditorSession::from_text(""),
+            ClipboardCopyFormat::PlainText,
+            Box::new(plain_sink),
+        );
+        plain.handle_effect(Effect::ClipboardWrite(plain_oversized));
+        assert!(plain_capture.contents().is_empty());
+        assert!(plain
+            .transient
+            .as_ref()
+            .is_some_and(|transient| transient.text.contains("100 KiB")));
+    }
+
+    #[test]
+    fn format_invariant_link_copy_is_identical_for_both_preferences() {
+        for copy_format in [
+            ClipboardCopyFormat::Markdown,
+            ClipboardCopyFormat::PlainText,
+        ] {
+            let sink = SharedClipboardSink::default();
+            let mut app = test_app_with_clipboard_format(
+                EditorSession::from_text(""),
+                copy_format,
+                Box::new(sink.clone()),
+            );
+            app.handle_effect(Effect::ClipboardWrite(ClipboardContent::invariant(
+                "https://example.test/path".to_string(),
+            )));
+            assert_eq!(sink.captures(), ["https://example.test/path"]);
+        }
+    }
+
+    #[test]
+    fn clipboard_copy_format_does_not_change_internal_put_behavior() {
+        let mut documents = Vec::new();
+        for copy_format in [
+            ClipboardCopyFormat::Markdown,
+            ClipboardCopyFormat::PlainText,
+        ] {
+            let sink = SharedClipboardSink::default();
+            let mut app = test_app_with_clipboard_format(
+                EditorSession::from_text("`code`\n"),
+                copy_format,
+                Box::new(sink),
+            );
+            type_chars(&mut app, ['v', 'l', 'l', 'l', 'y', 'p']);
+            documents.push(app.session().unwrap().document());
+        }
+
+        assert_eq!(documents[0], documents[1]);
+        assert_eq!(documents[0], "`codecode`\n");
     }
 
     #[test]
@@ -3040,7 +3263,7 @@ mod tests {
             KeyModifiers::NONE,
         )));
         let transient = success.transient.as_ref().expect("success feedback");
-        assert_eq!(transient.text, "copied to system clipboard");
+        assert_eq!(transient.text, "sent text to system clipboard");
         assert_eq!(transient.severity, oom_edit_core::Severity::Info);
         assert_eq!(success.session().unwrap().document(), original);
 

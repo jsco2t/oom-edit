@@ -204,6 +204,24 @@ fn whole_leaf(rendered: &str, source: std::ops::Range<usize>) -> InlineLeaf {
     }
 }
 
+fn code_payload_span(source: std::ops::Range<usize>, document: &str) -> std::ops::Range<usize> {
+    let Some(raw) = document.get(source.clone()) else {
+        return source;
+    };
+    let delimiter_len = raw.bytes().take_while(|byte| *byte == b'`').count();
+    if delimiter_len == 0 || raw.len() < delimiter_len * 2 {
+        return source;
+    }
+    let closing_start = raw.len() - delimiter_len;
+    if !raw.as_bytes()[closing_start..]
+        .iter()
+        .all(|byte| *byte == b'`')
+    {
+        return source;
+    }
+    source.start + delimiter_len..source.end - delimiter_len
+}
+
 /// Decode one parser leaf while the parser-provided range and raw token are
 /// still adjacent. Alignment is local and monotonic: delimiters may be
 /// skipped, but a visible group can never consume a candidate from another
@@ -224,24 +242,24 @@ fn mapped_leaf(
     while offset < raw.len() {
         if normalize_code {
             let normalized = if raw[offset..].starts_with("\r\n") {
-                Some((offset + 2, " "))
+                Some((offset + 2, vec![" ".to_string(), " ".to_string()]))
             } else if raw.as_bytes().get(offset) == Some(&b'\n')
                 || raw.as_bytes().get(offset) == Some(&b'\r')
             {
-                Some((offset + 1, " "))
+                Some((offset + 1, vec![" ".to_string()]))
             } else if raw[offset..].starts_with("\\|")
                 && desired.get(desired_index).is_some_and(|group| group == "|")
             {
-                Some((offset + 2, "|"))
+                Some((offset + 2, vec!["|".to_string()]))
             } else {
                 None
             };
-            if let Some((end, display)) = normalized {
+            if let Some((end, groups)) = normalized {
                 append_expected_groups(
                     &desired,
                     &mut desired_index,
                     &mut atoms,
-                    vec![display.to_string()],
+                    groups,
                     source.start + offset..source.start + end,
                 );
                 offset = end;
@@ -1020,7 +1038,8 @@ impl BlockBuilder {
             }
 
             Event::Code(code) => {
-                let leaf = mapped_leaf(code, span.clone(), &self.text, false, true);
+                let payload = code_payload_span(span.clone(), &self.text);
+                let leaf = mapped_leaf(code, payload, &self.text, false, true);
                 self.push_inline(Inline::Code(leaf), span.start);
             }
 

@@ -236,6 +236,74 @@ fn inline_code_normalization_keeps_each_display_group_on_its_exact_raw_token() {
 }
 
 #[test]
+fn code_span_atoms_never_claim_outer_backtick_delimiters() {
+    for (text, expected) in [
+        ("`plain`", "plain"),
+        ("`` `backticks` inside code ``", "`backticks` inside code"),
+        ("`` trailing` ``", "trailing`"),
+        ("``` ``double`` ```", "``double``"),
+        ("`` 東京 same same ``", "東京 same same"),
+    ] {
+        let model = BlockModel::build(text, None);
+        let BlockKind::Paragraph { inlines } = &model.blocks[0].kind else {
+            panic!("expected paragraph for {text:?}");
+        };
+        let Inline::Code(code) = &inlines[0] else {
+            panic!("expected inline code for {text:?}");
+        };
+        assert_eq!(code.text, expected, "wrong rendered payload for {text:?}");
+
+        let payload_start = text
+            .find(expected)
+            .unwrap_or_else(|| panic!("payload missing from {text:?}"));
+        let payload = payload_start..payload_start + expected.len();
+        assert_eq!(
+            code.atoms
+                .iter()
+                .map(|atom| &text[atom.source.clone()])
+                .collect::<String>(),
+            expected,
+            "visible atoms did not reconstruct the raw payload for {text:?}"
+        );
+        assert!(
+            code.atoms
+                .iter()
+                .all(|atom| payload.start <= atom.source.start && atom.source.end <= payload.end),
+            "a visible atom claimed an outer delimiter for {text:?}: {:?}",
+            code.atoms
+        );
+        for adjacent in code.atoms.windows(2) {
+            assert!(
+                adjacent[0].source.end <= adjacent[1].source.start,
+                "code payload provenance moved backward for {text:?}: {:?}",
+                code.atoms
+            );
+        }
+    }
+}
+
+#[test]
+fn crlf_code_span_normalization_owns_the_complete_line_ending() {
+    let text = "`alpha\r\nbeta`";
+    let model = BlockModel::build(text, None);
+    let BlockKind::Paragraph { inlines } = &model.blocks[0].kind else {
+        panic!("expected paragraph");
+    };
+    let Inline::Code(code) = &inlines[0] else {
+        panic!("expected inline code");
+    };
+    assert_eq!(code.text, "alpha  beta");
+    let crlf = text.find("\r\n").unwrap();
+    assert_eq!(
+        code.atoms
+            .iter()
+            .filter(|atom| atom.text == " " && atom.source == (crlf..crlf + 2))
+            .count(),
+        2
+    );
+}
+
+#[test]
 fn ordinary_inline_code_preserves_literal_escaped_pipe_byte_ownership() {
     let text = "`left\\|right`";
     let model = BlockModel::build(text, None);

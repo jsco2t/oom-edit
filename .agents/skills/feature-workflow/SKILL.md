@@ -1,6 +1,6 @@
 ---
 name: feature-workflow
-description: Plan, human-approve, autonomously execute, and archive an ordered software work package.
+description: Plan, human-approve, autonomously execute, reopen after acceptance feedback, and archive an ordered software work package.
 ---
 
 # Feature Workflow
@@ -40,7 +40,8 @@ Archive root:
 Supported explicit invocations are:
 
 - `$feature-workflow <work description>`
-- `$feature-workflow revise <feedback>`
+- `$feature-workflow revise <feedback>` — revise an unapproved plan or add an
+  acceptance-follow-up round to a DONE package
 - `$feature-workflow approve`
 - `$feature-workflow resume`
 - `$feature-workflow status`
@@ -71,6 +72,12 @@ Never create a second active work package.
 Never overwrite an existing work package.
 
 Never automatically delete a DONE work package.
+
+Schema version 2 adds acceptance-round history. When reading a schema-version-1
+package, interpret missing `acceptance_round` as `1`, missing
+`completed_rounds` as an empty list, and missing task `round` values as `1`.
+Do not rewrite state merely to normalize it; the post-completion revision helper
+performs the upgrade when an acceptance round is actually opened.
 
 ---
 
@@ -149,7 +156,8 @@ If:
 tell the human:
 
 "The previous work package is complete but has not been archived. Run
-`$feature-workflow archive` before starting another work package."
+`$feature-workflow revise <acceptance feedback>` to add fixes to this package,
+or `$feature-workflow archive` before starting a different work package."
 
 Stop.
 
@@ -226,7 +234,7 @@ with:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "work_id": "<work-id>",
   "title": "<human-readable title>",
   "phase": "PLANNING",
@@ -238,6 +246,8 @@ with:
   "baseline_sha": "<git HEAD>",
   "final_sha": null,
   "plan_revision": 1,
+  "acceptance_round": 1,
+  "completed_rounds": [],
   "approved_plan_sha256": null,
   "current_task": null,
   "tasks": [],
@@ -489,6 +499,7 @@ Each entry uses:
 {
   "id": "001",
   "path": "tasks/001-example.md",
+  "round": 1,
   "status": "PENDING",
   "attempts": 0,
   "implementation": null,
@@ -508,6 +519,8 @@ including:
 - title;
 - phase;
 - plan revision;
+- acceptance round;
+- prior completed-round count;
 - approval status;
 - current task;
 - task checklist;
@@ -539,47 +552,131 @@ End the turn.
 
 # Mode: revise
 
-Revision is valid only when:
+Revision is valid when:
 
-`phase == AWAITING_APPROVAL`
+- `phase == AWAITING_APPROVAL`; or
+- `phase == DONE`.
 
-Set:
+The phase determines whether this is an ordinary pre-approval revision or a
+new acceptance-follow-up round.
 
-`phase = PLANNING`
+## Pre-approval revision
 
-Increment:
+When `phase == AWAITING_APPROVAL`:
 
-`plan_revision`
+1. Set `phase = PLANNING`.
+2. Increment `plan_revision`.
+3. Apply the human's requested changes to plan.md, gate.json, and task documents
+   as necessary.
+4. Re-investigate repository code where needed.
+5. If task structure changes, rebuild `state.json -> tasks` while preserving
+   work-package identity, baseline_sha, acceptance_round, completed_rounds, and
+   every completed task/evidence entry.
+6. Set `phase = AWAITING_APPROVAL`, update status, and stop.
 
-Apply the human's requested changes.
+Do not modify product/source implementation during revision.
+After an acceptance round exists, only the active round's unapproved task
+documents may be revised; completed task documents and evidence remain immutable.
 
-Modify as necessary:
+## Post-completion acceptance follow-up
 
-- plan.md;
-- gate.json;
-- tasks/*.md.
+When `phase == DONE`, treat the feedback as bugs or missing acceptance work in
+the same delivery. Do not require archival and do not create a new work package.
 
-Re-investigate repository code where needed.
+### 1. Preserve and reopen the completed round
 
-Do not modify product/source implementation.
+Before changing any planning artifact, run:
 
-If task structure changes:
+`python3 .agents/skills/feature-workflow/scripts/begin_acceptance_round.py`
 
-rebuild:
+The script must:
 
-`state.json -> tasks`
+- verify the frozen approved-plan hash;
+- require a consistent DONE package with complete task evidence and final.md;
+- preserve the completed round's approval, completion, task, and final-evidence
+  metadata in `state.completed_rounds`;
+- rename final.md to the non-overwriting
+  `evidence/final-round-NNN.md` history path;
+- upgrade schema-version-1 state when needed;
+- increment `acceptance_round` and `plan_revision`;
+- reset only the current approval/completion fields;
+- set `phase = PLANNING`;
+- update status.md to the reopened planning state;
+- report the new round number and next task ID.
 
-Preserve work-package identity and baseline_sha.
+If the script refuses the transition, stop and report its error. Do not
+partially reproduce the transition by hand.
 
-When revision is finished:
+Historical task documents, task evidence, attempts, implementers, COMPLETE
+statuses, and prior-round evidence are immutable after this transition.
 
-set:
+### 2. Append the acceptance feedback
 
-`phase = AWAITING_APPROVAL`
+Append a new section to request.md named:
 
-Update status.
+`## Acceptance follow-up — Round N`
 
-Stop.
+Preserve the human's complete feedback in that section.
+
+Do not rewrite or delete earlier approved request or plan sections. If new
+evidence corrects an earlier assumption, append an explicit correction or
+supersession note so both history and current intent remain clear.
+
+### 3. Plan the fixes
+
+Re-investigate the repository and relevant completed-task evidence. Append a
+corresponding round section to plan.md that records:
+
+- observed acceptance failures;
+- root-cause or implementation findings supported by repository evidence;
+- the additive fix strategy;
+- affected architecture and tests;
+- the new task sequence;
+- round-specific risks and out-of-scope boundaries;
+- objective acceptance criteria.
+
+Keep gate.json unchanged unless the acceptance fixes genuinely require a
+different repository quality gate. Never weaken an existing gate.
+
+Do not modify product/source implementation during this planning round.
+
+### 4. Add new tasks
+
+Continue numbering after the highest existing task ID. Create only new task
+documents for the acceptance fixes. Never replace, renumber, or edit a completed
+task document.
+
+Append each new state entry in numeric order using:
+
+```json
+{
+  "id": "003",
+  "path": "tasks/003-example-fix.md",
+  "round": 2,
+  "status": "PENDING",
+  "attempts": 0,
+  "implementation": null,
+  "evidence": null
+}
+```
+
+New tasks use the normal task-document format, delegation rules, objective
+acceptance criteria, and exact validation commands.
+
+### 5. Request re-approval
+
+When planning is complete:
+
+- set `phase = AWAITING_APPROVAL`;
+- update `updated_at` and status.md;
+- render the active acceptance round and prior completed-round count in
+  status.md.
+
+Tell the human that the acceptance fixes were added to the existing package,
+identify the new task documents, and request explicit
+`$feature-workflow approve`.
+
+Stop. Do not resume implementation until that approval arrives.
 
 ---
 
@@ -650,6 +747,10 @@ stop.
 
 Otherwise continue from the exact recorded state.
 
+If `phase == PLANNING`, continue planning only. For an acceptance round, resume
+the post-completion revision steps after the preserved-round transition. Finish
+by returning to AWAITING_APPROVAL. Never enter implementation from PLANNING.
+
 Never redo a COMPLETE task.
 
 If the current task is already in:
@@ -684,6 +785,8 @@ Report:
 - work ID;
 - title;
 - phase;
+- acceptance round;
+- prior completed-round count;
 - current task;
 - task completion count;
 - retries;
@@ -1182,8 +1285,9 @@ Return a concise final report containing:
 - major implementation decisions;
 - final quality-gate results;
 - remaining non-blocking concerns;
-- reminder that the package remains active until the human explicitly runs
-  `$feature-workflow archive`.
+- reminder that the package remains active, and the human may run
+  `$feature-workflow revise <acceptance feedback>` for another acceptance round
+  or `$feature-workflow archive` to close it.
 
 Stop.
 
@@ -1220,6 +1324,7 @@ Require:
 - baseline_sha exists;
 - final_sha exists;
 - completed_at exists.
+- every `completed_rounds[].final_evidence` path exists.
 
 If any requirement is false:
 
@@ -1309,6 +1414,8 @@ with:
   "baseline_sha": "<sha>",
   "final_sha": "<sha>",
   "approved_plan_sha256": "<hash>",
+  "acceptance_rounds": 1,
+  "prior_completed_rounds": 0,
   "task_count": 0,
   "tasks_completed": 0,
   "result": "DONE",
