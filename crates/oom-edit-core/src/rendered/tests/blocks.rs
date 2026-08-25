@@ -468,6 +468,35 @@ fn synthetic_layout_cells_are_explicitly_unmapped() {
 }
 
 #[test]
+fn table_body_boundaries_follow_complete_logical_rows_without_source_atoms() {
+    let text = "outside\n\n| Header | Value |\n| --- | --- |\n| first row has enough words to wrap across multiple visual lines in its table cell | ordinary |\n| second | row |\n| third | final |\n";
+    let layout = rendered_layout_at_width(text, 80);
+    let boundaries = layout
+        .lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.styled.text.starts_with("│-"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(boundaries.len(), 2);
+    for (row, boundary) in boundaries {
+        assert_eq!(boundary.kind, LineKind::Synthetic);
+        assert_eq!(boundary.role, RenderedLineRole::Document);
+        assert!(boundary.atoms.iter().all(|atom| atom.source.is_none()));
+        assert!(boundary
+            .styled
+            .spans
+            .iter()
+            .any(|span| span.style == SemanticStyle::Muted));
+
+        let previous = &layout.lines[row - 1];
+        assert_eq!(previous.kind, LineKind::Content);
+        assert_eq!(boundary.source, previous.source);
+        assert_ne!(layout.lines[row + 1].source, boundary.source);
+    }
+}
+
+#[test]
 fn wrapped_source_atoms_keep_their_byte_ownership() {
     let text = "alpha beta gamma delta epsilon 東京 cafe\u{301}";
     let wide = rendered_layout_at_width(text, 80);

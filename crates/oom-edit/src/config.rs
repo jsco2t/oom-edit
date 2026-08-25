@@ -567,6 +567,16 @@ additional_dictionaries = ["team.txt", "/opt/shared.txt"]
         assert_eq!(toml::from_str::<Config>(&serialized).unwrap(), config);
     }
 
+    #[test]
+    fn removed_alternating_table_rows_field_is_ignored_and_not_serialized() {
+        let config: Config =
+            toml::from_str("[editor]\nwrap = false\nalternating_table_rows = true\n").unwrap();
+        assert!(!config.editor.wrap);
+        assert!(!toml::to_string(&config)
+            .unwrap()
+            .contains("alternating_table_rows"));
+    }
+
     /// Config round-trip: save and reload produces the same config.
     #[test]
     fn config_round_trip() {

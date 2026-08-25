@@ -2,8 +2,8 @@
    2  │ title: Kitchen Sink                                                    │
    3  │ author: Test                                                           │
   ┌ Trouble (2) ─────────────────────────────────────────────────────────────┐─┘
-  │▸ 1:1 warning [spell] Unknown word: teh                                   │
-  │  4:7 info    [spell] Review unusual spelling                             │
+  │▸ 1:1   warning [spell] Unknown word: teh                                 │
+  │  14:27 info    [spell] Review unusual spelling                           │
   │… checking diagnostics                                                    │
   │                                                                          │
   │                                                                          │

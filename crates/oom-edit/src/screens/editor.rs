@@ -25,6 +25,7 @@ pub struct EditorViewport {
     pub wrap: bool,
     pub left_col: usize,
     pub skip_rows: usize,
+    cursor_visible: bool,
 }
 
 impl EditorViewport {
@@ -34,7 +35,14 @@ impl EditorViewport {
             wrap,
             left_col,
             skip_rows,
+            cursor_visible: true,
         }
+    }
+
+    /// Control whether this screen owns the frame cursor.
+    pub(crate) const fn with_cursor_visible(mut self, cursor_visible: bool) -> Self {
+        self.cursor_visible = cursor_visible;
+        self
     }
 }
 
@@ -163,7 +171,9 @@ fn render_body(
         })
         .unwrap_or(0);
     let col = text_area.x + display_col;
-    frame.set_cursor_position(ratatui::layout::Position::new(col, row));
+    if viewport.cursor_visible {
+        frame.set_cursor_position(ratatui::layout::Position::new(col, row));
+    }
 }
 
 /// Render the line-number gutter.

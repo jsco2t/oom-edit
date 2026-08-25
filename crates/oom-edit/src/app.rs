@@ -31,7 +31,7 @@ use crate::lifecycle::{
 };
 use crate::overlay::{Overlay, SpellSuggestAction, TroubleAction, TroubleEntry, TroubleProgress};
 use crate::screens::editor::{render_editor, render_status_row, source_text_width, EditorViewport};
-use crate::screens::rendered::{render_rendered, RenderedViewport};
+use crate::screens::rendered::{render_rendered_with_settings, RenderedSettings, RenderedViewport};
 use crate::spell_host::SpellHost;
 use crate::theme::{self, ResolvedTheme, Theme, Tier};
 use crate::widgets::status_bar;
@@ -250,7 +250,7 @@ impl App {
         )
     }
 
-    /// Create an App with explicit spell resources and configured session default.
+    /// Create an App with explicit spell resources and configured session defaults.
     pub(crate) fn new_with_spell(
         session: EditorSession,
         resolved_theme: ResolvedTheme,
@@ -508,13 +508,15 @@ impl App {
         };
 
         // Render the appropriate screen behind the overlay.
+        let document_cursor_visible = !self.overlay.is_some();
         if let Some(ref mut entry) = self.tabs.get_mut(self.active_tab) {
             if entry.session.mode() != oom_edit_core::Mode::Insert {
-                render_rendered(
+                render_rendered_with_settings(
                     frame,
                     &mut entry.session,
                     RenderedViewport::new(entry.rendered_top, entry.rendered_left_col),
-                    self.relative_line_numbers,
+                    RenderedSettings::new(self.relative_line_numbers)
+                        .with_cursor_visible(document_cursor_visible),
                     body_area,
                     active_theme,
                     self.tier,
@@ -528,7 +530,8 @@ impl App {
                         self.wrap_enabled,
                         entry.left_col,
                         entry.skip_rows,
-                    ),
+                    )
+                    .with_cursor_visible(document_cursor_visible),
                     self.relative_line_numbers,
                     body_area,
                     active_theme,
@@ -2566,6 +2569,65 @@ mod tests {
     }
 
     #[test]
+    fn trouble_owns_cursor_visibility_over_normal_select_and_insert() {
+        use ratatui::backend::TestBackend;
+        use ratatui::style::Modifier;
+        use ratatui::Terminal;
+
+        for (mode_key, expected_mode) in [
+            (None, Mode::Normal),
+            (Some('v'), Mode::Select),
+            (Some('i'), Mode::Insert),
+        ] {
+            let mut app = test_app(EditorSession::from_text("bad\n"));
+            if let Some(mode_key) = mode_key {
+                app.handle_event(&Event::Key(KeyEvent::new(
+                    CrosstermKeyCode::Char(mode_key),
+                    KeyModifiers::NONE,
+                )));
+            }
+            assert_eq!(app.mode(), expected_mode);
+
+            let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+            terminal.draw(|frame| app.render(frame)).unwrap();
+            assert!(terminal.backend().cursor_visible());
+
+            app.set_overlay(Overlay::open_trouble(
+                vec![TroubleEntry::new(
+                    oom_edit_core::Diagnostic {
+                        provider: oom_edit_core::DiagnosticProvider::Spell,
+                        severity: oom_edit_core::DiagnosticSeverity::Warning,
+                        range: 0..3,
+                        source_text: "bad".to_string(),
+                        message: "Unknown word: bad".to_string(),
+                    },
+                    oom_edit_core::TextPosition { line: 0, column: 0 },
+                )],
+                TroubleProgress::Complete,
+            ));
+            terminal.draw(|frame| app.render(frame)).unwrap();
+            assert!(!terminal.backend().cursor_visible());
+            let selected = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .find(|cell| cell.symbol() == "▸")
+                .unwrap();
+            assert!(selected.modifier.contains(Modifier::REVERSED));
+
+            app.handle_event(&Event::Key(KeyEvent::new(
+                CrosstermKeyCode::Esc,
+                KeyModifiers::NONE,
+            )));
+            assert!(matches!(app.overlay, Overlay::None));
+            assert_eq!(app.mode(), expected_mode);
+            terminal.draw(|frame| app.render(frame)).unwrap();
+            assert!(terminal.backend().cursor_visible());
+        }
+    }
+
+    #[test]
     fn trouble_enter_atomically_jumps_cursor_ruler_and_wrapped_viewport_then_closes() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -2592,6 +2654,8 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(24, 6)).unwrap();
         terminal.draw(|frame| app.render(frame)).unwrap();
         press_space_command(&mut app, 'd');
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        assert!(!terminal.backend().cursor_visible());
         app.handle_event(&Event::Key(KeyEvent::new(
             CrosstermKeyCode::Char('j'),
             KeyModifiers::NONE,
@@ -2621,6 +2685,7 @@ mod tests {
         assert!(app.pending_scroll_follow);
 
         terminal.draw(|frame| app.render(frame)).unwrap();
+        assert!(terminal.backend().cursor_visible());
         assert!(
             app.tabs[0].rendered_top > 0,
             "jump must follow the viewport"

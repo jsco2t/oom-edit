@@ -349,7 +349,7 @@ Record decisions that future implementation tasks must respect.
 
 Enumerate the features/bugs/items represented by this work package.
 
-Include relevant test planning. All code changes are tested. 
+Include relevant test planning. All code changes are tested.
 
 ## Task sequence
 
@@ -928,15 +928,15 @@ Summarize important findings and fixes.
 
 ## Task-specific validation
 
-| Command | Result |
-| --- | --- |
-| `<command>` | PASS |
+| Command     | Result |
+| ----------- | ------ |
+| `<command>` | PASS   |
 
 ## Standard quality gate
 
-| Command | Result |
-| --- | --- |
-| `<command>` | PASS |
+| Command     | Result |
+| ----------- | ------ |
+| `<command>` | PASS   |
 
 ## Remaining concerns
 
@@ -1123,9 +1123,9 @@ Map every package-level acceptance criterion from plan.md to evidence.
 
 ## Final quality gate
 
-| Command | Result |
-| --- | --- |
-| `<command>` | PASS |
+| Command     | Result |
+| ----------- | ------ |
+| `<command>` | PASS   |
 
 ## Cumulative diff
 

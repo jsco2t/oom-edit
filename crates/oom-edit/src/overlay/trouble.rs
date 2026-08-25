@@ -49,6 +49,29 @@ pub(crate) enum TroubleAction {
     Jump(Diagnostic),
 }
 
+/// Display-cell widths shared by every row in one Trouble snapshot.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TroubleColumns {
+    location: usize,
+    severity: usize,
+    provider: usize,
+}
+
+impl TroubleColumns {
+    fn for_entries(entries: &[TroubleEntry]) -> Self {
+        entries.iter().fold(Self::default(), |mut columns, entry| {
+            columns.location = columns.location.max(display_width(&location_label(entry)));
+            columns.severity = columns
+                .severity
+                .max(display_width(severity_label(entry.diagnostic.severity)));
+            columns.provider = columns
+                .provider
+                .max(display_width(&provider_display(entry.diagnostic.provider)));
+            columns
+        })
+    }
+}
+
 /// Complete presentation state for the open diagnostics modal.
 #[derive(Debug)]
 pub struct TroubleState {
@@ -169,6 +192,7 @@ impl TroubleState {
         let row_capacity = usize::from(inner.height).saturating_sub(reserve_footer);
         let render_scroll =
             scroll_for_selection(self.scroll, self.selected, self.entries.len(), row_capacity);
+        let columns = TroubleColumns::for_entries(&self.entries);
 
         let mut lines = self
             .entries
@@ -176,7 +200,7 @@ impl TroubleState {
             .enumerate()
             .skip(render_scroll)
             .take(row_capacity)
-            .map(|(index, entry)| self.entry_line(index, entry, theme, tier))
+            .map(|(index, entry)| self.entry_line(index, entry, columns, theme, tier))
             .collect::<Vec<_>>();
 
         if let Some(warning) = &self.warning {
@@ -208,6 +232,7 @@ impl TroubleState {
         &self,
         index: usize,
         entry: &'a TroubleEntry,
+        columns: TroubleColumns,
         theme: &Theme,
         tier: Tier,
     ) -> Line<'a> {
@@ -221,17 +246,17 @@ impl TroubleState {
         if let Some(modifier) = selection {
             severity_style = severity_style.add_modifier(modifier);
         }
+        let location = padded(location_label(entry), columns.location);
+        let severity = padded(severity.to_string(), columns.severity);
+        let provider = padded(
+            provider_display(entry.diagnostic.provider),
+            columns.provider,
+        );
         Line::from(vec![
             Span::styled(if selected { "▸ " } else { "  " }, base),
-            Span::styled(
-                format!("{}:{} ", entry.position.line + 1, entry.position.column + 1),
-                base,
-            ),
-            Span::styled(format!("{severity:<7} "), severity_style),
-            Span::styled(
-                format!("[{}] ", provider_label(entry.diagnostic.provider)),
-                base,
-            ),
+            Span::styled(format!("{location} "), base),
+            Span::styled(format!("{severity} "), severity_style),
+            Span::styled(format!("{provider} "), base),
             Span::styled(entry.diagnostic.message.as_str(), base),
         ])
     }
@@ -274,6 +299,23 @@ const fn provider_label(provider: DiagnosticProvider) -> &'static str {
     match provider {
         DiagnosticProvider::Spell => "spell",
     }
+}
+
+fn location_label(entry: &TroubleEntry) -> String {
+    format!("{}:{}", entry.position.line + 1, entry.position.column + 1)
+}
+
+fn provider_display(provider: DiagnosticProvider) -> String {
+    format!("[{}]", provider_label(provider))
+}
+
+fn display_width(text: &str) -> usize {
+    Line::from(text).width()
+}
+
+fn padded(mut text: String, width: usize) -> String {
+    text.push_str(&" ".repeat(width.saturating_sub(display_width(&text))));
+    text
 }
 
 const fn severity_label(severity: DiagnosticSeverity) -> &'static str {
@@ -386,6 +428,98 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn line_text(line: Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn complete_snapshot_aligns_every_leading_column_by_display_width() {
+        let entries = vec![
+            TroubleEntry::new(
+                diagnostic(0, DiagnosticSeverity::Warning),
+                TextPosition { line: 0, column: 0 },
+            ),
+            TroubleEntry::new(
+                diagnostic(1, DiagnosticSeverity::Info),
+                TextPosition {
+                    line: 98,
+                    column: 123,
+                },
+            ),
+            TroubleEntry::new(
+                diagnostic(2, DiagnosticSeverity::Error),
+                TextPosition {
+                    line: 8,
+                    column: 11,
+                },
+            ),
+        ];
+        let state = TroubleState::new(entries, TroubleProgress::Complete);
+        let columns = TroubleColumns::for_entries(state.entries());
+        let theme = crate::theme::get_theme("default-dark");
+        let lines = state
+            .entries()
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                line_text(state.entry_line(index, entry, columns, theme, Tier::TrueColor))
+            })
+            .collect::<Vec<_>>();
+
+        let severity_starts = lines
+            .iter()
+            .zip(state.entries())
+            .map(|(line, entry)| {
+                let start = line
+                    .find(severity_label(entry.diagnostic.severity))
+                    .unwrap();
+                display_width(&line[..start])
+            })
+            .collect::<Vec<_>>();
+        let provider_starts = lines
+            .iter()
+            .map(|line| display_width(&line[..line.find("[spell]").unwrap()]))
+            .collect::<Vec<_>>();
+        let message_starts = lines
+            .iter()
+            .map(|line| display_width(&line[..line.find("message").unwrap()]))
+            .collect::<Vec<_>>();
+        assert!(severity_starts.windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(provider_starts.windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(message_starts.windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(lines[0].starts_with("▸ 1:1"));
+        assert!(lines[1].starts_with("  99:124"));
+    }
+
+    #[test]
+    fn offscreen_widest_location_keeps_columns_stable_while_scrolling() {
+        let mut entries = (0..20)
+            .map(|index| entry(index, DiagnosticSeverity::Warning))
+            .collect::<Vec<_>>();
+        entries.last_mut().unwrap().position = TextPosition {
+            line: 9_999,
+            column: 999,
+        };
+        let mut state = TroubleState::new(entries, TroubleProgress::Pending);
+        let selected_warning_column = |rendered: &str| {
+            let selected = rendered.lines().find(|line| line.contains('▸')).unwrap();
+            selected.find("warning").unwrap()
+        };
+        let initial_column = selected_warning_column(&rendered_text(&state));
+
+        for _ in 0..16 {
+            state.handle_key(&key(KeyCodeKind::Char('j')));
+        }
+        assert!(state.scroll() > 0);
+        assert_eq!(
+            selected_warning_column(&rendered_text(&state)),
+            initial_column
+        );
     }
 
     #[test]

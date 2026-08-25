@@ -1,9 +1,11 @@
-      ──────────────────────┬─────────────────────
-   1  nter naturally wide c │ Right naturally wide
-      umn                   │ umn
-      ──────────────────────┼─────────────────────
-   3   京 東 京 東 京 東 京 東 京    │   final repeated con
-      ──────────────────────┴─────────────────────
+      ────────────────┬──────────────────────────┐
+   1  naturally wide  │     Right naturally wide │
+                      │ column                   │
+      ────────────────┼──────────────────────────┤
+   3   東 京 東 京 東 京    │   final repeated content │
+      ----------------│--------------------------│
+   4  column content  │       second final value │
+      ────────────────┴──────────────────────────┘
 
 
 
@@ -19,6 +21,4 @@
 
 
 
-
-
- NORMAL  v=select                🅂 0 1:78  25% Top
+ NORMAL  v=select                🅂 0 1:83  20% Top

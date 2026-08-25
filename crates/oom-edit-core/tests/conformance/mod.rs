@@ -589,7 +589,7 @@ fn select_shape_projections_are_exact() {
     let selection = character.rendered_selection().unwrap();
     assert_eq!(selection.shape, SelectionShape::Character);
     assert_eq!(selection.source_ranges, vec![0..2]);
-    assert_eq!(selection.rows[0].columns, 0..2);
+    assert_eq!(selection.rows[0].columns, vec![0..2]);
 
     let wrapped_text = "alpha beta gamma delta\n";
     let mut line = EditorSession::from_text(wrapped_text);
@@ -600,10 +600,9 @@ fn select_shape_projections_are_exact() {
     assert_eq!(selection.shape, SelectionShape::Line);
     assert_eq!(selection.source_ranges, vec![0..wrapped_text.len()]);
     assert_eq!(selection.rows.len(), rendered_rows);
-    assert!(selection
-        .rows
-        .iter()
-        .all(|row| row.columns.start == 0 && row.columns.start < row.columns.end));
+    assert!(selection.rows.iter().all(|row| {
+        row.columns.len() == 1 && row.columns[0].start == 0 && !row.columns[0].is_empty()
+    }));
 
     let mut block = EditorSession::from_text("abcd\n\nwxyz\n");
     block.render_layout(40);
@@ -621,7 +620,7 @@ fn select_shape_projections_are_exact() {
             .iter()
             .map(|row| row.columns.clone())
             .collect::<Vec<_>>(),
-        vec![0..2, 0..2, 0..2]
+        vec![vec![0..2], vec![0..2], vec![0..2]]
     );
 
     let mut empty = EditorSession::from_text("one\n\ntwo\n");
@@ -820,7 +819,7 @@ fn select_metadata_intervals_and_styles() {
     assert_eq!(selection.shape, SelectionShape::Character);
     assert_eq!(selection.rows.len(), 1);
     assert_eq!(
-        selection.rows[0].columns.end - selection.rows[0].columns.start,
+        selection.rows[0].columns[0].end - selection.rows[0].columns[0].start,
         2
     );
     assert!(selection.source_ranges.iter().all(|range| {
@@ -1379,10 +1378,22 @@ fn resized_block_uses_one_coherent_projection_for_payload_and_delete() {
             .map(|row| (row.row, row.columns.clone(), row.source_ranges.clone()))
             .collect::<Vec<_>>(),
         vec![
-            (0, 0..3, std::iter::once(0..3).collect()),
-            (1, 0..3, std::iter::once(7..10).collect()),
-            (2, 0..3, vec![]),
-            (3, 0..3, std::iter::once(15..18).collect()),
+            (
+                0,
+                std::iter::once(0..3).collect(),
+                std::iter::once(0..3).collect()
+            ),
+            (
+                1,
+                std::iter::once(0..3).collect(),
+                std::iter::once(7..10).collect()
+            ),
+            (2, std::iter::once(0..3).collect(), vec![]),
+            (
+                3,
+                std::iter::once(0..3).collect(),
+                std::iter::once(15..18).collect()
+            ),
         ]
     );
     yank.handle_key(key('"'));

@@ -937,7 +937,10 @@ fn project_selection_for_vim(selection: RenderedSelection) -> ProjectedSelection
                 .rows
                 .into_iter()
                 .map(|row| ProjectedBlockRow {
-                    selected_width: row.columns.end.saturating_sub(row.columns.start),
+                    selected_width: row
+                        .columns
+                        .first()
+                        .map_or(0, |columns| columns.end.saturating_sub(columns.start)),
                     ranges: row.source_ranges,
                 })
                 .collect(),
@@ -1570,6 +1573,7 @@ impl EditorSession {
         );
         if let SelectionKind::Character { ranges } = &active.kind {
             selection.source_ranges = ranges.clone();
+            selection.rows = nav::character_selection_rows(ranges, layout);
         }
         Some(selection)
     }
@@ -2933,6 +2937,7 @@ impl EditorSession {
         );
         if let SelectionKind::Character { ranges } = &active.kind {
             selection.source_ranges = ranges.clone();
+            selection.rows = nav::character_selection_rows(ranges, layout);
         }
         if selection.source_ranges.is_empty() {
             return Vec::new();

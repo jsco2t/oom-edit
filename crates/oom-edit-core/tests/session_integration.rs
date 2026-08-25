@@ -268,6 +268,142 @@ fn rendered_character_selection_maps_inline_source() {
 }
 
 #[test]
+fn wrapped_table_character_selection_is_source_driven_and_operator_exact() {
+    let text = "| Description | Neighbor |\n| --- | --- |\n| alpha beta gamma delta epsilon zeta eta theta iota kappa lambda | NEIGHBOR CONTENT THAT FILLS ITS COLUMN |\n| OTHER | ROW |\n";
+    let cell_start = text.find("alpha").unwrap();
+    let cell_end = text.find(" | NEIGHBOR").unwrap();
+    let neighbor_start = text.find("NEIGHBOR").unwrap();
+    let neighbor_end = neighbor_start + "NEIGHBOR CONTENT THAT FILLS ITS COLUMN".len();
+
+    let select_cell = || {
+        let mut session = EditorSession::from_text(text);
+        let first_row = render_and_move_to(&mut session, "alpha beta", 80);
+        session.handle_key(key('v'));
+        session.handle_key(key('j'));
+        assert_eq!(session.rendered_cursor_line(), first_row + 1);
+        session
+    };
+
+    let mut forward = select_cell();
+    let before_resize = forward.rendered_selection().unwrap();
+    let boundary_rows = forward
+        .rendered_layout()
+        .unwrap()
+        .lines
+        .iter()
+        .enumerate()
+        .filter_map(|(row, line)| line.styled.text.starts_with("│-").then_some(row))
+        .collect::<Vec<_>>();
+    assert_eq!(boundary_rows.len(), 1);
+    assert!(before_resize
+        .rows
+        .iter()
+        .all(|row| !boundary_rows.contains(&row.row)));
+    assert!(before_resize.rows.len() >= 2);
+    assert!(before_resize.source_ranges.iter().all(|range| {
+        cell_start <= range.start
+            && range.end <= cell_end
+            && (range.end <= neighbor_start || neighbor_end <= range.start)
+    }));
+    assert!(before_resize
+        .rows
+        .iter()
+        .all(|row| row.columns.iter().all(|columns| !columns.is_empty())));
+
+    forward.handle_key(key('o'));
+    let reversed = forward.rendered_selection().unwrap();
+    assert_eq!(reversed.source_ranges, before_resize.source_ranges);
+    forward.render_layout(120);
+    assert_eq!(
+        forward.rendered_selection().unwrap().source_ranges,
+        before_resize.source_ranges
+    );
+
+    let selected_text = before_resize
+        .source_ranges
+        .iter()
+        .map(|range| &text[range.clone()])
+        .collect::<String>();
+    let mut yank = select_cell();
+    yank.handle_key(key('"'));
+    yank.handle_key(key('+'));
+    let effects = yank.handle_key(key('y'));
+    assert!(effects.iter().any(
+        |effect| matches!(effect, Effect::ClipboardWrite(payload) if payload == &selected_text)
+    ));
+
+    let mut expected_after_removal = text.to_string();
+    for range in before_resize.source_ranges.iter().rev() {
+        expected_after_removal.replace_range(range.clone(), "");
+    }
+    let mut delete = select_cell();
+    delete.handle_key(key('d'));
+    assert_eq!(delete.document(), expected_after_removal);
+
+    let mut change = select_cell();
+    change.handle_key(key('c'));
+    assert_eq!(change.mode(), Mode::Insert);
+    assert_eq!(change.document(), expected_after_removal);
+}
+
+#[test]
+fn rendered_navigation_crosses_synthetic_table_body_boundaries_deterministically() {
+    let text = "| Header | Value |\n| --- | --- |\n| first | row |\n| second | row |\n";
+    let mut session = EditorSession::from_text(text);
+    let first = render_and_move_to(&mut session, "first", 80);
+    let boundary = session
+        .rendered_layout()
+        .unwrap()
+        .lines
+        .iter()
+        .position(|line| line.styled.text.starts_with("│-"))
+        .unwrap();
+    assert_eq!(boundary, first + 1);
+
+    session.handle_key(key('j'));
+    assert_eq!(session.rendered_cursor_line(), boundary);
+    assert_eq!(session.cursor().0, 2);
+
+    session.handle_key(key('j'));
+    assert!(session.rendered_cursor_line() > boundary);
+    assert_eq!(session.cursor().0, 3);
+}
+
+#[test]
+fn table_body_boundaries_never_enter_selection_shapes_or_operator_payloads() {
+    let text = "| Header | Value |\n| --- | --- |\n| first | row |\n| second | row |\n";
+
+    for selection_key in [key('v'), key('V'), ctrl('v')] {
+        let mut session = EditorSession::from_text(text);
+        let first = render_and_move_to(&mut session, "first", 80);
+        let boundary = session
+            .rendered_layout()
+            .unwrap()
+            .lines
+            .iter()
+            .position(|line| line.styled.text.starts_with("│-"))
+            .unwrap();
+        assert_eq!(boundary, first + 1);
+
+        session.handle_key(selection_key);
+        session.handle_key(key('j'));
+        session.handle_key(key('j'));
+        let selection = session.rendered_selection().unwrap();
+        assert!(selection
+            .source_ranges
+            .iter()
+            .all(|range| !text[range.clone()].contains("---")));
+
+        session.handle_key(key('"'));
+        session.handle_key(key('+'));
+        let effects = session.handle_key(key('y'));
+        assert!(effects.iter().any(|effect| {
+            matches!(effect, Effect::ClipboardWrite(payload) if !payload.contains("---"))
+        }));
+    }
+}
+
+#[test]
 fn public_rendered_cursor_is_only_a_rendered_point() {
     let mut session = EditorSession::from_text("alpha\n");
     session.render_layout(40);
@@ -441,7 +577,7 @@ fn unicode_selection_atoms_stay_utf8_safe() {
     session.handle_key(key('l'));
     let selection = session.rendered_selection().unwrap();
     assert_eq!(selection.source_ranges, vec![0..7]);
-    assert_eq!(selection.rows[0].columns, 0..4);
+    assert_eq!(selection.rows[0].columns, vec![0..4]);
     session.handle_key(key('"'));
     session.handle_key(key('+'));
     let effects = session.handle_key(key('y'));
@@ -465,7 +601,7 @@ fn unicode_selection_atoms_stay_utf8_safe() {
             .iter()
             .map(|row| row.columns.clone())
             .collect::<Vec<_>>(),
-        vec![0..4, 0..4, 0..4]
+        vec![vec![0..4], vec![0..4], vec![0..4]]
     );
 }
 

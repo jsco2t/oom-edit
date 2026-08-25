@@ -42,10 +42,17 @@ pub fn render_table(
     .collect()
 }
 
-/// One rendered table line plus its logical Markdown row (header is zero).
+/// One rendered table line plus its content/source-row identity.
 pub(super) struct RenderedTableLine {
     pub(super) mapped: MappedLine,
-    pub(super) logical_row: Option<usize>,
+    pub(super) kind: RenderedTableLineKind,
+}
+
+/// Whether a table line is source content or generated near a source row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RenderedTableLineKind {
+    Content(usize),
+    SyntheticNear(usize),
 }
 
 impl RenderedTableLine {
@@ -104,7 +111,7 @@ pub(super) fn render_table_with_rows(
     // Top border
     lines.push(RenderedTableLine {
         mapped: build_border_row(alignments, &col_widths, true, true, source_span.clone()),
-        logical_row: None,
+        kind: RenderedTableLineKind::SyntheticNear(0),
     });
 
     // Header row
@@ -113,14 +120,14 @@ pub(super) fn render_table_with_rows(
             .into_iter()
             .map(|line| RenderedTableLine {
                 mapped: line,
-                logical_row: Some(0),
+                kind: RenderedTableLineKind::Content(0),
             }),
     );
 
     // Separator row
     lines.push(RenderedTableLine {
         mapped: build_separator_row(&col_widths),
-        logical_row: None,
+        kind: RenderedTableLineKind::SyntheticNear(0),
     });
 
     // Body rows
@@ -135,15 +142,21 @@ pub(super) fn render_table_with_rows(
             .into_iter()
             .map(|line| RenderedTableLine {
                 mapped: line,
-                logical_row: Some(row_idx + 1),
+                kind: RenderedTableLineKind::Content(row_idx + 1),
             }),
         );
+        if row_idx + 1 < num_body_rows {
+            lines.push(RenderedTableLine {
+                mapped: build_body_row_boundary(&col_widths),
+                kind: RenderedTableLineKind::SyntheticNear(row_idx + 1),
+            });
+        }
     }
 
     // Bottom border
     lines.push(RenderedTableLine {
         mapped: build_border_row(alignments, &col_widths, false, true, source_span.clone()),
-        logical_row: None,
+        kind: RenderedTableLineKind::SyntheticNear(num_body_rows),
     });
 
     lines
@@ -266,7 +279,18 @@ fn build_separator_row(col_widths: &[usize]) -> MappedLine {
     line
 }
 
-/// Split cell text into fixed-width chunks without splitting a character.
+/// Build a faint boundary between adjacent logical body rows.
+fn build_body_row_boundary(col_widths: &[usize]) -> MappedLine {
+    let mut line = MappedLine::default();
+    line.push_generated("│", SemanticStyle::Text);
+    for &width in col_widths {
+        line.push_generated(&"-".repeat(width + 2), SemanticStyle::Muted);
+        line.push_generated("│", SemanticStyle::Text);
+    }
+    line
+}
+
+/// Wrap a mapped table cell without separating display groups from source ownership.
 fn split_cell_text(line: &MappedLine, max_width: usize) -> Vec<MappedLine> {
     if max_width == 0 {
         return vec![MappedLine::default()];
@@ -279,22 +303,63 @@ fn split_cell_text(line: &MappedLine, max_width: usize) -> Vec<MappedLine> {
         let mut used = 0;
         while chunk_end < line.fragments.len() {
             let width = line.fragments[chunk_end].text.width();
-            if chunk_end > chunk_start && width > 0 && used + width > max_width {
+            if width > 0 && used + width > max_width {
                 break;
             }
             used += width;
             chunk_end += 1;
-            if used >= max_width {
-                break;
-            }
         }
+
         if chunk_end == chunk_start {
+            // An indivisible display group may be wider than the cell. Emit it
+            // whole so wrapping makes progress without splitting its source.
             chunk_end += 1;
         }
+
+        let has_overflow = chunk_end < line.fragments.len();
+        let next_is_whitespace = has_overflow
+            && line.fragments[chunk_end]
+                .text
+                .chars()
+                .all(char::is_whitespace);
+        let chunk_ends_with_word = line.fragments[chunk_end - 1]
+            .text
+            .chars()
+            .any(|character| !character.is_whitespace());
+        if has_overflow && !(next_is_whitespace && chunk_ends_with_word) {
+            if let Some(mut boundary) = line.fragments[chunk_start..chunk_end]
+                .iter()
+                .rposition(|fragment| fragment.text.chars().all(char::is_whitespace))
+                .map(|relative| chunk_start + relative)
+                .filter(|boundary| *boundary > chunk_start)
+            {
+                while boundary > chunk_start
+                    && line.fragments[boundary - 1]
+                        .text
+                        .chars()
+                        .all(char::is_whitespace)
+                {
+                    boundary -= 1;
+                }
+                chunk_end = boundary;
+            }
+        }
+
         lines.push(MappedLine {
             fragments: line.fragments[chunk_start..chunk_end].to_vec(),
         });
         chunk_start = chunk_end;
+
+        // Boundary whitespace is a layout separator, not visible content on
+        // either wrapped line. Its source ownership is intentionally omitted.
+        while chunk_start < line.fragments.len()
+            && line.fragments[chunk_start]
+                .text
+                .chars()
+                .all(char::is_whitespace)
+        {
+            chunk_start += 1;
+        }
     }
 
     if lines.is_empty() {
@@ -484,16 +549,80 @@ mod tests {
 
         let lines = render_table(&alignments, &header, &rows, 0..100);
 
-        // Should have: top border + header + separator + 2 body rows + bottom border
-        assert_eq!(lines.len(), 6);
+        // Body rows are separated by one contained dashed boundary.
+        assert_eq!(lines.len(), 7);
         assert_eq!(lines[0].text, "┌───────┬─────┐");
         assert_eq!(lines[1].text, "│ Name  │ Age │");
         assert_eq!(lines[2].text, "├───────┼─────┤");
         assert_eq!(lines[3].text, "│ Alice │ 30  │");
-        assert_eq!(lines[4].text, "│ Bob   │ 25  │");
-        assert_eq!(lines[5].text, "└───────┴─────┘");
+        assert_eq!(lines[4].text, "│-------│-----│");
+        assert_eq!(lines[5].text, "│ Bob   │ 25  │");
+        assert_eq!(lines[6].text, "└───────┴─────┘");
         assert_eq!(lines[1].text.matches('│').count(), 3);
         assert_eq!(lines[3].text.matches('│').count(), 3);
+    }
+
+    #[test]
+    fn body_row_boundaries_are_counted_styled_and_source_less() {
+        let header = make_row(&["Name", "Value"]);
+        let alignments = vec![TableAlignment::Left, TableAlignment::Left];
+
+        for body_count in 0usize..=3 {
+            let rows = (0..body_count)
+                .map(|index| make_row(&["row", if index == 0 { "one" } else { "value" }]))
+                .collect::<Vec<_>>();
+            let rendered = render_table_with_rows(&alignments, &header, &rows, 0..100, 80);
+            let boundaries = rendered
+                .iter()
+                .filter(|line| line.mapped.text().starts_with("│-"))
+                .collect::<Vec<_>>();
+            assert_eq!(boundaries.len(), body_count.saturating_sub(1));
+
+            for boundary in boundaries {
+                assert!(matches!(
+                    boundary.kind,
+                    RenderedTableLineKind::SyntheticNear(row) if row > 0
+                ));
+                assert!(boundary
+                    .mapped
+                    .fragments
+                    .iter()
+                    .all(|fragment| fragment.source.is_none()));
+                for fragment in &boundary.mapped.fragments {
+                    let expected = if fragment.text == "│" {
+                        SemanticStyle::Text
+                    } else {
+                        assert!(fragment.text.chars().all(|character| character == '-'));
+                        SemanticStyle::Muted
+                    };
+                    assert_eq!(fragment.style, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn body_row_boundaries_recompute_with_allocated_column_widths() {
+        let long = "a value long enough to reach the forty column natural cap";
+        let header = make_row(&[long, long]);
+        let rows = vec![make_row(&[long, long]), make_row(&[long, long])];
+        let alignments = vec![TableAlignment::Left, TableAlignment::Left];
+        let boundary = |available_width| {
+            render_table_with_rows(&alignments, &header, &rows, 0..100, available_width)
+                .into_iter()
+                .find(|line| line.mapped.text().starts_with("│-"))
+                .unwrap()
+                .mapped
+                .text()
+        };
+
+        let narrow = boundary(80);
+        let wide = boundary(100);
+        assert_eq!(narrow.width(), 80);
+        assert_eq!(wide.width(), 87);
+        assert_ne!(narrow, wide);
+        assert!(narrow.starts_with('│') && narrow.ends_with('│'));
+        assert!(wide.starts_with('│') && wide.ends_with('│'));
     }
 
     #[test]
@@ -692,12 +821,86 @@ mod tests {
         assert_eq!(split("abcdef", 4), vec!["abcd", "ef"]);
         assert_eq!(split("abc", 0), vec![""]);
         assert_eq!(split("abc", 1), vec!["a", "b", "c"]);
+        assert_eq!(split("abc def", 4), vec!["abc", "def"]);
+        assert_eq!(split("abc defg", 8), vec!["abc defg"]);
+        assert_eq!(split("abc defg x", 8), vec!["abc defg", "x"]);
+        assert_eq!(split("alpha   beta", 7), vec!["alpha", "beta"]);
         assert_eq!(split("abc東", 4), vec!["abc", "東"]);
         assert_eq!(split("東西", 1), vec!["東", "西"]);
         assert_eq!(
             split(&format!("{}*\u{fe0f}", "a".repeat(39)), 40),
             vec!["a".repeat(39), "*\u{fe0f}".to_string()]
         );
+    }
+
+    #[test]
+    fn table_prose_wraps_before_the_next_word() {
+        let text = "This is some interesting long text content written here.";
+        let wrapped = split_cell_text(&make_mapped(text), 36)
+            .into_iter()
+            .map(|line| line.text())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            wrapped,
+            [
+                "This is some interesting long text",
+                "content written here."
+            ]
+        );
+    }
+
+    #[test]
+    fn rendered_table_cell_uses_word_boundaries_at_the_column_cap() {
+        let prose = "This is some interesting long text content written here.";
+        let header = make_row(&["Description"]);
+        let rows = vec![make_row(&[prose])];
+        let lines = render_table(&[TableAlignment::Left], &header, &rows, 0..prose.len());
+
+        assert_eq!(lines.len(), 6);
+        assert!(lines[3].text.contains("This is some interesting long text"));
+        assert!(!lines[3].text.contains("co"));
+        assert!(lines[4].text.contains("content written here."));
+        let width = lines[0].text.width();
+        assert!(lines.iter().all(|line| line.text.width() == width));
+    }
+
+    #[test]
+    fn mapped_word_wrap_preserves_styles_and_exact_source_atoms() {
+        let text = "same same repeated";
+        let mut mapped = MappedLine::default();
+        for (offset, character) in text.char_indices() {
+            let end = offset + character.len_utf8();
+            mapped.push(
+                character.to_string(),
+                if offset < 5 {
+                    SemanticStyle::Emphasis
+                } else {
+                    SemanticStyle::CodeSpan
+                },
+                Some(offset..end),
+            );
+        }
+
+        let wrapped = split_cell_text(&mapped, 9);
+        assert_eq!(
+            wrapped.iter().map(MappedLine::text).collect::<Vec<_>>(),
+            ["same same", "repeated"]
+        );
+
+        let visible_atoms = wrapped
+            .into_iter()
+            .flat_map(|line| line.fragments)
+            .collect::<Vec<_>>();
+        let visible_text = visible_atoms
+            .iter()
+            .map(|fragment| fragment.text.as_str())
+            .collect::<String>();
+        assert_eq!(visible_text, "same samerepeated");
+        for fragment in visible_atoms {
+            let source = fragment.source.expect("visible text stays source-backed");
+            assert_eq!(&text[source], fragment.text);
+        }
     }
 
     #[test]

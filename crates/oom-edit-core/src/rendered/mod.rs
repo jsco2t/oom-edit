@@ -670,15 +670,17 @@ impl<'a> RenderedLayoutBuilder<'a> {
         let table_lines =
             table::render_table_with_rows(alignments, header, rows, source.clone(), self.width);
 
-        for (index, line) in table_lines.into_iter().enumerate() {
-            let logical_row = line.logical_row;
-            let nearest_row = logical_row.unwrap_or(if index == 0 { 0 } else { rows.len() });
+        for line in table_lines {
+            let (is_content, nearest_row) = match line.kind {
+                table::RenderedTableLineKind::Content(row) => (true, row),
+                table::RenderedTableLineKind::SyntheticNear(row) => (false, row),
+            };
             let row_source = row_spans
                 .get(nearest_row)
                 .cloned()
                 .unwrap_or_else(|| source.clone());
             let (styled, atoms) = line.into_parts();
-            if logical_row.is_some() {
+            if is_content {
                 self.lines.push(RenderedLine {
                     styled,
                     source: row_source.clone(),

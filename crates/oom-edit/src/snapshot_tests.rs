@@ -144,7 +144,10 @@ fn trouble_overlay() -> crate::overlay::Overlay {
                     source_text: "wierd".to_string(),
                     message: "Review unusual spelling".to_string(),
                 },
-                oom_edit_core::TextPosition { line: 3, column: 6 },
+                oom_edit_core::TextPosition {
+                    line: 13,
+                    column: 26,
+                },
             ),
         ],
         crate::overlay::TroubleProgress::Pending,
@@ -605,6 +608,7 @@ fn golden_rendered_table() {
         "| First naturally wide column | Center naturally wide column | Right naturally wide column |\n",
         "|:-----|:------:|------:|\n",
         "| alpha repeated content | 東京東京東京東京東京 | final repeated content |\n",
+        "| beta boundary content | resized column content | second final value |\n",
     );
     let mut probe = EditorSession::from_text(table);
     let layout = probe.render_layout(46);
@@ -615,7 +619,7 @@ fn golden_rendered_table() {
         .filter_map(|atom| atom.source.as_ref())
         .map(|range| &table[range.clone()])
         .collect::<String>();
-    for token in ["alpha", "Center", "final", "東京"] {
+    for token in ["alpha", "beta", "Center", "final", "東京"] {
         assert!(
             mapped_source.contains(token),
             "missing table source mapping for {token}"
@@ -887,8 +891,8 @@ fn trouble_rows_pin_selection_severity_provider_and_one_based_position() {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(rendered.contains("1:1 warning [spell] Unknown word: teh"));
-    assert!(rendered.contains("4:7 info    [spell] Review unusual spelling"));
+    assert!(rendered.contains("1:1   warning [spell] Unknown word: teh"));
+    assert!(rendered.contains("14:27 info    [spell] Review unusual spelling"));
     assert!(rendered.contains("… checking diagnostics"));
 }
 

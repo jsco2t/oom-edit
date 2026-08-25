@@ -467,18 +467,26 @@ pub fn project_selection(
         (active, anchor)
     };
 
+    let character_ranges = (shape == SelectionShape::Character)
+        .then(|| character_source_ranges(anchor, active, layout))
+        .flatten();
     let rows: Vec<RenderedSelectionRow> = match shape {
-        SelectionShape::Character => (first.row..=last.row)
-            .map(|row| {
-                let start = if row == first.row { first.column } else { 0 };
-                let end = if row == last.row {
-                    last.column
-                } else {
-                    usize::MAX
-                };
-                selection_row(row, start, end, layout)
-            })
-            .collect(),
+        SelectionShape::Character => character_ranges.as_ref().map_or_else(
+            || {
+                (first.row..=last.row)
+                    .map(|row| {
+                        let start = if row == first.row { first.column } else { 0 };
+                        let end = if row == last.row {
+                            last.column
+                        } else {
+                            usize::MAX
+                        };
+                        selection_row(row, start, end, layout)
+                    })
+                    .collect()
+            },
+            |ranges| character_selection_rows(ranges, layout),
+        ),
         SelectionShape::Line => {
             let first_source = source_for_point(first, layout)
                 .unwrap_or_else(|| layout.lines[first.row].source.clone());
@@ -502,21 +510,24 @@ pub fn project_selection(
             (anchor.row.min(active.row)..=anchor.row.max(active.row))
                 .map(|row| {
                     let mut selected = selection_row(row, left, right.saturating_sub(1), layout);
-                    selected.columns = left..right;
+                    selected.columns = single_interval(left..right);
                     selected
                 })
                 .collect()
         }
     };
 
-    let source_ranges = normalize_ranges(
-        rows.iter()
-            .flat_map(|row| row.source_ranges.iter().cloned())
-            .collect(),
-    );
+    let source_ranges = character_ranges.unwrap_or_else(|| {
+        normalize_ranges(
+            rows.iter()
+                .flat_map(|row| row.source_ranges.iter().cloned())
+                .collect(),
+        )
+    });
     let block_width = (shape == SelectionShape::Block).then(|| {
         rows.first()
-            .map_or(0, |row| row.columns.end.saturating_sub(row.columns.start))
+            .and_then(|row| row.columns.first())
+            .map_or(0, |columns| columns.end.saturating_sub(columns.start))
     });
 
     RenderedSelection {
@@ -542,23 +553,7 @@ pub fn project_selection_from_source_positions(
 ) -> RenderedSelection {
     let mut selection = project_selection(anchor, active, shape, layout, text);
     match shape {
-        SelectionShape::Character => {
-            let anchor_range = source_for_point(anchor, layout);
-            let active_range = source_for_point(active, layout);
-            if let (Some(anchor_range), Some(active_range)) = (anchor_range, active_range) {
-                let start = anchor_range.start.min(active_range.start);
-                let end = anchor_range.end.max(active_range.end);
-                selection.source_ranges = normalize_ranges(
-                    layout
-                        .lines
-                        .iter()
-                        .flat_map(|line| &line.atoms)
-                        .filter_map(|atom| atom.source.clone())
-                        .filter(|source| source.start >= start && source.end <= end)
-                        .collect(),
-                );
-            }
-        }
+        SelectionShape::Character => {}
         SelectionShape::Line => {
             let anchor_offset = doc_position_to_byte_offset(anchor_source.0, anchor_source.1, text);
             let active_offset = doc_position_to_byte_offset(active_source.0, active_source.1, text);
@@ -679,7 +674,8 @@ fn line_selection_rows(
             let physical = expand_physical_line(&source, text);
             (physical.start < selected.end && selected.start < physical.end).then(|| {
                 let mut projected = selection_row(row, 0, usize::MAX, layout);
-                projected.columns = 0..line.atoms.last().map_or(0, |atom| atom.columns.end);
+                projected.columns =
+                    single_interval(0..line.atoms.last().map_or(0, |atom| atom.columns.end));
                 projected.source_ranges = vec![physical];
                 projected
             })
@@ -707,7 +703,7 @@ fn selection_row(
     let Some(line) = layout.lines.get(row) else {
         return RenderedSelectionRow {
             row,
-            columns: 0..0,
+            columns: Vec::new(),
             source_ranges: Vec::new(),
         };
     };
@@ -732,9 +728,71 @@ fn selection_row(
     );
     RenderedSelectionRow {
         row,
-        columns,
+        columns: single_interval(columns),
         source_ranges,
     }
+}
+
+fn character_source_ranges(
+    anchor: RenderedPoint,
+    active: RenderedPoint,
+    layout: &RenderedLayout,
+) -> Option<Vec<Range<usize>>> {
+    let anchor_range = source_for_point(anchor, layout)?;
+    let active_range = source_for_point(active, layout)?;
+    let start = anchor_range.start.min(active_range.start);
+    let end = anchor_range.end.max(active_range.end);
+    Some(normalize_ranges(
+        layout
+            .lines
+            .iter()
+            .flat_map(|line| &line.atoms)
+            .filter_map(|atom| atom.source.clone())
+            .filter(|source| source.start >= start && source.end <= end)
+            .collect(),
+    ))
+}
+
+fn single_interval(columns: Range<usize>) -> Vec<Range<usize>> {
+    std::iter::once(columns).collect()
+}
+
+pub(crate) fn character_selection_rows(
+    source_ranges: &[Range<usize>],
+    layout: &RenderedLayout,
+) -> Vec<RenderedSelectionRow> {
+    layout
+        .lines
+        .iter()
+        .enumerate()
+        .filter_map(|(row, line)| {
+            let columns = normalize_ranges(
+                source_ranges
+                    .iter()
+                    .flat_map(|range| project_atom_intervals(range, &line.atoms))
+                    .collect(),
+            );
+            if columns.is_empty() {
+                return None;
+            }
+            let row_source_ranges = normalize_ranges(
+                line.atoms
+                    .iter()
+                    .filter_map(|atom| atom.source.clone())
+                    .filter(|source| {
+                        source_ranges.iter().any(|selected| {
+                            source.start < selected.end && selected.start < source.end
+                        })
+                    })
+                    .collect(),
+            );
+            Some(RenderedSelectionRow {
+                row,
+                columns,
+                source_ranges: row_source_ranges,
+            })
+        })
+        .collect()
 }
 
 /// Project a source byte range into source-backed rendered display intervals.
@@ -1437,7 +1495,81 @@ fn find_next_by_kind<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::style::{RenderedLine, StyledLine};
+    use crate::style::{RenderedLine, RenderedSourceAtom, StyledLine};
+
+    #[test]
+    fn character_projection_follows_source_through_non_linear_rows() {
+        let layout = layout_with_lines(vec![
+            rendered_line_with_atoms(vec![
+                RenderedSourceAtom {
+                    columns: 0..1,
+                    source: Some(0..1),
+                },
+                RenderedSourceAtom {
+                    columns: 1..2,
+                    source: None,
+                },
+                RenderedSourceAtom {
+                    columns: 2..3,
+                    source: Some(10..11),
+                },
+            ]),
+            rendered_line_with_atoms(vec![
+                RenderedSourceAtom {
+                    columns: 0..1,
+                    source: Some(1..2),
+                },
+                RenderedSourceAtom {
+                    columns: 1..2,
+                    source: None,
+                },
+                RenderedSourceAtom {
+                    columns: 2..3,
+                    source: Some(11..12),
+                },
+            ]),
+        ]);
+
+        let selection = project_selection(
+            RenderedPoint { row: 0, column: 0 },
+            RenderedPoint { row: 1, column: 0 },
+            SelectionShape::Character,
+            &layout,
+            "abcdefghijkl",
+        );
+
+        assert_eq!(selection.source_ranges, vec![0..2]);
+        assert_eq!(selection.rows[0].columns, vec![0..1]);
+        assert_eq!(selection.rows[1].columns, vec![0..1]);
+    }
+
+    #[test]
+    fn character_projection_retains_independent_intervals_on_one_row() {
+        let layout = layout_with_lines(vec![rendered_line_with_atoms(vec![
+            RenderedSourceAtom {
+                columns: 0..1,
+                source: Some(0..1),
+            },
+            RenderedSourceAtom {
+                columns: 1..2,
+                source: None,
+            },
+            RenderedSourceAtom {
+                columns: 2..4,
+                source: Some(2..5),
+            },
+            RenderedSourceAtom {
+                columns: 4..5,
+                source: Some(8..9),
+            },
+        ])]);
+
+        let rows = character_selection_rows(&[0..1, 2..5], &layout);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].columns, vec![0..1, 2..4]);
+        assert_eq!(rows[0].source_ranges, vec![0..1, 2..5]);
+    }
 
     #[test]
     fn enter_rendered_skips_synthetic_lines() {
@@ -1631,6 +1763,19 @@ mod tests {
             kind,
             role: crate::style::RenderedLineRole::Document,
             atoms: Vec::new(),
+        }
+    }
+
+    fn rendered_line_with_atoms(atoms: Vec<RenderedSourceAtom>) -> RenderedLine {
+        RenderedLine {
+            styled: StyledLine {
+                text: String::new(),
+                spans: Vec::new(),
+            },
+            source: 0..0,
+            kind: LineKind::Content,
+            role: crate::style::RenderedLineRole::Document,
+            atoms,
         }
     }
 }

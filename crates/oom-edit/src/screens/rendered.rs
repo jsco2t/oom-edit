@@ -41,12 +41,56 @@ impl RenderedViewport {
     }
 }
 
+/// App-owned presentation settings for the rendered surface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RenderedSettings {
+    relative_line_numbers: bool,
+    cursor_visible: bool,
+}
+
+impl RenderedSettings {
+    pub(crate) const fn new(relative_line_numbers: bool) -> Self {
+        Self {
+            relative_line_numbers,
+            cursor_visible: true,
+        }
+    }
+
+    /// Control whether this screen owns the frame cursor.
+    pub(crate) const fn with_cursor_visible(mut self, cursor_visible: bool) -> Self {
+        self.cursor_visible = cursor_visible;
+        self
+    }
+}
+
 /// Render Normal, Select, or Command into the body area.
+#[cfg(test)]
 pub fn render_rendered(
     frame: &mut Frame<'_>,
     session: &mut EditorSession,
     viewport: RenderedViewport,
     relative_line_numbers: bool,
+    area: Rect,
+    theme: &Theme,
+    tier: Tier,
+) {
+    render_rendered_with_settings(
+        frame,
+        session,
+        viewport,
+        RenderedSettings::new(relative_line_numbers),
+        area,
+        theme,
+        tier,
+    );
+}
+
+/// Render with explicit rendered-surface presentation settings.
+pub(crate) fn render_rendered_with_settings(
+    frame: &mut Frame<'_>,
+    session: &mut EditorSession,
+    viewport: RenderedViewport,
+    settings: RenderedSettings,
     area: Rect,
     theme: &Theme,
     tier: Tier,
@@ -91,7 +135,7 @@ pub fn render_rendered(
             mode,
             source_cursor_line,
             &layout.line_numbers[rendered_top..rendered_bottom],
-            relative_line_numbers,
+            settings.relative_line_numbers,
             gutter_area,
         );
     }
@@ -142,13 +186,18 @@ pub fn render_rendered(
             .as_ref()
             .and_then(|selection| selection.rows.iter().find(|row| row.row == i))
             .map(|row| row.columns.clone())
-            .filter(|columns| columns.start < columns.end);
+            .filter(|columns| columns.iter().any(|columns| !columns.is_empty()));
         let mut line = if let Some(columns) = selected {
             let mut style = theme.style(tier, oom_edit_core::SemanticStyle::Selection);
             if base_surface.is_some() {
                 style.bg = None;
             }
-            build_interval_highlighted_line(spans, columns, style)
+            let mut selected_line = Line::from(spans);
+            for columns in columns {
+                selected_line =
+                    build_interval_highlighted_line(selected_line.spans, columns, style);
+            }
+            selected_line
         } else if i == cursor_line {
             let mut style = theme.ui_style(tier, UiSlot::CursorLine);
             if rendered_line.role == oom_edit_core::RenderedLineRole::Metadata {
@@ -184,7 +233,12 @@ pub fn render_rendered(
     let cursor_row_visible = cursor.row >= rendered_top && cursor.row < rendered_bottom;
     let cursor_column_visible = cursor.column >= viewport.left
         && cursor.column < viewport.left.saturating_add(usize::from(text_width));
-    if text_area.width > 0 && text_area.height > 0 && cursor_row_visible && cursor_column_visible {
+    if settings.cursor_visible
+        && text_area.width > 0
+        && text_area.height > 0
+        && cursor_row_visible
+        && cursor_column_visible
+    {
         let row = text_area.y + (cursor.row - rendered_top) as u16;
         let column = text_area.x + (cursor.column - viewport.left) as u16;
         frame.set_cursor_position(ratatui::layout::Position::new(column, row));
@@ -789,6 +843,49 @@ mod tests {
     }
 
     #[test]
+    fn table_body_boundary_dashes_use_muted_style_in_every_theme_tier() {
+        let text = "| Header | Value |\n| --- | --- |\n| first | row |\n| second | row |\n";
+        for name in crate::theme::built_in_themes() {
+            for tier in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
+                let theme = get_theme(name);
+                let mut session = EditorSession::from_text(text);
+                let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        render_rendered(
+                            frame,
+                            &mut session,
+                            RenderedViewport::new(0, 0),
+                            false,
+                            frame.area(),
+                            theme,
+                            tier,
+                        );
+                    })
+                    .unwrap();
+                let boundary_row = session
+                    .rendered_layout()
+                    .unwrap()
+                    .lines
+                    .iter()
+                    .position(|line| line.styled.text.starts_with("│-"))
+                    .unwrap();
+                let gutter = (status_bar::gutter_width(session.line_count()) as u16).max(4);
+                let dash = terminal
+                    .backend()
+                    .buffer()
+                    .cell((gutter + 1, boundary_row as u16))
+                    .unwrap();
+                assert_eq!(dash.symbol(), "-");
+                assert!(
+                    dash.modifier.contains(Modifier::DIM),
+                    "theme={name}, tier={tier:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn normal_cursor_and_select_rows_use_distinct_styles() {
         let mut normal = EditorSession::from_text("# Heading\n\nBody\n");
         let mut normal_terminal = Terminal::new(TestBackend::new(40, 4)).unwrap();
@@ -930,7 +1027,9 @@ mod tests {
         session.handle_key(key('l'));
         let interval = session.rendered_selection().unwrap().rows[0]
             .columns
-            .clone();
+            .first()
+            .cloned()
+            .unwrap();
         let mut terminal = Terminal::new(TestBackend::new(40, 3)).unwrap();
         terminal
             .draw(|frame| {
@@ -962,6 +1061,63 @@ mod tests {
     }
 
     #[test]
+    fn table_selection_paints_each_interval_without_painting_separators() {
+        let mut session =
+            EditorSession::from_text("| Left | Right |\n| --- | --- |\n| AB | CD |\n");
+        let body_row = session
+            .render_layout(80)
+            .lines
+            .iter()
+            .position(|line| line.styled.text.contains(" AB "))
+            .unwrap();
+        while session.rendered_cursor_line() < body_row {
+            session.handle_key(key('j'));
+        }
+        session.handle_key(key('v'));
+        session.handle_key(key('l'));
+        session.handle_key(key('l'));
+        let selected = session.rendered_selection().unwrap().rows[0].clone();
+        assert_eq!(selected.row, body_row);
+        assert_eq!(selected.columns.len(), 2);
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 6)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_rendered(
+                    frame,
+                    &mut session,
+                    RenderedViewport::new(0, 0),
+                    false,
+                    frame.area(),
+                    &DEFAULT_DARK,
+                    Tier::TrueColor,
+                );
+            })
+            .unwrap();
+        let gutter = (status_bar::gutter_width(session.line_count()) as u16).max(4);
+        for interval in &selected.columns {
+            for column in interval.clone() {
+                assert!(terminal
+                    .backend()
+                    .buffer()
+                    .cell((gutter + column as u16, body_row as u16))
+                    .unwrap()
+                    .modifier
+                    .contains(Modifier::REVERSED));
+            }
+        }
+        let separator = selected.columns[0].end;
+        assert!(separator < selected.columns[1].start);
+        assert!(!terminal
+            .backend()
+            .buffer()
+            .cell((gutter + separator as u16, body_row as u16))
+            .unwrap()
+            .modifier
+            .contains(Modifier::REVERSED));
+    }
+
+    #[test]
     fn block_selection_paints_a_consistent_rectangle() {
         let mut session = EditorSession::from_text("abcd\n\nwxyz\n");
         session.render_layout(36);
@@ -974,7 +1130,7 @@ mod tests {
         assert!(selection
             .rows
             .iter()
-            .all(|row| row.columns.end - row.columns.start == 2));
+            .all(|row| row.columns.len() == 1 && row.columns[0] == (0..2)));
 
         let mut terminal = Terminal::new(TestBackend::new(40, 5)).unwrap();
         terminal
@@ -1099,7 +1255,10 @@ mod tests {
         let cell = terminal
             .backend()
             .buffer()
-            .cell((gutter + selected.columns.start as u16, selected.row as u16))
+            .cell((
+                gutter + selected.columns[0].start as u16,
+                selected.row as u16,
+            ))
             .unwrap();
         assert_eq!(
             cell.bg,
@@ -1376,7 +1535,7 @@ mod tests {
             .backend()
             .buffer()
             .cell((
-                gutter + selected.columns.start as u16,
+                gutter + selected.columns[0].start as u16,
                 first_body_row as u16,
             ))
             .unwrap();

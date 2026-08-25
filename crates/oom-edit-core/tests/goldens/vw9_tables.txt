@@ -2,6 +2,7 @@
 │ Left      │ Center │ Right │
 ├───────────┼────────┼───────┤
 │ a         │   b    │     c │
+│-----------│--------│-------│
 │ long text │   x    │     z │
 └───────────┴────────┴───────┘
 
@@ -12,17 +13,18 @@
 └────────┴───────┘
 
 ┌───────┬──────────────────────────────────────────┐
-│ Short │ This cell has content that is significan │
-│       │ tly longer than the forty column cap     │
+│ Short │ This cell has content that is            │
+│       │ significantly longer than the forty      │
+│       │ column cap                               │
 ├───────┼──────────────────────────────────────────┤
 │ ok    │ fits                                     │
 └───────┴──────────────────────────────────────────┘
 
 ┌─────────────────────────┬─────────────────────────┬──────────────────────────┐
-│ First naturally wide co │ Second naturally wide c │ Third naturally wide col │
-│ lumn                    │ olumn                   │ umn                      │
+│ First naturally wide    │  Second naturally wide  │     Third naturally wide │
+│ column                  │ column                  │ column                   │
 ├─────────────────────────┼─────────────────────────┼──────────────────────────┤
-│ repeated content repeat │ 東京東京東京東京東京東  │ final content that wraps │
-│ ed content repeated con │ 京東京東京東京東京      │  without being lost      │
-│ tent                    │                         │                          │
+│ repeated content        │ 東京東京東京東京東京東  │ final content that wraps │
+│ repeated content        │ 京東京東京東京東京      │ without being lost       │
+│ repeated content        │                         │                          │
 └─────────────────────────┴─────────────────────────┴──────────────────────────┘

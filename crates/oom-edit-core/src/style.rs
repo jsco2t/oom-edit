@@ -265,8 +265,8 @@ pub enum SelectionShape {
 pub struct RenderedSelectionRow {
     /// 0-based rendered row.
     pub row: usize,
-    /// Selected display-cell interval for painting.
-    pub columns: std::ops::Range<usize>,
+    /// Independent selected display-cell intervals for painting.
+    pub columns: Vec<std::ops::Range<usize>>,
     /// Ordered raw-source ranges contributed by this row.
     pub source_ranges: Vec<std::ops::Range<usize>>,
 }

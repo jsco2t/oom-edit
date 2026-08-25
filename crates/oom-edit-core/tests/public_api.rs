@@ -63,6 +63,12 @@ fn public_facade_types_are_available_at_crate_root() {
     let _: RenderedPoint = session.rendered_cursor();
     let _: &RenderedLayout = session.render_layout(20);
     let _: Option<RenderedSelection> = session.rendered_selection();
+    let selection_row = RenderedSelectionRow {
+        row: 0,
+        columns: vec![0..1, 2..3],
+        source_ranges: vec![0..1, 2..3],
+    };
+    assert_eq!(selection_row.columns.len(), 2);
     let _: RenderedLineRole = RenderedLineRole::CodeFence;
     let _: SourceFrame = session.render_source(Viewport {
         top_line: 0,
