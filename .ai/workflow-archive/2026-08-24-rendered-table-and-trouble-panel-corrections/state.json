@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "work_id": "2026-08-24-rendered-table-and-trouble-panel-corrections",
+  "title": "Rendered Table and Trouble Panel Corrections",
+  "phase": "DONE",
+  "created_at": "2026-08-24T19:00:02Z",
+  "updated_at": "2026-08-25T16:15:30Z",
+  "approved_at": "2026-08-25T15:32:48Z",
+  "completed_at": "2026-08-25T15:56:56Z",
+  "archived_at": "2026-08-25T16:15:30Z",
+  "baseline_sha": "d70b27b471ba872165056f8c4b26435723fb1cd2",
+  "final_sha": "cdb35f8ac2b4b3d9a354fcd8ab85f43ed9153e9e",
+  "plan_revision": 2,
+  "approved_plan_sha256": "bdfd7c59b501374db83bd1462a1f3e7f27d86ad1d3cb5dceab66628b8a7b990a",
+  "current_task": null,
+  "tasks": [
+    {
+      "id": "001",
+      "path": "tasks/001-word-boundary-table-wrapping.md",
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/001.md"
+    },
+    {
+      "id": "002",
+      "path": "tasks/002-source-driven-wrapped-table-selection.md",
+      "status": "COMPLETE",
+      "attempts": 2,
+      "implementation": "main",
+      "evidence": "evidence/002.md"
+    },
+    {
+      "id": "003",
+      "path": "tasks/003-configurable-alternating-table-rows.md",
+      "status": "COMPLETE",
+      "attempts": 2,
+      "implementation": "main",
+      "evidence": "evidence/003.md"
+    },
+    {
+      "id": "004",
+      "path": "tasks/004-trouble-panel-layout-and-cursor.md",
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/004.md"
+    },
+    {
+      "id": "005",
+      "path": "tasks/005-replace-row-backgrounds-with-dashed-boundaries.md",
+      "status": "COMPLETE",
+      "attempts": 3,
+      "implementation": "main",
+      "evidence": "evidence/005.md"
+    }
+  ],
+  "task_retry_limit": 3,
+  "final_retry_limit": 2,
+  "final_attempts": 1,
+  "stop_continuations": 0,
+  "max_stop_continuations": 50,
+  "block_reason": null
+}
