@@ -10,6 +10,11 @@ PROVENANCE_FILE=$ASSET_DIR/PROVENANCE.txt
 MANIFEST_FILE=$ASSET_DIR/MANIFEST.sha256
 DEPENDENCIES_FILE=$ROOT_DIR/docs/dependencies.md
 ARGS_FILE=$ROOT_DIR/crates/oom-edit/src/args.rs
+THEME_SOURCE_FILE=$ROOT_DIR/crates/oom-edit/src/theme.rs
+THEME_DIR=$ROOT_DIR/crates/oom-edit/assets/themes
+THEME_PROVENANCE_FILE=$THEME_DIR/PROVENANCE.toml
+THEME_MAPPING_FILE=$THEME_DIR/MAPPING.md
+THEME_MANIFEST_FILE=$THEME_DIR/MANIFEST.sha256
 
 fail() {
     echo "data-license-check: $*" >&2
@@ -46,20 +51,60 @@ require_literal() {
         fail "$path is missing required text: $literal"
 }
 
+require_absent() {
+    local path=$1
+    local literal=$2
+    if LC_ALL=C grep -Fq -- "$literal" "$path"; then
+        fail "$path contains excluded text: $literal"
+    fi
+}
+
+require_count() {
+    local path=$1
+    local literal=$2
+    local expected=$3
+    local actual
+    actual=$(LC_ALL=C grep -Fxc -- "$literal" "$path" || true)
+    [[ "$actual" == "$expected" ]] ||
+        fail "$path must contain '$literal' exactly $expected time(s), found $actual"
+}
+
+require_file_embedded() {
+    local needle=$1
+    local haystack=$2
+    python3 -c 'import pathlib, sys; raise SystemExit(0 if pathlib.Path(sys.argv[1]).read_bytes() in pathlib.Path(sys.argv[2]).read_bytes() else 1)' "$needle" "$haystack" ||
+        fail "$haystack does not contain complete file bytes from $needle"
+}
+
 for path in \
     "$LICENSE_FILE" \
     "$NOTICE_FILE" \
     "$PROVENANCE_FILE" \
     "$MANIFEST_FILE" \
     "$DEPENDENCIES_FILE" \
-    "$ARGS_FILE"; do
+    "$ARGS_FILE" \
+    "$THEME_SOURCE_FILE" \
+    "$THEME_PROVENANCE_FILE" \
+    "$THEME_MAPPING_FILE" \
+    "$THEME_MANIFEST_FILE"; do
     require_file "$path"
 done
 
 require_digest "$LICENSE_FILE" e72bf965adc079738d41f13cd8f03d5dfbe2da50ddcd96d1e0640d29c8ae9742
-require_digest "$NOTICE_FILE" 8d2597df5f1e802482bcacc9f100baf6c1be7dc4a95578d91baedd3313239019
+require_digest "$NOTICE_FILE" febf3a92df9b085baa024d9ad175998b1cf0179ca6f06028cbd7890663d51cf5
 require_digest "$PROVENANCE_FILE" 849bd99d9a040c724e59dc2a799f3ca4fdc7b48117c845e60395a4ad8186a502
 require_digest "$MANIFEST_FILE" 697d5188f328d1232ed27a213db4ab5b8c3eba9c1a22d77667c85c75975e54f0
+require_digest "$THEME_PROVENANCE_FILE" b581bc88ec9e532bbb5cc392edea924a9ed66ce7914a708138b29165b0a8f74a
+require_digest "$THEME_MAPPING_FILE" 24975a6a240f793eeb5933b03de57a928a28ea26484b4705c57ca7bc77a9a546
+require_digest "$THEME_MANIFEST_FILE" 9848a87d4165cf292c0683f888247e9b809a53ac5f4b434d888113026fb6a78b
+
+while read -r expected relative_path; do
+    [[ -n "$expected" && -n "$relative_path" ]] ||
+        fail "$THEME_MANIFEST_FILE contains an invalid row"
+    asset=$THEME_DIR/$relative_path
+    require_file "$asset"
+    require_digest "$asset" "$expected"
+done <"$THEME_MANIFEST_FILE"
 
 WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/oom-edit-data-license.XXXXXX")
 trap 'rm -rf "$WORK_DIR"' EXIT
@@ -165,6 +210,86 @@ for literal in \
 done
 
 require_literal "$ARGS_FILE" '"--licenses"'
-require_literal "$ARGS_FILE" 'include_str!("../assets/dict/SCOWL-LICENSE.txt")'
+require_literal "$ARGS_FILE" 'include_str!("../../../THIRD-PARTY-NOTICES.md")'
 
-echo "data-license-check: all bundled dictionary data and attribution surfaces are valid"
+for literal in \
+    'retrieved = "2026-08-25"' \
+    'mapping-notes = "MAPPING.md"' \
+    'name = "catppuccin-mocha"' \
+    'name = "dracula"' \
+    'name = "nord"' \
+    'name = "solarized-dark"' \
+    'name = "tokyo-night"' \
+    'declared-absence = "The pinned repository and license contain no project-specific copyright notice"' \
+    'origin-declared-fact = "Copyright (c) 2018-present Enkia"'; do
+    require_literal "$THEME_PROVENANCE_FILE" "$literal"
+done
+require_count "$THEME_PROVENANCE_FILE" '[[themes]]' 5
+
+python3 - "$THEME_SOURCE_FILE" "$THEME_PROVENANCE_FILE" <<'PY' ||
+import pathlib
+import re
+import sys
+
+theme_source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+provenance = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+
+registry_match = re.search(
+    r"static BUILTIN_THEMES:.*?= &\[(.*?)\n\];",
+    theme_source,
+    flags=re.DOTALL,
+)
+if registry_match is None:
+    raise SystemExit("built-in theme registry not found")
+
+registry = registry_match.group(1)
+registry_pairs = re.findall(
+    r'identifier: "([^"]+)",\s*spdx: "([^"]+)"',
+    registry,
+)
+if len(registry_pairs) != len(set(registry_pairs)):
+    raise SystemExit("built-in theme attribution identities are duplicated")
+
+provenance_pairs = []
+for block in provenance.split("[[themes]]")[1:]:
+    name_match = re.search(r'^name = "([^"]+)"$', block, flags=re.MULTILINE)
+    spdx_match = re.search(r'^spdx = "([^"]+)"$', block, flags=re.MULTILINE)
+    if name_match is None or spdx_match is None:
+        raise SystemExit("theme provenance row is missing name or SPDX identity")
+    provenance_pairs.append((name_match.group(1), spdx_match.group(1)))
+
+if len(provenance_pairs) != len(set(provenance_pairs)):
+    raise SystemExit("theme provenance identities are duplicated")
+if set(registry_pairs) != set(provenance_pairs):
+    raise SystemExit(
+        f"theme registry attribution identities {registry_pairs!r} do not match "
+        f"provenance identities {provenance_pairs!r}"
+    )
+PY
+    fail "built-in theme registry attribution does not match pinned provenance"
+
+for heading in \
+    '## Catppuccin Mocha bundled theme' \
+    '## Dracula bundled theme' \
+    '## Nord bundled theme' \
+    '## Solarized Dark bundled theme' \
+    '## Tokyo Night bundled theme'; do
+    require_count "$NOTICE_FILE" "$heading" 1
+done
+
+for license in \
+    "$THEME_DIR/upstream/catppuccin-mocha.LICENSE" \
+    "$THEME_DIR/upstream/dracula.LICENSE" \
+    "$THEME_DIR/upstream/nord.LICENSE" \
+    "$THEME_DIR/upstream/solarized-dark.LICENSE" \
+    "$THEME_DIR/upstream/tokyo-night.LICENSE" \
+    "$THEME_DIR/upstream/tokyo-night-enkia-origin.LICENSE.txt"; do
+    require_file_embedded "$license" "$NOTICE_FILE"
+done
+
+for path in "$THEME_PROVENANCE_FILE" "$THEME_MAPPING_FILE" "$NOTICE_FILE"; do
+    require_absent "$path" 'Gruvbox'
+    require_absent "$path" 'Rosé Pine'
+done
+
+echo "data-license-check: all bundled data and attribution surfaces are valid"

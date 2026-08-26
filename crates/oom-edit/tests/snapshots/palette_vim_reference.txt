@@ -1,24 +1,24 @@
-   1  ┌─ metadata ─────────────────────────────────────────────────────────────┐
-   2  │ title: Kitchen Sink                                                    │
-   3  │ ┌ Command Palette ─────────────────────────────────────────────┐       │
-   4  └─│>                                                             │───────┘
+   1 ┌─ metadata ──────────────────────────────────────────────────────────────┐
+   2 │ title: Kitchen Sink                                                     │
+   3 │ a┌ Command Palette ─────────────────────────────────────────────┐       │
+   4 └──│>                                                             │───────┘
         │                                                              │
-   6  █ │  spell-suggest  spelling suggestions           Space s       │
+   6 █ H│  spell-suggest  spelling suggestions           Space s       │
         │  spell-add      add word to personal dictiona… Space a       │
-   8  So│  spell-toggle   toggle spelling                Space z       │
+   8 Som│  spell-toggle   toggle spelling                Space z       │
         │  trouble        document diagnostics           Space d       │
-  10  ┃ │· ]s             next spelling diagnostic       SP-2:next-pre…│
+  10 ┃ A│· ]s             next spelling diagnostic       SP-2:next-pre…│
         │· [s             previous spelling diagnostic   SP-2:next-pre…│
-      ▏ │· :set spell / … enable or disable spelling     SP-1:set-togg…│
-  13  ▏ │· Space 1-9      jump to tab                    space-tab     │
-  14  ▏ │· g t            next tab                       next-tab      │
-  15  ▏ │· g T            previous tab                   prev-tab      │
-      ▏ │· {count} g t    jump to numbered tab           jump-to-tab   │
+     ▏ r│· :set spell / … enable or disable spelling     SP-1:set-togg…│
+  13 ▏ f│· Space 1-9      jump to tab                    space-tab     │
+  14 ▏  │· g t            next tab                       next-tab      │
+  15 ▏ }│· g T            previous tab                   prev-tab      │
+     ▏  │· {count} g t    jump to numbered tab           jump-to-tab   │
         │· :tabnew {path} open path in new tab           tab-new       │
-  18  ──│· :tabclose      close tab                      tab-close     │────────
+  18 ───│· :tabclose      close tab                      tab-close     │────────
         │· :qa            quit all tabs                  quit-all      │
-  20  An│▸ j/k, ↑/↓       Move by rendered row.          R-N1          │
+  20 Ano│▸ j/k, ↑/↓       Move by rendered row.          R-N1          │
         └──────────────────────────────────────────────────────────────┘
-  22  More text here.
+  22 More text here.
 
  NORMAL  ↑↓ navigate · type to filter · Enter execute · Esc close

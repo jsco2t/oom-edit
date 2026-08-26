@@ -17,6 +17,9 @@ blocks, Vim-style navigation and selections, multiple tabs, and idle-time spell
 checking. Its four public modes are rendered **Normal**, source **Insert**,
 rendered character/line/block **Select**, and **Command**.
 
+Release performance targets and their make-owned reproduction commands are
+documented in [docs/performance.md](docs/performance.md).
+
 ## Using oom-edit
 
 Open a document, or start with an empty buffer:
@@ -28,7 +31,7 @@ oom-edit
 
 When a path does not exist, the file is created on the first save. Use
 `oom-edit --help` for the complete command-line interface, or select a built-in
-theme for one run:
+or user theme for one run:
 
 ```console
 oom-edit --theme accessible notes.md
@@ -110,13 +113,86 @@ additional_dictionaries = []
 # Example: ["project.words", "/opt/shared/company.words"]
 ```
 
-The built-in themes are `default-dark`, `default-light`, and the color-free
-`accessible` theme. Theme selection follows this order: `--theme`, the
-`OOM_EDIT_THEME` environment variable, the configured theme for the active
-light/dark mode, then the matching built-in default. `NO_COLOR` and
-`TERM=dumb` select monochrome terminal output. `Space t` cycles compatible
-themes and saves the selected light or dark theme slot to the configuration
-file.
+### Themes
+
+The built-in themes, in catalog order, are `default-dark`,
+`catppuccin-mocha`, `dracula`, `nord`, `solarized-dark`, `tokyo-night`,
+`default-light`, and the color-free `accessible` theme. The five additional
+dark palettes are distributed with their upstream notices; Gruvbox and Rosé
+Pine are not bundled.
+
+User themes are direct `.toml` children of the `themes/` directory beside
+`config.toml`, for example
+`$XDG_CONFIG_HOME/oom-edit/themes/my-dark.toml`. The filename without `.toml`
+is the theme name and must be lowercase kebab-case; built-in names are
+reserved. Files are loaded once at startup in lexical filename order, must be
+UTF-8, and may be at most 65,536 bytes. Nested files and non-TOML files are
+ignored.
+
+A complete user theme uses this strict schema. Every `[palette]` entry is
+required and must be an exact `#RRGGBB` value. `[ansi]` is optional; omitted
+ANSI roles use the application defaults for the declared appearance.
+`appearance` must be `dark` or `light`; change the example's value to create a
+light theme.
+
+```toml
+appearance = "dark"
+
+[palette]
+background = "#101010"
+background-alt = "#202020"
+gutter-background = "#303030"
+gutter-text = "#909090"
+gutter-text-active = "#ffffff"
+surface = "#252525"
+surface-active = "#454545"
+border = "#707070"
+text = "#eeeeee"
+text-muted = "#888888"
+text-emphasis = "#ffffff"
+primary = "#cc66ff"
+secondary = "#66ccff"
+info = "#3399ff"
+success = "#33cc66"
+warning = "#ffcc33"
+error = "#ff3366"
+attention = "#ff9933"
+
+[ansi]
+gutter-background = "black"
+gutter-text = "dark-gray"
+gutter-text-active = "white"
+primary = "magenta"
+info = "blue"
+success = "green"
+warning = "yellow"
+error = "red"
+attention = "light-yellow"
+```
+
+Valid ANSI names are `black`, `red`, `green`, `yellow`, `blue`, `magenta`,
+`cyan`, `gray`, `dark-gray`, `light-red`, `light-green`, `light-yellow`,
+`light-blue`, `light-magenta`, `light-cyan`, and `white`. Unknown fields,
+missing palette roles, other color forms, inheritance, includes, custom style
+scopes, and user-controlled modifiers or gutter glyphs are rejected. Each
+rejected file produces one path-specific warning before the terminal starts;
+valid sibling themes remain available. Themes are not reloaded while the
+editor is running.
+
+Theme selection follows this order: `--theme`, the `OOM_EDIT_THEME`
+environment variable, the configured theme for the active light/dark mode,
+then the matching `default-dark` or `default-light`. An unknown, rejected, or
+appearance-incompatible selected name uses that matching default; it does not
+implicitly select `accessible`. `NO_COLOR` and `TERM=dumb` select monochrome
+terminal output. `Space t` cycles compatible built-ins followed by compatible
+user themes in lexical order and saves only the active light or dark config
+slot.
+
+Themes style the document body and the complete line-number gutter. Published
+Trouble diagnostics add one fixed marker before the aligned line number on each
+affected source line: `E`, `W`, `I`, or `H` for error, warning, info, or hint.
+The highest severity wins when a line has more than one diagnostic; glyphs and
+modifiers preserve the signal without color.
 
 Wrapping can also be changed for the running session with `:set wrap` and
 `:set nowrap`. Spell checking can be toggled with `Space z`, `:set spell`, or
@@ -143,5 +219,5 @@ read [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-`oom-edit` is released under the [MIT License](LICENSE). Bundled dictionary
-notices are available with `oom-edit --licenses`.
+`oom-edit` is released under the [MIT License](LICENSE). Bundled dictionary and
+theme notices are available with `oom-edit --licenses`.

@@ -1,0 +1,12 @@
+{
+  "standard_commands": [
+    "make check"
+  ],
+  "final_commands": [
+    "make fmt-check",
+    "make check",
+    "make bench-check",
+    "make bench",
+    "make tui-perf-compare BASELINE=/Users/jason/Developer/sources/personal/notebook/projects/oom-edit/features/04-themes/evidence/performance/baseline.tsv CANDIDATE=/Users/jason/Developer/sources/personal/notebook/projects/oom-edit/features/04-themes/evidence/performance/candidate.tsv OUTPUT=/Users/jason/Developer/sources/personal/notebook/projects/oom-edit/features/04-themes/evidence/performance/comparison.tsv"
+  ]
+}

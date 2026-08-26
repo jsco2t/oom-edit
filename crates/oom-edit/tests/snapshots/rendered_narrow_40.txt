@@ -1,9 +1,9 @@
-   1  █ Simple Document
+   1 █ Simple Document
 
-   3  Just some plain text here.
+   3 Just some plain text here.
 
-   5  No lists, no code blocks, no
-      blockquotes.
+   5 No lists, no code blocks, no
+     blockquotes.
 
 
 

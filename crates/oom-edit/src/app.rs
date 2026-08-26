@@ -26,14 +26,20 @@ use crate::command::keymap::{
 };
 use crate::command::AppCommand;
 use crate::config::{ClipboardCopyFormat, ConfigStore};
+use crate::gutter::{GutterTroubleItem, GutterTroubleSnapshot, PendingGutterTroubleBuild};
 use crate::lifecycle::{
     CloseTabRequest, DirtyClosePolicy, LifecycleAction, SaveContinuation, SaveRequest,
 };
 use crate::overlay::{Overlay, SpellSuggestAction, TroubleAction, TroubleEntry, TroubleProgress};
-use crate::screens::editor::{render_editor, render_status_row, source_text_width, EditorViewport};
+use crate::screens::editor::{
+    render_editor_with_gutter, render_status_row, source_text_width, DocumentPresentation,
+    EditorViewport,
+};
 use crate::screens::rendered::{render_rendered_with_settings, RenderedSettings, RenderedViewport};
 use crate::spell_host::SpellHost;
-use crate::theme::{self, ResolvedTheme, Theme, Tier};
+#[cfg(test)]
+use crate::theme;
+use crate::theme::{ResolvedTheme, Theme, ThemeCatalog, Tier};
 use crate::widgets::status_bar;
 use crate::widgets::which_key;
 
@@ -41,6 +47,8 @@ use crate::widgets::which_key;
 const SCROLLOFF: usize = 3;
 /// Horizontal scrolloff in no-wrap mode.
 const HSCROLLOFF: usize = 5;
+/// Maximum diagnostic offsets projected into gutter rows by one idle unit.
+const GUTTER_PROJECTION_ITEMS_PER_UNIT: usize = 64;
 
 fn body_height(total_height: u16, has_multiple_tabs: bool) -> u16 {
     let tab_bar_height = u16::from(has_multiple_tabs);
@@ -116,6 +124,17 @@ pub(crate) struct TabEntry {
     rendered_top: usize,
     /// First visible display column on rendered surfaces.
     rendered_left_col: usize,
+    /// Immutable marker summary consumed by the presentation layer.
+    gutter_trouble: GutterTroubleSnapshot,
+    /// Cooperative projection of one clean diagnostic publication.
+    pending_gutter_trouble: Option<PendingGutterTroubleBuild>,
+    /// Cancellation token advanced whenever this tab's summary is invalidated.
+    gutter_generation: u64,
+    /// Whether completed or pending state represents the current clean diagnostics.
+    gutter_publication_current: bool,
+    /// Number of diagnostic offsets projected, used by boundary tests and benchmarks.
+    #[cfg(test)]
+    gutter_projection_count: usize,
 }
 
 /// Explicit host-side services injected when constructing the TUI state.
@@ -173,7 +192,71 @@ impl TabEntry {
             skip_rows: 0,
             rendered_top: 0,
             rendered_left_col: 0,
+            gutter_trouble: GutterTroubleSnapshot::default(),
+            pending_gutter_trouble: None,
+            gutter_generation: 0,
+            gutter_publication_current: false,
+            #[cfg(test)]
+            gutter_projection_count: 0,
         }
+    }
+
+    fn invalidate_gutter_trouble(&mut self) {
+        self.gutter_generation = self.gutter_generation.wrapping_add(1);
+        self.gutter_trouble = GutterTroubleSnapshot::default();
+        self.pending_gutter_trouble = None;
+        self.gutter_publication_current = false;
+    }
+
+    fn invalidate_gutter_trouble_if_present(&mut self) -> bool {
+        if self.gutter_trouble.is_empty()
+            && self.pending_gutter_trouble.is_none()
+            && !self.gutter_publication_current
+        {
+            return false;
+        }
+        self.invalidate_gutter_trouble();
+        true
+    }
+
+    fn begin_gutter_publication(&mut self) {
+        self.pending_gutter_trouble = Some(PendingGutterTroubleBuild::new(
+            self.gutter_generation,
+            self.session.diagnostics().len(),
+        ));
+        self.gutter_publication_current = true;
+    }
+
+    fn advance_gutter_projection(&mut self) -> bool {
+        let Some(pending) = self.pending_gutter_trouble.as_mut() else {
+            return false;
+        };
+        let session = &self.session;
+        let advanced = pending.advance(GUTTER_PROJECTION_ITEMS_PER_UNIT, |index| {
+            let diagnostic = session.diagnostics().get(index)?;
+            let position = session.position_for_offset(diagnostic.range.start)?;
+            Some(GutterTroubleItem {
+                source_line: position.line,
+                severity: diagnostic.severity,
+            })
+        });
+        #[cfg(test)]
+        {
+            self.gutter_projection_count += advanced;
+        }
+        if !pending.is_complete() {
+            return advanced > 0;
+        }
+
+        let pending = self
+            .pending_gutter_trouble
+            .take()
+            .expect("completed gutter projection remains owned by its tab");
+        if let Some(snapshot) = pending.publish(self.gutter_generation) {
+            self.gutter_trouble = snapshot;
+            return true;
+        }
+        false
     }
 
     /// Get a mutable reference to the session.
@@ -221,6 +304,8 @@ pub struct App {
     pub theme_name: String,
     #[cfg(not(test))]
     theme_name: String,
+    /// Sole runtime owner for theme lookup, compatibility, and cycling.
+    theme_catalog: ThemeCatalog,
     /// Whether the active display mode was resolved as light at startup.
     is_light: bool,
     /// Explicitly injected persistence for theme changes.
@@ -264,6 +349,7 @@ impl App {
     ) -> Self {
         Self::new_with_spell(
             session,
+            ThemeCatalog::builtins(),
             resolved_theme,
             AppStartupOptions::new(
                 wrap_enabled,
@@ -283,6 +369,7 @@ impl App {
     /// Create an App with explicit spell resources and configured session defaults.
     pub(crate) fn new_with_spell(
         session: EditorSession,
+        theme_catalog: ThemeCatalog,
         resolved_theme: ResolvedTheme,
         options: AppStartupOptions,
         services: AppServices,
@@ -314,6 +401,7 @@ impl App {
             now: initial_time,
             transient: None,
             theme_name,
+            theme_catalog,
             is_light,
             config_store: services.config_store,
             spell_host: services.spell_host,
@@ -421,14 +509,19 @@ impl App {
         now.saturating_duration_since(self.last_input) >= duration
     }
 
-    /// Advance one bounded host-build or active-session scan unit.
+    /// Advance one bounded host, scan, or gutter-projection unit.
     pub(crate) fn on_idle_unit(&mut self, max_bytes: usize) -> bool {
+        if max_bytes == 0 {
+            return false;
+        }
         let enabled = self
             .tabs
             .get(self.active_tab)
             .is_some_and(|entry| entry.session.spell_enabled());
         let worked = if !enabled {
-            false
+            self.tabs
+                .get_mut(self.active_tab)
+                .is_some_and(TabEntry::invalidate_gutter_trouble_if_present)
         } else if self.spell_host.engine().is_none() {
             let worked = self.spell_host.advance(true, max_bytes);
             if let Some(message) = self.spell_host.take_unavailable_warning() {
@@ -439,9 +532,18 @@ impl App {
             let Some(engine) = self.spell_host.engine() else {
                 return false;
             };
-            self.tabs
-                .get_mut(self.active_tab)
-                .is_some_and(|entry| entry.session.spell_tick(engine, max_bytes))
+            self.tabs.get_mut(self.active_tab).is_some_and(|entry| {
+                let scan_worked = entry.session.spell_tick(engine, max_bytes);
+                if entry.session.diagnostics_pending() {
+                    entry.invalidate_gutter_trouble_if_present();
+                    return scan_worked;
+                }
+                if scan_worked || !entry.gutter_publication_current {
+                    entry.begin_gutter_publication();
+                    return true;
+                }
+                entry.advance_gutter_projection()
+            })
         };
         self.refresh_trouble_snapshot();
         worked
@@ -459,6 +561,106 @@ impl App {
             self.scroll_follow_count,
             self.last_input,
         )
+    }
+
+    /// Stable App-owned dimensions used by the private performance harness to
+    /// prove that repeated paints do not grow presentation state.
+    #[cfg(test)]
+    pub(crate) fn performance_state_shape(&self) -> (usize, usize, usize, bool) {
+        (
+            self.tabs.len(),
+            self.viewport_height,
+            self.viewport_width,
+            self.pending_scroll_follow,
+        )
+    }
+
+    /// Heap capacity owned by the active tab's cached rendered layout.
+    #[cfg(test)]
+    pub(crate) fn performance_rendered_layout_heap_bytes(&self) -> usize {
+        let Some(layout) = self
+            .active()
+            .and_then(|entry| entry.session.rendered_layout())
+        else {
+            return 0;
+        };
+        let mut bytes =
+            layout.lines.capacity() * std::mem::size_of::<oom_edit_core::RenderedLine>();
+        for line in &layout.lines {
+            bytes += line.styled.text.capacity();
+            bytes += line.styled.spans.capacity() * std::mem::size_of::<oom_edit_core::Span>();
+            bytes +=
+                line.atoms.capacity() * std::mem::size_of::<oom_edit_core::RenderedSourceAtom>();
+        }
+        bytes += layout.line_numbers.capacity() * std::mem::size_of::<Option<usize>>();
+        bytes += layout.jump_targets.capacity() * std::mem::size_of::<oom_edit_core::JumpTarget>();
+        bytes += layout.link_index.capacity() * std::mem::size_of::<(usize, String)>();
+        bytes += layout
+            .link_index
+            .iter()
+            .map(|(_, destination)| destination.capacity())
+            .sum::<usize>();
+        bytes
+    }
+
+    /// Heap capacity owned by the active tab's immutable gutter summary.
+    #[cfg(test)]
+    pub(crate) fn performance_gutter_snapshot_heap_bytes(&self) -> usize {
+        self.active()
+            .map_or(0, |entry| entry.gutter_trouble.heap_capacity_bytes())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn performance_diagnostics_pending(&self) -> bool {
+        self.active()
+            .is_some_and(|entry| entry.session.diagnostics_pending())
+    }
+
+    /// Install a completed marker snapshot outside a timed presentation region.
+    #[cfg(test)]
+    pub(crate) fn performance_set_gutter_snapshot(&mut self, source_lines: &[usize]) {
+        let items = source_lines
+            .iter()
+            .map(|line| (*line, oom_edit_core::DiagnosticSeverity::Warning))
+            .collect::<Vec<_>>();
+        if let Some(entry) = self.tabs.get_mut(self.active_tab) {
+            entry.gutter_trouble = GutterTroubleSnapshot::testing(&items);
+            entry.pending_gutter_trouble = None;
+            entry.gutter_publication_current = true;
+        }
+    }
+
+    /// Restart projection from the current clean diagnostic publication.
+    #[cfg(test)]
+    pub(crate) fn performance_restart_gutter_projection(&mut self) {
+        if let Some(entry) = self.tabs.get_mut(self.active_tab) {
+            entry.begin_gutter_publication();
+        }
+    }
+
+    /// Cancel completed and pending marker presentation state in constant time.
+    #[cfg(test)]
+    pub(crate) fn performance_cancel_gutter_projection(&mut self) {
+        if let Some(entry) = self.tabs.get_mut(self.active_tab) {
+            entry.invalidate_gutter_trouble();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gutter_projection_count(&self) -> usize {
+        self.active()
+            .map_or(0, |entry| entry.gutter_projection_count)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gutter_projection_pending(&self) -> bool {
+        self.active()
+            .is_some_and(|entry| entry.pending_gutter_trouble.is_some())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gutter_snapshot_len(&self) -> usize {
+        self.active().map_or(0, |entry| entry.gutter_trouble.len())
     }
 
     /// Number of open tabs.
@@ -479,7 +681,6 @@ impl App {
     /// Render the current frame.
     pub fn render(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
-        let active_theme = theme::get_theme(&self.theme_name);
 
         // Compute viewport height from terminal size.
         // When >1 tab: tab bar (1) + body + status (1).
@@ -504,6 +705,10 @@ impl App {
             self.pending_scroll_follow = false;
             self.scroll_follow();
         }
+        let active_theme = self
+            .theme_catalog
+            .get(&self.theme_name)
+            .expect("active theme remains present in the owned catalog");
 
         let mut draw_y = area.y;
 
@@ -553,11 +758,10 @@ impl App {
                     RenderedSettings::new(self.relative_line_numbers)
                         .with_cursor_visible(document_cursor_visible),
                     body_area,
-                    active_theme,
-                    self.tier,
+                    DocumentPresentation::new(active_theme, self.tier, &entry.gutter_trouble),
                 );
             } else {
-                render_editor(
+                render_editor_with_gutter(
                     frame,
                     &mut entry.session,
                     EditorViewport::new(
@@ -569,8 +773,7 @@ impl App {
                     .with_cursor_visible(document_cursor_visible),
                     self.relative_line_numbers,
                     body_area,
-                    active_theme,
-                    self.tier,
+                    DocumentPresentation::new(active_theme, self.tier, &entry.gutter_trouble),
                 );
             }
         }
@@ -762,7 +965,13 @@ impl App {
             let effects = self
                 .tabs
                 .get_mut(self.active_tab)
-                .map(|entry| entry.session.insert_paste(text))
+                .map(|entry| {
+                    let effects = entry.session.insert_paste(text);
+                    if entry.session.diagnostics_pending() {
+                        entry.invalidate_gutter_trouble_if_present();
+                    }
+                    effects
+                })
                 .unwrap_or_default();
             for effect in effects {
                 self.handle_effect(effect);
@@ -889,7 +1098,11 @@ impl App {
 
         // 3. Everything else → session.handle_key(key).
         let effects = if let Some(ref mut entry) = self.tabs.get_mut(self.active_tab) {
-            entry.session.handle_key(key_input)
+            let effects = entry.session.handle_key(key_input);
+            if entry.session.diagnostics_pending() {
+                entry.invalidate_gutter_trouble_if_present();
+            }
+            effects
         } else {
             Vec::new()
         };
@@ -1044,14 +1257,17 @@ impl App {
                 }));
             }
             AppCommand::CycleTheme => {
-                let next = theme::cycle_theme(&self.theme_name, self.is_light);
-                self.theme_name = next.to_string();
+                let next = self
+                    .theme_catalog
+                    .cycle_theme(&self.theme_name, self.is_light)
+                    .to_string();
+                self.theme_name.clone_from(&next);
                 // Persist to config.
                 let mut config = self.config_store.load();
                 if self.is_light {
-                    config.theme.light = next.to_string();
+                    config.theme.light.clone_from(&next);
                 } else {
-                    config.theme.dark = next.to_string();
+                    config.theme.dark.clone_from(&next);
                 }
                 if let Err(e) = self.config_store.save(&config) {
                     eprintln!("oom-edit: failed to save config: {e}");
@@ -1073,6 +1289,7 @@ impl App {
                 };
                 let enabled = !entry.session.spell_enabled();
                 entry.session.set_spell_enabled(enabled);
+                entry.invalidate_gutter_trouble();
                 self.set_transient(
                     if enabled {
                         "spell checking enabled".to_string()
@@ -1259,9 +1476,13 @@ impl App {
             .tabs
             .get_mut(self.active_tab)
             .map(|entry| {
-                entry
+                let effects = entry
                     .session
-                    .apply_spell_replacement(diagnostic, replacement)
+                    .apply_spell_replacement(diagnostic, replacement);
+                if entry.session.diagnostics_pending() {
+                    entry.invalidate_gutter_trouble_if_present();
+                }
+                effects
             })
             .unwrap_or_default();
         let success = effects
@@ -1293,8 +1514,12 @@ impl App {
             return false;
         }
 
-        match self.spell_host.add_personal_word(&diagnostic.source_text) {
+        let outcome = self.spell_host.add_personal_word(&diagnostic.source_text);
+        match outcome {
             Ok(oom_spell::AddWordOutcome::Inserted { normalized }) => {
+                for entry in &mut self.tabs {
+                    entry.invalidate_gutter_trouble();
+                }
                 self.set_transient(
                     format!("added '{normalized}' to personal dictionary"),
                     oom_edit_core::Severity::Info,
@@ -1450,13 +1675,7 @@ impl App {
         match EditorSession::open(path) {
             Ok(session) => {
                 let session = Self::seed_spell_config(session, self.spell_enabled_default);
-                let entry = &mut self.tabs[target];
-                entry.session = session;
-                entry.top_line = 0;
-                entry.left_col = 0;
-                entry.skip_rows = 0;
-                entry.rendered_top = 0;
-                entry.rendered_left_col = 0;
+                self.tabs[target] = TabEntry::new(session);
                 self.pending_scroll_follow = true;
                 self.set_transient(
                     if reloading {
@@ -2040,6 +2259,7 @@ mod tests {
         session.render_layout(74);
         App::new_with_spell(
             session,
+            ThemeCatalog::builtins(),
             theme::ResolvedTheme::injected("default-dark", false, Tier::TrueColor),
             AppStartupOptions::new(true, false, copy_format, true),
             AppServices::new(
@@ -2066,6 +2286,7 @@ mod tests {
     ) -> App {
         App::new_with_spell(
             session,
+            ThemeCatalog::builtins(),
             theme::ResolvedTheme::injected("default-dark", false, Tier::TrueColor),
             AppStartupOptions::new(true, false, ClipboardCopyFormat::Markdown, enabled),
             AppServices::new(
@@ -2079,24 +2300,315 @@ mod tests {
 
     fn drain_app_spelling(app: &mut App) {
         for _ in 0..10_000 {
-            app.on_idle_unit(crate::event::SPELL_WORK_UNIT_BYTES);
+            let worked = app.on_idle_unit(crate::event::SPELL_WORK_UNIT_BYTES);
             if app.spell_host_phase() == "Ready"
                 && app
                     .session()
                     .is_some_and(|session| !session.diagnostics_pending())
+                && !app.gutter_projection_pending()
+                && !worked
             {
-                // The first Ready observation can precede the generation-mismatch
-                // tick that starts the initial scan.
-                app.on_idle_unit(crate::event::SPELL_WORK_UNIT_BYTES);
-                if app
-                    .session()
-                    .is_some_and(|session| !session.diagnostics_pending())
-                {
-                    return;
-                }
+                return;
             }
         }
-        panic!("test App spell work did not drain");
+        panic!("test App background work did not drain");
+    }
+
+    fn advance_until_gutter_projection(app: &mut App) {
+        for _ in 0..10_000 {
+            assert!(app.on_idle_unit(crate::event::SPELL_WORK_UNIT_BYTES));
+            if app.gutter_projection_pending() {
+                return;
+            }
+        }
+        panic!("test App did not reach gutter projection");
+    }
+
+    fn repeated_misspellings(count: usize) -> String {
+        "misspelledd\n".repeat(count)
+    }
+
+    #[test]
+    fn gutter_projection_is_bounded_atomic_and_quiescent() {
+        let count = GUTTER_PROJECTION_ITEMS_PER_UNIT * 2 + 2;
+        let mut app = test_app_with_spell_host(
+            EditorSession::from_text(&repeated_misspellings(count)),
+            crate::spell_host::SpellHost::testing("known\n"),
+            true,
+        );
+
+        advance_until_gutter_projection(&mut app);
+        assert_eq!(app.gutter_projection_count(), 0);
+        assert_eq!(app.gutter_snapshot_len(), 0);
+
+        assert!(app.on_idle_unit(crate::event::SPELL_WORK_UNIT_BYTES));
+        assert_eq!(
+            app.gutter_projection_count(),
+            GUTTER_PROJECTION_ITEMS_PER_UNIT
+        );
+        assert!(app.gutter_projection_pending());
+        assert_eq!(app.gutter_snapshot_len(), 0);
+
+        assert!(app.on_idle_unit(crate::event::SPELL_WORK_UNIT_BYTES));
+        assert_eq!(
+            app.gutter_projection_count(),
+            GUTTER_PROJECTION_ITEMS_PER_UNIT * 2
+        );
+        assert!(app.gutter_projection_pending());
+        assert_eq!(app.gutter_snapshot_len(), 0);
+
+        assert!(app.on_idle_unit(crate::event::SPELL_WORK_UNIT_BYTES));
+        assert_eq!(app.gutter_projection_count(), count);
+        assert!(!app.gutter_projection_pending());
+        assert_eq!(app.gutter_snapshot_len(), count);
+        assert!(!app.on_idle_unit(crate::event::SPELL_WORK_UNIT_BYTES));
+    }
+
+    #[test]
+    fn synchronous_mutations_clear_gutter_without_projecting() {
+        let document = repeated_misspellings(3);
+        let mut app = test_app_with_spell_host(
+            EditorSession::from_text(&document),
+            crate::spell_host::SpellHost::testing("known\n"),
+            true,
+        );
+        drain_app_spelling(&mut app);
+        assert_eq!(app.gutter_snapshot_len(), 3);
+        let projected = app.gutter_projection_count();
+
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('i'),
+            KeyModifiers::NONE,
+        )));
+        app.handle_event(&Event::Paste("x".to_string()));
+        assert_eq!(app.gutter_snapshot_len(), 0);
+        assert!(!app.gutter_projection_pending());
+        assert_eq!(app.gutter_projection_count(), projected);
+
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        drain_app_spelling(&mut app);
+        assert!(!app.tabs[0].gutter_trouble.is_empty());
+        let projected = app.gutter_projection_count();
+        press_space_command(&mut app, 'z');
+        assert_eq!(app.gutter_snapshot_len(), 0);
+        assert!(!app.gutter_projection_pending());
+        assert_eq!(app.gutter_projection_count(), projected);
+        assert!(!app.on_idle_unit(crate::event::SPELL_WORK_UNIT_BYTES));
+        assert_eq!(app.spell_host_phase(), "Ready");
+    }
+
+    #[test]
+    fn canceled_gutter_generation_never_publishes_after_edit() {
+        let count = GUTTER_PROJECTION_ITEMS_PER_UNIT + 5;
+        let mut app = test_app_with_spell_host(
+            EditorSession::from_text(&repeated_misspellings(count)),
+            crate::spell_host::SpellHost::testing("known\n"),
+            true,
+        );
+        advance_until_gutter_projection(&mut app);
+        assert!(app.on_idle_unit(crate::event::SPELL_WORK_UNIT_BYTES));
+        let generation = app.tabs[0].gutter_generation;
+        let projected = app.gutter_projection_count();
+
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('i'),
+            KeyModifiers::NONE,
+        )));
+        app.handle_event(&Event::Paste("known ".to_string()));
+        assert!(app.tabs[0].gutter_generation > generation);
+        assert_eq!(app.gutter_snapshot_len(), 0);
+        assert!(!app.gutter_projection_pending());
+        assert_eq!(app.gutter_projection_count(), projected);
+        assert_eq!(app.tabs[0].gutter_trouble.severity(0), None);
+    }
+
+    #[test]
+    fn gutter_work_and_state_are_isolated_per_tab() {
+        let count = GUTTER_PROJECTION_ITEMS_PER_UNIT + 1;
+        let mut app = test_app_with_spell_host(
+            EditorSession::from_text(&repeated_misspellings(count)),
+            crate::spell_host::SpellHost::testing("known\n"),
+            true,
+        );
+        app.tabs.push(TabEntry::new(App::seed_spell_config(
+            EditorSession::from_text(&repeated_misspellings(count)),
+            true,
+        )));
+
+        drain_app_spelling(&mut app);
+        assert_eq!(app.tabs[0].gutter_trouble.len(), count);
+        assert_eq!(app.tabs[1].gutter_projection_count, 0);
+        assert!(app.tabs[1].gutter_trouble.is_empty());
+        let first_projected = app.tabs[0].gutter_projection_count;
+
+        app.next_tab();
+        advance_until_gutter_projection(&mut app);
+        assert!(app.on_idle_unit(crate::event::SPELL_WORK_UNIT_BYTES));
+        assert_eq!(
+            app.tabs[1].gutter_projection_count,
+            GUTTER_PROJECTION_ITEMS_PER_UNIT
+        );
+        assert_eq!(app.tabs[0].gutter_projection_count, first_projected);
+        assert_eq!(app.tabs[0].gutter_trouble.len(), count);
+        assert!(app.tabs[1].gutter_trouble.is_empty());
+
+        app.prev_tab();
+        assert_eq!(app.gutter_snapshot_len(), count);
+        assert!(!app.gutter_projection_pending());
+    }
+
+    #[test]
+    fn repeated_render_does_not_advance_or_grow_gutter_state() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = test_app_with_spell_host(
+            EditorSession::from_text(&repeated_misspellings(10)),
+            crate::spell_host::SpellHost::testing("known\n"),
+            true,
+        );
+        drain_app_spelling(&mut app);
+        let projected = app.gutter_projection_count();
+        let heap = app.performance_gutter_snapshot_heap_bytes();
+        let snapshot = app.tabs[0].gutter_trouble.clone();
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+
+        for _ in 0..20 {
+            terminal.draw(|frame| app.render(frame)).unwrap();
+        }
+
+        assert_eq!(app.gutter_projection_count(), projected);
+        assert_eq!(app.performance_gutter_snapshot_heap_bytes(), heap);
+        assert_eq!(app.tabs[0].gutter_trouble, snapshot);
+    }
+
+    #[test]
+    fn new_open_and_replace_start_with_empty_unprojected_gutters() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.md");
+        let second = directory.path().join("second.md");
+        std::fs::write(&first, "misspelledd\n").unwrap();
+        std::fs::write(&second, "anotherbadword\n").unwrap();
+
+        let mut app = test_app_with_spell_host(
+            EditorSession::open(&first).unwrap(),
+            crate::spell_host::SpellHost::testing("known\n"),
+            true,
+        );
+        assert!(app.tabs[0].gutter_trouble.is_empty());
+        assert!(app.tabs[0].pending_gutter_trouble.is_none());
+        assert_eq!(app.tabs[0].gutter_projection_count, 0);
+
+        app.open_tab(&second);
+        assert_eq!(app.active_tab, 1);
+        assert!(app.tabs[1].gutter_trouble.is_empty());
+        assert!(app.tabs[1].pending_gutter_trouble.is_none());
+        assert_eq!(app.tabs[1].gutter_projection_count, 0);
+
+        drain_app_spelling(&mut app);
+        assert_eq!(app.tabs[1].gutter_trouble.len(), 1);
+        app.replace_tab_from_disk(1, &first, false);
+        assert!(app.tabs[1].gutter_trouble.is_empty());
+        assert!(app.tabs[1].pending_gutter_trouble.is_none());
+        assert_eq!(app.tabs[1].gutter_projection_count, 0);
+    }
+
+    #[test]
+    fn provider_reset_clears_every_tab_without_sync_projection() {
+        let mut app = test_app_with_spell_host(
+            EditorSession::from_text("misspelledd\n"),
+            crate::spell_host::SpellHost::testing("known\n"),
+            true,
+        );
+        app.tabs.push(TabEntry::new(App::seed_spell_config(
+            EditorSession::from_text("misspelledd\n"),
+            true,
+        )));
+        drain_app_spelling(&mut app);
+        app.next_tab();
+        drain_app_spelling(&mut app);
+        app.prev_tab();
+        assert_eq!(app.tabs[0].gutter_trouble.len(), 1);
+        assert_eq!(app.tabs[1].gutter_trouble.len(), 1);
+        let projected = [
+            app.tabs[0].gutter_projection_count,
+            app.tabs[1].gutter_projection_count,
+        ];
+
+        press_space_command(&mut app, 'a');
+
+        for (index, entry) in app.tabs.iter().enumerate() {
+            assert!(entry.gutter_trouble.is_empty());
+            assert!(entry.pending_gutter_trouble.is_none());
+            assert_eq!(entry.gutter_projection_count, projected[index]);
+        }
+    }
+
+    #[test]
+    fn unavailable_provider_never_starts_gutter_projection() {
+        let mut app = test_app_with_spell_host(
+            EditorSession::from_text("misspelledd\n"),
+            crate::spell_host::SpellHost::testing_unavailable("configured list failed"),
+            true,
+        );
+        for _ in 0..100 {
+            if !app.on_idle_unit(crate::event::SPELL_WORK_UNIT_BYTES) {
+                break;
+            }
+        }
+        assert_eq!(app.spell_host_phase(), "Unavailable");
+        assert_eq!(app.gutter_snapshot_len(), 0);
+        assert!(!app.gutter_projection_pending());
+        assert_eq!(app.gutter_projection_count(), 0);
+        assert!(!app.on_idle_unit(crate::event::SPELL_WORK_UNIT_BYTES));
+    }
+
+    #[test]
+    fn published_marker_renders_in_both_modes_and_edit_hides_it_immediately() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = test_app_with_spell_host(
+            EditorSession::from_text("misspelledd\n"),
+            crate::spell_host::SpellHost::testing("known\n"),
+            true,
+        );
+        drain_app_spelling(&mut app);
+        assert_eq!(app.gutter_snapshot_len(), 1);
+        let projected = app.gutter_projection_count();
+        let mut terminal = Terminal::new(TestBackend::new(40, 6)).unwrap();
+
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        assert_eq!(
+            terminal.backend().buffer().cell((0, 0)).unwrap().symbol(),
+            "W"
+        );
+        assert_eq!(app.gutter_projection_count(), projected);
+
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('i'),
+            KeyModifiers::NONE,
+        )));
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        assert_eq!(
+            terminal.backend().buffer().cell((0, 0)).unwrap().symbol(),
+            "W"
+        );
+        assert_eq!(app.gutter_projection_count(), projected);
+
+        app.handle_event(&Event::Paste("x".to_string()));
+        assert_eq!(app.gutter_snapshot_len(), 0);
+        assert!(!app.gutter_projection_pending());
+        assert_eq!(app.gutter_projection_count(), projected);
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        assert_eq!(
+            terminal.backend().buffer().cell((0, 0)).unwrap().symbol(),
+            " "
+        );
+        assert_eq!(app.gutter_projection_count(), projected);
     }
 
     fn press_space_command(app: &mut App, continuation: char) {
@@ -2845,6 +3357,7 @@ mod tests {
         let initial = Instant::now();
         let mut app = App::new_with_spell(
             EditorSession::from_text("text\n"),
+            ThemeCatalog::builtins(),
             theme::ResolvedTheme::injected("default-dark", false, Tier::TrueColor),
             AppStartupOptions::new(true, false, ClipboardCopyFormat::Markdown, true),
             AppServices::new(
@@ -4643,9 +5156,8 @@ mod tests {
         assert_eq!(app.session().unwrap().mode(), oom_edit_core::Mode::Normal);
     }
 
-    /// T12: CycleTheme is a functional no-op (not a placeholder message).
     #[test]
-    fn app_cycle_theme_is_functional_noop() {
+    fn app_space_t_cycles_catalog_theme_and_reports_selection() {
         let session = EditorSession::from_text("hello");
         let mut app = test_app(session);
         let temp_dir = tempfile::tempdir().unwrap();
@@ -4653,24 +5165,18 @@ mod tests {
             temp_dir.path().join("oom-edit/config.toml"),
         ));
 
-        // Space-t should trigger CycleTheme.
         let space = KeyEvent::new(CrosstermKeyCode::Char(' '), KeyModifiers::NONE);
         app.handle_event(&Event::Key(space));
         let t = KeyEvent::new(CrosstermKeyCode::Char('t'), KeyModifiers::NONE);
         app.handle_event(&Event::Key(t));
 
-        // Should NOT show the "themes land in T15" placeholder.
-        let transient_text = app
-            .transient
-            .as_ref()
-            .map(|t| t.text.as_str())
-            .unwrap_or("");
-        assert!(
-            !transient_text.contains("T15"),
-            "CycleTheme should be functional, not a T15 placeholder"
+        assert_eq!(app.theme_name, "catppuccin-mocha");
+        assert_eq!(
+            app.transient
+                .as_ref()
+                .map(|transient| transient.text.as_str()),
+            Some("theme: catppuccin-mocha")
         );
-        // Should show a transient message about cycling.
-        assert!(app.transient.is_some());
     }
 
     #[test]
@@ -4702,10 +5208,10 @@ mod tests {
 
         for case in [
             Case {
-                name: "dark mode cycles to accessible",
+                name: "dark mode cycles to the next catalog theme",
                 current_theme: "default-dark",
                 is_light: false,
-                expected_theme: "accessible",
+                expected_theme: "catppuccin-mocha",
             },
             Case {
                 name: "dark mode recovers an incompatible current theme",
@@ -4757,6 +5263,123 @@ mod tests {
             }
             assert_eq!(app.theme_name, case.expected_theme, "{}", case.name);
             assert_eq!(persisted, expected_config, "{}", case.name);
+        }
+    }
+
+    #[test]
+    fn file_loaded_dark_and_light_themes_resolve_render_cycle_and_persist() {
+        for (appearance, name, inactive_name, expected_source, expected_next) in [
+            (
+                "dark",
+                "custom-dark",
+                "saved-light",
+                theme::ThemeSource::ConfigDark,
+                "default-dark",
+            ),
+            (
+                "light",
+                "custom-light",
+                "saved-dark",
+                theme::ThemeSource::ConfigLight,
+                "default-light",
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let config_path = directory.path().join("config.toml");
+            let themes = directory.path().join("themes");
+            std::fs::create_dir(&themes).unwrap();
+            std::fs::write(
+                themes.join(format!("{name}.toml")),
+                theme::test_user_theme_source(appearance),
+            )
+            .unwrap();
+
+            let mut config = crate::config::Config::default();
+            config.theme.mode = Some(appearance.to_string());
+            if appearance == "light" {
+                config.theme.dark = inactive_name.to_string();
+                config.theme.light = name.to_string();
+            } else {
+                config.theme.dark = name.to_string();
+                config.theme.light = inactive_name.to_string();
+            }
+            config.save_to_path(&config_path).unwrap();
+
+            let report = ThemeCatalog::load_from_config_path(&config_path);
+            assert!(report.warnings.is_empty());
+            let resolved = report.catalog.resolve_theme(
+                None,
+                config.theme.mode.as_deref(),
+                Some(&config.theme.dark),
+                Some(&config.theme.light),
+                &theme::EnvParts {
+                    colorterm: Some("truecolor".to_string()),
+                    ..theme::EnvParts::default()
+                },
+            );
+            assert_eq!(resolved.name, name);
+            assert_eq!(resolved.source, expected_source);
+
+            let custom_theme = report.catalog.get(name).unwrap();
+            let expected_text = custom_theme
+                .style(Tier::TrueColor, oom_edit_core::SemanticStyle::Text)
+                .fg
+                .unwrap();
+            let expected_status_background = custom_theme
+                .ui_style(Tier::TrueColor, crate::theme::UiSlot::StatusBar)
+                .bg
+                .unwrap();
+            let body = custom_theme
+                .ui_style(Tier::TrueColor, crate::theme::UiSlot::DocumentBody)
+                .bg
+                .unwrap();
+            let gutter = custom_theme
+                .ui_style(Tier::TrueColor, crate::theme::UiSlot::GutterBackground)
+                .bg
+                .unwrap();
+            assert_ne!(body, gutter);
+
+            let mut app = App::new_with_spell(
+                EditorSession::from_text("custom theme\n"),
+                report.catalog,
+                resolved,
+                AppStartupOptions::new(true, false, ClipboardCopyFormat::Markdown, true),
+                AppServices::new(
+                    Box::new(RecordingClipboardSink::default()),
+                    Box::new(crate::config::FileConfigStore::new(config_path.clone())),
+                    SpellHost::testing("custom\ntheme\n"),
+                ),
+                Instant::now(),
+            );
+
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 8)).unwrap();
+            let text_x = status_bar::gutter_width(1) as u16;
+            for source_mode in [false, true] {
+                if source_mode {
+                    app.handle_event(&Event::Key(KeyEvent::new(
+                        CrosstermKeyCode::Char('i'),
+                        KeyModifiers::NONE,
+                    )));
+                }
+                terminal.draw(|frame| app.render(frame)).unwrap();
+                let buffer = terminal.backend().buffer();
+                assert_eq!(buffer.cell((text_x, 0)).unwrap().fg, expected_text);
+                assert_eq!(buffer.cell((text_x, 3)).unwrap().bg, body);
+                assert_eq!(buffer.cell((0, 0)).unwrap().bg, gutter);
+                assert_eq!(buffer.cell((30, 7)).unwrap().bg, expected_status_background);
+            }
+
+            app.execute_command(AppCommand::CycleTheme);
+            assert_eq!(app.theme_name, expected_next);
+            let persisted = crate::config::Config::load_from_path(&config_path);
+            if appearance == "light" {
+                assert_eq!(persisted.theme.light, expected_next);
+                assert_eq!(persisted.theme.dark, inactive_name);
+            } else {
+                assert_eq!(persisted.theme.dark, expected_next);
+                assert_eq!(persisted.theme.light, inactive_name);
+            }
         }
     }
 

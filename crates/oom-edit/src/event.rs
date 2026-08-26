@@ -494,6 +494,7 @@ mod tests {
     ) -> App {
         App::new_with_spell(
             EditorSession::from_text(document),
+            crate::theme::ThemeCatalog::builtins(),
             crate::theme::ResolvedTheme::injected("default-dark", false, Tier::TrueColor),
             crate::app::AppStartupOptions::new(
                 true,
@@ -585,7 +586,7 @@ mod tests {
         assert!(outcome.redraw);
         assert_eq!(sample_count, 3);
         assert_eq!(scroll_follows, 1);
-        assert_eq!(viewport_width, 94);
+        assert_eq!(viewport_width, 95);
         assert_eq!(last_input, initial + Duration::from_millis(3));
         scheduler.request(outcome.redraw);
         scheduler
@@ -788,6 +789,47 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.to_string(), "scripted pending-input failure");
         assert_eq!(failed.spell_host_phase(), "Loading");
+    }
+
+    #[test]
+    fn pending_input_interrupts_between_bounded_gutter_units() {
+        let initial = Instant::now();
+        let wake = initial + SPELL_IDLE_DELAY;
+        let mut app = test_app_with_spell_at(
+            &"misspelledd\n".repeat(130),
+            "known\n".to_string(),
+            true,
+            initial,
+        );
+        for _ in 0..10_000 {
+            assert!(app.on_idle_unit(SPELL_WORK_UNIT_BYTES));
+            if app.gutter_projection_pending() {
+                break;
+            }
+        }
+        assert!(app.gutter_projection_pending());
+        assert_eq!(app.gutter_projection_count(), 0);
+        let mut probes = 0;
+
+        let outcome = handle_poll_outcome(
+            &mut app,
+            false,
+            None,
+            wake,
+            || panic!("timeout branch must not read an event"),
+            || {
+                probes += 1;
+                Ok(true)
+            },
+            || wake,
+        )
+        .unwrap();
+
+        assert!(outcome.redraw);
+        assert_eq!(probes, 1);
+        assert_eq!(app.gutter_projection_count(), 64);
+        assert!(app.gutter_projection_pending());
+        assert_eq!(app.gutter_snapshot_len(), 0);
     }
 
     #[test]

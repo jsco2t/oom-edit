@@ -5,6 +5,8 @@
 
 #[path = "../perf/fixtures.rs"]
 mod fixtures;
+#[path = "../perf/layout_metrics.rs"]
+mod layout_metrics;
 
 use std::time::{Duration, Instant};
 
@@ -12,6 +14,7 @@ use oom_edit_core::{EditorSession, KeyCode, KeyCodeKind, KeyInput, Mode, Modifie
 use oom_spell::{BuildProgress, SpellEngine, SpellEngineBuilder};
 
 const ONE_MIB: usize = 1024 * 1024;
+const LARGE_RENDERED_HEAP_LIMIT: usize = 64 * 1024 * 1024;
 const FIXTURE_SEED: u64 = 0x00_0D_D1_7E;
 
 #[derive(Clone, Copy)]
@@ -379,6 +382,55 @@ fn benchmark_rendered(document: &str) {
     );
 }
 
+fn benchmark_large_rendered_layout() {
+    let mut observations = Vec::new();
+    for bytes in [ONE_MIB / 4, ONE_MIB / 2, ONE_MIB] {
+        let document = fixtures::seeded_markdown_fixture(bytes, FIXTURE_SEED);
+        let stats = sampled_run(3, || {
+            let mut session = EditorSession::from_text(&document);
+            measure(|| {
+                session.render_layout(96);
+            })
+        });
+        let mut session = EditorSession::from_text(&document);
+        let layout = session.render_layout(96);
+        let heap_bytes = layout_metrics::rendered_layout_heap_bytes(layout);
+        println!(
+            "NFR-4 large_rendered_layout: {bytes} bytes, {} rendered lines, avg {}, worst {}, heap {heap_bytes} bytes",
+            layout.lines.len(),
+            format_duration(stats.average()),
+            format_duration(stats.worst),
+        );
+        observations.push((bytes, stats, heap_bytes));
+    }
+
+    let (_, largest, largest_heap) = observations.last().copied().unwrap();
+    assert!(
+        largest.worst < Duration::from_millis(250),
+        "NFR-4 large rendered layout worst {} exceeded 250.00ms",
+        format_duration(largest.worst)
+    );
+    assert!(
+        largest_heap <= LARGE_RENDERED_HEAP_LIMIT,
+        "NFR-4 large rendered layout heap {largest_heap} exceeded {LARGE_RENDERED_HEAP_LIMIT} bytes"
+    );
+    for pair in observations.windows(2) {
+        let (smaller_bytes, smaller, smaller_heap) = pair[0];
+        let (larger_bytes, larger, larger_heap) = pair[1];
+        assert!(
+            layout_metrics::within_large_layout_scaling(
+                smaller.average().as_nanos(),
+                larger.average().as_nanos(),
+            ),
+            "NFR-4 layout time grew by more than 2.25x from {smaller_bytes} to {larger_bytes} bytes"
+        );
+        assert!(
+            layout_metrics::within_large_layout_scaling(smaller_heap as u128, larger_heap as u128),
+            "NFR-4 layout heap grew by more than 2.25x from {smaller_bytes} to {larger_bytes} bytes"
+        );
+    }
+}
+
 fn benchmark_spell() {
     let engine = spell_engine();
     let document = spell_fixture_1mb();
@@ -497,5 +549,6 @@ fn main() {
     benchmark_edit_to_frame(&source);
     benchmark_injection_heavy_edit();
     benchmark_rendered(&rendered_5000_line_fixture());
+    benchmark_large_rendered_layout();
     benchmark_spell();
 }

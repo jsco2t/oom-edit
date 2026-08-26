@@ -2,7 +2,7 @@
 //!
 //! Three capability tiers: `TrueColor` (16M), `Color16` (ANSI 16), `Monochrome`
 //! (modifiers only). Every accessor always carries a modifier so no signal is
-//! color-only (NFR-7).
+//! color-only.
 //!
 //! Selection ladder (highest-priority first):
 //! `OOM_EDIT_THEME=accessible` | `NO_COLOR` | `TERM=dumb` → Monochrome, stop;
@@ -14,7 +14,11 @@
 
 use oom_edit_core::{DecorationKind, DiagnosticProvider, DiagnosticSeverity, SemanticStyle};
 use ratatui::style::{Color, Modifier, Style};
+use serde::Deserialize;
 use std::fmt;
+use std::fs;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 
 #[cfg(test)]
 pub(crate) const ZED_UI_TEXT: Color = Color::Rgb(200, 204, 212);
@@ -56,6 +60,10 @@ pub enum UiSlot {
     StatusWarning,
     /// Status bar error message.
     StatusError,
+    /// Full document body surface.
+    DocumentBody,
+    /// Full gutter surface behind numbers, markers, and blank rows.
+    GutterBackground,
     /// Gutter background.
     Gutter,
     /// Gutter current-line highlight.
@@ -86,36 +94,71 @@ pub enum UiSlot {
 
 // ── Palette tiers ───────────────────────────────────────────────────────────
 
-/// A color palette for one capability tier.
-#[derive(Debug, Clone)]
-pub enum Palette {
-    /// Full TrueColor (16M) palette.
+/// Borrowed palette rows used only by the built-in declarations.
+#[derive(Debug)]
+enum StaticPalette {
     TrueColor {
-        /// Semantic style → (foreground, modifiers).
         semantic: &'static [(SemanticStyle, Color, Modifier)],
-        /// UI slot → (foreground, background, modifiers). `Reset` foreground
-        /// inherits the styled cell's existing semantic foreground.
         ui: &'static [(UiSlot, Color, Option<Color>, Modifier)],
     },
-    /// 16-color ANSI palette.
     Color16 {
         semantic: &'static [(SemanticStyle, Color, Modifier)],
         ui: &'static [(UiSlot, Color, Option<Color>, Modifier)],
     },
-    /// Monochrome: foreground is `Color::Reset` (ignored), all signal in modifiers.
     Monochrome {
         semantic: &'static [(SemanticStyle, Modifier)],
         ui: &'static [(UiSlot, Modifier)],
     },
 }
 
-#[expect(dead_code)]
+impl StaticPalette {
+    fn materialize(&self) -> Palette {
+        match self {
+            Self::TrueColor { semantic, ui } => Palette::TrueColor {
+                semantic: semantic.to_vec(),
+                ui: ui.to_vec(),
+            },
+            Self::Color16 { semantic, ui } => Palette::Color16 {
+                semantic: semantic.to_vec(),
+                ui: ui.to_vec(),
+            },
+            Self::Monochrome { semantic, ui } => Palette::Monochrome {
+                semantic: semantic.to_vec(),
+                ui: ui.to_vec(),
+            },
+        }
+    }
+}
+
+/// An owned color palette for one capability tier.
+#[derive(Debug, Clone)]
+pub enum Palette {
+    /// Full TrueColor (16M) palette.
+    TrueColor {
+        /// Semantic style → (foreground, modifiers).
+        semantic: Vec<(SemanticStyle, Color, Modifier)>,
+        /// UI slot → (foreground, background, modifiers). `Reset` foreground
+        /// inherits the styled cell's existing semantic foreground.
+        ui: Vec<(UiSlot, Color, Option<Color>, Modifier)>,
+    },
+    /// 16-color ANSI palette.
+    Color16 {
+        semantic: Vec<(SemanticStyle, Color, Modifier)>,
+        ui: Vec<(UiSlot, Color, Option<Color>, Modifier)>,
+    },
+    /// Monochrome: foreground is `Color::Reset` (ignored), all signal in modifiers.
+    Monochrome {
+        semantic: Vec<(SemanticStyle, Modifier)>,
+        ui: Vec<(UiSlot, Modifier)>,
+    },
+}
+
 impl Palette {
     /// Resolve a [`SemanticStyle`] to a ratatui [`Style`].
     pub fn resolve_semantic(&self, style: SemanticStyle) -> Style {
         match self {
             Palette::TrueColor { semantic, .. } | Palette::Color16 { semantic, .. } => {
-                for &(s, fg, modif) in semantic.iter() {
+                for &(s, fg, modif) in semantic {
                     if s == style {
                         return Style::default().fg(fg).add_modifier(modif);
                     }
@@ -123,7 +166,7 @@ impl Palette {
                 Style::default().add_modifier(Modifier::BOLD)
             }
             Palette::Monochrome { semantic, .. } => {
-                for &(s, modif) in semantic.iter() {
+                for &(s, modif) in semantic {
                     if s == style {
                         return Style::default().fg(Color::Reset).add_modifier(modif);
                     }
@@ -139,7 +182,7 @@ impl Palette {
     pub fn resolve_ui(&self, slot: UiSlot) -> Style {
         match self {
             Palette::TrueColor { ui, .. } | Palette::Color16 { ui, .. } => {
-                for &(s, fg, bg, modif) in ui.iter() {
+                for &(s, fg, bg, modif) in ui {
                     if s == slot {
                         let mut s = Style::default().add_modifier(modif);
                         // Reset is the palette sentinel for chrome that must
@@ -156,23 +199,12 @@ impl Palette {
                 palette_fallback(slot)
             }
             Palette::Monochrome { ui, .. } => {
-                for &(s, modif) in ui.iter() {
+                for &(s, modif) in ui {
                     if s == slot {
                         return Style::default().fg(Color::Reset).add_modifier(modif);
                     }
                 }
                 palette_fallback(slot).fg(Color::Reset)
-            }
-        }
-    }
-
-    /// Does this palette have any true foreground colors (not Reset)?
-    fn has_colors(&self) -> bool {
-        match self {
-            Palette::Monochrome { .. } => false,
-            Palette::TrueColor { semantic, ui } | Palette::Color16 { semantic, ui, .. } => {
-                semantic.iter().any(|&(_, fg, _)| fg != Color::Reset)
-                    || ui.iter().any(|&(_, fg, _, _)| fg != Color::Reset)
             }
         }
     }
@@ -191,12 +223,31 @@ fn palette_fallback(slot: UiSlot) -> Style {
 
 // ── Theme ───────────────────────────────────────────────────────────────────
 
-/// A named theme with a palette for each capability tier.
+/// A borrowed built-in declaration with a palette for each capability tier.
+#[derive(Debug)]
+struct StaticTheme {
+    name: &'static str,
+    truecolor: StaticPalette,
+    color16: StaticPalette,
+    monochrome: StaticPalette,
+}
+
+impl StaticTheme {
+    fn materialize(&self) -> Theme {
+        Theme {
+            name: self.name.to_string(),
+            truecolor: self.truecolor.materialize(),
+            color16: self.color16.materialize(),
+            monochrome: self.monochrome.materialize(),
+        }
+    }
+}
+
+/// An owned named theme with a palette for each capability tier.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct Theme {
     /// The theme's display name (e.g. "default-dark", "accessible").
-    pub name: &'static str,
+    pub name: String,
     /// TrueColor palette.
     pub truecolor: Palette,
     /// 16-color palette.
@@ -216,7 +267,6 @@ impl Theme {
     }
 
     /// Resolve a [`UiSlot`] to a ratatui [`Style`] for the active tier.
-    #[allow(dead_code)]
     pub fn ui_style(&self, tier: Tier, slot: UiSlot) -> Style {
         match tier {
             Tier::TrueColor => self.truecolor.resolve_ui(slot),
@@ -252,7 +302,6 @@ impl Theme {
     }
 
     /// Get the palette for the active tier (for completeness tests).
-    #[allow(dead_code)]
     pub fn palette_for(&self, tier: Tier) -> &Palette {
         match tier {
             Tier::TrueColor => &self.truecolor,
@@ -333,7 +382,7 @@ impl fmt::Display for ThemeSource {
 /// Complete, pure result of startup theme resolution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedTheme {
-    /// Active built-in theme name.
+    /// Active theme name.
     pub name: String,
     /// Light/dark display mode.
     pub display_mode: DisplayMode,
@@ -351,8 +400,8 @@ impl ResolvedTheme {
         self.display_mode == DisplayMode::Light
     }
 
-    /// Construct a fully coherent resolved value for injected hosts/tests
-    /// that already chose a built-in name, display mode, and capability.
+    /// Construct a fully coherent resolved value for tests that have already
+    /// chosen a catalog name, display mode, and capability.
     #[cfg(test)]
     pub(crate) fn injected(name: &str, is_light: bool, capability: Tier) -> Self {
         let palette_kind = match get_theme(name).palette_for(capability) {
@@ -470,12 +519,736 @@ impl EnvParts {
     }
 }
 
-/// Resolve the active theme name through the selection ladder.
-///
-/// Priority: `--theme` flag > compatible config dark/light slot > the display
-/// mode's built-in default.
-/// The returned value is the sole input for startup diagnostics and App theme
-/// construction, so selection provenance cannot drift from presentation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ThemeAttribution {
+    identifier: &'static str,
+    spdx: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct ThemeEntry {
+    theme: Theme,
+    compatible_mode: Option<DisplayMode>,
+    fallback: bool,
+    attribution: Option<ThemeAttribution>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    origin: ThemeOrigin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ThemeOrigin {
+    Builtin,
+    User(PathBuf),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ThemeLoadWarningKind {
+    TooLarge,
+    InvalidUtf8,
+    InvalidToml,
+    InvalidName,
+    ReservedName,
+    DuplicateName,
+    ReadFailed,
+}
+
+impl fmt::Display for ThemeLoadWarningKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::TooLarge => "file exceeds 65536 bytes",
+            Self::InvalidUtf8 => "file is not valid UTF-8",
+            Self::InvalidToml => "invalid theme TOML",
+            Self::InvalidName => "invalid theme name",
+            Self::ReservedName => "theme name is reserved",
+            Self::DuplicateName => "duplicate theme name",
+            Self::ReadFailed => "file could not be read",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ThemeLoadWarning {
+    pub(crate) path: PathBuf,
+    pub(crate) kind: ThemeLoadWarningKind,
+    detail: String,
+}
+
+impl fmt::Display for ThemeLoadWarning {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "theme '{}': {}: {}",
+            self.path.display(),
+            self.kind,
+            self.detail
+        )
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ThemeLoadReport {
+    pub(crate) catalog: ThemeCatalog,
+    pub(crate) warnings: Vec<ThemeLoadWarning>,
+}
+
+const MAX_USER_THEME_BYTES: usize = 65_536;
+
+/// The one runtime owner for theme lookup, compatibility, fallback, and cycle order.
+#[derive(Debug, Clone)]
+pub(crate) struct ThemeCatalog {
+    themes: Vec<ThemeEntry>,
+}
+
+impl ThemeCatalog {
+    pub(crate) fn builtins() -> Self {
+        Self {
+            themes: BUILTIN_THEMES
+                .iter()
+                .map(|spec| {
+                    let entry = ThemeEntry {
+                        theme: (spec.build)(),
+                        compatible_mode: spec.compatible_mode,
+                        fallback: spec.fallback,
+                        attribution: spec.attribution,
+                        origin: ThemeOrigin::Builtin,
+                    };
+                    debug_assert_eq!(entry.theme.name, spec.name);
+                    debug_assert!(entry.attribution.is_none_or(|attribution| {
+                        attribution.identifier == entry.theme.name && !attribution.spdx.is_empty()
+                    }));
+                    entry
+                })
+                .collect(),
+        }
+    }
+
+    pub(crate) fn load_from_config_path(config_path: &Path) -> ThemeLoadReport {
+        let config_dir = config_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        Self::load_from_directory(&config_dir.join("themes"))
+    }
+
+    fn load_from_directory(directory: &Path) -> ThemeLoadReport {
+        let mut catalog = Self::builtins();
+        let mut warnings = Vec::new();
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return ThemeLoadReport { catalog, warnings };
+            }
+            Err(error) => {
+                warnings.push(load_warning(
+                    directory,
+                    ThemeLoadWarningKind::ReadFailed,
+                    error,
+                ));
+                return ThemeLoadReport { catalog, warnings };
+            }
+        };
+
+        let mut candidates = Vec::new();
+        for entry in entries {
+            match entry {
+                Ok(entry) => match entry.file_type() {
+                    Ok(file_type)
+                        if file_type.is_file()
+                            && entry.path().extension().is_some_and(|ext| ext == "toml") =>
+                    {
+                        candidates.push(entry.path());
+                    }
+                    Ok(_) => {}
+                    Err(error) => warnings.push(load_warning(
+                        &entry.path(),
+                        ThemeLoadWarningKind::ReadFailed,
+                        error,
+                    )),
+                },
+                Err(error) => warnings.push(load_warning(
+                    directory,
+                    ThemeLoadWarningKind::ReadFailed,
+                    error,
+                )),
+            }
+        }
+        candidates.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
+
+        for path in candidates {
+            if let Err(warning) = catalog.load_file(&path) {
+                warnings.push(warning);
+            }
+        }
+        warnings.sort_by(|left, right| left.path.cmp(&right.path));
+        ThemeLoadReport { catalog, warnings }
+    }
+
+    fn load_file(&mut self, path: &Path) -> Result<(), ThemeLoadWarning> {
+        let name = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .filter(|name| valid_theme_name(name))
+            .ok_or_else(|| {
+                load_warning(
+                    path,
+                    ThemeLoadWarningKind::InvalidName,
+                    "expected lowercase kebab-case filename",
+                )
+            })?;
+        if BUILTIN_THEMES.iter().any(|spec| spec.name == name) {
+            return Err(load_warning(
+                path,
+                ThemeLoadWarningKind::ReservedName,
+                "built-in names cannot be overridden",
+            ));
+        }
+        if self.get(name).is_some() {
+            return Err(load_warning(
+                path,
+                ThemeLoadWarningKind::DuplicateName,
+                "a theme with this name is already loaded",
+            ));
+        }
+
+        let bytes = read_bounded_theme(path)
+            .map_err(|error| load_warning(path, ThemeLoadWarningKind::ReadFailed, error))?;
+        if bytes.len() > MAX_USER_THEME_BYTES {
+            return Err(load_warning(
+                path,
+                ThemeLoadWarningKind::TooLarge,
+                format!("maximum is {MAX_USER_THEME_BYTES} bytes"),
+            ));
+        }
+        let source = std::str::from_utf8(&bytes)
+            .map_err(|error| load_warning(path, ThemeLoadWarningKind::InvalidUtf8, error))?;
+        let parsed: UserThemeFile = toml::from_str(source)
+            .map_err(|error| load_warning(path, ThemeLoadWarningKind::InvalidToml, error))?;
+        let mode = parsed.appearance.display_mode();
+        let theme = parsed.build(name);
+        self.themes.push(ThemeEntry {
+            theme,
+            compatible_mode: Some(mode),
+            fallback: false,
+            attribution: None,
+            origin: ThemeOrigin::User(path.to_path_buf()),
+        });
+        Ok(())
+    }
+
+    pub(crate) fn get(&self, name: &str) -> Option<&Theme> {
+        self.themes
+            .iter()
+            .find(|entry| entry.theme.name == name)
+            .map(|entry| &entry.theme)
+    }
+
+    fn entry(&self, name: &str) -> Option<&ThemeEntry> {
+        self.themes.iter().find(|entry| entry.theme.name == name)
+    }
+
+    fn fallback(&self, mode: DisplayMode) -> &ThemeEntry {
+        self.themes
+            .iter()
+            .find(|entry| entry.fallback && entry.compatible_mode == Some(mode))
+            .expect("each display mode has exactly one built-in fallback")
+    }
+
+    fn supports_mode(&self, name: &str, mode: DisplayMode) -> bool {
+        self.entry(name).is_some_and(|entry| {
+            entry
+                .compatible_mode
+                .is_none_or(|compatible| compatible == mode)
+        })
+    }
+
+    pub(crate) fn resolve_theme(
+        &self,
+        cli_theme: Option<&str>,
+        config_mode: Option<&str>,
+        config_dark: Option<&str>,
+        config_light: Option<&str>,
+        env: &EnvParts,
+    ) -> ResolvedTheme {
+        let is_light = env.is_light(config_mode);
+        let mode = if is_light {
+            DisplayMode::Light
+        } else {
+            DisplayMode::Dark
+        };
+        let fallback = self.fallback(mode).theme.name.as_str();
+        let configured = if is_light { config_light } else { config_dark };
+        let (name, source): (&str, ThemeSource) = match cli_theme {
+            Some(cli) if self.supports_mode(cli, mode) => (cli, ThemeSource::Cli),
+            Some(cli) => {
+                eprintln!("oom-edit: unavailable theme '{cli}', using {fallback}");
+                (fallback, ThemeSource::Fallback)
+            }
+            None => match env.oom_edit_theme.as_deref() {
+                Some(name) if self.supports_mode(name, mode) => (name, ThemeSource::Environment),
+                Some(_) => (fallback, ThemeSource::Fallback),
+                None => match configured {
+                    Some(name) if self.supports_mode(name, mode) => (
+                        name,
+                        if is_light {
+                            ThemeSource::ConfigLight
+                        } else {
+                            ThemeSource::ConfigDark
+                        },
+                    ),
+                    Some(_) | None => (fallback, ThemeSource::Fallback),
+                },
+            },
+        };
+
+        let capability = env.capability();
+        let palette_kind = palette_kind(self.get(name).expect("resolved theme exists"), capability);
+        ResolvedTheme {
+            name: name.to_string(),
+            display_mode: mode,
+            capability,
+            palette_kind,
+            source,
+        }
+    }
+
+    pub(crate) fn cycle_theme(&self, current: &str, is_light: bool) -> &str {
+        let mode = if is_light {
+            DisplayMode::Light
+        } else {
+            DisplayMode::Dark
+        };
+        let compatible: Vec<&ThemeEntry> = self
+            .themes
+            .iter()
+            .filter(|entry| {
+                entry
+                    .compatible_mode
+                    .is_none_or(|compatible| compatible == mode)
+            })
+            .collect();
+        let fallback = self.fallback(mode).theme.name.as_str();
+        let Some(index) = compatible
+            .iter()
+            .position(|entry| entry.theme.name == current)
+        else {
+            return fallback;
+        };
+        compatible[(index + 1) % compatible.len()]
+            .theme
+            .name
+            .as_str()
+    }
+
+    #[cfg(test)]
+    fn entries(&self) -> &[ThemeEntry] {
+        &self.themes
+    }
+}
+
+fn load_warning(
+    path: &Path,
+    kind: ThemeLoadWarningKind,
+    detail: impl fmt::Display,
+) -> ThemeLoadWarning {
+    ThemeLoadWarning {
+        path: path.to_path_buf(),
+        kind,
+        detail: detail.to_string(),
+    }
+}
+
+fn valid_theme_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.split('-').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        })
+}
+
+fn read_bounded_theme(path: &Path) -> io::Result<Vec<u8>> {
+    let file = fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take((MAX_USER_THEME_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserThemeFile {
+    appearance: UserAppearance,
+    palette: UserPalette,
+    #[serde(default)]
+    ansi: UserAnsi,
+}
+
+impl UserThemeFile {
+    fn build(self, name: &str) -> Theme {
+        let mode = self.appearance.display_mode();
+        let truecolor = self.palette.into_roles();
+        let mut color16 = default_user_ansi_roles(mode);
+        self.ansi.apply(&mut color16);
+        build_role_theme(name, truecolor, color16)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum UserAppearance {
+    Dark,
+    Light,
+}
+
+impl UserAppearance {
+    fn display_mode(self) -> DisplayMode {
+        match self {
+            Self::Dark => DisplayMode::Dark,
+            Self::Light => DisplayMode::Light,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HexColor(Color);
+
+impl<'de> Deserialize<'de> for HexColor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        let bytes = value.as_bytes();
+        if bytes.len() != 7 || bytes[0] != b'#' || !bytes[1..].iter().all(u8::is_ascii_hexdigit) {
+            return Err(serde::de::Error::custom("expected an exact #RRGGBB color"));
+        }
+        let component = |start| {
+            u8::from_str_radix(&value[start..start + 2], 16)
+                .expect("validated ASCII hexadecimal component")
+        };
+        Ok(Self(Color::Rgb(component(1), component(3), component(5))))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct UserPalette {
+    background: HexColor,
+    background_alt: HexColor,
+    gutter_background: HexColor,
+    gutter_text: HexColor,
+    gutter_text_active: HexColor,
+    surface: HexColor,
+    surface_active: HexColor,
+    border: HexColor,
+    text: HexColor,
+    text_muted: HexColor,
+    text_emphasis: HexColor,
+    primary: HexColor,
+    secondary: HexColor,
+    info: HexColor,
+    success: HexColor,
+    warning: HexColor,
+    error: HexColor,
+    attention: HexColor,
+}
+
+impl UserPalette {
+    fn into_roles(self) -> PaletteRoles {
+        PaletteRoles {
+            background: self.background.0,
+            background_alt: self.background_alt.0,
+            gutter_background: self.gutter_background.0,
+            gutter_text: self.gutter_text.0,
+            gutter_text_active: self.gutter_text_active.0,
+            surface: self.surface.0,
+            surface_active: self.surface_active.0,
+            border: self.border.0,
+            text: self.text.0,
+            text_muted: self.text_muted.0,
+            text_emphasis: self.text_emphasis.0,
+            primary: self.primary.0,
+            secondary: self.secondary.0,
+            info: self.info.0,
+            success: self.success.0,
+            warning: self.warning.0,
+            error: self.error.0,
+            attention: self.attention.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum AnsiColor {
+    Black,
+    Red,
+    Green,
+    Yellow,
+    Blue,
+    Magenta,
+    Cyan,
+    Gray,
+    DarkGray,
+    LightRed,
+    LightGreen,
+    LightYellow,
+    LightBlue,
+    LightMagenta,
+    LightCyan,
+    White,
+}
+
+impl AnsiColor {
+    fn color(self) -> Color {
+        match self {
+            Self::Black => Color::Black,
+            Self::Red => Color::Red,
+            Self::Green => Color::Green,
+            Self::Yellow => Color::Yellow,
+            Self::Blue => Color::Blue,
+            Self::Magenta => Color::Magenta,
+            Self::Cyan => Color::Cyan,
+            Self::Gray => Color::Gray,
+            Self::DarkGray => Color::DarkGray,
+            Self::LightRed => Color::LightRed,
+            Self::LightGreen => Color::LightGreen,
+            Self::LightYellow => Color::LightYellow,
+            Self::LightBlue => Color::LightBlue,
+            Self::LightMagenta => Color::LightMagenta,
+            Self::LightCyan => Color::LightCyan,
+            Self::White => Color::White,
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct UserAnsi {
+    background: Option<AnsiColor>,
+    background_alt: Option<AnsiColor>,
+    gutter_background: Option<AnsiColor>,
+    gutter_text: Option<AnsiColor>,
+    gutter_text_active: Option<AnsiColor>,
+    surface: Option<AnsiColor>,
+    surface_active: Option<AnsiColor>,
+    border: Option<AnsiColor>,
+    text: Option<AnsiColor>,
+    text_muted: Option<AnsiColor>,
+    text_emphasis: Option<AnsiColor>,
+    primary: Option<AnsiColor>,
+    secondary: Option<AnsiColor>,
+    info: Option<AnsiColor>,
+    success: Option<AnsiColor>,
+    warning: Option<AnsiColor>,
+    error: Option<AnsiColor>,
+    attention: Option<AnsiColor>,
+}
+
+impl UserAnsi {
+    fn apply(self, roles: &mut PaletteRoles) {
+        macro_rules! apply {
+            ($($field:ident),+ $(,)?) => {
+                $(if let Some(color) = self.$field { roles.$field = color.color(); })+
+            };
+        }
+        apply!(
+            background,
+            background_alt,
+            gutter_background,
+            gutter_text,
+            gutter_text_active,
+            surface,
+            surface_active,
+            border,
+            text,
+            text_muted,
+            text_emphasis,
+            primary,
+            secondary,
+            info,
+            success,
+            warning,
+            error,
+            attention,
+        );
+    }
+}
+
+fn default_user_ansi_roles(mode: DisplayMode) -> PaletteRoles {
+    if mode == DisplayMode::Dark {
+        return ansi_roles(Color::Magenta, Color::Cyan, Color::Blue);
+    }
+    PaletteRoles {
+        background: Color::White,
+        background_alt: Color::Gray,
+        gutter_background: Color::Gray,
+        gutter_text: Color::DarkGray,
+        gutter_text_active: Color::Black,
+        surface: Color::Gray,
+        surface_active: Color::DarkGray,
+        border: Color::DarkGray,
+        text: Color::Black,
+        text_muted: Color::DarkGray,
+        text_emphasis: Color::Black,
+        primary: Color::Blue,
+        secondary: Color::Magenta,
+        info: Color::Cyan,
+        success: Color::Green,
+        warning: Color::Yellow,
+        error: Color::Red,
+        attention: Color::Yellow,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_user_theme_source(appearance: &str) -> String {
+    format!(
+        r##"appearance = "{appearance}"
+
+[palette]
+background = "#101010"
+background-alt = "#202020"
+gutter-background = "#303030"
+gutter-text = "#909090"
+gutter-text-active = "#ffffff"
+surface = "#252525"
+surface-active = "#454545"
+border = "#707070"
+text = "#eeeeee"
+text-muted = "#888888"
+text-emphasis = "#ffffff"
+primary = "#cc66ff"
+secondary = "#66ccff"
+info = "#3399ff"
+success = "#33cc66"
+warning = "#ffcc33"
+error = "#ff3366"
+attention = "#ff9933"
+
+[ansi]
+gutter-background = "black"
+gutter-text = "dark-gray"
+gutter-text-active = "white"
+primary = "magenta"
+info = "blue"
+success = "green"
+warning = "yellow"
+error = "red"
+attention = "light-yellow"
+"##
+    )
+}
+
+fn palette_kind(theme: &Theme, capability: Tier) -> PaletteKind {
+    match theme.palette_for(capability) {
+        Palette::TrueColor { .. } => PaletteKind::TrueColor,
+        Palette::Color16 { .. } => PaletteKind::Color16,
+        Palette::Monochrome { .. } => PaletteKind::Monochrome,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BuiltinThemeSpec {
+    name: &'static str,
+    compatible_mode: Option<DisplayMode>,
+    fallback: bool,
+    attribution: Option<ThemeAttribution>,
+    build: fn() -> Theme,
+}
+
+static BUILTIN_THEMES: &[BuiltinThemeSpec] = &[
+    BuiltinThemeSpec {
+        name: "default-dark",
+        compatible_mode: Some(DisplayMode::Dark),
+        fallback: true,
+        attribution: None,
+        build: build_default_dark,
+    },
+    BuiltinThemeSpec {
+        name: "catppuccin-mocha",
+        compatible_mode: Some(DisplayMode::Dark),
+        fallback: false,
+        attribution: Some(ThemeAttribution {
+            identifier: "catppuccin-mocha",
+            spdx: "MIT",
+        }),
+        build: build_catppuccin_mocha,
+    },
+    BuiltinThemeSpec {
+        name: "dracula",
+        compatible_mode: Some(DisplayMode::Dark),
+        fallback: false,
+        attribution: Some(ThemeAttribution {
+            identifier: "dracula",
+            spdx: "MIT",
+        }),
+        build: build_dracula,
+    },
+    BuiltinThemeSpec {
+        name: "nord",
+        compatible_mode: Some(DisplayMode::Dark),
+        fallback: false,
+        attribution: Some(ThemeAttribution {
+            identifier: "nord",
+            spdx: "MIT",
+        }),
+        build: build_nord,
+    },
+    BuiltinThemeSpec {
+        name: "solarized-dark",
+        compatible_mode: Some(DisplayMode::Dark),
+        fallback: false,
+        attribution: Some(ThemeAttribution {
+            identifier: "solarized-dark",
+            spdx: "MIT",
+        }),
+        build: build_solarized_dark,
+    },
+    BuiltinThemeSpec {
+        name: "tokyo-night",
+        compatible_mode: Some(DisplayMode::Dark),
+        fallback: false,
+        attribution: Some(ThemeAttribution {
+            identifier: "tokyo-night",
+            spdx: "Apache-2.0",
+        }),
+        build: build_tokyo_night,
+    },
+    BuiltinThemeSpec {
+        name: "default-light",
+        compatible_mode: Some(DisplayMode::Light),
+        fallback: true,
+        attribution: None,
+        build: build_default_light,
+    },
+    BuiltinThemeSpec {
+        name: "accessible",
+        compatible_mode: None,
+        fallback: false,
+        attribution: None,
+        build: build_accessible,
+    },
+];
+
+#[cfg(test)]
+static TEST_THEME_CATALOG: std::sync::LazyLock<ThemeCatalog> =
+    std::sync::LazyLock::new(ThemeCatalog::builtins);
+
+#[cfg(test)]
+pub fn get_theme(name: &str) -> &'static Theme {
+    TEST_THEME_CATALOG
+        .get(name)
+        .unwrap_or_else(|| &TEST_THEME_CATALOG.fallback(DisplayMode::Dark).theme)
+}
+
+#[cfg(test)]
+pub fn built_in_themes() -> impl ExactSizeIterator<Item = &'static str> + Clone {
+    BUILTIN_THEMES.iter().map(|spec| spec.name)
+}
+
+#[cfg(test)]
 pub fn resolve_theme(
     cli_theme: Option<&str>,
     config_mode: Option<&str>,
@@ -483,144 +1256,450 @@ pub fn resolve_theme(
     config_light: Option<&str>,
     env: &EnvParts,
 ) -> ResolvedTheme {
-    let is_light = env.is_light(config_mode);
+    TEST_THEME_CATALOG.resolve_theme(cli_theme, config_mode, config_dark, config_light, env)
+}
 
-    // Determine theme name: CLI flag > config slot > default.
-    let fallback = if is_light {
-        "default-light"
-    } else {
-        "default-dark"
-    };
-    let configured = if is_light { config_light } else { config_dark };
-    let (name, source): (String, ThemeSource) = match cli_theme {
-        Some(cli) if is_known(cli) => (cli.to_string(), ThemeSource::Cli),
-        Some(cli) => {
-            eprintln!("oom-edit: unknown theme '{cli}', using {fallback}");
-            (fallback.to_string(), ThemeSource::Fallback)
+#[cfg(test)]
+pub fn cycle_theme(current: &str, is_light: bool) -> &'static str {
+    TEST_THEME_CATALOG.cycle_theme(current, is_light)
+}
+
+fn add_surface_slots(
+    theme: &mut Theme,
+    truecolor_gutter: Option<Color>,
+    color16_gutter: Option<Color>,
+) {
+    for (palette, gutter) in [
+        (&mut theme.truecolor, truecolor_gutter),
+        (&mut theme.color16, color16_gutter),
+    ] {
+        match palette {
+            Palette::TrueColor { ui, .. } | Palette::Color16 { ui, .. } => {
+                ui.push((UiSlot::DocumentBody, Color::Reset, None, Modifier::empty()));
+                ui.push((
+                    UiSlot::GutterBackground,
+                    Color::Reset,
+                    gutter,
+                    Modifier::empty(),
+                ));
+            }
+            Palette::Monochrome { ui, .. } => {
+                ui.push((UiSlot::DocumentBody, Modifier::empty()));
+                ui.push((UiSlot::GutterBackground, Modifier::empty()));
+            }
         }
-        None => match env.oom_edit_theme.as_deref().filter(|name| is_known(name)) {
-            Some(name) => (name.to_string(), ThemeSource::Environment),
-            None => match configured.filter(|name| is_known(name) && supports_mode(name, is_light))
-            {
-                Some(name) => (
-                    name.to_string(),
-                    if is_light {
-                        ThemeSource::ConfigLight
-                    } else {
-                        ThemeSource::ConfigDark
-                    },
-                ),
-                None => (fallback.to_string(), ThemeSource::Fallback),
-            },
-        },
-    };
-
-    let capability = env.capability();
-    let palette_kind = match get_theme(&name).palette_for(capability) {
-        Palette::TrueColor { .. } => PaletteKind::TrueColor,
-        Palette::Color16 { .. } => PaletteKind::Color16,
-        Palette::Monochrome { .. } => PaletteKind::Monochrome,
-    };
-
-    ResolvedTheme {
-        name,
-        display_mode: if is_light {
-            DisplayMode::Light
-        } else {
-            DisplayMode::Dark
-        },
-        capability,
-        palette_kind,
-        source,
+    }
+    match &mut theme.monochrome {
+        Palette::Monochrome { ui, .. } => {
+            ui.push((UiSlot::DocumentBody, Modifier::empty()));
+            ui.push((UiSlot::GutterBackground, Modifier::empty()));
+        }
+        Palette::TrueColor { .. } | Palette::Color16 { .. } => {
+            unreachable!("legacy monochrome declarations stay color-free")
+        }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct BuiltinThemeSpec {
-    theme: &'static Theme,
-    compatible_mode: Option<DisplayMode>,
+fn build_default_dark() -> Theme {
+    let mut theme = DEFAULT_DARK_SPEC.materialize();
+    add_surface_slots(&mut theme, Some(Color::Rgb(47, 52, 62)), Some(Color::Black));
+    theme
 }
 
-static BUILTIN_THEMES: &[BuiltinThemeSpec] = &[
-    BuiltinThemeSpec {
-        theme: &DEFAULT_DARK,
-        compatible_mode: Some(DisplayMode::Dark),
-    },
-    BuiltinThemeSpec {
-        theme: &DEFAULT_LIGHT,
-        compatible_mode: Some(DisplayMode::Light),
-    },
-    BuiltinThemeSpec {
-        theme: &ACCESSIBLE,
-        compatible_mode: None,
-    },
-];
-
-/// Get the built-in theme by name.
-pub fn get_theme(name: &str) -> &'static Theme {
-    BUILTIN_THEMES
-        .iter()
-        .find(|spec| spec.theme.name == name)
-        .unwrap_or(&BUILTIN_THEMES[0])
-        .theme
+fn build_default_light() -> Theme {
+    let mut theme = DEFAULT_LIGHT_SPEC.materialize();
+    add_surface_slots(
+        &mut theme,
+        Some(Color::Rgb(225, 228, 232)),
+        Some(Color::Gray),
+    );
+    theme
 }
 
-/// Get the list of built-in theme names.
-#[cfg(test)]
-pub fn built_in_themes() -> impl ExactSizeIterator<Item = &'static str> + Clone {
-    BUILTIN_THEMES.iter().map(|spec| spec.theme.name)
+fn build_accessible() -> Theme {
+    let mut theme = ACCESSIBLE_SPEC.materialize();
+    add_surface_slots(&mut theme, None, None);
+    theme
 }
 
-fn is_known(name: &str) -> bool {
-    BUILTIN_THEMES.iter().any(|spec| spec.theme.name == name)
+#[derive(Clone, Copy)]
+struct PaletteRoles {
+    background: Color,
+    background_alt: Color,
+    gutter_background: Color,
+    gutter_text: Color,
+    gutter_text_active: Color,
+    surface: Color,
+    surface_active: Color,
+    border: Color,
+    text: Color,
+    text_muted: Color,
+    text_emphasis: Color,
+    primary: Color,
+    secondary: Color,
+    info: Color,
+    success: Color,
+    warning: Color,
+    error: Color,
+    attention: Color,
 }
 
-fn supports_mode(name: &str, is_light: bool) -> bool {
-    let mode = if is_light {
-        DisplayMode::Light
-    } else {
-        DisplayMode::Dark
-    };
-    BUILTIN_THEMES.iter().any(|spec| {
-        spec.theme.name == name
-            && spec
-                .compatible_mode
-                .is_none_or(|compatible| compatible == mode)
-    })
+fn semantic_rows(roles: PaletteRoles) -> Vec<(SemanticStyle, Color, Modifier)> {
+    vec![
+        (SemanticStyle::Text, roles.text, Modifier::empty()),
+        (SemanticStyle::Heading1, roles.primary, Modifier::BOLD),
+        (SemanticStyle::Heading2, roles.warning, Modifier::BOLD),
+        (SemanticStyle::Heading3, roles.attention, Modifier::BOLD),
+        (SemanticStyle::Heading4, roles.success, Modifier::BOLD),
+        (SemanticStyle::Heading5, roles.info, Modifier::BOLD),
+        (SemanticStyle::Heading6, roles.secondary, Modifier::BOLD),
+        (SemanticStyle::Emphasis, roles.secondary, Modifier::ITALIC),
+        (SemanticStyle::Strong, roles.warning, Modifier::BOLD),
+        (
+            SemanticStyle::Strikethrough,
+            roles.text,
+            Modifier::CROSSED_OUT,
+        ),
+        (SemanticStyle::CodeSpan, roles.success, Modifier::empty()),
+        (SemanticStyle::CodeBlock, roles.success, Modifier::empty()),
+        (SemanticStyle::Quote, roles.warning, Modifier::ITALIC),
+        (SemanticStyle::ListMarker, roles.attention, Modifier::BOLD),
+        (SemanticStyle::Link, roles.secondary, Modifier::UNDERLINED),
+        (SemanticStyle::LinkUrl, roles.info, Modifier::UNDERLINED),
+        (SemanticStyle::Rule, roles.border, Modifier::DIM),
+        (SemanticStyle::HtmlRaw, roles.text_muted, Modifier::DIM),
+        (SemanticStyle::FmDelimiter, roles.border, Modifier::DIM),
+        (SemanticStyle::FmKey, roles.warning, Modifier::BOLD),
+        (SemanticStyle::FmValue, roles.success, Modifier::empty()),
+        (SemanticStyle::Keyword, roles.error, Modifier::BOLD),
+        (SemanticStyle::Function, roles.primary, Modifier::empty()),
+        (SemanticStyle::TypeName, roles.secondary, Modifier::empty()),
+        (SemanticStyle::StringLit, roles.success, Modifier::empty()),
+        (SemanticStyle::NumberLit, roles.secondary, Modifier::empty()),
+        (SemanticStyle::Comment, roles.text_muted, Modifier::ITALIC),
+        (SemanticStyle::Operator, roles.attention, Modifier::empty()),
+        (SemanticStyle::Variable, roles.text, Modifier::empty()),
+        (SemanticStyle::Punct, roles.text_muted, Modifier::empty()),
+        (SemanticStyle::Selection, Color::Reset, Modifier::REVERSED),
+        (SemanticStyle::Match, roles.info, Modifier::UNDERLINED),
+        (SemanticStyle::CursorLine, Color::Reset, Modifier::empty()),
+        (SemanticStyle::Muted, roles.text_muted, Modifier::DIM),
+    ]
 }
 
-/// Cycle to the next built-in theme compatible with the display mode.
-/// Returns the mode's default when `current` is unknown or incompatible.
-pub fn cycle_theme(current: &str, is_light: bool) -> &'static str {
-    let mode = if is_light {
-        DisplayMode::Light
-    } else {
-        DisplayMode::Dark
-    };
-    let compatible = |spec: &&BuiltinThemeSpec| {
-        spec.compatible_mode
-            .is_none_or(|compatible| compatible == mode)
-    };
-    let fallback = BUILTIN_THEMES
-        .iter()
-        .find(compatible)
-        .expect("each display mode has a built-in theme")
-        .theme
-        .name;
-    let Some(current_index) = BUILTIN_THEMES
-        .iter()
-        .position(|spec| spec.theme.name == current && compatible(&spec))
-    else {
-        return fallback;
-    };
-    BUILTIN_THEMES
-        .iter()
-        .cycle()
-        .skip(current_index + 1)
-        .find(compatible)
-        .expect("compatible theme cycle is nonempty")
-        .theme
-        .name
+fn ui_rows(roles: PaletteRoles) -> Vec<(UiSlot, Color, Option<Color>, Modifier)> {
+    vec![
+        (
+            UiSlot::StatusBar,
+            roles.text,
+            Some(roles.background_alt),
+            Modifier::DIM,
+        ),
+        (
+            UiSlot::BadgeNormal,
+            roles.background,
+            Some(roles.primary),
+            Modifier::BOLD,
+        ),
+        (
+            UiSlot::BadgeInsert,
+            roles.background,
+            Some(roles.success),
+            Modifier::BOLD,
+        ),
+        (
+            UiSlot::BadgeSelect,
+            roles.background,
+            Some(roles.secondary),
+            Modifier::BOLD,
+        ),
+        (
+            UiSlot::BadgeCommand,
+            roles.background,
+            Some(roles.warning),
+            Modifier::BOLD,
+        ),
+        (UiSlot::Border, roles.border, None, Modifier::DIM),
+        (UiSlot::HintKey, roles.primary, None, Modifier::BOLD),
+        (UiSlot::HintDesc, roles.text, None, Modifier::empty()),
+        (UiSlot::StatusSuccess, roles.success, None, Modifier::BOLD),
+        (UiSlot::StatusInfo, roles.info, None, Modifier::BOLD),
+        (UiSlot::StatusWarning, roles.warning, None, Modifier::BOLD),
+        (UiSlot::StatusError, roles.error, None, Modifier::BOLD),
+        (
+            UiSlot::DocumentBody,
+            roles.text,
+            Some(roles.background),
+            Modifier::empty(),
+        ),
+        (
+            UiSlot::GutterBackground,
+            Color::Reset,
+            Some(roles.gutter_background),
+            Modifier::empty(),
+        ),
+        (UiSlot::Gutter, roles.gutter_text, None, Modifier::DIM),
+        (
+            UiSlot::GutterCurrent,
+            roles.gutter_text_active,
+            None,
+            Modifier::BOLD,
+        ),
+        (
+            UiSlot::CursorLine,
+            Color::Reset,
+            Some(roles.surface),
+            Modifier::DIM,
+        ),
+        (
+            UiSlot::NormalCursor,
+            Color::Reset,
+            Some(roles.surface_active),
+            Modifier::BOLD,
+        ),
+        (
+            UiSlot::CodeFence,
+            Color::Reset,
+            Some(roles.surface),
+            Modifier::empty(),
+        ),
+        (
+            UiSlot::MetadataPanel,
+            Color::Reset,
+            Some(roles.background_alt),
+            Modifier::DIM,
+        ),
+        (UiSlot::TabActive, roles.text_emphasis, None, Modifier::BOLD),
+        (UiSlot::TabInactive, roles.text_muted, None, Modifier::DIM),
+        (UiSlot::TabSeparator, roles.border, None, Modifier::DIM),
+        (
+            UiSlot::PaletteSurface,
+            roles.text,
+            Some(roles.surface),
+            Modifier::DIM,
+        ),
+        (
+            UiSlot::PaletteText,
+            roles.text,
+            Some(roles.surface),
+            Modifier::empty(),
+        ),
+        (
+            UiSlot::PaletteSecondary,
+            roles.text_muted,
+            Some(roles.surface),
+            Modifier::DIM,
+        ),
+        (
+            UiSlot::PaletteSelected,
+            roles.text_emphasis,
+            Some(roles.surface_active),
+            Modifier::REVERSED,
+        ),
+    ]
+}
+
+fn monochrome_semantic_rows(
+    rows: &[(SemanticStyle, Color, Modifier)],
+) -> Vec<(SemanticStyle, Modifier)> {
+    rows.iter()
+        .map(|(slot, _, modifiers)| (*slot, *modifiers))
+        .collect()
+}
+
+fn monochrome_ui_rows(
+    rows: &[(UiSlot, Color, Option<Color>, Modifier)],
+) -> Vec<(UiSlot, Modifier)> {
+    rows.iter()
+        .map(|(slot, _, _, modifiers)| {
+            let modifiers = if *slot == UiSlot::NormalCursor {
+                *modifiers | Modifier::UNDERLINED
+            } else {
+                *modifiers
+            };
+            (*slot, modifiers)
+        })
+        .collect()
+}
+
+fn build_role_theme(name: &str, truecolor: PaletteRoles, color16: PaletteRoles) -> Theme {
+    let truecolor_semantic = semantic_rows(truecolor);
+    let truecolor_ui = ui_rows(truecolor);
+    let color16_semantic = semantic_rows(color16);
+    let color16_ui = ui_rows(color16);
+    Theme {
+        name: name.to_string(),
+        monochrome: Palette::Monochrome {
+            semantic: monochrome_semantic_rows(&truecolor_semantic),
+            ui: monochrome_ui_rows(&truecolor_ui),
+        },
+        truecolor: Palette::TrueColor {
+            semantic: truecolor_semantic,
+            ui: truecolor_ui,
+        },
+        color16: Palette::Color16 {
+            semantic: color16_semantic,
+            ui: color16_ui,
+        },
+    }
+}
+
+fn ansi_roles(primary: Color, secondary: Color, info: Color) -> PaletteRoles {
+    PaletteRoles {
+        background: Color::Black,
+        background_alt: Color::DarkGray,
+        gutter_background: Color::DarkGray,
+        gutter_text: Color::Gray,
+        gutter_text_active: Color::White,
+        surface: Color::DarkGray,
+        surface_active: Color::Gray,
+        border: Color::Gray,
+        text: Color::White,
+        text_muted: Color::Gray,
+        text_emphasis: Color::White,
+        primary,
+        secondary,
+        info,
+        success: Color::Green,
+        warning: Color::Yellow,
+        error: Color::Red,
+        attention: Color::Yellow,
+    }
+}
+
+fn build_catppuccin_mocha() -> Theme {
+    build_role_theme(
+        "catppuccin-mocha",
+        PaletteRoles {
+            background: Color::Rgb(0x1e, 0x1e, 0x2e),
+            background_alt: Color::Rgb(0x18, 0x18, 0x25),
+            gutter_background: Color::Rgb(0x18, 0x18, 0x25),
+            gutter_text: Color::Rgb(0x7f, 0x84, 0x9c),
+            gutter_text_active: Color::Rgb(0xcd, 0xd6, 0xf4),
+            surface: Color::Rgb(0x31, 0x32, 0x44),
+            surface_active: Color::Rgb(0x58, 0x5b, 0x70),
+            border: Color::Rgb(0x45, 0x47, 0x5a),
+            text: Color::Rgb(0xcd, 0xd6, 0xf4),
+            text_muted: Color::Rgb(0x7f, 0x84, 0x9c),
+            text_emphasis: Color::Rgb(0xf5, 0xe0, 0xdc),
+            primary: Color::Rgb(0xcb, 0xa6, 0xf7),
+            secondary: Color::Rgb(0xb4, 0xbe, 0xfe),
+            info: Color::Rgb(0x89, 0xb4, 0xfa),
+            success: Color::Rgb(0xa6, 0xe3, 0xa1),
+            warning: Color::Rgb(0xf9, 0xe2, 0xaf),
+            error: Color::Rgb(0xf3, 0x8b, 0xa8),
+            attention: Color::Rgb(0xfa, 0xb3, 0x87),
+        },
+        ansi_roles(Color::Magenta, Color::Cyan, Color::Blue),
+    )
+}
+
+fn build_dracula() -> Theme {
+    build_role_theme(
+        "dracula",
+        PaletteRoles {
+            background: Color::Rgb(0x28, 0x2a, 0x36),
+            background_alt: Color::Rgb(0x44, 0x47, 0x5a),
+            gutter_background: Color::Rgb(0x44, 0x47, 0x5a),
+            gutter_text: Color::Rgb(0x62, 0x72, 0xa4),
+            gutter_text_active: Color::Rgb(0xf8, 0xf8, 0xf2),
+            surface: Color::Rgb(0x44, 0x47, 0x5a),
+            surface_active: Color::Rgb(0x62, 0x72, 0xa4),
+            border: Color::Rgb(0x62, 0x72, 0xa4),
+            text: Color::Rgb(0xf8, 0xf8, 0xf2),
+            text_muted: Color::Rgb(0x62, 0x72, 0xa4),
+            text_emphasis: Color::Rgb(0xf8, 0xf8, 0xf2),
+            primary: Color::Rgb(0xbd, 0x93, 0xf9),
+            secondary: Color::Rgb(0xff, 0x79, 0xc6),
+            info: Color::Rgb(0x8b, 0xe9, 0xfd),
+            success: Color::Rgb(0x50, 0xfa, 0x7b),
+            warning: Color::Rgb(0xf1, 0xfa, 0x8c),
+            error: Color::Rgb(0xff, 0x55, 0x55),
+            attention: Color::Rgb(0xff, 0xb8, 0x6c),
+        },
+        ansi_roles(Color::Magenta, Color::Magenta, Color::Cyan),
+    )
+}
+
+fn build_nord() -> Theme {
+    build_role_theme(
+        "nord",
+        PaletteRoles {
+            background: Color::Rgb(0x2e, 0x34, 0x40),
+            background_alt: Color::Rgb(0x3b, 0x42, 0x52),
+            gutter_background: Color::Rgb(0x3b, 0x42, 0x52),
+            gutter_text: Color::Rgb(0x4c, 0x56, 0x6a),
+            gutter_text_active: Color::Rgb(0xec, 0xef, 0xf4),
+            surface: Color::Rgb(0x3b, 0x42, 0x52),
+            surface_active: Color::Rgb(0x43, 0x4c, 0x5e),
+            border: Color::Rgb(0x4c, 0x56, 0x6a),
+            text: Color::Rgb(0xd8, 0xde, 0xe9),
+            text_muted: Color::Rgb(0x4c, 0x56, 0x6a),
+            text_emphasis: Color::Rgb(0xec, 0xef, 0xf4),
+            primary: Color::Rgb(0x88, 0xc0, 0xd0),
+            secondary: Color::Rgb(0xb4, 0x8e, 0xad),
+            info: Color::Rgb(0x81, 0xa1, 0xc1),
+            success: Color::Rgb(0xa3, 0xbe, 0x8c),
+            warning: Color::Rgb(0xeb, 0xcb, 0x8b),
+            error: Color::Rgb(0xbf, 0x61, 0x6a),
+            attention: Color::Rgb(0xd0, 0x87, 0x70),
+        },
+        ansi_roles(Color::Cyan, Color::Magenta, Color::Blue),
+    )
+}
+
+fn build_solarized_dark() -> Theme {
+    build_role_theme(
+        "solarized-dark",
+        PaletteRoles {
+            background: Color::Rgb(0x00, 0x2b, 0x36),
+            background_alt: Color::Rgb(0x07, 0x36, 0x42),
+            gutter_background: Color::Rgb(0x07, 0x36, 0x42),
+            gutter_text: Color::Rgb(0x58, 0x6e, 0x75),
+            gutter_text_active: Color::Rgb(0x93, 0xa1, 0xa1),
+            surface: Color::Rgb(0x07, 0x36, 0x42),
+            surface_active: Color::Rgb(0x58, 0x6e, 0x75),
+            border: Color::Rgb(0x58, 0x6e, 0x75),
+            text: Color::Rgb(0x83, 0x94, 0x96),
+            text_muted: Color::Rgb(0x58, 0x6e, 0x75),
+            text_emphasis: Color::Rgb(0x93, 0xa1, 0xa1),
+            primary: Color::Rgb(0x26, 0x8b, 0xd2),
+            secondary: Color::Rgb(0x6c, 0x71, 0xc4),
+            info: Color::Rgb(0x2a, 0xa1, 0x98),
+            success: Color::Rgb(0x85, 0x99, 0x00),
+            warning: Color::Rgb(0xb5, 0x89, 0x00),
+            error: Color::Rgb(0xdc, 0x32, 0x2f),
+            attention: Color::Rgb(0xcb, 0x4b, 0x16),
+        },
+        ansi_roles(Color::Blue, Color::Magenta, Color::Cyan),
+    )
+}
+
+fn build_tokyo_night() -> Theme {
+    build_role_theme(
+        "tokyo-night",
+        PaletteRoles {
+            background: Color::Rgb(0x1a, 0x1b, 0x26),
+            background_alt: Color::Rgb(0x16, 0x16, 0x1e),
+            gutter_background: Color::Rgb(0x16, 0x16, 0x1e),
+            gutter_text: Color::Rgb(0x3b, 0x42, 0x61),
+            gutter_text_active: Color::Rgb(0xa9, 0xb1, 0xd6),
+            surface: Color::Rgb(0x29, 0x2e, 0x42),
+            surface_active: Color::Rgb(0x39, 0x4b, 0x70),
+            border: Color::Rgb(0x41, 0x48, 0x68),
+            text: Color::Rgb(0xc0, 0xca, 0xf5),
+            text_muted: Color::Rgb(0x56, 0x5f, 0x89),
+            text_emphasis: Color::Rgb(0xb4, 0xf9, 0xf8),
+            primary: Color::Rgb(0x7a, 0xa2, 0xf7),
+            secondary: Color::Rgb(0xbb, 0x9a, 0xf7),
+            info: Color::Rgb(0x7d, 0xcf, 0xff),
+            success: Color::Rgb(0x9e, 0xce, 0x6a),
+            warning: Color::Rgb(0xe0, 0xaf, 0x68),
+            error: Color::Rgb(0xf7, 0x76, 0x8e),
+            attention: Color::Rgb(0xff, 0x9e, 0x64),
+        },
+        ansi_roles(Color::Blue, Color::Magenta, Color::Cyan),
+    )
 }
 
 // ── Built-in: default-dark ──────────────────────────────────────────────────
@@ -647,9 +1726,9 @@ fn heading_colors_dark() -> [Color; 6] {
     ]
 }
 
-pub static DEFAULT_DARK: Theme = Theme {
+static DEFAULT_DARK_SPEC: StaticTheme = StaticTheme {
     name: "default-dark",
-    truecolor: Palette::TrueColor {
+    truecolor: StaticPalette::TrueColor {
         semantic: &[
             (
                 SemanticStyle::Text,
@@ -958,7 +2037,7 @@ pub static DEFAULT_DARK: Theme = Theme {
             ),
         ],
     },
-    color16: Palette::Color16 {
+    color16: StaticPalette::Color16 {
         semantic: &[
             (SemanticStyle::Text, Color::White, Modifier::empty()),
             (SemanticStyle::Heading1, Color::Yellow, Modifier::BOLD),
@@ -1082,7 +2161,7 @@ pub static DEFAULT_DARK: Theme = Theme {
             ),
         ],
     },
-    monochrome: Palette::Monochrome {
+    monochrome: StaticPalette::Monochrome {
         semantic: &[
             (SemanticStyle::Text, Modifier::empty()),
             (SemanticStyle::Heading1, Modifier::BOLD),
@@ -1151,9 +2230,9 @@ pub static DEFAULT_DARK: Theme = Theme {
 
 // ── Built-in: default-light ─────────────────────────────────────────────────
 
-pub static DEFAULT_LIGHT: Theme = Theme {
+static DEFAULT_LIGHT_SPEC: StaticTheme = StaticTheme {
     name: "default-light",
-    truecolor: Palette::TrueColor {
+    truecolor: StaticPalette::TrueColor {
         semantic: &[
             (SemanticStyle::Text, Color::Black, Modifier::empty()),
             (SemanticStyle::Heading1, Color::Red, Modifier::BOLD),
@@ -1278,7 +2357,7 @@ pub static DEFAULT_LIGHT: Theme = Theme {
             ),
         ],
     },
-    color16: Palette::Color16 {
+    color16: StaticPalette::Color16 {
         semantic: &[
             (SemanticStyle::Text, Color::Black, Modifier::empty()),
             (SemanticStyle::Heading1, Color::Red, Modifier::BOLD),
@@ -1403,7 +2482,7 @@ pub static DEFAULT_LIGHT: Theme = Theme {
             ),
         ],
     },
-    monochrome: Palette::Monochrome {
+    monochrome: StaticPalette::Monochrome {
         semantic: &[
             (SemanticStyle::Text, Modifier::empty()),
             (SemanticStyle::Heading1, Modifier::BOLD),
@@ -1472,9 +2551,9 @@ pub static DEFAULT_LIGHT: Theme = Theme {
 
 // ── Built-in: accessible (Monochrome) ───────────────────────────────────────
 
-pub static ACCESSIBLE: Theme = Theme {
+static ACCESSIBLE_SPEC: StaticTheme = StaticTheme {
     name: "accessible",
-    truecolor: Palette::Monochrome {
+    truecolor: StaticPalette::Monochrome {
         semantic: &[
             (SemanticStyle::Text, Modifier::empty()),
             (SemanticStyle::Heading1, Modifier::BOLD),
@@ -1539,7 +2618,7 @@ pub static ACCESSIBLE: Theme = Theme {
             (UiSlot::PaletteSelected, Modifier::REVERSED),
         ],
     },
-    color16: Palette::Monochrome {
+    color16: StaticPalette::Monochrome {
         semantic: &[
             (SemanticStyle::Text, Modifier::empty()),
             (SemanticStyle::Heading1, Modifier::BOLD),
@@ -1604,7 +2683,7 @@ pub static ACCESSIBLE: Theme = Theme {
             (UiSlot::PaletteSelected, Modifier::REVERSED),
         ],
     },
-    monochrome: Palette::Monochrome {
+    monochrome: StaticPalette::Monochrome {
         semantic: &[
             (SemanticStyle::Text, Modifier::empty()),
             (SemanticStyle::Heading1, Modifier::BOLD),
@@ -1671,7 +2750,13 @@ pub static ACCESSIBLE: Theme = Theme {
     },
 };
 
-// ── Legacy compatibility ────────────────────────────────────────────────────
+#[cfg(test)]
+pub static DEFAULT_DARK: std::sync::LazyLock<Theme> = std::sync::LazyLock::new(build_default_dark);
+#[cfg(test)]
+pub static DEFAULT_LIGHT: std::sync::LazyLock<Theme> =
+    std::sync::LazyLock::new(build_default_light);
+#[cfg(test)]
+pub static ACCESSIBLE: std::sync::LazyLock<Theme> = std::sync::LazyLock::new(build_accessible);
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
@@ -1686,9 +2771,10 @@ mod tests {
     /// of every built-in theme.
     #[test]
     fn all_semantic_styles_resolve() {
-        let themes: Vec<_> = BUILTIN_THEMES
+        let themes: Vec<_> = TEST_THEME_CATALOG
+            .entries()
             .iter()
-            .map(|spec| (spec.theme.name, spec.theme))
+            .map(|entry| (entry.theme.name.as_str(), &entry.theme))
             .collect();
 
         let variants = [
@@ -1746,7 +2832,11 @@ mod tests {
     /// Monochrome palettes must not have any foreground color other than Reset.
     #[test]
     fn monochrome_has_no_fg_colors() {
-        for theme in BUILTIN_THEMES.iter().map(|spec| spec.theme) {
+        for theme in TEST_THEME_CATALOG
+            .entries()
+            .iter()
+            .map(|entry| &entry.theme)
+        {
             let mono = &theme.monochrome;
             if let Palette::Monochrome { semantic, ui } = mono {
                 for (style, _) in semantic.iter() {
@@ -1774,7 +2864,11 @@ mod tests {
     /// Selection style always carries REVERSED on every tier of every theme.
     #[test]
     fn selection_carries_reversed() {
-        for theme in BUILTIN_THEMES.iter().map(|spec| spec.theme) {
+        for theme in TEST_THEME_CATALOG
+            .entries()
+            .iter()
+            .map(|entry| &entry.theme)
+        {
             for tier in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
                 let style = theme.style(tier, SemanticStyle::Selection);
                 assert!(
@@ -1788,7 +2882,11 @@ mod tests {
 
     #[test]
     fn cursor_line_has_a_distinct_non_color_carrier() {
-        for theme in BUILTIN_THEMES.iter().map(|spec| spec.theme) {
+        for theme in TEST_THEME_CATALOG
+            .entries()
+            .iter()
+            .map(|entry| &entry.theme)
+        {
             for tier in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
                 let selection = theme.style(tier, SemanticStyle::Selection);
                 let cursor = theme.ui_style(tier, UiSlot::CursorLine);
@@ -1868,7 +2966,11 @@ mod tests {
     /// Search matches must remain visible when foreground colors are absent.
     #[test]
     fn search_match_carries_underline() {
-        for theme in BUILTIN_THEMES.iter().map(|spec| spec.theme) {
+        for theme in TEST_THEME_CATALOG
+            .entries()
+            .iter()
+            .map(|entry| &entry.theme)
+        {
             for tier in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
                 let style = theme.style(tier, SemanticStyle::Match);
                 assert!(
@@ -1886,7 +2988,11 @@ mod tests {
             provider: DiagnosticProvider::Spell,
             severity: DiagnosticSeverity::Warning,
         };
-        for theme in BUILTIN_THEMES.iter().map(|spec| spec.theme) {
+        for theme in TEST_THEME_CATALOG
+            .entries()
+            .iter()
+            .map(|entry| &entry.theme)
+        {
             for tier in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
                 let style = theme.decoration_style(tier, diagnostic);
                 assert!(style.add_modifier.contains(Modifier::UNDERLINED));
@@ -1910,9 +3016,10 @@ mod tests {
     /// non-default property on every tier.
     #[test]
     fn every_accessor_nonempty() {
-        let themes: Vec<_> = BUILTIN_THEMES
+        let themes: Vec<_> = TEST_THEME_CATALOG
+            .entries()
             .iter()
-            .map(|spec| (spec.theme.name, spec.theme))
+            .map(|entry| (entry.theme.name.as_str(), &entry.theme))
             .collect();
 
         let ui_slots = [
@@ -1928,6 +3035,8 @@ mod tests {
             UiSlot::StatusInfo,
             UiSlot::StatusWarning,
             UiSlot::StatusError,
+            UiSlot::DocumentBody,
+            UiSlot::GutterBackground,
             UiSlot::Gutter,
             UiSlot::GutterCurrent,
             UiSlot::CursorLine,
@@ -1947,8 +3056,14 @@ mod tests {
             for tier in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
                 for slot in &ui_slots {
                     let style = theme.ui_style(tier, *slot);
+                    let legacy_terminal_body = *slot == UiSlot::DocumentBody
+                        && matches!(*name, "default-dark" | "default-light")
+                        && tier != Tier::Monochrome;
                     assert!(
-                        style.fg.is_some() || style.bg.is_some() || !style.add_modifier.is_empty(),
+                        legacy_terminal_body
+                            || style.fg.is_some()
+                            || style.bg.is_some()
+                            || !style.add_modifier.is_empty(),
                         "UI slot {slot:?} on {name} tier {tier:?} must carry at least one property"
                     );
                 }
@@ -2145,13 +3260,13 @@ mod tests {
     fn resolve_cli_theme_takes_priority() {
         let env = EnvParts::default();
         let resolved = resolve_theme(
-            Some("default-light"),
+            Some("catppuccin-mocha"),
             None,
             Some("default-dark"),
             Some("default-light"),
             &env,
         );
-        assert_eq!(resolved.name, "default-light");
+        assert_eq!(resolved.name, "catppuccin-mocha");
         assert_eq!(resolved.source, ThemeSource::Cli);
     }
 
@@ -2300,7 +3415,8 @@ mod tests {
             Some("default-light"),
             &env,
         );
-        assert_eq!(dark_cli_override.name, "default-light");
+        assert_eq!(dark_cli_override.name, "default-dark");
+        assert_eq!(dark_cli_override.source, ThemeSource::Fallback);
 
         let light_cli_override = resolve_theme(
             Some("default-dark"),
@@ -2309,7 +3425,8 @@ mod tests {
             Some("default-light"),
             &env,
         );
-        assert_eq!(light_cli_override.name, "default-dark");
+        assert_eq!(light_cli_override.name, "default-light");
+        assert_eq!(light_cli_override.source, ThemeSource::Fallback);
     }
 
     // ── Built-in themes ─────────────────────────────────────────────────
@@ -2317,34 +3434,55 @@ mod tests {
     #[test]
     fn built_in_themes_list() {
         let themes: Vec<_> = built_in_themes().collect();
-        assert_eq!(themes.len(), 3);
-        assert!(themes.contains(&"default-dark"));
-        assert!(themes.contains(&"default-light"));
-        assert!(themes.contains(&"accessible"));
+        assert_eq!(
+            themes,
+            vec![
+                "default-dark",
+                "catppuccin-mocha",
+                "dracula",
+                "nord",
+                "solarized-dark",
+                "tokyo-night",
+                "default-light",
+                "accessible",
+            ]
+        );
     }
 
     #[test]
     fn builtin_theme_registry_has_unique_names_and_mode_defaults() {
         let mut names = std::collections::HashSet::new();
         for spec in BUILTIN_THEMES {
-            assert!(names.insert(spec.theme.name));
+            assert!(names.insert(spec.name));
         }
-        let first_dark = BUILTIN_THEMES
+        assert!(!names.contains("gruvbox"));
+        assert!(!names.contains("rose-pine"));
+        for mode in [DisplayMode::Dark, DisplayMode::Light] {
+            assert_eq!(
+                BUILTIN_THEMES
+                    .iter()
+                    .filter(|spec| spec.fallback && spec.compatible_mode == Some(mode))
+                    .count(),
+                1
+            );
+        }
+        let attributed: Vec<_> = BUILTIN_THEMES
             .iter()
-            .find(|spec| {
-                spec.compatible_mode
-                    .is_none_or(|mode| mode == DisplayMode::Dark)
+            .filter_map(|spec| {
+                spec.attribution
+                    .map(|attribution| (spec.name, attribution.identifier, attribution.spdx))
             })
-            .unwrap();
-        let first_light = BUILTIN_THEMES
-            .iter()
-            .find(|spec| {
-                spec.compatible_mode
-                    .is_none_or(|mode| mode == DisplayMode::Light)
-            })
-            .unwrap();
-        assert_eq!(first_dark.theme.name, "default-dark");
-        assert_eq!(first_light.theme.name, "default-light");
+            .collect();
+        assert_eq!(
+            attributed,
+            vec![
+                ("catppuccin-mocha", "catppuccin-mocha", "MIT"),
+                ("dracula", "dracula", "MIT"),
+                ("nord", "nord", "MIT"),
+                ("solarized-dark", "solarized-dark", "MIT"),
+                ("tokyo-night", "tokyo-night", "Apache-2.0"),
+            ]
+        );
     }
 
     #[test]
@@ -2353,40 +3491,30 @@ mod tests {
             built_in_themes().collect::<Vec<_>>(),
             BUILTIN_THEMES
                 .iter()
-                .map(|spec| spec.theme.name)
+                .map(|spec| spec.name)
                 .collect::<Vec<_>>()
         );
-        for (index, spec) in BUILTIN_THEMES.iter().enumerate() {
-            assert!(std::ptr::eq(get_theme(spec.theme.name), spec.theme));
+        for spec in BUILTIN_THEMES {
+            let theme = get_theme(spec.name);
+            assert_eq!(theme.name, spec.name);
             for mode in [DisplayMode::Dark, DisplayMode::Light] {
-                let is_light = mode == DisplayMode::Light;
                 assert_eq!(
-                    supports_mode(spec.theme.name, is_light),
+                    TEST_THEME_CATALOG.supports_mode(spec.name, mode),
                     spec.compatible_mode
                         .is_none_or(|compatible| compatible == mode)
                 );
-                if supports_mode(spec.theme.name, is_light) {
-                    let expected = BUILTIN_THEMES
-                        .iter()
-                        .cycle()
-                        .skip(index + 1)
-                        .find(|candidate| {
-                            candidate
-                                .compatible_mode
-                                .is_none_or(|compatible| compatible == mode)
-                        })
-                        .unwrap()
-                        .theme
-                        .name;
-                    assert_eq!(cycle_theme(spec.theme.name, is_light), expected);
-                }
             }
         }
     }
 
     #[test]
     fn cycle_theme_stays_within_display_mode() {
-        assert_eq!(cycle_theme("default-dark", false), "accessible");
+        assert_eq!(cycle_theme("default-dark", false), "catppuccin-mocha");
+        assert_eq!(cycle_theme("catppuccin-mocha", false), "dracula");
+        assert_eq!(cycle_theme("dracula", false), "nord");
+        assert_eq!(cycle_theme("nord", false), "solarized-dark");
+        assert_eq!(cycle_theme("solarized-dark", false), "tokyo-night");
+        assert_eq!(cycle_theme("tokyo-night", false), "accessible");
         assert_eq!(cycle_theme("accessible", false), "default-dark");
         assert_eq!(cycle_theme("default-light", true), "accessible");
         assert_eq!(cycle_theme("accessible", true), "default-light");
@@ -2395,6 +3523,657 @@ mod tests {
         assert_eq!(cycle_theme("default-dark", true), "default-light");
         assert_eq!(cycle_theme("nonexistent", false), "default-dark");
         assert_eq!(cycle_theme("nonexistent", true), "default-light");
+    }
+
+    #[test]
+    fn custom_theme_parser_accepts_complete_dark_and_light_palettes() {
+        for appearance in ["dark", "light"] {
+            let parsed: UserThemeFile =
+                toml::from_str(&test_user_theme_source(appearance)).unwrap();
+            let mode = parsed.appearance.display_mode();
+            let theme = parsed.build("custom-theme");
+            assert_eq!(
+                mode,
+                if appearance == "dark" {
+                    DisplayMode::Dark
+                } else {
+                    DisplayMode::Light
+                }
+            );
+            assert_eq!(
+                theme.ui_style(Tier::TrueColor, UiSlot::DocumentBody).bg,
+                Some(Color::Rgb(0x10, 0x10, 0x10))
+            );
+            assert_eq!(
+                theme.ui_style(Tier::Color16, UiSlot::GutterBackground).bg,
+                Some(Color::Black)
+            );
+            assert_eq!(
+                theme.style(Tier::TrueColor, SemanticStyle::Heading1).fg,
+                Some(Color::Rgb(0xcc, 0x66, 0xff))
+            );
+            assert_eq!(
+                theme.style(Tier::Monochrome, SemanticStyle::Heading1).fg,
+                Some(Color::Reset)
+            );
+        }
+    }
+
+    #[test]
+    fn readme_user_theme_example_is_the_complete_tested_schema() {
+        let readme = include_str!("../../../README.md");
+        let section = readme
+            .split_once("A complete user theme uses this strict schema.")
+            .expect("README should describe the strict user-theme schema")
+            .1;
+        let source = section
+            .split_once("```toml\n")
+            .expect("README should contain a TOML user-theme example")
+            .1
+            .split_once("```")
+            .expect("README user-theme example should close its code fence")
+            .0;
+        assert_eq!(source.trim(), test_user_theme_source("dark").trim());
+        let parsed: UserThemeFile = toml::from_str(source).unwrap();
+        let theme = parsed.build("readme-example");
+        assert_eq!(
+            theme.ui_style(Tier::TrueColor, UiSlot::DocumentBody).bg,
+            Some(Color::Rgb(0x10, 0x10, 0x10))
+        );
+
+        for name in built_in_themes() {
+            assert!(readme.contains(&format!("`{name}`")), "{name}");
+        }
+        let normalized_readme = readme.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(normalized_readme.contains(
+            "`default-dark`, `catppuccin-mocha`, `dracula`, `nord`, `solarized-dark`, `tokyo-night`, `default-light`, and the color-free `accessible` theme"
+        ));
+        for required in [
+            "65,536 bytes",
+            "lowercase kebab-case",
+            "loaded once at startup",
+            "`appearance` must be `dark` or `light`",
+            "matching `default-dark` or `default-light`",
+            "implicitly select `accessible`",
+            "valid sibling themes remain available",
+            "not reloaded while the editor is running",
+            "inheritance",
+            "user-controlled modifiers or gutter glyphs",
+        ] {
+            assert!(
+                normalized_readme.contains(required),
+                "README is missing {required:?}"
+            );
+        }
+        for excluded in ["Gruvbox", "Rosé Pine"] {
+            assert!(normalized_readme.contains(excluded));
+        }
+    }
+
+    #[test]
+    fn lowered_custom_theme_has_complete_rows_and_fixed_accessibility_carriers() {
+        let parsed: UserThemeFile = toml::from_str(&test_user_theme_source("dark")).unwrap();
+        let custom = parsed.build("custom-theme");
+        let reference = get_theme("catppuccin-mocha");
+
+        for tier in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
+            match (custom.palette_for(tier), reference.palette_for(tier)) {
+                (
+                    Palette::TrueColor {
+                        semantic: custom_semantic,
+                        ui: custom_ui,
+                    }
+                    | Palette::Color16 {
+                        semantic: custom_semantic,
+                        ui: custom_ui,
+                    },
+                    Palette::TrueColor {
+                        semantic: reference_semantic,
+                        ui: reference_ui,
+                    }
+                    | Palette::Color16 {
+                        semantic: reference_semantic,
+                        ui: reference_ui,
+                    },
+                ) => {
+                    assert_eq!(
+                        custom_semantic
+                            .iter()
+                            .map(|row| row.0)
+                            .collect::<std::collections::HashSet<_>>(),
+                        reference_semantic.iter().map(|row| row.0).collect()
+                    );
+                    assert_eq!(
+                        custom_ui
+                            .iter()
+                            .map(|row| row.0)
+                            .collect::<std::collections::HashSet<_>>(),
+                        reference_ui.iter().map(|row| row.0).collect()
+                    );
+                }
+                (
+                    Palette::Monochrome {
+                        semantic: custom_semantic,
+                        ui: custom_ui,
+                    },
+                    Palette::Monochrome {
+                        semantic: reference_semantic,
+                        ui: reference_ui,
+                    },
+                ) => {
+                    assert_eq!(custom_semantic, reference_semantic);
+                    assert_eq!(custom_ui, reference_ui);
+                }
+                _ => panic!("custom and bundled role themes must lower to the same tier shape"),
+            }
+        }
+
+        assert!(custom
+            .style(Tier::Monochrome, SemanticStyle::Selection)
+            .add_modifier
+            .contains(Modifier::REVERSED));
+        assert!(custom
+            .style(Tier::Monochrome, SemanticStyle::Match)
+            .add_modifier
+            .contains(Modifier::UNDERLINED));
+        assert!(custom
+            .ui_style(Tier::Monochrome, UiSlot::NormalCursor)
+            .add_modifier
+            .contains(Modifier::UNDERLINED));
+        for severity in [
+            DiagnosticSeverity::Error,
+            DiagnosticSeverity::Warning,
+            DiagnosticSeverity::Info,
+            DiagnosticSeverity::Hint,
+        ] {
+            let style = custom.decoration_style(
+                Tier::Monochrome,
+                DecorationKind::Diagnostic {
+                    provider: DiagnosticProvider::Spell,
+                    severity,
+                },
+            );
+            assert!(style.fg.is_none() || style.fg == Some(Color::Reset));
+            assert!(!style.add_modifier.is_empty());
+        }
+    }
+
+    #[test]
+    fn custom_theme_parser_rejects_invalid_contract_rows() {
+        let valid = test_user_theme_source("dark");
+        for (case, source) in [
+            (
+                "missing role",
+                valid.replace("attention = \"#ff9933\"\n", ""),
+            ),
+            (
+                "unknown palette key",
+                valid.replace(
+                    "attention = \"#ff9933\"",
+                    "attention = \"#ff9933\"\nextra = \"#000000\"",
+                ),
+            ),
+            ("short color", valid.replace("#101010", "#101")),
+            ("alpha color", valid.replace("#101010", "#101010ff")),
+            ("non-hex color", valid.replace("#101010", "#zzzzzz")),
+            (
+                "appearance",
+                valid.replace("appearance = \"dark\"", "appearance = \"sepia\""),
+            ),
+            (
+                "ansi",
+                valid.replace("primary = \"magenta\"", "primary = \"orange\""),
+            ),
+            (
+                "inheritance",
+                format!("inherits = \"default-dark\"\n{valid}"),
+            ),
+            ("include", format!("include = \"other.toml\"\n{valid}")),
+        ] {
+            assert!(
+                toml::from_str::<UserThemeFile>(&source).is_err(),
+                "{case} must fail"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_theme_names_are_exact_lowercase_kebab_case() {
+        for valid in ["a", "dark-one", "theme-2", "v2-theme"] {
+            assert!(valid_theme_name(valid), "{valid}");
+        }
+        for invalid in [
+            "",
+            "-leading",
+            "trailing-",
+            "two--hyphens",
+            "Upper",
+            "under_score",
+            "unicode-é",
+            ".hidden",
+        ] {
+            assert!(!valid_theme_name(invalid), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn theme_loader_enforces_exact_size_and_error_precedence() {
+        let directory = tempfile::tempdir().unwrap();
+        let exact_path = directory.path().join("exact.toml");
+        let mut exact = test_user_theme_source("dark").into_bytes();
+        exact.extend_from_slice(b"\n#");
+        exact.resize(MAX_USER_THEME_BYTES, b'x');
+        fs::write(&exact_path, &exact).unwrap();
+        let mut catalog = ThemeCatalog::builtins();
+        catalog.load_file(&exact_path).unwrap();
+        assert!(catalog.get("exact").is_some());
+
+        let oversized_path = directory.path().join("oversized.toml");
+        let mut oversized = exact;
+        oversized.push(0xff);
+        fs::write(&oversized_path, oversized).unwrap();
+        let warning = catalog.load_file(&oversized_path).unwrap_err();
+        assert_eq!(warning.kind, ThemeLoadWarningKind::TooLarge);
+        assert_eq!(read_bounded_theme(&oversized_path).unwrap().len(), 65_537);
+    }
+
+    #[test]
+    fn theme_catalog_discovers_direct_children_in_lexical_order_and_isolates_failures() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        let themes = directory.path().join("themes");
+        fs::create_dir_all(themes.join("nested")).unwrap();
+        fs::write(themes.join("zeta.toml"), test_user_theme_source("dark")).unwrap();
+        fs::write(themes.join("alpha.toml"), test_user_theme_source("light")).unwrap();
+        fs::write(themes.join("broken.toml"), "appearance = [").unwrap();
+        fs::write(themes.join("ignored.txt"), test_user_theme_source("dark")).unwrap();
+        fs::write(
+            themes.join("nested/hidden.toml"),
+            test_user_theme_source("dark"),
+        )
+        .unwrap();
+
+        let report = ThemeCatalog::load_from_config_path(&config_path);
+        assert_eq!(report.warnings.len(), 1);
+        assert_eq!(report.warnings[0].path, themes.join("broken.toml"));
+        assert_eq!(report.warnings[0].kind, ThemeLoadWarningKind::InvalidToml);
+        let user_entries: Vec<_> = report
+            .catalog
+            .entries()
+            .iter()
+            .filter_map(|entry| match &entry.origin {
+                ThemeOrigin::User(path) => Some((entry.theme.name.as_str(), path.as_path())),
+                ThemeOrigin::Builtin => None,
+            })
+            .collect();
+        assert_eq!(
+            user_entries,
+            vec![
+                ("alpha", themes.join("alpha.toml").as_path()),
+                ("zeta", themes.join("zeta.toml").as_path()),
+            ]
+        );
+        assert!(report.catalog.get("hidden").is_none());
+    }
+
+    #[test]
+    fn theme_load_warnings_are_typed_ordered_and_startup_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        let themes = directory.path().join("themes");
+        fs::create_dir(&themes).unwrap();
+        fs::write(themes.join("Bad.toml"), test_user_theme_source("dark")).unwrap();
+        fs::write(
+            themes.join("accessible.toml"),
+            test_user_theme_source("dark"),
+        )
+        .unwrap();
+        fs::write(themes.join("invalid-utf8.toml"), [0xff]).unwrap();
+        fs::write(themes.join("valid.toml"), test_user_theme_source("dark")).unwrap();
+
+        let first = ThemeCatalog::load_from_config_path(&config_path);
+        let actual: Vec<_> = first
+            .warnings
+            .iter()
+            .map(|warning| {
+                (
+                    warning
+                        .path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    warning.kind,
+                )
+            })
+            .collect();
+        assert_eq!(
+            actual,
+            vec![
+                ("Bad.toml".to_string(), ThemeLoadWarningKind::InvalidName),
+                (
+                    "accessible.toml".to_string(),
+                    ThemeLoadWarningKind::ReservedName,
+                ),
+                (
+                    "invalid-utf8.toml".to_string(),
+                    ThemeLoadWarningKind::InvalidUtf8,
+                ),
+            ]
+        );
+        assert!(first.catalog.get("valid").is_some());
+
+        fs::write(themes.join("later.toml"), test_user_theme_source("light")).unwrap();
+        assert!(first.catalog.get("later").is_none());
+        assert!(ThemeCatalog::load_from_config_path(&config_path)
+            .catalog
+            .get("later")
+            .is_some());
+
+        let duplicate = first
+            .catalog
+            .clone()
+            .load_file(&themes.join("valid.toml"))
+            .unwrap_err();
+        assert_eq!(duplicate.kind, ThemeLoadWarningKind::DuplicateName);
+        let missing = ThemeCatalog::builtins()
+            .load_file(&themes.join("missing.toml"))
+            .unwrap_err();
+        assert_eq!(missing.kind, ThemeLoadWarningKind::ReadFailed);
+        let missing_directory =
+            ThemeCatalog::load_from_config_path(&directory.path().join("other/config.toml"));
+        assert!(missing_directory.warnings.is_empty());
+    }
+
+    #[test]
+    fn custom_catalog_resolution_and_cycle_are_mode_aware() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        let themes = directory.path().join("themes");
+        fs::create_dir(&themes).unwrap();
+        fs::write(themes.join("a-dark.toml"), test_user_theme_source("dark")).unwrap();
+        fs::write(themes.join("b-light.toml"), test_user_theme_source("light")).unwrap();
+        let catalog = ThemeCatalog::load_from_config_path(&config_path).catalog;
+
+        assert_eq!(catalog.cycle_theme("accessible", false), "a-dark");
+        assert_eq!(catalog.cycle_theme("a-dark", false), "default-dark");
+        assert_eq!(catalog.cycle_theme("accessible", true), "b-light");
+        assert_eq!(catalog.cycle_theme("b-light", true), "default-light");
+
+        let dark_env = EnvParts {
+            colorterm: Some("truecolor".to_string()),
+            ..EnvParts::default()
+        };
+        assert_eq!(
+            catalog
+                .resolve_theme(Some("a-dark"), None, None, None, &dark_env)
+                .name,
+            "a-dark"
+        );
+        assert_eq!(
+            catalog
+                .resolve_theme(Some("b-light"), None, None, None, &dark_env)
+                .name,
+            "default-dark"
+        );
+        let light_env = EnvParts::default();
+        assert_eq!(
+            catalog
+                .resolve_theme(None, Some("light"), None, Some("b-light"), &light_env)
+                .name,
+            "b-light"
+        );
+        let selected_env = EnvParts {
+            oom_edit_theme: Some("a-dark".to_string()),
+            ..EnvParts::default()
+        };
+        assert_eq!(
+            catalog
+                .resolve_theme(None, None, None, None, &selected_env)
+                .source,
+            ThemeSource::Environment
+        );
+    }
+
+    #[test]
+    fn catalogs_own_independent_names_and_style_tables() {
+        let first = ThemeCatalog::builtins();
+        let second = ThemeCatalog::builtins();
+        for name in built_in_themes() {
+            let first_theme = first.get(name).unwrap();
+            let second_theme = second.get(name).unwrap();
+            assert_ne!(first_theme as *const Theme, second_theme as *const Theme);
+            assert_ne!(first_theme.name.as_ptr(), second_theme.name.as_ptr());
+            let (
+                Palette::TrueColor {
+                    semantic: first, ..
+                },
+                Palette::TrueColor {
+                    semantic: second, ..
+                },
+            ) = (&first_theme.truecolor, &second_theme.truecolor)
+            else {
+                if name == "accessible" {
+                    continue;
+                }
+                panic!("color theme must own TrueColor rows");
+            };
+            assert_ne!(first.as_ptr(), second.as_ptr());
+        }
+    }
+
+    #[test]
+    fn legacy_body_stays_terminal_default_and_gutter_additions_are_isolated() {
+        for (theme, truecolor_gutter, ansi_gutter) in [
+            (&*DEFAULT_DARK, Color::Rgb(47, 52, 62), Color::Black),
+            (&*DEFAULT_LIGHT, Color::Rgb(225, 228, 232), Color::Gray),
+        ] {
+            for tier in [Tier::TrueColor, Tier::Color16] {
+                let body = theme.ui_style(tier, UiSlot::DocumentBody);
+                assert_eq!(body.fg, None, "{} {tier:?}", theme.name);
+                assert_eq!(body.bg, None, "{} {tier:?}", theme.name);
+                assert_eq!(body.add_modifier, Modifier::empty());
+            }
+            assert_eq!(
+                theme.ui_style(Tier::TrueColor, UiSlot::GutterBackground).bg,
+                Some(truecolor_gutter)
+            );
+            assert_eq!(
+                theme.ui_style(Tier::Color16, UiSlot::GutterBackground).bg,
+                Some(ansi_gutter)
+            );
+        }
+        for tier in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
+            for slot in [UiSlot::DocumentBody, UiSlot::GutterBackground] {
+                let style = ACCESSIBLE.ui_style(tier, slot);
+                assert_eq!(style.fg, Some(Color::Reset));
+                assert_eq!(style.bg, None);
+            }
+        }
+    }
+
+    #[test]
+    fn bundled_theme_anchor_values_match_pinned_provenance() {
+        let cases = [
+            (
+                "catppuccin-mocha",
+                Color::Rgb(0x1e, 0x1e, 0x2e),
+                Color::Rgb(0x18, 0x18, 0x25),
+                Color::Rgb(0xcd, 0xd6, 0xf4),
+                Color::Rgb(0xcb, 0xa6, 0xf7),
+                Color::Rgb(0xa6, 0xe3, 0xa1),
+                Color::Rgb(0xf9, 0xe2, 0xaf),
+                Color::Rgb(0xf3, 0x8b, 0xa8),
+            ),
+            (
+                "dracula",
+                Color::Rgb(0x28, 0x2a, 0x36),
+                Color::Rgb(0x44, 0x47, 0x5a),
+                Color::Rgb(0xf8, 0xf8, 0xf2),
+                Color::Rgb(0xbd, 0x93, 0xf9),
+                Color::Rgb(0x50, 0xfa, 0x7b),
+                Color::Rgb(0xf1, 0xfa, 0x8c),
+                Color::Rgb(0xff, 0x55, 0x55),
+            ),
+            (
+                "nord",
+                Color::Rgb(0x2e, 0x34, 0x40),
+                Color::Rgb(0x3b, 0x42, 0x52),
+                Color::Rgb(0xd8, 0xde, 0xe9),
+                Color::Rgb(0x88, 0xc0, 0xd0),
+                Color::Rgb(0xa3, 0xbe, 0x8c),
+                Color::Rgb(0xeb, 0xcb, 0x8b),
+                Color::Rgb(0xbf, 0x61, 0x6a),
+            ),
+            (
+                "solarized-dark",
+                Color::Rgb(0x00, 0x2b, 0x36),
+                Color::Rgb(0x07, 0x36, 0x42),
+                Color::Rgb(0x83, 0x94, 0x96),
+                Color::Rgb(0x26, 0x8b, 0xd2),
+                Color::Rgb(0x85, 0x99, 0x00),
+                Color::Rgb(0xb5, 0x89, 0x00),
+                Color::Rgb(0xdc, 0x32, 0x2f),
+            ),
+            (
+                "tokyo-night",
+                Color::Rgb(0x1a, 0x1b, 0x26),
+                Color::Rgb(0x16, 0x16, 0x1e),
+                Color::Rgb(0xc0, 0xca, 0xf5),
+                Color::Rgb(0x7a, 0xa2, 0xf7),
+                Color::Rgb(0x9e, 0xce, 0x6a),
+                Color::Rgb(0xe0, 0xaf, 0x68),
+                Color::Rgb(0xf7, 0x76, 0x8e),
+            ),
+        ];
+        for (name, body, gutter, text, primary, success, warning, error) in cases {
+            let theme = get_theme(name);
+            assert_eq!(
+                theme.ui_style(Tier::TrueColor, UiSlot::DocumentBody).bg,
+                Some(body),
+                "{name} body"
+            );
+            assert_eq!(
+                theme.ui_style(Tier::TrueColor, UiSlot::GutterBackground).bg,
+                Some(gutter),
+                "{name} gutter"
+            );
+            assert_eq!(
+                theme.style(Tier::TrueColor, SemanticStyle::Text).fg,
+                Some(text)
+            );
+            assert_eq!(
+                theme.style(Tier::TrueColor, SemanticStyle::Heading1).fg,
+                Some(primary)
+            );
+            assert_eq!(
+                theme.ui_style(Tier::TrueColor, UiSlot::StatusSuccess).fg,
+                Some(success)
+            );
+            assert_eq!(
+                theme.ui_style(Tier::TrueColor, UiSlot::StatusWarning).fg,
+                Some(warning)
+            );
+            assert_eq!(
+                theme.ui_style(Tier::TrueColor, UiSlot::StatusError).fg,
+                Some(error)
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_themes_have_distinct_body_gutters_and_explicit_ansi() {
+        for name in [
+            "catppuccin-mocha",
+            "dracula",
+            "nord",
+            "solarized-dark",
+            "tokyo-night",
+        ] {
+            let theme = get_theme(name);
+            for tier in [Tier::TrueColor, Tier::Color16] {
+                let body = theme.ui_style(tier, UiSlot::DocumentBody).bg;
+                let gutter = theme.ui_style(tier, UiSlot::GutterBackground).bg;
+                assert!(body.is_some(), "{name} {tier:?} body");
+                assert!(gutter.is_some(), "{name} {tier:?} gutter");
+                assert_ne!(body, gutter, "{name} {tier:?}");
+            }
+            let Palette::Color16 { semantic, ui } = &theme.color16 else {
+                panic!("{name} must have explicit ANSI rows");
+            };
+            assert!(semantic
+                .iter()
+                .all(|(_, color, _)| !matches!(color, Color::Rgb(_, _, _))));
+            assert!(ui.iter().all(|(_, foreground, background, _)| {
+                !matches!(foreground, Color::Rgb(_, _, _))
+                    && !matches!(background, Some(Color::Rgb(_, _, _)))
+            }));
+        }
+    }
+
+    #[test]
+    fn bundled_theme_primary_text_contrast_is_reviewed() {
+        fn linear(component: u8) -> f64 {
+            let value = f64::from(component) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        fn luminance(color: Color) -> f64 {
+            let Color::Rgb(red, green, blue) = color else {
+                panic!("contrast checks require RGB anchors");
+            };
+            0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue)
+        }
+        fn ratio(first: Color, second: Color) -> f64 {
+            let (bright, dark) = {
+                let first = luminance(first);
+                let second = luminance(second);
+                if first >= second {
+                    (first, second)
+                } else {
+                    (second, first)
+                }
+            };
+            (bright + 0.05) / (dark + 0.05)
+        }
+
+        for name in [
+            "catppuccin-mocha",
+            "dracula",
+            "nord",
+            "solarized-dark",
+            "tokyo-night",
+        ] {
+            let theme = get_theme(name);
+            let text = theme
+                .style(Tier::TrueColor, SemanticStyle::Text)
+                .fg
+                .unwrap();
+            let body = theme
+                .ui_style(Tier::TrueColor, UiSlot::DocumentBody)
+                .bg
+                .unwrap();
+            let surface = theme
+                .ui_style(Tier::TrueColor, UiSlot::CodeFence)
+                .bg
+                .unwrap();
+            assert!(ratio(text, body) >= 4.5, "{name} body contrast");
+            // Solarized's canonical base0-on-base02 pairing is 4.11:1. Keep the
+            // approved upstream role mapping while guarding against further drift.
+            let surface_minimum = if name == "solarized-dark" { 4.0 } else { 4.5 };
+            assert!(
+                ratio(text, surface) >= surface_minimum,
+                "{name} surface contrast"
+            );
+            let status = theme.ui_style(Tier::TrueColor, UiSlot::StatusBar);
+            assert!(
+                ratio(status.fg.unwrap(), status.bg.unwrap()) >= surface_minimum,
+                "{name} status contrast"
+            );
+        }
     }
 
     #[test]
@@ -2838,35 +4617,37 @@ mod tests {
             panic!("default-dark TrueColor palette changed tiers");
         };
 
-        for (slot, foreground, _) in *semantic {
+        for &(slot, foreground, _) in semantic {
             if matches!(slot, SemanticStyle::Selection | SemanticStyle::CursorLine) {
                 assert_eq!(
-                    *foreground,
+                    foreground,
                     Color::Reset,
                     "semantic slot {slot:?} is an intentional composition sentinel"
                 );
             } else {
-                assert_rgb(*foreground, &format!("semantic slot {slot:?}"));
+                assert_rgb(foreground, &format!("semantic slot {slot:?}"));
             }
         }
-        for (slot, foreground, background, _) in *ui {
+        for &(slot, foreground, background, _) in ui {
             if matches!(
                 slot,
                 UiSlot::CursorLine
                     | UiSlot::NormalCursor
                     | UiSlot::CodeFence
                     | UiSlot::MetadataPanel
+                    | UiSlot::DocumentBody
+                    | UiSlot::GutterBackground
             ) {
                 assert_eq!(
-                    *foreground,
+                    foreground,
                     Color::Reset,
                     "UI cursor-line foreground is an intentional composition sentinel"
                 );
             } else {
-                assert_rgb(*foreground, &format!("UI slot {slot:?} foreground"));
+                assert_rgb(foreground, &format!("UI slot {slot:?} foreground"));
             }
             if let Some(background) = background {
-                assert_rgb(*background, &format!("UI slot {slot:?} background"));
+                assert_rgb(background, &format!("UI slot {slot:?} background"));
             }
         }
     }
@@ -2892,9 +4673,10 @@ mod tests {
     /// Every UiSlot variant is covered in every tier of every built-in theme.
     #[test]
     fn all_ui_slots_covered() {
-        let themes: Vec<_> = BUILTIN_THEMES
+        let themes: Vec<_> = TEST_THEME_CATALOG
+            .entries()
             .iter()
-            .map(|spec| (spec.theme.name, spec.theme))
+            .map(|entry| (entry.theme.name.as_str(), &entry.theme))
             .collect();
 
         let slots = [
@@ -2910,6 +4692,8 @@ mod tests {
             UiSlot::StatusInfo,
             UiSlot::StatusWarning,
             UiSlot::StatusError,
+            UiSlot::DocumentBody,
+            UiSlot::GutterBackground,
             UiSlot::Gutter,
             UiSlot::GutterCurrent,
             UiSlot::CursorLine,
@@ -2963,7 +4747,11 @@ mod tests {
                 assert!(!style.add_modifier.is_empty(), "{} {tier:?}", theme.name);
             }
         }
-        for theme in BUILTIN_THEMES.iter().map(|spec| spec.theme) {
+        for theme in TEST_THEME_CATALOG
+            .entries()
+            .iter()
+            .map(|entry| &entry.theme)
+        {
             let style = theme.ui_style(Tier::Monochrome, UiSlot::MetadataPanel);
             assert_eq!(style.fg, Some(Color::Reset));
             assert!(!style.add_modifier.is_empty(), "{} monochrome", theme.name);
@@ -3016,7 +4804,11 @@ mod tests {
             );
         }
 
-        for theme in BUILTIN_THEMES.iter().map(|spec| spec.theme) {
+        for theme in TEST_THEME_CATALOG
+            .entries()
+            .iter()
+            .map(|entry| &entry.theme)
+        {
             let style = theme.ui_style(Tier::Monochrome, UiSlot::CodeFence);
             assert_eq!(style.fg, Some(Color::Reset), "{} monochrome", theme.name);
             assert_eq!(style.bg, None, "{} monochrome", theme.name);
@@ -3130,7 +4922,11 @@ mod tests {
             UiSlot::BadgeCommand,
         ];
 
-        for theme in BUILTIN_THEMES.iter().map(|spec| spec.theme) {
+        for theme in TEST_THEME_CATALOG
+            .entries()
+            .iter()
+            .map(|entry| &entry.theme)
+        {
             for slot in slots {
                 let style = theme.ui_style(Tier::Monochrome, slot);
                 assert_eq!(style.fg, Some(Color::Reset));
@@ -3178,7 +4974,11 @@ mod tests {
             UiSlot::TabSeparator,
         ];
 
-        for theme in BUILTIN_THEMES.iter().map(|spec| spec.theme) {
+        for theme in TEST_THEME_CATALOG
+            .entries()
+            .iter()
+            .map(|entry| &entry.theme)
+        {
             for tier in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
                 for slot in slots {
                     assert!(

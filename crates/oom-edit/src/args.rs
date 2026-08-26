@@ -1,4 +1,4 @@
-//! Command-line arguments for the `oom-edit` binary (FR-6.10).
+//! Command-line arguments for the `oom-edit` binary.
 //!
 //! Hand-parsed (no `clap` — design rule: hand-roll small well-specified things).
 //! Parsing runs in `main` **before** any terminal setup, so `--help`,
@@ -7,16 +7,16 @@
 
 use std::path::PathBuf;
 
-const LICENSES_TEXT: &str = include_str!("../assets/dict/SCOWL-LICENSE.txt");
+const LICENSES_TEXT: &str = include_str!("../../../THIRD-PARTY-NOTICES.md");
 
 /// The parsed CLI arguments.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Args {
     /// Positional file path to open, if any.
     pub path: Option<PathBuf>,
-    /// `--theme NAME`: built-in theme name.
+    /// `--theme NAME`: built-in or user theme name.
     pub theme: Option<String>,
-    /// Hidden debug flag: trigger a panic for NFR-5 verification.
+    /// Hidden debug flag used to verify terminal restoration after a panic.
     #[allow(dead_code)]
     pub panic_test: bool,
 }
@@ -141,7 +141,7 @@ USAGE:
     oom-edit [OPTIONS] [--] [path]
 
 OPTIONS:
-    --theme NAME        Theme (default-dark, default-light, accessible)
+    --theme NAME        Built-in or user theme name
     --licenses          Print bundled-data licenses and exit
     -h, --help          Print this help and exit
     -V, --version       Print version and exit
@@ -223,7 +223,22 @@ mod tests {
     #[test]
     fn licenses_is_exact_pre_terminal_message() {
         match parse(&["--licenses"]) {
-            Ok(ParseOutcome::Message(message)) => assert_eq!(message, LICENSES_TEXT),
+            Ok(ParseOutcome::Message(message)) => {
+                assert_eq!(message, include_str!("../../../THIRD-PARTY-NOTICES.md"));
+                for required in [
+                    "SCOWL generated word-list data",
+                    "Catppuccin Mocha bundled theme",
+                    "Dracula bundled theme",
+                    "Nord bundled theme",
+                    "Solarized Dark bundled theme",
+                    "Tokyo Night bundled theme",
+                    "Copyright (c) 2018-present Enkia",
+                ] {
+                    assert!(message.contains(required), "missing notice: {required}");
+                }
+                assert!(!message.contains("Gruvbox"));
+                assert!(!message.contains("Rosé Pine"));
+            }
             other => panic!("expected licenses message, got {other:?}"),
         }
     }
@@ -324,6 +339,13 @@ mod tests {
             }
             other => panic!("expected help message, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn help_describes_open_theme_name_set() {
+        let help = help_text();
+        assert!(help.contains("--theme NAME        Built-in or user theme name"));
+        assert!(!help.contains("default-dark, default-light, accessible"));
     }
 
     #[test]

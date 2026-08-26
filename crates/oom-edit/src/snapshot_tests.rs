@@ -26,7 +26,10 @@ use crate::theme::{
 };
 
 fn resolve_test_theme_at(name: &str, capability: Tier) -> crate::theme::ResolvedTheme {
-    let config = crate::Config::default();
+    let mut config = crate::Config::default();
+    if name == "default-light" {
+        config.theme.mode = Some("light".to_string());
+    }
     let env = match capability {
         Tier::TrueColor => EnvParts {
             term: Some("xterm-256color".to_string()),
@@ -44,6 +47,7 @@ fn resolve_test_theme_at(name: &str, capability: Tier) -> crate::theme::Resolved
         },
     };
     crate::resolve_startup_theme(
+        &crate::theme::ThemeCatalog::builtins(),
         Some(name),
         &config,
         crate::config::ConfigPresence::default(),

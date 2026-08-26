@@ -378,7 +378,7 @@ pub fn build_gutter(
 }
 
 /// Blank terminal cells reserved between the final gutter digit and source text.
-pub const GUTTER_CONTENT_GAP: usize = 2;
+pub const GUTTER_CONTENT_GAP: usize = 1;
 
 /// Right-align a gutter label while reserving the trailing content gap.
 fn format_gutter_cell(text: &str, width: usize) -> String {
@@ -638,22 +638,50 @@ mod tests {
 
     #[test]
     fn gutter_width_tracks_digit_boundaries() {
-        assert_eq!(gutter_width(9), 6);
-        assert_eq!(gutter_width(10), 6);
-        assert_eq!(gutter_width(100), 6);
-        assert_eq!(gutter_width(1000), 7);
+        assert_eq!(gutter_width(9), 5);
+        assert_eq!(gutter_width(10), 5);
+        assert_eq!(gutter_width(100), 5);
+        assert_eq!(gutter_width(1000), 6);
     }
 
     #[test]
     fn gutter_padding_alignment_and_document_bounds_are_stable() {
-        let gutter = build_gutter(Mode::Insert, 95, 97, 10, 100, false, 6);
-        assert_eq!(gutter[4], " 100  ");
-        assert_eq!(gutter[5], "      ");
-        assert_eq!(gutter[9], "      ");
+        let gutter = build_gutter(Mode::Insert, 95, 97, 10, 100, false, 5);
+        assert_eq!(gutter[4], " 100 ");
+        assert_eq!(gutter[5], "     ");
+        assert_eq!(gutter[9], "     ");
 
-        for row in build_gutter(Mode::Normal, 0, 1, 3, 1000, true, 7) {
-            assert_eq!(row.len(), 7);
-            assert!(row.ends_with("  "));
+        for row in build_gutter(Mode::Normal, 0, 1, 3, 1000, true, 6) {
+            assert_eq!(row.len(), 6);
+            assert!(row.ends_with(' '));
+            assert!(!row.ends_with("  "));
+        }
+    }
+
+    #[test]
+    fn gutter_keeps_the_number_field_across_digit_boundaries() {
+        let absolute = build_gutter(Mode::Insert, 8, 9, 4, 1000, false, 6);
+        assert_eq!(absolute, ["    9 ", "   10 ", "   11 ", "   12 "]);
+
+        let relative = build_gutter(Mode::Normal, 8, 9, 4, 1000, true, 6);
+        assert_eq!(relative, ["   -1 ", "   10 ", "   +1 ", "   +2 "]);
+
+        for (line_count, expected) in [
+            (9, "   9 "),
+            (10, "  10 "),
+            (999, " 999 "),
+            (1000, " 1000 "),
+        ] {
+            let row = build_gutter(
+                Mode::Insert,
+                line_count - 1,
+                line_count - 1,
+                1,
+                line_count,
+                false,
+                gutter_width(line_count),
+            );
+            assert_eq!(row, [expected]);
         }
     }
 

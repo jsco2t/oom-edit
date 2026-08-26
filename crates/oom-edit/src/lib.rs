@@ -28,8 +28,11 @@ pub(crate) mod clipboard;
 pub(crate) mod command;
 pub(crate) mod config;
 pub(crate) mod event;
+pub(crate) mod gutter;
 pub(crate) mod lifecycle;
 pub(crate) mod overlay;
+#[cfg(test)]
+mod perf_tests;
 pub(crate) mod screens;
 #[cfg(test)]
 pub(crate) mod snapshot_tests;
@@ -50,15 +53,16 @@ use crate::app::{App, AppServices};
 use crate::config::{Config, ConfigPresence};
 use crate::spell_host::{resolve_wordlist_source, SpellHost};
 use crate::terminal_guard::TerminalGuard;
-use crate::theme::{EnvParts, ResolvedTheme};
+use crate::theme::{EnvParts, ResolvedTheme, ThemeCatalog};
 
 fn resolve_startup_theme(
+    catalog: &ThemeCatalog,
     cli_theme: Option<&str>,
     config: &Config,
     presence: ConfigPresence,
     env: &EnvParts,
 ) -> ResolvedTheme {
-    theme::resolve_theme(
+    catalog.resolve_theme(
         cli_theme,
         config.theme.mode.as_deref(),
         presence.dark.then_some(config.theme.dark.as_str()),
@@ -82,14 +86,24 @@ fn resolve_startup_theme(
 pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     // Load config (never fails — warns to stderr on malformed config).
     let (config, config_presence) = Config::load_with_presence();
+    let config_path = crate::config::config_path();
 
     let env = EnvParts::from_current_process();
+    let theme_report = ThemeCatalog::load_from_config_path(&config_path);
+    for warning in &theme_report.warnings {
+        eprintln!("oom-edit: warning: {warning}");
+    }
+    let theme_catalog = theme_report.catalog;
 
     // Resolve theme through the selection ladder.
-    let resolved_theme =
-        resolve_startup_theme(args.theme.as_deref(), &config, config_presence, &env);
+    let resolved_theme = resolve_startup_theme(
+        &theme_catalog,
+        args.theme.as_deref(),
+        &config,
+        config_presence,
+        &env,
+    );
 
-    let config_path = crate::config::config_path();
     let spell_resolution = resolve_wordlist_source(&config.spell, &config_path);
     if let Some(warning) = &spell_resolution.warning {
         eprintln!("oom-edit: warning: {warning}");
@@ -114,6 +128,7 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let app = App::new_with_spell(
         session,
+        theme_catalog,
         resolved_theme,
         app::AppStartupOptions::new(
             config.editor.wrap,
@@ -134,10 +149,9 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
-    // NFR-5 verification: deliberate panic while the terminal is in raw mode.
-    // The panic hook should restore the terminal before the default handler.
+    // Deliberately panic in raw mode so restoration can be verified.
     if args.panic_test {
-        panic!("--panic-test: deliberate panic for NFR-5 verification");
+        panic!("--panic-test: deliberate panic for terminal-restoration verification");
     }
 
     // Run the event loop.
@@ -148,7 +162,8 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 mod startup_tests {
     use super::*;
     use crate::config::EditorConfig;
-    use crate::theme::ThemeSource;
+    use crate::theme::{ThemeLoadWarningKind, ThemeSource};
+    use std::fs;
 
     #[test]
     fn production_resolver_reports_partial_config_slot_as_fallback() {
@@ -164,11 +179,14 @@ mod startup_tests {
             colorterm: Some("truecolor".to_string()),
             ..EnvParts::default()
         };
-        let fallback = resolve_startup_theme(None, &config, ConfigPresence::default(), &env);
+        let catalog = ThemeCatalog::builtins();
+        let fallback =
+            resolve_startup_theme(&catalog, None, &config, ConfigPresence::default(), &env);
         assert_eq!(fallback.name, "default-dark");
         assert_eq!(fallback.source, ThemeSource::Fallback);
 
         let configured = resolve_startup_theme(
+            &catalog,
             None,
             &config,
             ConfigPresence {
@@ -179,5 +197,66 @@ mod startup_tests {
         );
         assert_eq!(configured.name, "default-dark");
         assert_eq!(configured.source, ThemeSource::ConfigDark);
+    }
+
+    #[test]
+    fn rejected_selected_theme_and_unrelated_failure_warn_before_matching_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        let themes = directory.path().join("themes");
+        fs::create_dir(&themes).unwrap();
+        fs::write(themes.join("broken-selected.toml"), "appearance = [").unwrap();
+        fs::write(themes.join("unrelated-invalid.toml"), [0xff]).unwrap();
+
+        let report = ThemeCatalog::load_from_config_path(&config_path);
+        let warnings = report
+            .warnings
+            .iter()
+            .map(|warning| {
+                (
+                    warning.path.file_name().unwrap().to_string_lossy(),
+                    warning.kind,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            warnings,
+            vec![
+                (
+                    "broken-selected.toml".into(),
+                    ThemeLoadWarningKind::InvalidToml,
+                ),
+                (
+                    "unrelated-invalid.toml".into(),
+                    ThemeLoadWarningKind::InvalidUtf8,
+                ),
+            ]
+        );
+
+        let mut config = Config::default();
+        config.theme.mode = Some("light".to_string());
+        config.theme.light = "broken-selected".to_string();
+        let resolved = resolve_startup_theme(
+            &report.catalog,
+            None,
+            &config,
+            ConfigPresence {
+                dark: false,
+                light: true,
+            },
+            &EnvParts::default(),
+        );
+        assert_eq!(resolved.name, "default-light");
+        assert_eq!(resolved.source, ThemeSource::Fallback);
+
+        let startup_source = include_str!("lib.rs");
+        let load = startup_source
+            .find("ThemeCatalog::load_from_config_path")
+            .unwrap();
+        let warnings = startup_source
+            .find("for warning in &theme_report.warnings")
+            .unwrap();
+        let terminal = startup_source.find("TerminalGuard::new()").unwrap();
+        assert!(load < warnings && warnings < terminal);
     }
 }

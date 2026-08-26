@@ -993,6 +993,13 @@ impl<'a> RenderedLayoutBuilder<'a> {
 
 fn rendered_line_numbers(lines: &[RenderedLine], text: &str) -> Vec<Option<usize>> {
     let mut previous_content_source: Option<Range<usize>> = None;
+    let mut line_starts = Vec::with_capacity(text.len() / 80 + 1);
+    line_starts.push(0);
+    line_starts.extend(
+        text.bytes()
+            .enumerate()
+            .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
+    );
     lines
         .iter()
         .map(|line| {
@@ -1003,7 +1010,7 @@ fn rendered_line_numbers(lines: &[RenderedLine], text: &str) -> Vec<Option<usize
             }
             previous_content_source = Some(line.source.clone());
             let start = line.source.start.min(text.len());
-            Some(text[..start].bytes().filter(|byte| *byte == b'\n').count() + 1)
+            Some(line_starts.partition_point(|line_start| *line_start <= start))
         })
         .collect()
 }
@@ -1136,6 +1143,35 @@ pub(crate) use wrap::{text_width, wrap_source_line};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rendered_line_number_index_preserves_content_and_synthetic_semantics() {
+        fn line(source: Range<usize>, kind: LineKind) -> RenderedLine {
+            RenderedLine {
+                styled: StyledLine {
+                    text: String::new(),
+                    spans: Vec::new(),
+                },
+                source,
+                kind,
+                role: RenderedLineRole::Document,
+                atoms: Vec::new(),
+            }
+        }
+
+        let text = "first\nsecond\nthird";
+        let lines = vec![
+            line(0..5, LineKind::Content),
+            line(0..5, LineKind::Content),
+            line(6..12, LineKind::Synthetic),
+            line(6..12, LineKind::Content),
+            line(13..18, LineKind::Content),
+        ];
+        assert_eq!(
+            rendered_line_numbers(&lines, text),
+            vec![Some(1), None, None, Some(2), Some(3)]
+        );
+    }
 
     #[test]
     fn heading_text_inherits_its_level_style() {

@@ -41,12 +41,16 @@ build-examples: ## Build all examples with locked offline dependencies
 # Test
 # ---------------------------------------------------------------------------
 .PHONY: test
-test: feature-workflow-test ## Run the full test suite
+test: feature-workflow-test tui-perf-test ## Run the full test suite
 	bash scripts/with-isolated-config.sh cargo test --workspace --offline --locked
 
 .PHONY: feature-workflow-test
 feature-workflow-test: ## Test feature-workflow helper scripts
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .agents/skills/feature-workflow/tests -p 'test_*.py'
+
+.PHONY: tui-perf-test
+tui-perf-test: ## Test TUI performance evidence tooling
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_tui_performance.py'
 
 .PHONY: test-update-snapshots
 test-update-snapshots: ## Re-run tests with OOM_UPDATE_SNAPSHOTS=1 to (re)write golden files
@@ -116,6 +120,7 @@ check: ## Run fmt-check + lint + build + test + deny + audit + data-license-chec
 	echo ""; \
 	echo "test"; \
 	if PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .agents/skills/feature-workflow/tests -p 'test_*.py' 2>&1 \
+		&& PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_tui_performance.py' 2>&1 \
 		&& bash scripts/with-isolated-config.sh cargo test --workspace --offline --locked 2>&1; then \
 		echo "[PASS] test"; PASS=$$((PASS + 1)); \
 	else \
@@ -202,11 +207,21 @@ vendor: ## Re-vendor dependencies (requires network)
 .PHONY: bench
 bench: ## Run exact asserting release performance gates
 	cargo bench --workspace --offline --locked
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/tui_performance.py gate
 
 .PHONY: bench-check
 bench-check: ## Run asserting debug performance smoke gates
 	cargo test -p oom-spell --offline --locked --test perf_smoke
 	cargo test -p oom-edit-core --offline --locked --test perf_smoke
+	cargo test -p oom-edit --offline --locked --lib perf_tests::tui_gutter_debug_performance_smoke -- --exact --ignored --test-threads=1
+
+.PHONY: tui-perf-record
+tui-perf-record: ## Record TUI performance TSV (BRANCH_ROLE, OUTPUT, TRIALS)
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/tui_performance.py record --role "$(BRANCH_ROLE)" --output "$(OUTPUT)" --trials "$(TRIALS)"
+
+.PHONY: tui-perf-compare
+tui-perf-compare: ## Compare baseline/candidate TUI TSV evidence
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/tui_performance.py compare --baseline "$(BASELINE)" --candidate "$(CANDIDATE)" --output "$(OUTPUT)"
 
 # ---------------------------------------------------------------------------
 # Run

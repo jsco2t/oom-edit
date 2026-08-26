@@ -14,6 +14,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
+#[cfg(test)]
+use crate::gutter::GutterTroubleSnapshot;
+use crate::screens::editor::DocumentPresentation;
 use crate::theme::{Theme, Tier, UiSlot};
 use crate::widgets::spans;
 use crate::widgets::status_bar;
@@ -74,14 +77,14 @@ pub fn render_rendered(
     theme: &Theme,
     tier: Tier,
 ) {
+    let gutter_trouble = GutterTroubleSnapshot::default();
     render_rendered_with_settings(
         frame,
         session,
         viewport,
         RenderedSettings::new(relative_line_numbers),
         area,
-        theme,
-        tier,
+        DocumentPresentation::new(theme, tier, &gutter_trouble),
     );
 }
 
@@ -92,10 +95,15 @@ pub(crate) fn render_rendered_with_settings(
     viewport: RenderedViewport,
     settings: RenderedSettings,
     area: Rect,
-    theme: &Theme,
-    tier: Tier,
+    presentation: DocumentPresentation<'_>,
 ) {
+    let theme = presentation.theme;
+    let tier = presentation.tier;
     let height = area.height.max(1) as usize;
+    frame.render_widget(
+        Block::default().style(theme.ui_style(tier, UiSlot::DocumentBody)),
+        area,
+    );
     let mode = session.mode();
     let source_cursor_line = session.cursor().0;
     let gutter_width = (status_bar::gutter_width(session.line_count()) as u16)
@@ -128,7 +136,7 @@ pub(crate) fn render_rendered_with_settings(
         .rendered_layout()
         .expect("rendered layout was built for this frame");
 
-    if gutter_width > 0 && gutter_width < area.width {
+    if gutter_width > 0 {
         let gutter_area = Rect::new(area.x, area.y, gutter_width, area.height);
         super::editor::render_gutter(
             frame,
@@ -137,6 +145,7 @@ pub(crate) fn render_rendered_with_settings(
             &layout.line_numbers[rendered_top..rendered_bottom],
             settings.relative_line_numbers,
             gutter_area,
+            presentation,
         );
     }
     let text_area = Rect::new(
@@ -405,6 +414,74 @@ mod tests {
         let mut session = EditorSession::from_text("# misspelledd\n");
         drain_spell(&mut session, &engine);
         session
+    }
+
+    #[test]
+    fn rendered_markers_follow_numbered_rows_across_synthetic_rows_and_hscroll() {
+        let theme = get_theme("catppuccin-mocha");
+        let snapshot = GutterTroubleSnapshot::testing(&[
+            (0, DiagnosticSeverity::Warning),
+            (1, DiagnosticSeverity::Warning),
+            (2, DiagnosticSeverity::Warning),
+        ]);
+        let source =
+            "| a very wide heading | another wide heading |\n| --- | --- |\n| value | value |\n";
+        let mut session = EditorSession::from_text(source);
+
+        for left in [0, 5] {
+            let mut terminal = Terminal::new(TestBackend::new(18, 12)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_rendered_with_settings(
+                        frame,
+                        &mut session,
+                        RenderedViewport::new(0, left),
+                        RenderedSettings::new(false),
+                        frame.area(),
+                        DocumentPresentation::new(theme, Tier::TrueColor, &snapshot),
+                    );
+                })
+                .unwrap();
+            let line_numbers = session
+                .rendered_layout()
+                .unwrap()
+                .line_numbers
+                .iter()
+                .take(12)
+                .copied()
+                .collect::<Vec<_>>();
+            let layout_height = session.rendered_layout().unwrap().lines.len().min(12);
+            assert!(line_numbers.iter().any(Option::is_none));
+            let buffer = terminal.backend().buffer();
+            let gutter_background = theme
+                .ui_style(Tier::TrueColor, UiSlot::GutterBackground)
+                .bg
+                .unwrap();
+            let body_background = theme
+                .ui_style(Tier::TrueColor, UiSlot::DocumentBody)
+                .bg
+                .unwrap();
+            let mut markers = 0;
+            for row in 0..12 {
+                let expected = if line_numbers.get(row).copied().flatten().is_some() {
+                    markers += 1;
+                    "W"
+                } else {
+                    " "
+                };
+                assert_eq!(buffer.cell((0, row as u16)).unwrap().symbol(), expected);
+                for column in 0..5 {
+                    assert_eq!(
+                        buffer.cell((column, row as u16)).unwrap().bg,
+                        gutter_background
+                    );
+                }
+            }
+            for row in layout_height..12 {
+                assert_eq!(buffer.cell((17, row as u16)).unwrap().bg, body_background);
+            }
+            assert_eq!(markers, 2);
+        }
     }
 
     #[test]
@@ -752,9 +829,9 @@ mod tests {
                 .into_iter()
                 .map(|row| (row.row, row.columns))
                 .collect::<Vec<_>>(),
-            [(0, 0..5), (1, 0..5), (2, 0..1)]
+            [(0, 0..6), (1, 0..5)]
         );
-        for (row, columns) in [(0, 0..5), (1, 0..5), (2, 0..1)] {
+        for (row, columns) in [(0, 0..6), (1, 0..5)] {
             for column in columns {
                 let cell = wrapped_terminal
                     .backend()
@@ -767,7 +844,7 @@ mod tests {
         let neighbor = wrapped_terminal
             .backend()
             .buffer()
-            .cell((gutter + 1, 2))
+            .cell((gutter + 5, 1))
             .unwrap();
         assert!(!neighbor.modifier.contains(Modifier::UNDERLINED));
     }
@@ -1610,6 +1687,30 @@ mod tests {
         assert_eq!(buffer.cell((0, 0)).unwrap().symbol(), " ");
         assert_eq!(buffer.cell((3, 0)).unwrap().symbol(), "1");
         assert_eq!(buffer.cell((3, 1)).unwrap().symbol(), " ");
+    }
+
+    #[test]
+    fn rendered_body_starts_after_the_compact_gutter() {
+        let mut session = EditorSession::from_text("plain text\n");
+        let mut terminal = Terminal::new(TestBackend::new(20, 2)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_rendered(
+                    frame,
+                    &mut session,
+                    RenderedViewport::new(0, 0),
+                    false,
+                    frame.area(),
+                    &DEFAULT_DARK,
+                    Tier::TrueColor,
+                );
+            })
+            .unwrap();
+
+        assert_eq!(status_bar::gutter_width(session.line_count()), 5);
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer.cell((4, 0)).unwrap().symbol(), " ");
+        assert_eq!(buffer.cell((5, 0)).unwrap().symbol(), "p");
     }
 
     #[test]

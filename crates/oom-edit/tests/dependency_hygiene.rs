@@ -67,6 +67,63 @@ fn tui_resolves_single_crossterm_version() {
 }
 
 #[test]
+fn tui_runtime_tree_has_no_network_and_source_has_no_plugin_loading() {
+    let output = Command::new("cargo")
+        .args(["tree", "-p", "oom-edit", "--edges", "normal", "--offline"])
+        .current_dir(workspace_root())
+        .output()
+        .expect("cargo tree should run");
+    let stdout = checked_stdout(output, "cargo tree -p oom-edit --edges normal --offline");
+    assert!(stdout
+        .lines()
+        .next()
+        .is_some_and(|line| line.starts_with("oom-edit v")));
+    for banned in ["reqwest", "hyper ", "curl ", "wasmtime", "rhai ", "mlua "] {
+        assert!(
+            !stdout.contains(banned),
+            "runtime dependency tree contains forbidden network/plugin component {banned:?}:\n{stdout}"
+        );
+    }
+
+    let root = workspace_root();
+    for manifest in [
+        "crates/oom-edit/Cargo.toml",
+        "crates/oom-edit-core/Cargo.toml",
+    ] {
+        let source = std::fs::read_to_string(root.join(manifest)).unwrap();
+        for banned in ["libloading =", "abi_stable =", "wasmtime =", "mlua ="] {
+            assert!(
+                !source.contains(banned),
+                "{manifest} directly enables plugin runtime {banned:?}"
+            );
+        }
+    }
+    for source_directory in [
+        root.join("crates/oom-edit/src"),
+        root.join("crates/oom-edit-core/src"),
+    ] {
+        let mut pending = vec![source_directory];
+        while let Some(path) = pending.pop() {
+            for entry in std::fs::read_dir(path).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    let source = std::fs::read_to_string(&path).unwrap();
+                    for banned in ["libloading::", "Library::new(", "TcpStream::connect("] {
+                        assert!(
+                            !source.contains(banned),
+                            "{} dynamically loads code or opens a network path via {banned:?}",
+                            path.display()
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn make_deny_and_check_promote_warnings() {
     let root = workspace_root();
 

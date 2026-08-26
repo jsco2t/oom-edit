@@ -57,6 +57,57 @@ const ASSETS: &[ExpectedAsset] = &[
     },
 ];
 
+const THEME_ASSETS: &[(&str, &str)] = &[
+    (
+        "upstream/catppuccin-mocha.palette.json",
+        "4bc114bb6b3c9a9c9e156564aa84625aef32c5da514d9dd431cf1fcad433a05f",
+    ),
+    (
+        "upstream/catppuccin-mocha.LICENSE",
+        "814096d2c34cc216c624738a49356f32b7237733b4f7edb0685f4e50ef5074ba",
+    ),
+    (
+        "upstream/dracula.palette.md",
+        "412b7b8bea0a1061c32aa25177daf4eada29a90582f8a83722b0ab259c3e0532",
+    ),
+    (
+        "upstream/dracula.LICENSE",
+        "38b806a7e799cca4e9821e6f8d65cf0d8bfaaddbe454b41f12e5baad52d310f1",
+    ),
+    (
+        "upstream/nord.palette.scss",
+        "03d9dd98ff983308d10a9a4820c870e9eed7183a2d8aa689e3041e6d7cf1511b",
+    ),
+    (
+        "upstream/nord.LICENSE",
+        "25ac8188d670bd2ad2ce2f4f55ab88573010ee9f7a4502543cb1eea1e2274f8a",
+    ),
+    (
+        "upstream/solarized-dark.palette.md",
+        "f10571c994648365faab9c4f83bdd7699aa2cd056f111af5e29099c2673c5bc1",
+    ),
+    (
+        "upstream/solarized-dark.LICENSE",
+        "494aefdabf86acce06bd63001ad8aedad4ee38da23509d3f917d95aa3368b9a6",
+    ),
+    (
+        "upstream/tokyo-night-night.palette.lua",
+        "a8d87bf7aeb44617de4168d26fd9c1167bf3e7278acb0e155855caf6267b9c2d",
+    ),
+    (
+        "upstream/tokyo-night-storm.palette.lua",
+        "a96775b3b2bae3da751322806f7daaf2f8c9242cf4b52493732c62dc45c8894c",
+    ),
+    (
+        "upstream/tokyo-night.LICENSE",
+        "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+    ),
+    (
+        "upstream/tokyo-night-enkia-origin.LICENSE.txt",
+        "e3f5d0d772cda0f4f67405696f15a0f335460a2b3944eff40f00675aadacb31b",
+    ),
+];
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -258,14 +309,86 @@ fn license_notices_match_all_distribution_surfaces() {
         "--licenses should not initialize the TUI"
     );
     let binary_output = String::from_utf8(output.stdout).expect("license output should be UTF-8");
-    assert_eq!(binary_output, license);
+    assert_eq!(binary_output, notices);
     assert!(binary_output.contains(ATKINSON_NOTICE));
     assert!(binary_output.contains(TITZE_NOTICE));
-    for absent in ["Geoff Kuenning", "BSD", "MIT", "endorse or promote"] {
+    for heading in [
+        "## Catppuccin Mocha bundled theme",
+        "## Dracula bundled theme",
+        "## Nord bundled theme",
+        "## Solarized Dark bundled theme",
+        "## Tokyo Night bundled theme",
+    ] {
+        assert_eq!(binary_output.matches(heading).count(), 1, "{heading}");
+    }
+    for (_, relative) in [
+        ("catppuccin", "catppuccin-mocha.LICENSE"),
+        ("dracula", "dracula.LICENSE"),
+        ("nord", "nord.LICENSE"),
+        ("solarized", "solarized-dark.LICENSE"),
+        ("tokyo-night", "tokyo-night.LICENSE"),
+        ("enkia", "tokyo-night-enkia-origin.LICENSE.txt"),
+    ] {
+        let complete = fs::read_to_string(
+            root.join("crates/oom-edit/assets/themes/upstream")
+                .join(relative),
+        )
+        .expect("theme license should be readable");
+        assert!(binary_output.contains(&complete), "missing {relative}");
+    }
+    for absent in ["Gruvbox", "Rosé Pine"] {
         assert!(
             !binary_output.contains(absent),
             "binary output must not contain {absent:?}"
         );
+    }
+}
+
+#[test]
+fn theme_provenance_assets_and_mapping_are_pinned() {
+    let root = workspace_root();
+    let theme_dir = root.join("crates/oom-edit/assets/themes");
+    let manifest = fs::read_to_string(theme_dir.join("MANIFEST.sha256"))
+        .expect("theme manifest should be readable");
+    for (relative, expected) in THEME_ASSETS {
+        let path = theme_dir.join(relative);
+        assert_eq!(sha256(&path), *expected, "{relative}");
+        assert!(
+            manifest.contains(&format!("{expected}  {relative}")),
+            "theme manifest is missing {relative}"
+        );
+    }
+
+    let provenance = fs::read_to_string(theme_dir.join("PROVENANCE.toml"))
+        .expect("theme provenance should be readable");
+    let mapping =
+        fs::read_to_string(theme_dir.join("MAPPING.md")).expect("theme mapping should be readable");
+    assert_eq!(provenance.matches("[[themes]]").count(), 5);
+    for name in [
+        "catppuccin-mocha",
+        "dracula",
+        "nord",
+        "solarized-dark",
+        "tokyo-night",
+    ] {
+        assert!(provenance.contains(&format!("name = \"{name}\"")));
+    }
+    for role in [
+        "background",
+        "gutter-background",
+        "gutter-text-active",
+        "text-emphasis",
+        "primary",
+        "success",
+        "warning",
+        "error",
+        "attention",
+    ] {
+        assert!(mapping.contains(&format!("| {role} |")), "{role}");
+    }
+    for excluded in ["Gruvbox", "Rosé Pine"] {
+        assert!(!provenance.contains(excluded));
+        assert!(!mapping.contains(excluded));
     }
 }
 
@@ -540,15 +663,26 @@ fn data_license_check_fails_closed_for_contract_mutations() {
         "THIRD-PARTY-NOTICES.md",
         "docs/dependencies.md",
         "crates/oom-edit/src/args.rs",
+        "crates/oom-edit/src/theme.rs",
         "crates/oom-edit/assets/dict/SCOWL-LICENSE.txt",
         "crates/oom-edit/assets/dict/MANIFEST.sha256",
         "crates/oom-edit/assets/dict/PROVENANCE.txt",
         "crates/oom-edit/assets/dict/en_US.txt",
         "crates/oom-edit/assets/dict/en_CA.txt",
         "crates/oom-edit/assets/dict/en_AU.txt",
+        "crates/oom-edit/assets/themes/PROVENANCE.toml",
+        "crates/oom-edit/assets/themes/MAPPING.md",
+        "crates/oom-edit/assets/themes/MANIFEST.sha256",
     ];
     for relative in files {
         copy_fixture_file(&root, fixture.path(), relative);
+    }
+    for (relative, _) in THEME_ASSETS {
+        copy_fixture_file(
+            &root,
+            fixture.path(),
+            &format!("crates/oom-edit/assets/themes/{relative}"),
+        );
     }
 
     let baseline = data_license_check(&root, fixture.path());
@@ -622,7 +756,27 @@ fn data_license_check_fails_closed_for_contract_mutations() {
         ("crates/oom-edit/src/args.rs", "\"--licenses\""),
         (
             "crates/oom-edit/src/args.rs",
-            "include_str!(\"../assets/dict/SCOWL-LICENSE.txt\")",
+            "include_str!(\"../../../THIRD-PARTY-NOTICES.md\")",
+        ),
+        (
+            "THIRD-PARTY-NOTICES.md",
+            "## Tokyo Night bundled theme\n",
+        ),
+        (
+            "crates/oom-edit/assets/themes/PROVENANCE.toml",
+            "name = \"catppuccin-mocha\"\n",
+        ),
+        (
+            "crates/oom-edit/src/theme.rs",
+            "identifier: \"catppuccin-mocha\",\n",
+        ),
+        (
+            "crates/oom-edit/assets/themes/MAPPING.md",
+            "| gutter-background |",
+        ),
+        (
+            "crates/oom-edit/assets/themes/MANIFEST.sha256",
+            "4bc114bb6b3c9a9c9e156564aa84625aef32c5da514d9dd431cf1fcad433a05f  upstream/catppuccin-mocha.palette.json\n",
         ),
         (
             "crates/oom-edit/assets/dict/PROVENANCE.txt",
@@ -690,5 +844,22 @@ fn data_license_check_fails_closed_for_contract_mutations() {
             "data-license-check must fail after removing {needle:?} from {relative}"
         );
         fs::write(&path, original).expect("fixture should restore");
+    }
+
+    for (relative, _) in THEME_ASSETS {
+        let path = fixture
+            .path()
+            .join("crates/oom-edit/assets/themes")
+            .join(relative);
+        let original = fs::read(&path).expect("theme asset should be readable");
+        let mut tampered = original.clone();
+        tampered.extend_from_slice(b"\ntampered\n");
+        fs::write(&path, tampered).expect("tampered theme asset should write");
+        let output = data_license_check(&root, fixture.path());
+        assert!(
+            !output.status.success(),
+            "data-license-check must fail after tampering with {relative}"
+        );
+        fs::write(&path, original).expect("theme asset should restore");
     }
 }

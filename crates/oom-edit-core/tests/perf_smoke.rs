@@ -5,6 +5,8 @@
 
 #[path = "../perf/fixtures.rs"]
 mod fixtures;
+#[path = "../perf/layout_metrics.rs"]
+mod layout_metrics;
 
 mod perf_assertions {
     use std::sync::{Mutex, MutexGuard};
@@ -197,6 +199,35 @@ mod perf_assertions {
         println!("NFR-4 smoke: 5000 lines, cold {cold:?}, resize {resize:?}");
         assert!(cold < Duration::from_secs(2));
         assert!(resize < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn perf_smoke_nfr4_large_rendered_layout_shape() {
+        let _serial = serial();
+        let mut observations = Vec::new();
+        for bytes in [ONE_MIB / 4, ONE_MIB / 2, ONE_MIB] {
+            let doc = super::fixtures::seeded_markdown_fixture(bytes, FIXTURE_SEED);
+            let mut session = EditorSession::from_text(&doc);
+            let started = Instant::now();
+            let layout = session.render_layout(96);
+            let elapsed = started.elapsed();
+            let heap = super::layout_metrics::rendered_layout_heap_bytes(layout);
+            observations.push((bytes, elapsed, heap));
+        }
+        assert!(observations[2].1 < Duration::from_secs(4));
+        assert!(observations[2].2 <= 64 * 1024 * 1024);
+        for pair in observations.windows(2) {
+            assert!(super::layout_metrics::within_large_layout_scaling(
+                pair[0].2 as u128,
+                pair[1].2 as u128,
+            ));
+        }
+    }
+
+    #[test]
+    fn nfr4_large_layout_scaling_limit_is_exact() {
+        assert!(super::layout_metrics::within_large_layout_scaling(4, 9));
+        assert!(!super::layout_metrics::within_large_layout_scaling(4, 10));
     }
 
     #[test]

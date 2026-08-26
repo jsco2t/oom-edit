@@ -1,0 +1,80 @@
+schema-version = 1
+retrieved = "2026-08-25"
+mapping-notes = "MAPPING.md"
+
+[[themes]]
+name = "catppuccin-mocha"
+variant = "Catppuccin Palette, Mocha"
+appearance = "dark"
+repository = "https://github.com/catppuccin/palette"
+revision = "07d02aa110ef9eb7e7427afca5c73ba9cf7f8ebd"
+spdx = "MIT"
+declared-fact = "Copyright (c) 2021 Catppuccin"
+palette-paths = ["palette.json"]
+palette-sha256 = ["4bc114bb6b3c9a9c9e156564aa84625aef32c5da514d9dd431cf1fcad433a05f"]
+license-path = "LICENSE"
+license-sha256 = "814096d2c34cc216c624738a49356f32b7237733b4f7edb0685f4e50ef5074ba"
+audit-assets = ["upstream/catppuccin-mocha.palette.json", "upstream/catppuccin-mocha.LICENSE"]
+
+[[themes]]
+name = "dracula"
+variant = "Dracula Classic specification"
+appearance = "dark"
+repository = "https://github.com/dracula/dracula-theme"
+revision = "2985f660b04e6961b0887ffac2f8d3f35f431698"
+spdx = "MIT"
+declared-fact = "Copyright (c) 2023 Dracula Theme"
+palette-paths = ["README.md"]
+palette-sha256 = ["412b7b8bea0a1061c32aa25177daf4eada29a90582f8a83722b0ab259c3e0532"]
+license-path = "LICENSE"
+license-sha256 = "38b806a7e799cca4e9821e6f8d65cf0d8bfaaddbe454b41f12e5baad52d310f1"
+audit-assets = ["upstream/dracula.palette.md", "upstream/dracula.LICENSE"]
+
+[[themes]]
+name = "nord"
+variant = "Official Nord 0–15 palette"
+appearance = "dark"
+repository = "https://github.com/nordtheme/nord"
+revision = "1cef71605416a222e57225b544540ce0fcec18d4"
+spdx = "MIT"
+declared-fact = "Copyright (c) 2016-present Sven Greb <development@svengreb.de> (https://www.svengreb.de)"
+palette-paths = ["src/nord.scss"]
+palette-sha256 = ["03d9dd98ff983308d10a9a4820c870e9eed7183a2d8aa689e3041e6d7cf1511b"]
+license-path = "license"
+license-sha256 = "25ac8188d670bd2ad2ce2f4f55ab88573010ee9f7a4502543cb1eea1e2274f8a"
+audit-assets = ["upstream/nord.palette.scss", "upstream/nord.LICENSE"]
+
+[[themes]]
+name = "solarized-dark"
+variant = "Original Solarized dark base relationship and accents"
+appearance = "dark"
+repository = "https://github.com/altercation/solarized"
+revision = "62f656a02f93c5190a8753159e34b385588d5ff3"
+spdx = "MIT"
+declared-fact = "Copyright (c) 2011 Ethan Schoonover"
+palette-paths = ["README.md"]
+palette-sha256 = ["f10571c994648365faab9c4f83bdd7699aa2cd056f111af5e29099c2673c5bc1"]
+license-path = "LICENSE"
+license-sha256 = "494aefdabf86acce06bd63001ad8aedad4ee38da23509d3f917d95aa3368b9a6"
+audit-assets = ["upstream/solarized-dark.palette.md", "upstream/solarized-dark.LICENSE"]
+
+[[themes]]
+name = "tokyo-night"
+variant = "folke/tokyonight.nvim Night palette with Night background overrides over Storm"
+appearance = "dark"
+repository = "https://github.com/folke/tokyonight.nvim"
+revision = "cdc07ac78467a233fd62c493de29a17e0cf2b2b6"
+spdx = "Apache-2.0"
+declared-fact = "Folke Lemaitre is the repository author and maintainer"
+declared-absence = "The pinned repository and license contain no project-specific copyright notice"
+palette-paths = ["lua/tokyonight/colors/night.lua", "lua/tokyonight/colors/storm.lua"]
+palette-sha256 = ["a8d87bf7aeb44617de4168d26fd9c1167bf3e7278acb0e155855caf6267b9c2d", "a96775b3b2bae3da751322806f7daaf2f8c9242cf4b52493732c62dc45c8894c"]
+license-path = "LICENSE"
+license-sha256 = "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+origin-repository = "https://github.com/enkia/tokyo-night-vscode-theme"
+origin-revision = "7c0f11eaef322f293621ca7befe462214b7ea468"
+origin-license-path = "LICENSE.txt"
+origin-license-sha256 = "e3f5d0d772cda0f4f67405696f15a0f335460a2b3944eff40f00675aadacb31b"
+origin-spdx = "MIT"
+origin-declared-fact = "Copyright (c) 2018-present Enkia"
+audit-assets = ["upstream/tokyo-night-night.palette.lua", "upstream/tokyo-night-storm.palette.lua", "upstream/tokyo-night.LICENSE", "upstream/tokyo-night-enkia-origin.LICENSE.txt"]
