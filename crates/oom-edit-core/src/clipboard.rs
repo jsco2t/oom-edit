@@ -8,7 +8,7 @@ use std::ops::Range;
 
 use crate::style::{RenderedLayout, RenderedSelection, RenderedSelectionRow, SelectionShape};
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Clipboard text represented both as Markdown source and rendered plain text.
 ///
@@ -78,13 +78,23 @@ pub(crate) fn rendered_selection_content(
             let mut markdown_rows = Vec::with_capacity(selection.rows.len());
             let mut plain_rows = Vec::with_capacity(selection.rows.len());
             for row in &selection.rows {
-                let markdown = markdown_for_ranges(
+                let mut markdown = markdown_for_ranges(
                     &row.source_ranges,
                     &selection.source_ranges,
                     &constructs,
                     &visible_sources,
                     document,
                 );
+                let selected_width = row
+                    .columns
+                    .first()
+                    .map_or(0, |columns| columns.end.saturating_sub(columns.start));
+                let raw_width = UnicodeWidthStr::width(markdown.as_str());
+                let padding = selection
+                    .block_width
+                    .unwrap_or_default()
+                    .saturating_sub(selected_width.max(raw_width));
+                markdown.push_str(&" ".repeat(padding));
                 let plain_text = rendered_plain_text_for_row(row, layout);
                 markdown_rows.push(markdown);
                 plain_rows.push(plain_text);
@@ -171,7 +181,7 @@ fn markdown_for_ranges(
             ranges.push(last.end..construct.end);
         }
     }
-    concatenate_ranges(&normalize_ranges(ranges), document)
+    concatenate_envelope(&normalize_ranges(ranges), document)
 }
 
 fn visible_source_ranges(layout: &RenderedLayout) -> Vec<Range<usize>> {
@@ -197,6 +207,19 @@ fn concatenate_ranges(ranges: &[Range<usize>], document: &str) -> String {
         .iter()
         .filter_map(|range| document.get(range.clone()))
         .collect()
+}
+
+fn concatenate_envelope(ranges: &[Range<usize>], document: &str) -> String {
+    let Some(first) = ranges.first() else {
+        return String::new();
+    };
+    let Some(last) = ranges.last() else {
+        return String::new();
+    };
+    document
+        .get(first.start..last.end)
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn normalize_ranges(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
@@ -403,6 +426,45 @@ mod tests {
 
         assert_eq!(content.markdown(), markdown);
         assert_eq!(content.plain_text(), "App and emphasis with link & *\n");
+    }
+
+    #[test]
+    fn character_markdown_envelope_preserves_source_only_gaps() {
+        let document = "alpha  \n\n  **beta**";
+        let beta = document.find("beta").unwrap();
+        let selected = vec![0..5, beta..beta + 4];
+
+        let markdown = markdown_for_ranges(
+            &selected,
+            &selected,
+            &inline_construct_spans(document),
+            &selected,
+            document,
+        );
+
+        assert_eq!(markdown, document);
+    }
+
+    #[test]
+    fn character_markdown_envelope_does_not_add_partial_boundary_delimiters() {
+        let document = "*emphasis* and [label](target)";
+        let emphasis = document.find("emph").unwrap();
+        let label = document.find("label").unwrap();
+        let selected = vec![emphasis..emphasis + 4, label..label + 3];
+        let visible = vec![
+            emphasis..emphasis + "emphasis".len(),
+            label..label + "label".len(),
+        ];
+
+        let markdown = markdown_for_ranges(
+            &selected,
+            &selected,
+            &inline_construct_spans(document),
+            &visible,
+            document,
+        );
+
+        assert_eq!(markdown, "emphasis* and [lab");
     }
 
     #[test]

@@ -3667,6 +3667,102 @@ mod tests {
     }
 
     #[test]
+    fn uppercase_y_copies_plain_text_once_and_keeps_markdown_for_put() {
+        let source = "`alpha` omega";
+        for copy_format in [
+            ClipboardCopyFormat::Markdown,
+            ClipboardCopyFormat::PlainText,
+        ] {
+            for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+                let sink = SharedClipboardSink::default();
+                let mut app = test_app_with_clipboard_format(
+                    EditorSession::from_text(source),
+                    copy_format,
+                    Box::new(sink.clone()),
+                );
+                let atom_count = app.session().unwrap().rendered_layout().unwrap().lines[0]
+                    .atoms
+                    .iter()
+                    .filter(|atom| atom.source.is_some())
+                    .count();
+
+                type_chars(
+                    &mut app,
+                    std::iter::once('v')
+                        .chain(std::iter::repeat_n('l', atom_count.saturating_sub(1))),
+                );
+                app.handle_event(&Event::Key(KeyEvent::new(
+                    CrosstermKeyCode::Char('Y'),
+                    modifiers,
+                )));
+
+                assert_eq!(sink.captures(), ["alpha omega"]);
+                assert_eq!(app.session().unwrap().mode(), Mode::Normal);
+                assert_eq!(app.session().unwrap().document(), source);
+
+                type_chars(&mut app, ['p']);
+                assert_eq!(
+                    app.session().unwrap().document(),
+                    format!("{source}{source}")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn uppercase_y_reports_clipboard_failures() {
+        let mut session = EditorSession::from_text("`code`");
+        session.render_layout(74);
+        let mut app = App::new(
+            session,
+            theme::ResolvedTheme::injected("default-dark", false, Tier::TrueColor),
+            true,
+            false,
+            Box::new(FailingClipboardSink),
+            Box::new(crate::config::DisabledConfigStore),
+            std::time::Instant::now(),
+        );
+        type_chars(&mut app, ['v', 'l', 'l', 'l', 'Y']);
+
+        let transient = app.transient.as_ref().expect("failure feedback");
+        assert!(transient.text.contains("Clipboard error"));
+        assert_eq!(transient.severity, oom_edit_core::Severity::Warning);
+        assert_eq!(app.session().unwrap().document(), "`code`");
+    }
+
+    #[test]
+    fn uppercase_y_size_limit_applies_to_plain_text_payload() {
+        let oversized_plain = "x".repeat(100 * 1024 + 1);
+        let (sink, capture) = crate::clipboard::Osc52Clipboard::for_test();
+        let mut rejected = test_app_with_clipboard_format(
+            EditorSession::from_text(&oversized_plain),
+            ClipboardCopyFormat::Markdown,
+            Box::new(sink),
+        );
+        type_chars(&mut rejected, ['V', 'Y']);
+        assert!(capture.contents().is_empty());
+        assert!(rejected
+            .transient
+            .as_ref()
+            .is_some_and(|transient| transient.text.contains("100 KiB")));
+
+        let oversized_markdown =
+            format!("[label](https://example.test/{})\n", "x".repeat(100 * 1024));
+        let (sink, capture) = crate::clipboard::Osc52Clipboard::for_test();
+        let mut accepted = test_app_with_clipboard_format(
+            EditorSession::from_text(&oversized_markdown),
+            ClipboardCopyFormat::Markdown,
+            Box::new(sink),
+        );
+        type_chars(&mut accepted, ['V', 'Y']);
+        assert!(!capture.contents().is_empty());
+        assert_eq!(
+            accepted.transient.as_ref().unwrap().text,
+            "sent text to system clipboard"
+        );
+    }
+
+    #[test]
     fn clipboard_size_limit_applies_to_the_configured_representation() {
         let markdown_oversized =
             ClipboardContent::new("m".repeat(100 * 1024 + 1), "p".repeat(100 * 1024));
@@ -3764,7 +3860,7 @@ mod tests {
         }
 
         assert_eq!(documents[0], documents[1]);
-        assert_eq!(documents[0], "`codecode`\n");
+        assert_eq!(documents[0], "`code`code``\n");
     }
 
     #[test]

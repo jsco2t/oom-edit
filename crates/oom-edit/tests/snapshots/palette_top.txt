@@ -8,16 +8,16 @@
    8 Som│· Ctrl-V         block-wise selection           select-block  │
         │· Esc / Ctrl-C   cancel selection               cancel-select │
   10 ┃ A│· "{register}    select register                select-regist…│
-        │· y              yank and send to clipboard     select-yank   │
-     ▏ r│· d / x          delete selection               select-delete │
-  13 ▏ f│· c              change selection               select-change │
-  14 ▏  │· >              indent selection               select-indent │
-  15 ▏ }│· <              outdent selection              select-outdent│
-     ▏  │· o              swap selection endpoint        select-swap-a…│
-        │· /              search rendered text           search        │
-  18 ───│· :              enter Command mode             command       │────────
-        │  help           command palette                Space h       │
-  20 Ano│  save           save                           Space w       │
+        │· y              yank (Markdown by default) to… select-yank   │
+     ▏ r│· Y              yank and send plain text to c… select-yank-p…│
+  13 ▏ f│· d / x          delete selection               select-delete │
+  14 ▏  │· c              change selection               select-change │
+  15 ▏ }│· >              indent selection               select-indent │
+     ▏  │· <              outdent selection              select-outdent│
+        │· o              swap selection endpoint        select-swap-a…│
+  18 ───│· /              search rendered text           search        │────────
+        │· :              enter Command mode             command       │
+  20 Ano│  help           command palette                Space h       │
         └──────────────────────────────────────────────────────────────┘
   22 More text here.
 

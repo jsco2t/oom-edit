@@ -34,6 +34,18 @@ fn ctrl(ch: char) -> KeyInput {
     }
 }
 
+fn shifted(ch: char) -> KeyInput {
+    KeyInput {
+        code: KeyCode {
+            kind: KeyCodeKind::Char(ch),
+        },
+        mods: Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        },
+    }
+}
+
 fn clipboard_writes(effects: &[Effect]) -> Vec<&str> {
     effects
         .iter()
@@ -103,6 +115,184 @@ fn rendered_copy_preserves_markdown_and_prepares_sanitized_plain_text() {
     assert_eq!(contents[0].plain_text(), expected_plain);
     assert_eq!(session.document(), source);
     assert_eq!(session.mode(), Mode::Normal);
+}
+
+#[test]
+fn rendered_plain_text_yank_is_one_shot_and_keeps_markdown_register() {
+    let source = "`alpha`\n\n**beta**\n\nomega";
+    for yank_key in [key('Y'), shifted('Y')] {
+        let mut session = EditorSession::from_text(source);
+        let layout = session.render_layout(40);
+        let last_atoms = layout
+            .lines
+            .iter()
+            .rev()
+            .find(|line| line.atoms.iter().any(|atom| atom.source.is_some()))
+            .unwrap()
+            .atoms
+            .iter()
+            .filter(|atom| atom.source.is_some())
+            .count();
+
+        session.handle_key(key('v'));
+        session.handle_key(special(KeyCodeKind::End));
+        for _ in 1..last_atoms {
+            session.handle_key(key('l'));
+        }
+        let effects = session.handle_key(yank_key);
+        let contents = clipboard_contents(&effects);
+
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0].markdown(), "alpha\nbeta\nomega");
+        assert_eq!(contents[0].plain_text(), "alpha\nbeta\nomega");
+        assert_eq!(session.mode(), Mode::Normal);
+        assert_eq!(session.document(), source);
+
+        session.handle_key(key('p'));
+        assert_eq!(session.document(), format!("{source}{source}"));
+    }
+}
+
+#[test]
+fn rendered_plain_text_yank_rejects_ctrl_and_alt_variants() {
+    for mods in [
+        Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        },
+        Modifiers {
+            alt: true,
+            ..Modifiers::default()
+        },
+    ] {
+        let mut session = EditorSession::from_text("`code`");
+        session.render_layout(40);
+        session.handle_key(key('v'));
+        let effects = session.handle_key(KeyInput {
+            code: KeyCode {
+                kind: KeyCodeKind::Char('Y'),
+            },
+            mods,
+        });
+
+        assert!(clipboard_contents(&effects).is_empty());
+        assert_eq!(session.mode(), Mode::Select);
+        assert_eq!(session.document(), "`code`");
+    }
+}
+
+#[test]
+fn rendered_character_yank_preserves_multiline_markdown_and_whitespace() {
+    let source = concat!(
+        "alpha trailing  \n",
+        "\n",
+        "  **beta** and [link](https://example.test)\n",
+        "\n",
+        "```rust\n",
+        "let café = `one`;  \n",
+        "```\n",
+        "\n",
+        "| Name | Value |\n",
+        "| --- | --- |\n",
+        "| x | &amp; |\n",
+        "\n",
+        "omega",
+    );
+    for reverse in [false, true] {
+        let mut session = EditorSession::from_text(source);
+        let layout = session.render_layout(120);
+        let last_row = layout
+            .lines
+            .iter()
+            .rposition(|line| line.atoms.iter().any(|atom| atom.source.is_some()))
+            .unwrap();
+        let first_atoms = layout.lines[0]
+            .atoms
+            .iter()
+            .filter(|atom| atom.source.is_some())
+            .count();
+        let last_atoms = layout.lines[last_row]
+            .atoms
+            .iter()
+            .filter(|atom| atom.source.is_some())
+            .count();
+
+        if reverse {
+            session.handle_key(special(KeyCodeKind::End));
+            for _ in 1..last_atoms {
+                session.handle_key(key('l'));
+            }
+            session.handle_key(key('v'));
+            session.handle_key(special(KeyCodeKind::Home));
+            for _ in 1..first_atoms {
+                session.handle_key(key('h'));
+            }
+        } else {
+            session.handle_key(key('v'));
+            session.handle_key(special(KeyCodeKind::End));
+            for _ in 1..last_atoms {
+                session.handle_key(key('l'));
+            }
+        }
+
+        let effects = session.handle_key(key('y'));
+        let contents = clipboard_contents(&effects);
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0].markdown(), source);
+        assert_eq!(session.document(), source);
+    }
+}
+
+#[test]
+fn rendered_character_yank_preserves_soft_wrap_spaces_without_newlines() {
+    let source = "alpha beta gamma delta epsilon zeta eta theta";
+    let mut session = EditorSession::from_text(source);
+    let layout = session.render_layout(9);
+    assert!(layout.lines.len() > 2);
+    let last_atoms = layout
+        .lines
+        .last()
+        .unwrap()
+        .atoms
+        .iter()
+        .filter(|atom| atom.source.is_some())
+        .count();
+
+    session.handle_key(key('v'));
+    session.handle_key(special(KeyCodeKind::End));
+    for _ in 1..last_atoms {
+        session.handle_key(key('l'));
+    }
+    let effects = session.handle_key(key('y'));
+
+    assert_eq!(clipboard_writes(&effects), [source]);
+}
+
+#[test]
+fn rendered_multiline_yank_register_round_trips_exact_source() {
+    let source = "alpha  \n\n  **beta**\nomega";
+    let mut session = EditorSession::from_text(source);
+    let layout = session.render_layout(40);
+    let last_atoms = layout
+        .lines
+        .iter()
+        .rev()
+        .find(|line| line.atoms.iter().any(|atom| atom.source.is_some()))
+        .unwrap()
+        .atoms
+        .iter()
+        .filter(|atom| atom.source.is_some())
+        .count();
+
+    session.handle_key(key('v'));
+    session.handle_key(special(KeyCodeKind::End));
+    for _ in 1..last_atoms {
+        session.handle_key(key('l'));
+    }
+    assert_eq!(clipboard_writes(&session.handle_key(key('y'))), [source]);
+
+    session.handle_key(key('p'));
+    assert_eq!(session.document(), format!("{source}{source}"));
 }
 
 #[test]
@@ -426,14 +616,11 @@ fn wrapped_table_character_selection_is_source_driven_and_operator_exact() {
         before_resize.source_ranges
     );
 
-    let selected_text = before_resize
-        .source_ranges
-        .iter()
-        .map(|range| &text[range.clone()])
-        .collect::<String>();
+    let selected_text = &text[before_resize.source_ranges.first().unwrap().start
+        ..before_resize.source_ranges.last().unwrap().end];
     let mut yank = select_cell();
     let effects = yank.handle_key(key('y'));
-    assert_eq!(clipboard_writes(&effects), [selected_text.as_str()]);
+    assert_eq!(clipboard_writes(&effects), [selected_text]);
 
     let mut expected_after_removal = text.to_string();
     for range in before_resize.source_ranges.iter().rev() {
@@ -612,12 +799,40 @@ fn link_index_select_y_exits_and_enter_stays_without_source_ranges() {
 
     session.handle_key(key('v'));
     assert_eq!(
+        session.handle_key(key('Y')),
+        vec![
+            Effect::ClipboardWrite(ClipboardContent::invariant(destination.to_string())),
+            Effect::ModeChanged(Mode::Normal),
+        ]
+    );
+    assert_eq!(session.mode(), Mode::Normal);
+
+    session.handle_key(key('v'));
+    assert_eq!(
         session.handle_key(special(KeyCodeKind::Enter)),
         vec![Effect::ClipboardWrite(ClipboardContent::invariant(
             destination.to_string()
         ))]
     );
     assert_eq!(session.mode(), Mode::Select);
+}
+
+#[test]
+fn link_index_yank_keys_keep_named_and_black_hole_isolation() {
+    let destination = "https://example.com/register-safe";
+    for yank_key in ['y', 'Y'] {
+        for register in ['a', '_'] {
+            let mut session = EditorSession::from_text(&format!("[label]({destination})\n"));
+            render_and_move_to(&mut session, &format!("[0] {destination}"), 80);
+            for input in [key('v'), key('"'), key(register)] {
+                session.handle_key(input);
+            }
+
+            let effects = session.handle_key(key(yank_key));
+            assert!(clipboard_contents(&effects).is_empty());
+            assert_eq!(session.mode(), Mode::Normal);
+        }
+    }
 }
 
 #[test]
@@ -904,6 +1119,37 @@ fn select_default_and_explicit_system_yanks_emit_exact_payload_once() {
         assert_eq!(clipboard_writes(&effects), ["# one\n"]);
         assert_eq!(session.document(), "# one\n# two\n");
         assert_eq!(session.mode(), Mode::Normal);
+    }
+}
+
+#[test]
+fn select_plain_text_yank_preserves_register_publication_rules() {
+    for (register, publishes) in [
+        (None, true),
+        (Some('+'), true),
+        (Some('*'), true),
+        (Some('a'), false),
+        (Some('_'), false),
+    ] {
+        let mut session = EditorSession::from_text("# one\n# two\n");
+        session.render_layout(40);
+        session.handle_key(key('V'));
+        if let Some(register) = register {
+            session.handle_key(key('"'));
+            session.handle_key(key(register));
+        }
+        let effects = session.handle_key(key('Y'));
+        let expected_writes = if publishes { vec!["one\n"] } else { Vec::new() };
+        assert_eq!(clipboard_writes(&effects), expected_writes);
+        assert_eq!(session.document(), "# one\n# two\n");
+        assert_eq!(session.mode(), Mode::Normal);
+
+        if register == Some('a') {
+            for input in [key('"'), key('a'), key('p')] {
+                session.handle_key(input);
+            }
+            assert_eq!(session.document(), "# one\n# one\n# two\n");
+        }
     }
 }
 

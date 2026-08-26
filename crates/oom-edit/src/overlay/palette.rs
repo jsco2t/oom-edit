@@ -719,6 +719,10 @@ mod tests {
             row,
             PaletteRow::Reference { row_id, .. } if row_id == "select-yank"
         )));
+        assert!(normal_rows.iter().any(|row| matches!(
+            row,
+            PaletteRow::Reference { row_id, .. } if row_id == "select-yank-plain-text"
+        )));
     }
 
     #[test]

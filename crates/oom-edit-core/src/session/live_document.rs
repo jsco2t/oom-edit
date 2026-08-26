@@ -10,7 +10,8 @@ use crate::input::KeyInput;
 use crate::spell::{Diagnostic, SpellState};
 use crate::syntax::Highlighter;
 use crate::vim::{
-    Mode as VimMode, ProjectedSelection, RangeOperator, Register, UndoMark, VimCore, VimEffect,
+    Mode as VimMode, ProjectedSelection, ProjectedYank, RangeOperator, Register, UndoMark, VimCore,
+    VimEffect,
 };
 
 /// Result of one atomic live-document mutation.
@@ -167,6 +168,16 @@ impl LiveDocument {
         register: Register,
     ) -> MutationOutcome {
         let effects = self.vim.apply_selection(selection, operator, register);
+        self.refresh_derived(&effects);
+        MutationOutcome { effects }
+    }
+
+    pub(super) fn apply_yank(
+        &mut self,
+        yank: ProjectedYank,
+        register: Register,
+    ) -> MutationOutcome {
+        let effects = self.vim.apply_yank(yank, register);
         self.refresh_derived(&effects);
         MutationOutcome { effects }
     }

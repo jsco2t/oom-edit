@@ -9,6 +9,7 @@ pub enum RegistryEntryId {
     CancelSelect,
     SelectRegister,
     SelectYank,
+    SelectYankPlainText,
     SelectDelete,
     SelectChange,
     SelectIndent,
@@ -199,10 +200,18 @@ pub static COMMANDS: &[CommandSpec] = &[
     row!(
         SelectYank,
         "select-yank",
-        "yank and send to clipboard",
+        "yank (Markdown by default) to clipboard",
         Contexts::SELECT,
         BindingRole::CoreKey { display: "y" },
         Some(2)
+    ),
+    row!(
+        SelectYankPlainText,
+        "select-yank-plain-text",
+        "yank and send plain text to clipboard",
+        Contexts::SELECT,
+        BindingRole::CoreKey { display: "Y" },
+        None
     ),
     row!(
         SelectDelete,
@@ -502,7 +511,7 @@ mod tests {
             assert!(!spec.contexts.is_empty());
             assert!(!rendered_binding(spec).is_empty());
         }
-        assert_eq!(COMMANDS.len(), 31);
+        assert_eq!(COMMANDS.len(), 32);
     }
 
     #[test]
@@ -651,10 +660,18 @@ mod tests {
             (
                 RegistryEntryId::SelectYank,
                 "select-yank",
-                "yank and send to clipboard",
+                "yank (Markdown by default) to clipboard",
                 Contexts::SELECT,
                 BindingRole::CoreKey { display: "y" },
                 Some(2),
+            ),
+            (
+                RegistryEntryId::SelectYankPlainText,
+                "select-yank-plain-text",
+                "yank and send plain text to clipboard",
+                Contexts::SELECT,
+                BindingRole::CoreKey { display: "Y" },
+                None,
             ),
             (
                 RegistryEntryId::SelectDelete,

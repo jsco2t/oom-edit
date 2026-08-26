@@ -46,6 +46,7 @@ points are:
 | `Esc` | Return to rendered Normal mode |
 | `v`, `V`, `Ctrl-V` | Start character, line, or block Select mode |
 | `y` (in Select) | Yank the selection and send its exact Markdown source to the system clipboard |
+| `Y` (in Select) | Yank the selection and send syntax-free plain text to the system clipboard |
 | `:` | Enter Command mode |
 | `Space h` | Open help and the command palette |
 | `Space w` | Save |
@@ -57,17 +58,20 @@ In rendered Select, plain `y` preserves the normal in-process yank and also
 sends the selection's exact Markdown source—including inline delimiters such as
 backticks—to the system clipboard. This Markdown-preserving behavior is the
 default. Set `clipboard.copy_format` to `"plain-text"` to strip Markdown syntax,
-decode escapes and entities, and copy the rendered text instead. Explicit `"+y`
-and `"*y` remain available as alternatives. Automatic clipboard publication
-applies only to rendered Select yanks; deletes, changes, and yanks from source
-Normal mode do not publish implicitly.
+decode escapes and entities, and copy the rendered text instead. For an
+occasional syntax-free copy without changing that preference, use uppercase
+`Y`. Both yank keys retain exact Markdown in the in-process register, so later
+`p`/`P` operations remain source-preserving. Explicit `"+y`, `"*y`, `"+Y`, and
+`"*Y` remain available as alternatives. Automatic clipboard publication applies
+only to rendered Select yanks; deletes, changes, and yanks from source Normal
+mode do not publish implicitly.
 
 Clipboard output uses OSC 52 and is best effort. It requires OSC 52 support to
 be enabled in the terminal and, when applicable, in tmux. The success message
 only confirms that oom-edit emitted the sequence; terminals do not acknowledge
 whether they applied it. Outgoing text over 100 KiB and terminal output errors
-produce a visible warning. The size limit is applied after the configured copy
-format is selected.
+produce a visible warning. The size limit is applied to the text actually sent:
+the configured format for `y`, or plain text for `Y`.
 
 To paste the desktop clipboard, enter Insert mode and use the terminal's native
 paste action. Bracketed paste is inserted as one operation. `"+p` uses

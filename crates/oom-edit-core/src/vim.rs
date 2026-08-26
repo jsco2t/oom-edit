@@ -111,6 +111,13 @@ pub(crate) struct ProjectedBlockRow {
     pub(crate) selected_width: usize,
 }
 
+/// Exact source payload paired with renderer-projected yank geometry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectedYank {
+    pub(crate) selection: ProjectedSelection,
+    pub(crate) payload: String,
+}
+
 impl ProjectedSelection {
     fn ranges(&self) -> Vec<Range<usize>> {
         match self {
@@ -980,6 +987,27 @@ impl VimCore {
         operator: RangeOperator,
         register: Register,
     ) -> Vec<VimEffect> {
+        self.apply_selection_inner(selection, operator, register, None)
+    }
+
+    /// Apply a rendered yank whose exact register payload was prepared from
+    /// source provenance by the session.
+    pub(crate) fn apply_yank(&mut self, yank: ProjectedYank, register: Register) -> Vec<VimEffect> {
+        self.apply_selection_inner(
+            yank.selection,
+            RangeOperator::Yank,
+            register,
+            Some(yank.payload),
+        )
+    }
+
+    fn apply_selection_inner(
+        &mut self,
+        selection: ProjectedSelection,
+        operator: RangeOperator,
+        register: Register,
+        yank_payload: Option<String>,
+    ) -> Vec<VimEffect> {
         let source_ranges = selection.ranges();
         if matches!(operator, RangeOperator::Indent | RangeOperator::Outdent) {
             let Some(first) = source_ranges.first() else {
@@ -1004,7 +1032,7 @@ impl VimCore {
             ProjectedSelection::Block { width, .. } => *width,
             _ => 0,
         };
-        let payload = match &selection {
+        let payload = yank_payload.unwrap_or_else(|| match &selection {
             ProjectedSelection::Block { rows, .. } => rows
                 .iter()
                 .map(|row| {
@@ -1026,7 +1054,7 @@ impl VimCore {
                     .filter_map(|range| old_text.get(range.clone()))
                     .collect()
             }
-        };
+        });
         match operator {
             RangeOperator::Yank => {
                 if matches!(selection, ProjectedSelection::Block { .. }) {
@@ -1629,6 +1657,27 @@ mod projected_selection_tests {
         assert_eq!(register_state(&vim, '0'), expected);
         assert_eq!(register_state(&vim, '+'), expected);
         assert_eq!(vim.text(), "alpha **beta** omega");
+    }
+
+    #[test]
+    fn projected_yank_records_exact_payload_without_broadening_ranges() {
+        let mut vim = VimCore::new("alpha\nbeta\n");
+        let effects = vim.apply_yank(
+            ProjectedYank {
+                selection: ProjectedSelection::Character {
+                    ranges: vec![0..5, 6..10],
+                },
+                payload: "alpha\nbeta".to_string(),
+            },
+            Register::Unnamed,
+        );
+
+        assert_eq!(clipboard_payloads(&effects), ["alpha\nbeta"]);
+        let expected = ("alpha\nbeta".to_string(), false, false, 0);
+        assert_eq!(register_state(&vim, '"'), expected);
+        assert_eq!(register_state(&vim, '0'), expected);
+        assert_eq!(register_state(&vim, '+'), expected);
+        assert_eq!(vim.text(), "alpha\nbeta\n");
     }
 
     #[test]

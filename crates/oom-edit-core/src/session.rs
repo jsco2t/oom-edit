@@ -867,7 +867,8 @@ pub struct Viewport {
 // ── VimCore re-export (internal) ──────────────────────────────────────────
 
 use crate::vim::{
-    ProjectedBlockRow, ProjectedSelection, RangeOperator, Register, UndoMark, VimEffect,
+    ProjectedBlockRow, ProjectedSelection, ProjectedYank, RangeOperator, Register, UndoMark,
+    VimEffect,
 };
 
 // ── Document (internal) ───────────────────────────────────────────────────
@@ -963,6 +964,12 @@ enum SelectionKind {
     Character { ranges: Vec<Range<usize>> },
     Line,
     Block,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum YankPublication {
+    Configured,
+    PlainText,
 }
 
 impl SelectionKind {
@@ -2474,9 +2481,12 @@ impl EditorSession {
         if self.first_heading_bracket_is_pending(key) {
             return Vec::new();
         }
-        if key.mods == Modifiers::default()
-            && matches!(key.code.kind, KeyCodeKind::Char('y') | KeyCodeKind::Enter)
-        {
+        let plain_text_yank =
+            matches!(key.code.kind, KeyCodeKind::Char('Y')) && !key.mods.ctrl && !key.mods.alt;
+        let default_yank =
+            key.mods == Modifiers::default() && matches!(key.code.kind, KeyCodeKind::Char('y'));
+        let enter = key.mods == Modifiers::default() && key.code.kind == KeyCodeKind::Enter;
+        if default_yank || plain_text_yank || enter {
             let copy_focused_link = matches!(key.code.kind, KeyCodeKind::Enter)
                 || self
                     .rendered_selection()
@@ -2485,15 +2495,21 @@ impl EditorSession {
                 (copy_focused_link, self.focused_synthetic_link_destination())
             {
                 self.rendered_state.count = 0;
-                self.rendered_state.register_input = RegisterInput::Default;
-                let effects = vec![Effect::ClipboardWrite(
-                    crate::clipboard::ClipboardContent::invariant(destination),
-                )];
-                return if matches!(key.code.kind, KeyCodeKind::Char('y')) {
-                    self.finish_select(Mode::Normal, effects)
+                if enter {
+                    self.rendered_state.register_input = RegisterInput::Default;
+                    return vec![Effect::ClipboardWrite(
+                        crate::clipboard::ClipboardContent::invariant(destination),
+                    )];
+                }
+                let register = self.rendered_state.register_input.take();
+                let effects = if matches!(register, Register::Unnamed | Register::System) {
+                    vec![Effect::ClipboardWrite(
+                        crate::clipboard::ClipboardContent::invariant(destination),
+                    )]
                 } else {
-                    effects
+                    Vec::new()
                 };
+                return self.finish_select(Mode::Normal, effects);
             }
         }
         if key.mods.ctrl && matches!(key.code.kind, KeyCodeKind::Char('c')) {
@@ -2501,6 +2517,9 @@ impl EditorSession {
         }
         if key.mods.ctrl && matches!(key.code.kind, KeyCodeKind::Char('v' | 'V')) {
             return self.switch_or_cancel_selection_shape(SelectionShape::Block);
+        }
+        if plain_text_yank {
+            return self.apply_select_operator(RangeOperator::Yank, YankPublication::PlainText);
         }
         if key.mods == Modifiers::default() {
             match key.code.kind {
@@ -2525,14 +2544,25 @@ impl EditorSession {
                     self.rendered_state.register_input = RegisterInput::AwaitingName;
                     return Vec::new();
                 }
-                KeyCodeKind::Char('y') => return self.apply_select_operator(RangeOperator::Yank),
-                KeyCodeKind::Char('d') | KeyCodeKind::Char('x') => {
-                    return self.apply_select_operator(RangeOperator::Delete)
+                KeyCodeKind::Char('y') => {
+                    return self
+                        .apply_select_operator(RangeOperator::Yank, YankPublication::Configured)
                 }
-                KeyCodeKind::Char('c') => return self.apply_select_operator(RangeOperator::Change),
-                KeyCodeKind::Char('>') => return self.apply_select_operator(RangeOperator::Indent),
+                KeyCodeKind::Char('d') | KeyCodeKind::Char('x') => {
+                    return self
+                        .apply_select_operator(RangeOperator::Delete, YankPublication::Configured)
+                }
+                KeyCodeKind::Char('c') => {
+                    return self
+                        .apply_select_operator(RangeOperator::Change, YankPublication::Configured)
+                }
+                KeyCodeKind::Char('>') => {
+                    return self
+                        .apply_select_operator(RangeOperator::Indent, YankPublication::Configured)
+                }
                 KeyCodeKind::Char('<') => {
-                    return self.apply_select_operator(RangeOperator::Outdent)
+                    return self
+                        .apply_select_operator(RangeOperator::Outdent, YankPublication::Configured)
                 }
                 _ => {
                     self.rendered_state.register_input = RegisterInput::Default;
@@ -2923,7 +2953,11 @@ impl EditorSession {
         }
     }
 
-    fn apply_select_operator(&mut self, operator: RangeOperator) -> Vec<Effect> {
+    fn apply_select_operator(
+        &mut self,
+        operator: RangeOperator,
+        publication: YankPublication,
+    ) -> Vec<Effect> {
         let Some(layout) = self.rendered_state.layout_cache.as_ref() else {
             return Vec::new();
         };
@@ -2950,9 +2984,25 @@ impl EditorSession {
             crate::clipboard::rendered_selection_content(&selection, layout, &self.live.text());
         let register = self.rendered_state.register_input.take();
         let projected = project_selection_for_vim(selection);
-        let vim_effects = self.live.apply_selection(projected, operator, register);
+        let vim_effects = if operator == RangeOperator::Yank {
+            self.live.apply_yank(
+                ProjectedYank {
+                    selection: projected,
+                    payload: clipboard_content.markdown().to_string(),
+                },
+                register,
+            )
+        } else {
+            self.live.apply_selection(projected, operator, register)
+        };
+        let clipboard_output = match publication {
+            YankPublication::Configured => clipboard_content.clone(),
+            YankPublication::PlainText => crate::clipboard::ClipboardContent::invariant(
+                clipboard_content.plain_text().to_string(),
+            ),
+        };
         let effects =
-            self.translate_vim_effects_with_clipboard(vim_effects, Some(&clipboard_content));
+            self.translate_vim_effects_with_clipboard(vim_effects, Some(&clipboard_output));
         self.remap_active_cursor_from_canonical();
         let target_mode = if operator == RangeOperator::Change {
             Mode::Insert
