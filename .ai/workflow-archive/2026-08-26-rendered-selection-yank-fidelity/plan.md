@@ -89,3 +89,76 @@ No benchmark command is added: the change is event-driven selection copying, not
 - [ ] Plain `y` retains the backward-compatible `copy_format` policy with `markdown` as the default; `Y` explicitly chooses plain text for its one-shot system copy.
 - [ ] README, configuration guidance, changelog, command registry, palette/help rows, hint/meta-tests, and exact binding contracts agree on `y` versus `Y` behavior.
 - [ ] Public API guards and dependency hygiene remain unchanged, no dependency is added, and `make check` passes.
+
+## Acceptance follow-up — Round 2
+
+### Observed acceptance gap
+
+Copying only source-backed code content works and preserves its whitespace, but selecting the complete rendered fenced-code surface does not reliably include the opening and closing Markdown fence lines. In particular, the language info string on the opening fence and the closing delimiter can be omitted even though the selection visually spans the complete block.
+
+### Root cause and repository evidence
+
+- `render_code_fence` renders the opening fence as a synthetic `▏ <language>` row and the closing fence as a synthetic `▏` row. Their display atoms correctly carry no source ranges because the visible gutter glyphs are renderer-generated rather than literal backticks.
+- The block parser nevertheless supplies `render_code_fence` with the exact full block source span and exact content span. The opening and closing source boundaries are therefore known at the parser leaf while layout is built.
+- The layout currently retains only `RenderedLineRole::CodeFence` after rendering. It does not retain a private association between the contiguous rendered fence surface and the full Markdown block span.
+- Rendered Select consequently projects only code-content atoms. Round 1's source-envelope repair can preserve bytes between selected content atoms, but it cannot extend beyond the first or last selected atom to recover a source-only opening or closing fence.
+
+### Additive fix strategy
+
+Retain renderer-neutral, crate-private fenced-region metadata when each `BlockKind::CodeFence` is rendered. Each region will pair the complete rendered row interval with the exact full source span already owned by that parser leaf. Synthetic gutter atoms remain source-less, and the public `RenderedLayout`/crate-root API remains unchanged.
+
+During yank preparation only, clone the projected selection and expand that yank-specific source geometry when its rendered row interval fully covers a fenced region from opening row through closing row. Use the expanded selection for the exact Markdown clipboard payload and internal yank register, including the empty-fence case. Keep the original rendered selection as the authoritative geometry for painting and every destructive or transforming operator.
+
+A selection confined to code-content rows will not cover both boundary rows and therefore follows the existing Round 1 path unchanged. A complete surface selection copies the exact canonical source block, including the original opening delimiter, language/info marker, body whitespace and newlines, closing delimiter, and selected physical-line ending. The behavior applies in forward and reverse selection directions and composes with the existing `y`/`Y` publication policy: default `y` publishes Markdown, while `Y` publishes syntax-free text but retains the complete Markdown fence in the internal register.
+
+### Architectural decisions
+
+- Fence boundaries are retained from the existing block parser at render time. Do not reconstruct them with substring matching, terminal-cell scraping, or delimiter searches during copy.
+- Region metadata is private core state associated with the cached rendered layout. It introduces no public DTO field or crate-root export.
+- Generated gutter cells remain source-less. Fence metadata describes block-level selection coverage; it does not assign the displayed `▏` or language label to raw backtick bytes.
+- Expansion is yank-only. Delete, change, indent, outdent, block selection, cursor mapping, and the public rendered-selection projection continue to use the original atom-derived ranges.
+- Full-surface detection is based on rendered row coverage, so it remains stable for empty bodies, highlighted languages, wrapping, nested container prefixes, and forward/reverse endpoints.
+- Existing configured `y`, one-shot `Y`, register publication, clipboard limit/error, and put semantics remain authoritative.
+
+### Work included
+
+1. Preserve private full-source and rendered-row metadata for fenced-code regions as part of layout construction and invalidation.
+2. Expand only yank-specific source geometry when a characterwise or linewise rendered selection spans the complete fence surface.
+3. Preserve exact content-only copying without adding either fence when the selection remains inside the body.
+4. Cover language markers, exact whitespace/newlines, empty and multiline bodies, forward/reverse selections, supported fence delimiters, nested container prefixes, internal put behavior, `Y`, and unchanged non-yank geometry.
+
+### New task sequence
+
+3. `tasks/003-preserve-complete-code-fences.md`
+
+Task 003 is additive to the immutable completed Round 1 tasks.
+
+### Quality gate
+
+`gate.json` remains unchanged. Both the task and final package gate run `make check`, the repository's complete format, lint, build, test, supply-chain, and bundled-data licensing gate. No dependency or developer workflow is introduced.
+
+### Risks
+
+- Treating any contact with a code block as full-block selection would regress content-only copies. Expansion must require coverage of both rendered boundary rows.
+- Reusing expanded ranges for destructive operators would silently broaden edits. The expanded selection must exist only in the yank path.
+- Empty fences have no content atoms, so tests must prove the fence metadata alone is sufficient to produce a non-empty yank and register payload.
+- Nested list or blockquote fences contain structural prefixes in their canonical source. Exact full-block copying must retain those bytes rather than synthesizing a standalone fence.
+- Fence metadata must invalidate atomically with the cached layout so edits or width changes cannot leave stale source spans.
+
+### Out of scope
+
+- Changing how fenced code blocks are visually rendered.
+- Making generated gutter glyphs source-backed or copying those glyphs.
+- Changing content-only copy semantics, blockwise rectangular yanks, source-mode yanks, or Markdown parsing rules.
+- Changing destructive selection geometry or adding a dedicated code-block selection command.
+- Adding public API, dependencies, clipboard formats, or keybindings.
+
+### Round 2 acceptance criteria
+
+- [ ] A rendered characterwise or linewise selection that spans a complete fenced-code surface copies the exact canonical Markdown block with default `y`, including the opening delimiter, language/info marker, body whitespace and newlines, closing delimiter, and selected final line ending.
+- [ ] Complete-fence copying is exact in forward and reverse directions for empty and multiline blocks, supported backtick/tilde fence forms, longer delimiters, syntax-highlighted and unknown languages, and fences nested in lists or blockquotes.
+- [ ] Selecting only content within a fenced block copies exactly that content with Round 1 whitespace fidelity and adds neither fence delimiter nor the language marker.
+- [ ] Full-fence `y` records the same exact Markdown in the internal linewise or characterwise register, and `p`/`P` round-trips it without loss.
+- [ ] Full-fence `Y` publishes syntax-free body text while retaining the exact fenced Markdown in the internal register; configured `y`, named/black-hole/system registers, clipboard limits, and error reporting remain unchanged.
+- [ ] Generated gutter atoms remain source-less, and selection painting, cursor mapping, blockwise selection, delete, change, indent, and outdent retain their existing source geometry.
+- [ ] No public API or dependency changes are introduced, and `make check` passes.

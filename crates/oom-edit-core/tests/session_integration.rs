@@ -82,6 +82,56 @@ fn render_and_move_to(session: &mut EditorSession, needle: &str, width: u16) -> 
     target
 }
 
+fn first_code_fence_rows(session: &mut EditorSession, width: u16) -> (usize, usize) {
+    let layout = session.render_layout(width);
+    let first = layout
+        .lines
+        .iter()
+        .position(|line| line.role == RenderedLineRole::CodeFence)
+        .expect("rendered layout should contain a fenced-code surface");
+    let end = layout.lines[first..]
+        .iter()
+        .position(|line| line.role != RenderedLineRole::CodeFence)
+        .map_or(layout.lines.len(), |offset| first + offset);
+    (first, end - 1)
+}
+
+fn move_to_rendered_row(session: &mut EditorSession, row: usize) {
+    while session.rendered_cursor_line() < row {
+        session.handle_key(key('j'));
+    }
+    while session.rendered_cursor_line() > row {
+        session.handle_key(key('k'));
+    }
+}
+
+fn yank_first_code_fence(
+    source: &str,
+    shape_key: char,
+    reverse: bool,
+) -> (String, String, EditorSession) {
+    let mut session = EditorSession::from_text(source);
+    let (first, last) = first_code_fence_rows(&mut session, 120);
+    let (anchor, active, motion) = if reverse {
+        (last, first, 'k')
+    } else {
+        (first, last, 'j')
+    };
+    move_to_rendered_row(&mut session, anchor);
+    session.handle_key(key(shape_key));
+    for _ in 0..anchor.abs_diff(active) {
+        session.handle_key(key(motion));
+    }
+    let effects = session.handle_key(key('y'));
+    let content = clipboard_contents(&effects);
+    assert_eq!(content.len(), 1);
+    (
+        content[0].markdown().to_string(),
+        content[0].plain_text().to_string(),
+        session,
+    )
+}
+
 #[test]
 fn session_starts_in_rendered_normal() {
     let mut session = EditorSession::from_text("# Hello\n\nWorld\n");
@@ -266,6 +316,222 @@ fn rendered_character_yank_preserves_soft_wrap_spaces_without_newlines() {
     let effects = session.handle_key(key('y'));
 
     assert_eq!(clipboard_writes(&effects), [source]);
+}
+
+#[test]
+fn rendered_complete_code_fence_yank_preserves_exact_source() {
+    let cases = [
+        (
+            concat!(
+                "before\n\n",
+                "````rust extra\n",
+                "fn main() {  \n",
+                "    println!(\"hello\");\n",
+                "}\n",
+                "````\n",
+                "\nafter\n",
+            ),
+            concat!(
+                "````rust extra\n",
+                "fn main() {  \n",
+                "    println!(\"hello\");\n",
+                "}\n",
+                "````\n",
+            ),
+        ),
+        (
+            "~~~~text\nThis is some text\n~~~~\n",
+            "~~~~text\nThis is some text\n~~~~\n",
+        ),
+        (
+            "> ```text\n> nested code\n> ```\n",
+            "> ```text\n> nested code\n> ```\n",
+        ),
+        (
+            "- ~~~unknown-language\n  nested code\n  ~~~",
+            "- ~~~unknown-language\n  nested code\n  ~~~",
+        ),
+    ];
+
+    for (source, expected) in cases {
+        for shape_key in ['v', 'V'] {
+            for reverse in [false, true] {
+                let (markdown, _, session) = yank_first_code_fence(source, shape_key, reverse);
+                assert_eq!(markdown, expected, "shape={shape_key}, reverse={reverse}");
+                assert_eq!(session.document(), source);
+            }
+        }
+    }
+}
+
+#[test]
+fn rendered_complete_empty_fence_yanks_without_source_backed_body_atoms() {
+    let source = "```text\n```\n";
+
+    for shape_key in ['v', 'V'] {
+        for reverse in [false, true] {
+            let (markdown, plain_text, session) = yank_first_code_fence(source, shape_key, reverse);
+            assert_eq!(markdown, source);
+            assert_eq!(plain_text, "");
+            assert_eq!(session.document(), source);
+        }
+    }
+}
+
+#[test]
+fn rendered_selection_spanning_multiple_complete_fences_yanks_exact_source() {
+    let source = concat!(
+        "```rust\n",
+        "first\n",
+        "```\n",
+        "\n",
+        "between\n",
+        "\n",
+        "~~~unknown\n",
+        "second\n",
+        "~~~\n",
+    );
+
+    for shape_key in ['v', 'V'] {
+        for reverse in [false, true] {
+            let mut session = EditorSession::from_text(source);
+            let code_rows: Vec<_> = session
+                .render_layout(120)
+                .lines
+                .iter()
+                .enumerate()
+                .filter_map(|(row, line)| (line.role == RenderedLineRole::CodeFence).then_some(row))
+                .collect();
+            let first = *code_rows.first().unwrap();
+            let last = *code_rows.last().unwrap();
+            let (anchor, active, motion) = if reverse {
+                (last, first, 'k')
+            } else {
+                (first, last, 'j')
+            };
+            move_to_rendered_row(&mut session, anchor);
+            session.handle_key(key(shape_key));
+            for _ in 0..anchor.abs_diff(active) {
+                session.handle_key(key(motion));
+            }
+
+            assert_eq!(clipboard_writes(&session.handle_key(key('y'))), [source]);
+            assert_eq!(session.document(), source);
+        }
+    }
+}
+
+#[test]
+fn rendered_complete_fence_selection_survives_layout_rebuild() {
+    let source = "```text\nThis is some text\n```\n";
+
+    for shape_key in ['v', 'V'] {
+        let mut session = EditorSession::from_text(source);
+        let (first, last) = first_code_fence_rows(&mut session, 120);
+        move_to_rendered_row(&mut session, first);
+        session.handle_key(key(shape_key));
+        for _ in first..last {
+            session.handle_key(key('j'));
+        }
+
+        session.render_layout(24);
+        assert_eq!(clipboard_writes(&session.handle_key(key('y'))), [source]);
+    }
+}
+
+#[test]
+fn rendered_code_fence_content_only_yanks_do_not_add_delimiters() {
+    let source = "```rust\n  alpha  \n    beta\n```\n";
+
+    let mut character = EditorSession::from_text(source);
+    let first_body = render_and_move_to(&mut character, "alpha", 120);
+    let last_body = character
+        .render_layout(120)
+        .lines
+        .iter()
+        .position(|line| line.styled.text.contains("beta"))
+        .unwrap();
+    let last_atoms = character.render_layout(120).lines[last_body]
+        .atoms
+        .iter()
+        .filter(|atom| atom.source.is_some())
+        .count();
+    character.handle_key(key('v'));
+    for _ in first_body..last_body {
+        character.handle_key(key('j'));
+    }
+    for _ in 1..last_atoms {
+        character.handle_key(key('l'));
+    }
+    assert_eq!(
+        clipboard_writes(&character.handle_key(key('y'))),
+        ["  alpha  \n    beta"]
+    );
+
+    let mut line = EditorSession::from_text(source);
+    render_and_move_to(&mut line, "alpha", 120);
+    line.handle_key(key('V'));
+    line.handle_key(key('j'));
+    let line_selection = line.rendered_selection().unwrap();
+    assert_eq!(
+        line_selection
+            .source_ranges
+            .iter()
+            .map(|range| &source[range.clone()])
+            .collect::<Vec<_>>(),
+        ["```rust\n  alpha  \n    beta\n"]
+    );
+    assert_eq!(
+        clipboard_writes(&line.handle_key(key('y'))),
+        ["  alpha  \n    beta\n"]
+    );
+}
+
+#[test]
+fn rendered_complete_fence_plain_text_yank_keeps_exact_markdown_register() {
+    let source = "```rust\nfn main() {}\n```\n";
+    for (put, insertion) in [
+        ('p', source.find('f').unwrap() + 1),
+        ('P', source.find('f').unwrap()),
+    ] {
+        let mut session = EditorSession::from_text(source);
+        let (first, last) = first_code_fence_rows(&mut session, 120);
+        move_to_rendered_row(&mut session, first);
+        session.handle_key(key('v'));
+        for _ in first..last {
+            session.handle_key(key('j'));
+        }
+
+        assert_eq!(
+            clipboard_writes(&session.handle_key(key('Y'))),
+            ["fn main() {}\n"]
+        );
+        session.handle_key(key(put));
+        assert_eq!(
+            session.document(),
+            format!("{}{source}{}", &source[..insertion], &source[insertion..])
+        );
+    }
+}
+
+#[test]
+fn complete_fence_yank_expansion_does_not_broaden_delete_geometry() {
+    let source = "```rust\ncode\n```\n";
+    let mut session = EditorSession::from_text(source);
+    let (first, last) = first_code_fence_rows(&mut session, 120);
+    move_to_rendered_row(&mut session, first);
+    session.handle_key(key('v'));
+    for _ in first..last {
+        session.handle_key(key('j'));
+    }
+
+    let selection = session.rendered_selection().unwrap();
+    assert!(selection
+        .source_ranges
+        .iter()
+        .all(|range| range.start > 0 && range.end < source.len()));
+    session.handle_key(key('x'));
+    assert_eq!(session.document(), "```rust\n\n```\n");
 }
 
 #[test]

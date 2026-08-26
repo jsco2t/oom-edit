@@ -29,6 +29,13 @@ use crate::style::{
 use crate::syntax;
 use wrap::{wrap_mapped_line, MappedLine};
 
+/// Private source provenance for one complete rendered fenced-code surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RenderedCodeFenceRegion {
+    pub(crate) rows: Range<usize>,
+    pub(crate) source: Range<usize>,
+}
+
 // ── Public API ─────────────────────────────────────────────────────────────
 
 impl RenderedLayout {
@@ -42,18 +49,18 @@ impl RenderedLayout {
     /// the last.
     #[cfg(test)]
     pub(crate) fn build(model: &BlockModel, width: u16, highlighter: &syntax::Highlighter) -> Self {
-        Self::build_with_front_matter_state(model, width, highlighter, false)
+        Self::build_with_fence_regions(model, width, highlighter, false).0
     }
 
-    /// Build a layout while controlling the front-matter panel's collapsed state.
-    pub(crate) fn build_with_front_matter_state(
+    /// Build a layout and its private fenced-code provenance companion.
+    pub(crate) fn build_with_fence_regions(
         model: &BlockModel,
         width: u16,
         highlighter: &syntax::Highlighter,
         front_matter_collapsed: bool,
-    ) -> Self {
+    ) -> (Self, Vec<RenderedCodeFenceRegion>) {
         if width == 0 {
-            return Self::default();
+            return (Self::default(), Vec::new());
         }
 
         let layout = RenderedLayoutBuilder::new(model, width, highlighter, front_matter_collapsed);
@@ -74,6 +81,7 @@ struct RenderedLayoutBuilder<'a> {
     next_link_marker: usize,
     footnote_defs: Vec<FootnoteDef>,
     front_matter_collapsed: bool,
+    code_fence_regions: Vec<RenderedCodeFenceRegion>,
 }
 
 impl<'a> RenderedLayoutBuilder<'a> {
@@ -94,10 +102,11 @@ impl<'a> RenderedLayoutBuilder<'a> {
             next_link_marker: 0,
             footnote_defs: Vec::new(),
             front_matter_collapsed,
+            code_fence_regions: Vec::new(),
         }
     }
 
-    fn build(mut self) -> RenderedLayout {
+    fn build(mut self) -> (RenderedLayout, Vec<RenderedCodeFenceRegion>) {
         // Process top-level blocks
         for (i, block) in self.model.blocks.iter().enumerate() {
             if i > 0 && !self.lines.is_empty() {
@@ -117,12 +126,15 @@ impl<'a> RenderedLayoutBuilder<'a> {
         }
 
         let line_numbers = rendered_line_numbers(&self.lines, self.highlighter.text());
-        RenderedLayout {
-            lines: self.lines,
-            line_numbers,
-            jump_targets: self.jump_targets,
-            link_index: self.link_index,
-        }
+        (
+            RenderedLayout {
+                lines: self.lines,
+                line_numbers,
+                jump_targets: self.jump_targets,
+                link_index: self.link_index,
+            },
+            self.code_fence_regions,
+        )
     }
 
     fn add_synthetic_blank(&mut self, source: Range<usize>) {
@@ -474,6 +486,21 @@ impl<'a> RenderedLayoutBuilder<'a> {
         for line in &mut self.lines[first_fence_line..] {
             line.role = RenderedLineRole::CodeFence;
         }
+        let document = self.highlighter.text();
+        let source_start = document[..source.start.min(document.len())]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        let source_end = source.end
+            + usize::from(
+                document
+                    .as_bytes()
+                    .get(source.end)
+                    .is_some_and(|byte| *byte == b'\n'),
+            );
+        self.code_fence_regions.push(RenderedCodeFenceRegion {
+            rows: first_fence_line..self.lines.len(),
+            source: source_start..source_end,
+        });
     }
 
     fn render_fenced_code_body(

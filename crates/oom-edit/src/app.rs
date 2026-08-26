@@ -3710,6 +3710,52 @@ mod tests {
     }
 
     #[test]
+    fn complete_fence_copy_honors_yank_output_policy() {
+        let source = "```rust\nfn main() {}\n```\n";
+        for (copy_format, yank, expected) in [
+            (ClipboardCopyFormat::Markdown, 'y', source),
+            (ClipboardCopyFormat::PlainText, 'y', "fn main() {}\n"),
+            (ClipboardCopyFormat::Markdown, 'Y', "fn main() {}\n"),
+        ] {
+            let sink = SharedClipboardSink::default();
+            let mut app = test_app_with_clipboard_format(
+                EditorSession::from_text(source),
+                copy_format,
+                Box::new(sink.clone()),
+            );
+            let (first, last) = {
+                let layout = app.session_mut().unwrap().render_layout(74);
+                let first = layout
+                    .lines
+                    .iter()
+                    .position(|line| line.role == oom_edit_core::RenderedLineRole::CodeFence)
+                    .unwrap();
+                let end = layout.lines[first..]
+                    .iter()
+                    .position(|line| line.role != oom_edit_core::RenderedLineRole::CodeFence)
+                    .map_or(layout.lines.len(), |offset| first + offset);
+                (first, end - 1)
+            };
+            let current = app.session().unwrap().rendered_cursor_line();
+            if current < first {
+                type_chars(&mut app, std::iter::repeat_n('j', first - current));
+            } else {
+                type_chars(&mut app, std::iter::repeat_n('k', current - first));
+            }
+
+            type_chars(
+                &mut app,
+                std::iter::once('v')
+                    .chain(std::iter::repeat_n('j', last - first))
+                    .chain(std::iter::once(yank)),
+            );
+
+            assert_eq!(sink.captures(), [expected]);
+            assert_eq!(app.session().unwrap().document(), source);
+        }
+    }
+
+    #[test]
     fn uppercase_y_reports_clipboard_failures() {
         let mut session = EditorSession::from_text("`code`");
         session.render_layout(74);

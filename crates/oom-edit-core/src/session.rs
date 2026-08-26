@@ -877,14 +877,15 @@ use crate::document::{Document, LineEnding};
 use crate::error::{OpenError, SaveError};
 use crate::frontmatter::FrontMatter;
 use crate::rendered::nav;
-use crate::rendered::BlockModel;
+use crate::rendered::{BlockModel, RenderedCodeFenceRegion};
 use crate::spell::{
     DecorationKind, Diagnostic, DiagnosticDecorationRow, DiagnosticProvider, PositionError,
     TextPosition,
 };
 use crate::style::{
-    LineKind, RenderedCursor, RenderedLayout, RenderedPoint, RenderedSearch, RenderedSelection,
-    RenderedSourceAtom, SearchDirection, SelectionShape, SourceDecoration, TargetKind,
+    LineKind, RenderedCursor, RenderedLayout, RenderedLineRole, RenderedPoint, RenderedSearch,
+    RenderedSelection, RenderedSourceAtom, SearchDirection, SelectionShape, SourceDecoration,
+    TargetKind,
 };
 use live_document::LiveDocument;
 use std::ops::Range;
@@ -947,6 +948,89 @@ fn project_selection_for_vim(selection: RenderedSelection) -> ProjectedSelection
                 .collect(),
         },
     }
+}
+
+fn prepare_fenced_code_yank_selection(
+    mut selection: RenderedSelection,
+    layout: &RenderedLayout,
+    document: &str,
+    fence_regions: &[RenderedCodeFenceRegion],
+) -> RenderedSelection {
+    if selection.shape == SelectionShape::Block {
+        return selection;
+    }
+
+    let selected_rows = selection.anchor.row.min(selection.active.row)
+        ..selection
+            .anchor
+            .row
+            .max(selection.active.row)
+            .saturating_add(1);
+    if selection.shape == SelectionShape::Line
+        && fence_regions.iter().any(|region| {
+            region.rows.start < selected_rows.start && selected_rows.end < region.rows.end
+        })
+    {
+        selection.source_ranges = layout.lines[selected_rows.clone()]
+            .iter()
+            .filter(|line| line.role == RenderedLineRole::CodeFence)
+            .map(|line| {
+                let mut source = line.source.clone();
+                if document.as_bytes().get(source.end) == Some(&b'\n') {
+                    source.end += 1;
+                }
+                source
+            })
+            .collect();
+    }
+    let covered: Vec<_> = fence_regions
+        .iter()
+        .filter(|region| {
+            selected_rows.start <= region.rows.start && region.rows.end <= selected_rows.end
+        })
+        .cloned()
+        .collect();
+    if selection.shape == SelectionShape::Line {
+        for region in fence_regions {
+            if selected_rows.start == region.rows.start {
+                selection
+                    .source_ranges
+                    .retain(|range| region.source.start < range.end);
+                for range in &mut selection.source_ranges {
+                    range.start = range.start.max(region.source.start);
+                }
+            }
+            if selected_rows.end == region.rows.end {
+                selection
+                    .source_ranges
+                    .retain(|range| range.start < region.source.end);
+                for range in &mut selection.source_ranges {
+                    range.end = range.end.min(region.source.end);
+                }
+            }
+        }
+    }
+    selection
+        .source_ranges
+        .extend(covered.into_iter().map(|region| region.source));
+    selection
+        .source_ranges
+        .retain(|range| range.start < range.end);
+    selection
+        .source_ranges
+        .sort_by_key(|range| (range.start, range.end));
+    let mut normalized: Vec<Range<usize>> = Vec::with_capacity(selection.source_ranges.len());
+    for range in selection.source_ranges.drain(..) {
+        if let Some(previous) = normalized.last_mut() {
+            if range.start <= previous.end {
+                previous.end = previous.end.max(range.end);
+                continue;
+            }
+        }
+        normalized.push(range);
+    }
+    selection.source_ranges = normalized;
+    selection
 }
 
 // ── RenderedState ──────────────────────────────────────────────────────────
@@ -1118,6 +1202,8 @@ impl RenderedSearchState {
 struct RenderedState {
     /// Cached rendered layout (None = needs rebuild).
     layout_cache: Option<RenderedLayout>,
+    /// Full source spans paired with rendered fenced-code row intervals.
+    code_fence_regions: Vec<RenderedCodeFenceRegion>,
     /// The width used when the layout was last built.
     last_width: u16,
     /// Current cursor position in rendered coordinates.
@@ -1145,6 +1231,7 @@ impl RenderedState {
     fn new() -> Self {
         Self {
             layout_cache: None,
+            code_fence_regions: Vec::new(),
             last_width: 0,
             cursor: RenderedCursor::new(0),
             register_input: RegisterInput::Default,
@@ -1165,6 +1252,7 @@ impl RenderedState {
     /// Invalidate the layout cache.
     fn invalidate(&mut self) {
         self.layout_cache = None;
+        self.code_fence_regions.clear();
     }
 }
 
@@ -2184,10 +2272,16 @@ impl EditorSession {
                     && selection
                         .as_ref()
                         .is_some_and(|selection| selection.anchor.atom.is_some()));
+            let active_line_remap = selection.as_ref().is_some_and(|selection| {
+                selection.active.atom.is_none() && selection.active.line.is_some()
+            });
+            let anchor_line_remap = selection.as_ref().is_some_and(|selection| {
+                selection.anchor.atom.is_none() && selection.anchor.line.is_some()
+            });
             let text = self.live.text();
             let fm_span = crate::frontmatter::front_matter_span(&text);
             let model = BlockModel::build(&text, fm_span);
-            let layout = RenderedLayout::build_with_front_matter_state(
+            let (layout, code_fence_regions) = RenderedLayout::build_with_fence_regions(
                 &model,
                 width,
                 self.live.highlighter(),
@@ -2202,7 +2296,7 @@ impl EditorSession {
                 })
                 .flatten()
                 .or_else(|| {
-                    (block_selection && !active_atom_remap)
+                    active_line_remap
                         .then(|| {
                             selection
                                 .as_ref()
@@ -2231,7 +2325,7 @@ impl EditorSession {
                 })
                 .flatten()
                 .or_else(|| {
-                    (block_selection && !anchor_atom_remap)
+                    anchor_line_remap
                         .then(|| {
                             selection
                                 .as_ref()
@@ -2256,6 +2350,7 @@ impl EditorSession {
                     })
                 });
             self.rendered_state.layout_cache = Some(layout);
+            self.rendered_state.code_fence_regions = code_fence_regions;
             self.rendered_state.last_width = width;
             self.rendered_state.cursor = cursor;
             if let SessionMode::Select(selection) = &mut self.session_mode {
@@ -2976,6 +3071,14 @@ impl EditorSession {
         if let SelectionKind::Character { ranges } = &active.kind {
             selection.source_ranges = ranges.clone();
             selection.rows = nav::character_selection_rows(ranges, layout);
+        }
+        if operator == RangeOperator::Yank {
+            selection = prepare_fenced_code_yank_selection(
+                selection,
+                layout,
+                self.live.highlighter().text(),
+                &self.rendered_state.code_fence_regions,
+            );
         }
         if selection.source_ranges.is_empty() {
             return Vec::new();

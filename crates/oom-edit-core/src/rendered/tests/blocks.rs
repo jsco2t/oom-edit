@@ -25,6 +25,17 @@ fn rendered_layout_at_width(text: &str, width: u16) -> RenderedLayout {
     RenderedLayout::build(&model, width, &highlighter)
 }
 
+fn rendered_layout_with_fence_regions(
+    text: &str,
+) -> (
+    RenderedLayout,
+    Vec<crate::rendered::RenderedCodeFenceRegion>,
+) {
+    let model = BlockModel::build(text, None);
+    let highlighter = Highlighter::new(text);
+    RenderedLayout::build_with_fence_regions(&model, 80, &highlighter, false)
+}
+
 fn source_backed_ranges(layout: &RenderedLayout, text: &str) -> Vec<std::ops::Range<usize>> {
     layout
         .lines
@@ -923,6 +934,45 @@ fn fenced_layout_marks_complete_surface_role() {
                 assert!(text.is_char_boundary(source.end));
             }
         }
+    }
+}
+
+#[test]
+fn fenced_layout_retains_private_full_source_regions() {
+    let text = concat!(
+        "before\n\n",
+        "> ````rust extra\n",
+        "> code\n",
+        "> ````\n",
+        "\n",
+        "```text\n",
+        "```\n",
+    );
+    let (layout, regions) = rendered_layout_with_fence_regions(text);
+
+    assert_eq!(regions.len(), 2);
+    assert_eq!(
+        &text[regions[0].source.clone()],
+        "> ````rust extra\n> code\n> ````\n"
+    );
+    assert_eq!(&text[regions[1].source.clone()], "```text\n```\n");
+    for region in regions {
+        let surface = &layout.lines[region.rows];
+        assert!(surface
+            .iter()
+            .all(|line| line.role == RenderedLineRole::CodeFence));
+        assert!(surface
+            .first()
+            .unwrap()
+            .atoms
+            .iter()
+            .all(|atom| atom.source.is_none()));
+        assert!(surface
+            .last()
+            .unwrap()
+            .atoms
+            .iter()
+            .all(|atom| atom.source.is_none()));
     }
 }
 
