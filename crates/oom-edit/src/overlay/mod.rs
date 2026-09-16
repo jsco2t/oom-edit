@@ -54,11 +54,6 @@ impl Overlay {
         matches!(self, Overlay::Palette(_))
     }
 
-    /// Is the spelling-suggestion modal open?
-    pub(crate) fn is_spell_suggest(&self) -> bool {
-        matches!(self, Overlay::SpellSuggest(_))
-    }
-
     /// Is the provider-neutral diagnostics modal open?
     pub(crate) fn is_trouble(&self) -> bool {
         matches!(self, Overlay::Trouble(_))

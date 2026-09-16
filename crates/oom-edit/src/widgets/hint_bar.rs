@@ -9,7 +9,9 @@
 
 use ratatui::text::Line;
 
-use crate::command::{commands_for, registry::Contexts, rendered_binding, BindingRole};
+use crate::command::{
+    commands_for, registry::Contexts, rendered_binding, BindingAlias, BindingRole,
+};
 
 /// A single hint cell for the hint bar.
 #[derive(Debug, Clone)]
@@ -40,13 +42,40 @@ pub fn build_hints(ctx: Contexts) -> Vec<HintCell> {
     for spec in quick_cmds {
         match spec.binding {
             BindingRole::AppChord { continuation, .. } => {
+                for alias in spec.aliases {
+                    if let BindingAlias::Direct { key, contexts } = alias {
+                        if contexts.contains(ctx) {
+                            cells.push(HintCell {
+                                text: format!("{key}={}", spec.quick_label.unwrap_or(spec.desc)),
+                                compact_text: None,
+                                disabled: false,
+                            });
+                        }
+                    }
+                }
                 space_insert_at.get_or_insert(cells.len());
-                compact_space_hint
-                    .get_or_insert_with(|| format!("Space+{continuation}={}", spec.name));
+                let mut keys = vec![continuation.to_string()];
                 space_items.push(format!(
                     "{continuation}={}",
                     spec.quick_label.unwrap_or(spec.desc)
                 ));
+                for alias in spec.aliases {
+                    if let BindingAlias::Space {
+                        continuation,
+                        contexts,
+                    } = alias
+                    {
+                        if contexts.contains(ctx) {
+                            keys.push(continuation.to_string());
+                            space_items.push(format!(
+                                "{continuation}={}",
+                                spec.quick_label.unwrap_or(spec.desc)
+                            ));
+                        }
+                    }
+                }
+                compact_space_hint
+                    .get_or_insert_with(|| format!("Space+{}={}", keys.join("/"), spec.name));
             }
             _ => {
                 let keys = rendered_binding(spec);
@@ -136,12 +165,16 @@ mod tests {
     #[test]
     fn build_hints_groups_space_continuations_and_keeps_standalone_keys() {
         let cells = build_hints(Contexts::NORMAL);
-        assert_eq!(cells.len(), 4);
+        assert_eq!(cells.len(), 5);
         assert_eq!(cells[0].text, "v=select");
         assert_eq!(cells[1].text, "/=search");
         assert_eq!(cells[2].text, ":=command");
-        assert_eq!(cells[3].text, "Space [h=commands, w=save, q=quit]");
-        assert_eq!(cells[3].compact_text.as_deref(), Some("Space+h=help"));
+        assert_eq!(cells[3].text, "?=commands");
+        assert_eq!(
+            cells[4].text,
+            "Space [h=commands, ?=commands, w=save, q=quit]"
+        );
+        assert_eq!(cells[4].compact_text.as_deref(), Some("Space+h/?=help"));
     }
 
     #[test]
@@ -152,6 +185,8 @@ mod tests {
         assert!(text.contains("v=select"));
         assert!(text.contains("/=search"));
         assert!(text.contains(":=command"));
+        assert!(text.contains("?=commands"));
+        assert!(text.contains("?=commands, w=save"));
         assert_eq!(text.matches("Space [").count(), 1);
         assert!(!text.contains("help / command palette"));
         assert!(text.contains("save"));

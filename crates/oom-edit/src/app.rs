@@ -13,11 +13,16 @@
 
 use std::time::Instant;
 
-use crossterm::event::{Event, KeyCode as CrosstermKeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    Event, KeyCode as CrosstermKeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
+};
+use ratatui::layout::Rect;
 use ratatui::Frame;
 
 use oom_edit_core::ClipboardSink;
-use oom_edit_core::{EditorSession, Effect, KeyCode, KeyCodeKind, KeyInput, Modifiers};
+use oom_edit_core::{
+    EditorSession, Effect, KeyCode, KeyCodeKind, KeyInput, Modifiers, RenderedPoint, Viewport,
+};
 
 use crossterm::event::MouseEventKind;
 
@@ -49,6 +54,31 @@ const SCROLLOFF: usize = 3;
 const HSCROLLOFF: usize = 5;
 /// Maximum diagnostic offsets projected into gutter rows by one idle unit.
 const GUTTER_PROJECTION_ITEMS_PER_UNIT: usize = 64;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PointerGesture {
+    #[default]
+    Idle,
+    Pressed(PointerAnchor),
+    Dragging(PointerDrag),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PointerAnchor {
+    Rendered(RenderedPoint),
+    Source { offset: usize, viewport: Viewport },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PointerDrag {
+    Rendered(RenderedPoint),
+    Source {
+        offset: usize,
+        viewport: Viewport,
+        rendered_anchor: RenderedPoint,
+        source_frame: u64,
+    },
+}
 
 fn body_height(total_height: u16, has_multiple_tabs: bool) -> u16 {
     let tab_bar_height = u16::from(has_multiple_tabs);
@@ -285,6 +315,10 @@ pub struct App {
     viewport_height: usize,
     /// Source text viewport width, excluding the line-number gutter.
     viewport_width: usize,
+    /// Document body geometry from the most recent frame.
+    body_area: Rect,
+    pointer_gesture: PointerGesture,
+    frame_generation: u64,
     /// Follow requested by a state transition that returns before the normal
     /// event tail (tab switches and registry-dispatched session commands).
     pending_scroll_follow: bool,
@@ -394,6 +428,9 @@ impl App {
             pending_input: PendingAppInput::Idle,
             viewport_height: 22,
             viewport_width: 76,
+            body_area: Rect::new(0, 0, 0, 0),
+            pointer_gesture: PointerGesture::Idle,
+            frame_generation: 0,
             pending_scroll_follow: true,
             last_follow_geometry: None,
             wrap_enabled,
@@ -680,6 +717,7 @@ impl App {
 
     /// Render the current frame.
     pub fn render(&mut self, frame: &mut Frame<'_>) {
+        self.frame_generation = self.frame_generation.wrapping_add(1);
         let area = frame.area();
 
         // Compute viewport height from terminal size.
@@ -692,7 +730,14 @@ impl App {
         let viewport_height = body_height as usize;
         let viewport_width = self
             .active()
-            .map(|entry| source_text_width(area.width, entry.session.line_count()) as usize)
+            .map(|entry| {
+                source_text_width(
+                    area.width,
+                    entry.session.line_count(),
+                    self.relative_line_numbers
+                        && entry.session.mode() != oom_edit_core::Mode::Insert,
+                ) as usize
+            })
             .unwrap_or(area.width as usize);
         self.viewport_height = viewport_height;
         self.viewport_width = viewport_width;
@@ -738,6 +783,7 @@ impl App {
             width: area.width,
             height: body_height,
         };
+        self.body_area = body_area;
 
         // Compute status area.
         let status_area = ratatui::layout::Rect {
@@ -775,6 +821,18 @@ impl App {
                     body_area,
                     DocumentPresentation::new(active_theme, self.tier, &entry.gutter_trouble),
                 );
+            }
+        }
+        if let Some(anchor) = self
+            .active()
+            .and_then(|entry| entry.session.rendered_selection())
+            .map(|selection| selection.anchor)
+        {
+            if let PointerGesture::Dragging(PointerDrag::Source {
+                rendered_anchor, ..
+            }) = &mut self.pointer_gesture
+            {
+                *rendered_anchor = anchor;
             }
         }
 
@@ -823,7 +881,7 @@ impl App {
                 matches!(
                     s.mode(),
                     oom_edit_core::Mode::Normal | oom_edit_core::Mode::Select
-                )
+                ) && s.rendered_search_prompt().is_none()
             })
             .unwrap_or(false)
     }
@@ -908,13 +966,6 @@ impl App {
         self.active().map(|t| t.rendered_top).unwrap_or(0)
     }
 
-    /// Set the active tab's rendered_top.
-    fn set_rendered_top(&mut self, val: usize) {
-        if let Some(entry) = self.tabs.get_mut(self.active_tab) {
-            entry.rendered_top = val;
-        }
-    }
-
     /// Get the active tab's rendered horizontal offset.
     #[cfg_attr(not(test), expect(dead_code))]
     fn rendered_left_col(&self) -> usize {
@@ -935,16 +986,34 @@ impl App {
         self.record_input(now);
         // Handle resize events — rebuild rendered layout on width change.
         if let Event::Resize(_width, height) = event {
+            self.pointer_gesture = PointerGesture::Idle;
             // Clamp viewport height using the same chrome rows as render().
             self.viewport_height = body_height(*height, self.has_multiple_tabs()) as usize;
             self.viewport_width = self
                 .active()
-                .map(|entry| source_text_width(*_width, entry.session.line_count()) as usize)
+                .map(|entry| {
+                    source_text_width(
+                        *_width,
+                        entry.session.line_count(),
+                        self.relative_line_numbers
+                            && entry.session.mode() != oom_edit_core::Mode::Insert,
+                    ) as usize
+                })
                 .unwrap_or(*_width as usize);
+            self.body_area = Rect::new(
+                0,
+                u16::from(self.has_multiple_tabs()),
+                *_width,
+                self.viewport_height.min(usize::from(u16::MAX)) as u16,
+            );
             self.last_follow_geometry = Some((self.viewport_height, self.viewport_width));
             if let Some(ref mut entry) = self.tabs.get_mut(self.active_tab) {
                 if entry.session.mode() != oom_edit_core::Mode::Insert {
-                    let text_width = source_text_width(*_width, entry.session.line_count());
+                    let text_width = source_text_width(
+                        *_width,
+                        entry.session.line_count(),
+                        self.relative_line_numbers,
+                    );
                     entry.session.render_layout(text_width);
                 }
             }
@@ -953,11 +1022,9 @@ impl App {
             return;
         }
 
-        // Suggestion input is fully modal. Resize remains a presentation
-        // event, but paste and mouse input cannot reach the document beneath.
-        if (self.overlay.is_spell_suggest() || self.overlay.is_trouble())
-            && matches!(event, Event::Paste(_) | Event::Mouse(_))
-        {
+        // Modal overlays exclusively own the document surface.
+        if self.overlay.is_some() && matches!(event, Event::Mouse(_)) {
+            self.pointer_gesture = PointerGesture::Idle;
             return;
         }
 
@@ -980,20 +1047,12 @@ impl App {
             return;
         }
 
-        // Handle mouse wheel scroll (FR-6.11).
         if let Event::Mouse(mouse) = event {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => {
-                    self.scroll_up(3);
-                    return;
-                }
-                MouseEventKind::ScrollDown => {
-                    self.scroll_down(3);
-                    return;
-                }
-                _ => return, // Other mouse events are no-ops in v1.
-            }
+            self.handle_mouse(*mouse);
+            return;
         }
+
+        self.pointer_gesture = PointerGesture::Idle;
 
         // Translate crossterm event → core KeyInput.
         let key_input = match event {
@@ -2025,43 +2084,359 @@ impl App {
         (top_line, skip_rows, 0)
     }
 
-    /// Scroll up by `lines` rows — Vim Ctrl-e / Ctrl-y style (viewport moves,
-    /// cursor stays put). Rendered modes scroll `rendered_top`.
-    fn scroll_up(&mut self, lines: usize) {
-        if let Some(entry) = self.active() {
-            match entry.session.mode() {
-                oom_edit_core::Mode::Normal
-                | oom_edit_core::Mode::Select
-                | oom_edit_core::Mode::Command => {
-                    self.set_rendered_top(entry.rendered_top.saturating_sub(lines));
+    fn pointer_cell(&self, mouse: MouseEvent, source_surface: bool) -> Option<(usize, usize)> {
+        let area = self.body_area;
+        let row = mouse.row.checked_sub(area.y)?;
+        let column = mouse.column.checked_sub(area.x)?;
+        if row >= area.height || column >= area.width {
+            return None;
+        }
+        let entry = self.active()?;
+        let relative = self.relative_line_numbers
+            && !source_surface
+            && entry.session.mode() != oom_edit_core::Mode::Insert;
+        let gutter =
+            (status_bar::gutter_width(entry.session.line_count(), relative) as u16).min(area.width);
+        let text_column = column.checked_sub(gutter)?;
+        (usize::from(text_column) < self.viewport_width)
+            .then_some((usize::from(row), usize::from(text_column)))
+    }
+
+    fn source_viewport(&self, entry: &TabEntry) -> Viewport {
+        Viewport {
+            top_line: entry.top_line,
+            height: self.body_area.height,
+            width: self.viewport_width.min(usize::from(u16::MAX)) as u16,
+            wrap: self.wrap_enabled,
+            left_col: entry.left_col,
+            skip_rows: entry.skip_rows,
+        }
+    }
+
+    fn rendered_pointer_point(&self, row: usize, column: usize) -> Option<RenderedPoint> {
+        let entry = self.active()?;
+        Some(RenderedPoint {
+            row: entry.rendered_top.saturating_add(row),
+            column: entry.rendered_left_col.saturating_add(column),
+        })
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.active().is_some_and(|entry| {
+            entry.session.mode() == oom_edit_core::Mode::Command
+                || entry.session.rendered_search_prompt().is_some()
+        }) {
+            self.pointer_gesture = PointerGesture::Idle;
+            return;
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.pointer_gesture = PointerGesture::Idle;
+                self.scroll_pointer(mouse, -3);
+            }
+            MouseEventKind::ScrollDown => {
+                self.pointer_gesture = PointerGesture::Idle;
+                self.scroll_pointer(mouse, 3);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.pointer_gesture = PointerGesture::Idle;
+                let Some((row, column)) = self.pointer_cell(mouse, false) else {
+                    return;
+                };
+                let Some(entry) = self.active() else { return };
+                let mode = entry.session.mode();
+                if mode == oom_edit_core::Mode::Command {
+                    return;
                 }
-                _ => {
-                    self.set_top_line(entry.top_line.saturating_sub(lines));
+                let viewport = self.source_viewport(entry);
+                let rendered_point = self.rendered_pointer_point(row, column);
+                let Some(entry) = self.tabs.get_mut(self.active_tab) else {
+                    return;
+                };
+                let anchor = if mode == oom_edit_core::Mode::Insert {
+                    let Some(offset) = entry
+                        .session
+                        .source_offset_at_viewport_cell(viewport, row, column)
+                    else {
+                        return;
+                    };
+                    if entry.session.jump_to_offset(offset).is_err() {
+                        return;
+                    }
+                    PointerAnchor::Source { offset, viewport }
+                } else {
+                    entry.session.render_layout(viewport.width);
+                    entry
+                        .session
+                        .move_to_rendered_point(rendered_point.expect("active rendered point"));
+                    PointerAnchor::Rendered(entry.session.rendered_cursor())
+                };
+                self.pointer_gesture = PointerGesture::Pressed(anchor);
+                self.pending_scroll_follow = false;
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let gesture = self.pointer_gesture;
+                let source_surface = match gesture {
+                    PointerGesture::Pressed(PointerAnchor::Source { .. }) => true,
+                    PointerGesture::Dragging(PointerDrag::Source { source_frame, .. }) => {
+                        source_frame == self.frame_generation
+                    }
+                    _ => false,
+                };
+                let Some((row, column)) = self.pointer_cell(mouse, source_surface) else {
+                    return;
+                };
+                let rendered_point = self.rendered_pointer_point(row, column);
+                let Some(entry) = self.tabs.get_mut(self.active_tab) else {
+                    return;
+                };
+                match gesture {
+                    PointerGesture::Pressed(PointerAnchor::Source {
+                        offset: anchor,
+                        viewport,
+                    }) => {
+                        let Some(active) = entry
+                            .session
+                            .source_offset_at_viewport_cell(viewport, row, column)
+                        else {
+                            return;
+                        };
+                        if entry
+                            .session
+                            .select_source_offsets(anchor, active, viewport.width)
+                            .is_ok()
+                        {
+                            let rendered_anchor = entry
+                                .session
+                                .rendered_selection()
+                                .expect("source drag entered Select")
+                                .anchor;
+                            self.pointer_gesture = PointerGesture::Dragging(PointerDrag::Source {
+                                offset: anchor,
+                                viewport,
+                                rendered_anchor,
+                                source_frame: self.frame_generation,
+                            });
+                            self.pending_scroll_follow = true;
+                        }
+                    }
+                    PointerGesture::Dragging(PointerDrag::Source {
+                        offset: anchor,
+                        viewport,
+                        rendered_anchor,
+                        source_frame,
+                    }) if source_frame == self.frame_generation => {
+                        let Some(active) = entry
+                            .session
+                            .source_offset_at_viewport_cell(viewport, row, column)
+                        else {
+                            return;
+                        };
+                        if entry
+                            .session
+                            .select_source_offsets(anchor, active, viewport.width)
+                            .is_ok()
+                        {
+                            self.pointer_gesture = PointerGesture::Dragging(PointerDrag::Source {
+                                offset: anchor,
+                                viewport,
+                                rendered_anchor,
+                                source_frame,
+                            });
+                        }
+                    }
+                    PointerGesture::Pressed(PointerAnchor::Rendered(anchor))
+                    | PointerGesture::Dragging(PointerDrag::Rendered(anchor))
+                    | PointerGesture::Dragging(PointerDrag::Source {
+                        rendered_anchor: anchor,
+                        ..
+                    }) => {
+                        let active = rendered_point.expect("active rendered point");
+                        entry.session.select_rendered_points(anchor, active);
+                        self.pointer_gesture =
+                            PointerGesture::Dragging(PointerDrag::Rendered(anchor));
+                        self.pending_scroll_follow = false;
+                    }
+                    PointerGesture::Idle => {}
                 }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.pointer_gesture = PointerGesture::Idle;
+            }
+            MouseEventKind::Moved => {}
+            _ => {
+                self.pointer_gesture = PointerGesture::Idle;
             }
         }
     }
 
-    /// Scroll down by `lines` rows — Vim Ctrl-e style (viewport moves,
-    /// cursor stays put). Rendered modes scroll `rendered_top`.
-    fn scroll_down(&mut self, lines: usize) {
-        if let Some(entry) = self.active() {
-            match entry.session.mode() {
-                oom_edit_core::Mode::Normal
-                | oom_edit_core::Mode::Select
-                | oom_edit_core::Mode::Command => {
-                    let layout = entry.session.rendered_layout();
-                    let layout_height = layout.map(|l| l.lines.len()).unwrap_or(0);
-                    let max_top = layout_height.saturating_sub(self.viewport_height);
-                    self.set_rendered_top((entry.rendered_top + lines).min(max_top));
-                }
-                _ => {
-                    let line_count = entry.session.line_count();
-                    let max_top = line_count.saturating_sub(self.viewport_height);
-                    self.set_top_line((entry.top_line + lines).min(max_top));
-                }
+    fn source_rows_remaining(
+        session: &EditorSession,
+        top_line: usize,
+        skip_rows: usize,
+        width: u16,
+        enough: usize,
+    ) -> usize {
+        let mut rows = 0usize;
+        for line in top_line..session.line_count() {
+            let height = session.visual_row_info(line, 0, width, true).1;
+            rows = rows.saturating_add(if line == top_line {
+                height.saturating_sub(skip_rows)
+            } else {
+                height
+            });
+            if rows >= enough {
+                break;
             }
         }
+        rows
+    }
+
+    fn scroll_pointer(&mut self, mouse: MouseEvent, delta: isize) {
+        let area = self.body_area;
+        if mouse.column < area.x
+            || mouse.column >= area.x.saturating_add(area.width)
+            || mouse.row < area.y
+            || mouse.row >= area.y.saturating_add(area.height)
+        {
+            return;
+        }
+        let width = self.viewport_width.min(usize::from(u16::MAX)) as u16;
+        let height = self.viewport_height;
+        let Some(entry) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        if height == 0 || width == 0 || delta == 0 {
+            return;
+        }
+        if entry.session.mode() != oom_edit_core::Mode::Insert {
+            entry.session.render_layout(width);
+            let layout_height = entry
+                .session
+                .rendered_layout()
+                .map_or(0, |layout| layout.lines.len());
+            let old_top = entry.rendered_top;
+            let max_top = layout_height.saturating_sub(height);
+            let new_top = if delta < 0 {
+                old_top.saturating_sub(delta.unsigned_abs())
+            } else {
+                old_top.saturating_add(delta as usize).min(max_top)
+            };
+            if new_top == old_top {
+                return;
+            }
+            let old_screen_row = entry
+                .session
+                .rendered_cursor()
+                .row
+                .saturating_sub(old_top)
+                .min(height - 1);
+            let target = RenderedPoint {
+                row: new_top
+                    .saturating_add(old_screen_row)
+                    .min(layout_height.saturating_sub(1)),
+                column: entry.session.rendered_cursor().column,
+            };
+            entry.rendered_top = new_top;
+            entry.session.move_to_rendered_point(target);
+        } else {
+            let mut viewport = Viewport {
+                top_line: entry.top_line,
+                height: height.min(usize::from(u16::MAX)) as u16,
+                width,
+                wrap: self.wrap_enabled,
+                left_col: entry.left_col,
+                skip_rows: entry.skip_rows,
+            };
+            let frame = entry.session.render_source(viewport);
+            let old_row = usize::from(frame.cursor.0).min(height - 1);
+            let old_col = frame
+                .lines
+                .get(old_row)
+                .map(|line| {
+                    let prefix: String = line
+                        .text
+                        .chars()
+                        .take(usize::from(frame.cursor.1))
+                        .collect();
+                    ratatui::text::Line::from(prefix).width()
+                })
+                .unwrap_or(0);
+            let mut moved = false;
+            for _ in 0..delta.unsigned_abs() {
+                if delta > 0 {
+                    if !self.wrap_enabled {
+                        let max_top = entry.session.line_count().saturating_sub(height);
+                        if viewport.top_line >= max_top {
+                            break;
+                        }
+                        viewport.top_line += 1;
+                    } else {
+                        let rows = entry
+                            .session
+                            .visual_row_info(viewport.top_line, 0, width, true)
+                            .1;
+                        if viewport.skip_rows + 1 < rows {
+                            viewport.skip_rows += 1;
+                        } else if viewport.top_line + 1 < entry.session.line_count() {
+                            viewport.top_line += 1;
+                            viewport.skip_rows = 0;
+                        } else {
+                            break;
+                        }
+                        if Self::source_rows_remaining(
+                            &entry.session,
+                            viewport.top_line,
+                            viewport.skip_rows,
+                            width,
+                            height,
+                        ) < height
+                        {
+                            if viewport.skip_rows > 0 {
+                                viewport.skip_rows -= 1;
+                            } else {
+                                viewport.top_line -= 1;
+                                viewport.skip_rows = entry
+                                    .session
+                                    .visual_row_info(viewport.top_line, 0, width, true)
+                                    .1
+                                    .saturating_sub(1);
+                            }
+                            break;
+                        }
+                    }
+                } else if viewport.skip_rows > 0 && self.wrap_enabled {
+                    viewport.skip_rows -= 1;
+                } else if viewport.top_line > 0 {
+                    viewport.top_line -= 1;
+                    viewport.skip_rows = if self.wrap_enabled {
+                        entry
+                            .session
+                            .visual_row_info(viewport.top_line, 0, width, true)
+                            .1
+                            .saturating_sub(1)
+                    } else {
+                        0
+                    };
+                } else {
+                    break;
+                }
+                moved = true;
+            }
+            if !moved {
+                return;
+            }
+            entry.top_line = viewport.top_line;
+            entry.skip_rows = viewport.skip_rows;
+            if let Some(offset) = entry.session.source_offset_at_viewport_cell(
+                viewport,
+                old_row,
+                old_col.min(usize::from(width).saturating_sub(1)),
+            ) {
+                let _ = entry.session.jump_to_offset(offset);
+            }
+        }
+        self.pending_scroll_follow = false;
     }
 }
 
@@ -2236,6 +2611,309 @@ mod tests {
     /// Create a test App with a recording clipboard sink.
     fn test_app(session: EditorSession) -> App {
         test_app_at(session, std::time::Instant::now())
+    }
+
+    fn pointer_event(app: &mut App, kind: MouseEventKind, column: u16, row: u16) {
+        app.handle_event(&Event::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }));
+    }
+
+    #[test]
+    fn pointer_scroll_click_and_drag_keep_rendered_view_and_selection() {
+        let source: String = (0..50).map(|row| format!("# row {row:02}\n")).collect();
+        let mut app = test_app(EditorSession::from_text(&source));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 8)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let gutter = status_bar::gutter_width(app.session().unwrap().line_count(), false) as u16;
+
+        for _ in 0..10 {
+            pointer_event(&mut app, MouseEventKind::ScrollDown, gutter, 2);
+        }
+        assert_eq!(app.tabs[0].rendered_top, 30);
+        assert_eq!(app.session().unwrap().rendered_cursor().row, 30);
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        assert_eq!(app.tabs[0].rendered_top, 30);
+
+        pointer_event(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            gutter + 2,
+            2,
+        );
+        assert_eq!(app.session().unwrap().rendered_cursor().row, 32);
+        assert!(!app.pending_scroll_follow);
+        pointer_event(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            gutter + 4,
+            2,
+        );
+        assert_eq!(app.session().unwrap().mode(), Mode::Select);
+        let selection = app.session().unwrap().rendered_selection().unwrap();
+        assert_eq!(&source[selection.source_ranges[0].clone()], "row");
+        pointer_event(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            gutter + 4,
+            2,
+        );
+        assert_eq!(app.pointer_gesture, PointerGesture::Idle);
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        assert_eq!(app.tabs[0].rendered_top, 30);
+        assert_eq!(app.session().unwrap().mode(), Mode::Select);
+
+        let before = app.session().unwrap().cursor();
+        pointer_event(&mut app, MouseEventKind::Down(MouseButton::Left), gutter, 7);
+        assert_eq!(app.session().unwrap().cursor(), before);
+        app.overlay = Overlay::open_palette(Contexts::SELECT);
+        pointer_event(&mut app, MouseEventKind::Down(MouseButton::Left), gutter, 1);
+        pointer_event(&mut app, MouseEventKind::ScrollDown, gutter, 1);
+        assert_eq!(app.session().unwrap().cursor(), before);
+        assert_eq!(app.tabs[0].rendered_top, 30);
+    }
+
+    #[test]
+    fn pointer_scroll_and_source_drag_follow_insert_viewport() {
+        let source: String = (0..30).map(|row| format!("line {row:02} 界\n")).collect();
+        let mut app = test_app(EditorSession::from_text(&source));
+        enter_insert(&mut app);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(24, 7)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let gutter = status_bar::gutter_width(app.session().unwrap().line_count(), false) as u16;
+        pointer_event(&mut app, MouseEventKind::ScrollDown, gutter, 1);
+        assert_eq!(app.tabs[0].top_line, 3);
+        assert_eq!(app.session().unwrap().cursor().0, 3);
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        assert_eq!(app.tabs[0].top_line, 3);
+        pointer_event(&mut app, MouseEventKind::Down(MouseButton::Left), gutter, 2);
+        assert_eq!(app.session().unwrap().cursor(), (5, 0));
+        pointer_event(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            gutter + 3,
+            2,
+        );
+        assert_eq!(app.session().unwrap().mode(), Mode::Select);
+        let first_range = app
+            .session()
+            .unwrap()
+            .rendered_selection()
+            .unwrap()
+            .source_ranges[0]
+            .clone();
+        pointer_event(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            gutter + 4,
+            2,
+        );
+        let second_range = app
+            .session()
+            .unwrap()
+            .rendered_selection()
+            .unwrap()
+            .source_ranges[0]
+            .clone();
+        assert!(
+            second_range.end > first_range.end,
+            "batched source drags keep source geometry"
+        );
+        assert_eq!(
+            app.session().unwrap().rendered_selection().unwrap().shape,
+            oom_edit_core::SelectionShape::Character
+        );
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        pointer_event(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            gutter + 5,
+            2,
+        );
+        assert_eq!(app.session().unwrap().mode(), Mode::Select);
+        pointer_event(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            gutter + 3,
+            2,
+        );
+        assert_eq!(app.session().unwrap().mode(), Mode::Select);
+    }
+
+    #[test]
+    fn pointer_insert_click_uses_horizontal_source_window() {
+        let mut app = test_app(EditorSession::from_text("ab界cd\n"));
+        enter_insert(&mut app);
+        app.wrap_enabled = false;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(12, 4)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        app.tabs[0].left_col = 2;
+        app.pending_scroll_follow = false;
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let gutter = status_bar::gutter_width(app.session().unwrap().line_count(), false) as u16;
+        pointer_event(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            gutter + 1,
+            0,
+        );
+        assert_eq!(app.session().unwrap().cursor(), (0, 3));
+    }
+
+    #[test]
+    fn pointer_normal_click_respects_rendered_horizontal_window() {
+        let mut app = test_app(EditorSession::from_text("abcdefghijklmnopqrstuvwxyz"));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(12, 4)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        app.tabs[0].rendered_left_col = 5;
+        app.pending_scroll_follow = false;
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let gutter = status_bar::gutter_width(app.session().unwrap().line_count(), false) as u16;
+        pointer_event(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            gutter + 1,
+            0,
+        );
+        assert_eq!(app.session().unwrap().cursor(), (0, 6));
+        assert_eq!(app.session().unwrap().rendered_cursor().column, 6);
+    }
+
+    #[test]
+    fn pointer_wheel_keeps_cursor_at_viewed_content_across_mode_changes() {
+        let source: String = (0..50).map(|row| format!("# row {row:02}\n")).collect();
+        let mut app = test_app(EditorSession::from_text(&source));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 8)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        for _ in 0..10 {
+            pointer_event(&mut app, MouseEventKind::ScrollDown, 1, 2);
+        }
+        let focused_source_line = app.session().unwrap().cursor().0;
+        assert!(focused_source_line >= 10);
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('i'),
+            KeyModifiers::NONE,
+        )));
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        assert_eq!(app.session().unwrap().cursor().0, focused_source_line);
+        assert!(app.tabs[0].top_line > 0);
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        assert_eq!(app.session().unwrap().cursor().0, focused_source_line);
+        assert!(app.tabs[0].rendered_top > 0);
+    }
+
+    #[test]
+    fn pointer_wheel_advances_wrapped_source_rows_and_stops_at_boundaries() {
+        let mut app = test_app(EditorSession::from_text(&format!(
+            "{}\nlast\n",
+            "abcdefghij".repeat(10)
+        )));
+        enter_insert(&mut app);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(12, 5)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        pointer_event(&mut app, MouseEventKind::ScrollDown, 1, 1);
+        assert_eq!(app.tabs[0].top_line, 0);
+        assert_eq!(app.tabs[0].skip_rows, 3);
+        assert_eq!(app.session().unwrap().cursor().0, 0);
+        assert!(app.session().unwrap().cursor().1 > 0);
+        for _ in 0..20 {
+            pointer_event(&mut app, MouseEventKind::ScrollDown, 1, 1);
+        }
+        let end = (app.tabs[0].top_line, app.tabs[0].skip_rows);
+        pointer_event(&mut app, MouseEventKind::ScrollDown, 1, 1);
+        assert_eq!((app.tabs[0].top_line, app.tabs[0].skip_rows), end);
+        for _ in 0..20 {
+            pointer_event(&mut app, MouseEventKind::ScrollUp, 1, 1);
+        }
+        assert_eq!((app.tabs[0].top_line, app.tabs[0].skip_rows), (0, 0));
+    }
+
+    #[test]
+    fn source_drag_anchor_remaps_after_select_changes_text_width() {
+        let mut app = test_app(EditorSession::from_text("abcdefghijklmno\n"));
+        app.relative_line_numbers = true;
+        enter_insert(&mut app);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(10, 5)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let source_gutter =
+            status_bar::gutter_width(app.session().unwrap().line_count(), false) as u16;
+        pointer_event(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            source_gutter + 6,
+            0,
+        );
+        pointer_event(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            source_gutter,
+            1,
+        );
+        assert_eq!(app.session().unwrap().mode(), Mode::Select);
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let anchor = app.session().unwrap().rendered_selection().unwrap().anchor;
+        let PointerGesture::Dragging(PointerDrag::Source {
+            rendered_anchor, ..
+        }) = app.pointer_gesture
+        else {
+            panic!("source drag should retain its remapped anchor");
+        };
+        assert_eq!(rendered_anchor, anchor);
+        let rendered_gutter =
+            status_bar::gutter_width(app.session().unwrap().line_count(), true) as u16;
+        let screen_row = anchor.row.saturating_sub(app.tabs[0].rendered_top) as u16;
+        pointer_event(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            rendered_gutter + anchor.column as u16 + 1,
+            screen_row,
+        );
+        assert_eq!(
+            app.session()
+                .unwrap()
+                .rendered_selection()
+                .unwrap()
+                .source_ranges[0]
+                .start,
+            6
+        );
+    }
+
+    #[test]
+    fn pointer_does_not_mutate_document_while_prompt_owns_input() {
+        for prompt in [':', '/'] {
+            let source: String = (0..20).map(|row| format!("# row {row}\n")).collect();
+            let mut app = test_app(EditorSession::from_text(&source));
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 8)).unwrap();
+            terminal.draw(|frame| app.render(frame)).unwrap();
+            app.handle_event(&Event::Key(KeyEvent::new(
+                CrosstermKeyCode::Char(prompt),
+                KeyModifiers::NONE,
+            )));
+            let cursor = app.session().unwrap().cursor();
+            let top = app.tabs[0].rendered_top;
+            pointer_event(&mut app, MouseEventKind::ScrollDown, 1, 1);
+            pointer_event(&mut app, MouseEventKind::Down(MouseButton::Left), 4, 2);
+            pointer_event(&mut app, MouseEventKind::Drag(MouseButton::Left), 6, 2);
+            assert_eq!(app.session().unwrap().cursor(), cursor);
+            assert_eq!(app.tabs[0].rendered_top, top);
+            assert_eq!(app.pointer_gesture, PointerGesture::Idle);
+        }
     }
 
     fn test_app_at(mut session: EditorSession, initial_time: Instant) -> App {
@@ -2584,7 +3262,7 @@ mod tests {
         terminal.draw(|frame| app.render(frame)).unwrap();
         assert_eq!(
             terminal.backend().buffer().cell((0, 0)).unwrap().symbol(),
-            "W"
+            "•"
         );
         assert_eq!(app.gutter_projection_count(), projected);
 
@@ -2595,7 +3273,7 @@ mod tests {
         terminal.draw(|frame| app.render(frame)).unwrap();
         assert_eq!(
             terminal.backend().buffer().cell((0, 0)).unwrap().symbol(),
-            "W"
+            "•"
         );
         assert_eq!(app.gutter_projection_count(), projected);
 
@@ -4772,6 +5450,90 @@ mod tests {
     }
 
     #[test]
+    fn app_question_shortcuts_open_one_palette_in_their_contexts() {
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+            let mut normal = test_app(EditorSession::from_text("hello"));
+            normal.handle_event(&Event::Key(KeyEvent::new(
+                CrosstermKeyCode::Char('?'),
+                modifiers,
+            )));
+            assert!(normal.overlay.is_palette());
+            assert_eq!(normal.session().unwrap().rendered_search_prompt(), None);
+
+            let mut prefixed = test_app(EditorSession::from_text("hello"));
+            prefixed.handle_event(&Event::Key(KeyEvent::new(
+                CrosstermKeyCode::Char(' '),
+                KeyModifiers::NONE,
+            )));
+            prefixed.handle_event(&Event::Key(KeyEvent::new(
+                CrosstermKeyCode::Char('?'),
+                modifiers,
+            )));
+            assert!(prefixed.overlay.is_palette());
+
+            let mut selected = test_app(EditorSession::from_text("hello"));
+            selected.handle_event(&Event::Key(KeyEvent::new(
+                CrosstermKeyCode::Char('v'),
+                KeyModifiers::NONE,
+            )));
+            selected.handle_event(&Event::Key(KeyEvent::new(
+                CrosstermKeyCode::Char(' '),
+                KeyModifiers::NONE,
+            )));
+            selected.handle_event(&Event::Key(KeyEvent::new(
+                CrosstermKeyCode::Char('?'),
+                modifiers,
+            )));
+            assert!(selected.overlay.is_palette());
+            assert_eq!(selected.session().unwrap().mode(), Mode::Select);
+        }
+
+        let mut search = test_app(EditorSession::from_text("hello"));
+        search.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('/'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            search
+                .session()
+                .unwrap()
+                .rendered_search_prompt()
+                .as_deref(),
+            Some("/")
+        );
+        assert!(!search.overlay.is_some());
+        search.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('?'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            search
+                .session()
+                .unwrap()
+                .rendered_search_prompt()
+                .as_deref(),
+            Some("/")
+        );
+        assert!(!search.overlay.is_some());
+
+        let mut inserted = test_app(EditorSession::from_text("hello"));
+        enter_insert(&mut inserted);
+        inserted.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('?'),
+            KeyModifiers::NONE,
+        )));
+        assert!(!inserted.overlay.is_some());
+        assert!(inserted.session().unwrap().document().contains('?'));
+
+        let mut controlled = test_app(EditorSession::from_text("hello"));
+        controlled.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('?'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(!controlled.overlay.is_some());
+    }
+
+    #[test]
     fn app_plain_v_enters_select() {
         let session = EditorSession::from_text("hello");
         let mut app = test_app(session);
@@ -4788,7 +5550,7 @@ mod tests {
         let mut app = test_app(EditorSession::from_text(
             "one\n\ntwo\n\nthree\n\nfour\n\nfive\n",
         ));
-        app.set_rendered_top(8);
+        app.tabs[0].rendered_top = 8;
 
         app.handle_effect(Effect::OpenRequested { path, force: true });
 
@@ -5496,7 +6258,7 @@ mod tests {
 
             let mut terminal =
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 8)).unwrap();
-            let text_x = status_bar::gutter_width(1) as u16;
+            let text_x = status_bar::gutter_width(1, false) as u16;
             for source_mode in [false, true] {
                 if source_mode {
                     app.handle_event(&Event::Key(KeyEvent::new(

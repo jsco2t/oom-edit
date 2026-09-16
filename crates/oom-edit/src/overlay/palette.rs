@@ -13,7 +13,9 @@ use ratatui::{
     Frame,
 };
 
-use crate::command::{rendered_binding, AppCommand, BindingRole, Contexts};
+#[cfg(test)]
+use crate::command::rendered_binding;
+use crate::command::{rendered_binding_for, AppCommand, BindingRole, Contexts};
 use crate::theme::{Theme, Tier, UiSlot};
 
 // ── Vim reference table ─────────────────────────────────────────────────────
@@ -25,7 +27,6 @@ pub static VIM_REFERENCE: &[(&str, &str, &str)] = &[
     ("gg / G", "Jump to the first / last rendered row.", "R-N2"),
     ("Tab / S-Tab", "Move between rendered jump targets.", "R-N3"),
     ("/pattern⏎", "Search rendered text forward.", "R-N4"),
-    ("?pattern⏎", "Search rendered text backward.", "R-N4"),
     ("n / N", "Repeat the rendered search.", "R-N4"),
     ("i/a/I/A/o/O", "Enter source Insert mode.", "R-I1"),
     ("Esc", "Return from Insert to rendered Normal.", "R-I2"),
@@ -129,7 +130,7 @@ impl PaletteState {
         // App commands section.
         for spec in crate::command::COMMANDS {
             let enabled = spec.contexts.contains(ctx);
-            let keys = rendered_binding(spec);
+            let keys = rendered_binding_for(spec, ctx);
             match spec.binding {
                 BindingRole::AppChord { command, .. } => rows.push(PaletteRow::Command {
                     id: command,
@@ -675,16 +676,16 @@ mod tests {
             ..PaletteState::default()
         };
         let rows = palette.build_rows(Contexts::ALL);
-        assert_eq!(palette.filter_rows(&rows).len(), 3);
+        assert_eq!(palette.filter_rows(&rows).len(), 2);
 
         let down = key(KeyCodeKind::Down);
         for _ in 0..5 {
             assert!(palette.handle_key(&down));
         }
-        assert_eq!(palette.selected, 2);
+        assert_eq!(palette.selected, 1);
 
         assert!(palette.handle_key(&key(KeyCodeKind::Tab)));
-        assert_eq!(palette.selected, 2);
+        assert_eq!(palette.selected, 1);
     }
 
     #[test]
@@ -743,6 +744,27 @@ mod tests {
                 }
             }));
         }
+    }
+
+    #[test]
+    fn palette_help_row_lists_only_contextual_question_shortcuts() {
+        let palette = PaletteState::new(Contexts::NORMAL);
+        let help_keys = |context| {
+            palette
+                .build_rows(context)
+                .into_iter()
+                .find_map(|row| match row {
+                    PaletteRow::Command {
+                        id: AppCommand::Help,
+                        keys,
+                        ..
+                    } => Some(keys),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(help_keys(Contexts::NORMAL), "? / Space h/?");
+        assert_eq!(help_keys(Contexts::SELECT), "Space h/?");
     }
 
     #[test]

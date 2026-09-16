@@ -1,0 +1,8 @@
+{
+  "standard_commands": [
+    "make check"
+  ],
+  "final_commands": [
+    "make check"
+  ]
+}

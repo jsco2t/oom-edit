@@ -1,24 +1,24 @@
-   1 ┌─ metadata ──────────────────────────────────────────────────────────────┐
-   2 │ title: Kitchen Sink                                                     │
-   3 │ a┌ Command Palette ─────────────────────────────────────────────┐       │
-   4 └──│> sav                                                         │───────┘
+  1 ┌─ metadata ───────────────────────────────────────────────────────────────┐
+  2 │ title: Kitchen Sink                                                      │
+  3 │ au┌ Command Palette ─────────────────────────────────────────────┐       │
+  4 └───│> sav                                                         │───────┘
         │                                                              │
-   6 █ H│▸ save           save                           Space w       │
+  6 █ He│▸ save           save                           Space w       │
         │· ]s             next spelling diagnostic       SP-2:next-pre…│
-   8 Som│· [s             previous spelling diagnostic   SP-2:next-pre…│
+  8 Some│· [s             previous spelling diagnostic   SP-2:next-pre…│
         │· g T            previous tab                   prev-tab      │
-  10 ┃ A│· Tab / S-Tab    Move between rendered jump ta… R-N3          │
+ 10 ┃ A │· Tab / S-Tab    Move between rendered jump ta… R-N3          │
         │· :w             Save (atomic).                 V-X1          │
-     ▏ r│· :w {path}      Save a copy to path without r… V-X1          │
-  13 ▏ f│· :q!            Quit; discards changes.        V-X2          │
-  14 ▏  │· :wq            Save then quit.                V-X3          │
-  15 ▏ }│· :x             Save then quit (if changed).   V-X3          │
-     ▏  │· :saveas {path} Save to path and retarget buf… V-X5          │
+    ▏ ru│· :w {path}      Save a copy to path without r… V-X1          │
+ 13 ▏ fn│· :q!            Quit; discards changes.        V-X2          │
+ 14 ▏   │· :wq            Save then quit.                V-X3          │
+ 15 ▏ } │· :x             Save then quit (if changed).   V-X3          │
+    ▏   │· :saveas {path} Save to path and retarget buf… V-X5          │
         │· :s/pat/rep/    Substitute on current line.    V-X7          │
-  18 ───│· :s/pat/rep/g   Substitute all on current lin… V-X7          │────────
+ 18 ────│· :s/pat/rep/g   Substitute all on current lin… V-X7          │────────
         │· :%s/pat/rep/g  Substitute all in document.    V-X7          │
-  20 Ano│· :noh           Clear search-match highlighti… V-X8          │
+ 20 Anot│· :noh           Clear search-match highlighti… V-X8          │
         └──────────────────────────────────────────────────────────────┘
-  22 More text here.
+ 22 More text here.
 
  NORMAL  ↑↓ navigate · type to filter · Enter execute · Esc close

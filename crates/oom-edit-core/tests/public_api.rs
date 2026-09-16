@@ -78,6 +78,24 @@ fn public_facade_types_are_available_at_crate_root() {
         left_col: 0,
         skip_rows: 0,
     });
+    let _: Option<usize> = session.source_offset_at_viewport_cell(
+        Viewport {
+            top_line: 0,
+            height: 2,
+            width: 20,
+            wrap: true,
+            left_col: 0,
+            skip_rows: 0,
+        },
+        0,
+        0,
+    );
+    let _: Vec<Effect> = session.move_to_rendered_point(RenderedPoint { row: 0, column: 0 });
+    let _: Vec<Effect> = session.select_rendered_points(
+        RenderedPoint { row: 0, column: 0 },
+        RenderedPoint { row: 0, column: 1 },
+    );
+    let _: Result<Vec<Effect>, PositionError> = session.select_source_offsets(0, 1, 20);
 
     let mut clipboard = RecordingClipboardSink::default();
     ClipboardSink::copy(&mut clipboard, "root").unwrap();

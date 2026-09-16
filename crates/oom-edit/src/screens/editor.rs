@@ -7,7 +7,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::command::registry::Contexts;
-use crate::gutter::{marker_style, GutterMarkerRole, GutterTroubleSnapshot};
+use crate::gutter::{marker_style, severity_priority, GutterTroubleSnapshot};
 use crate::theme::{Theme, Tier, UiSlot};
 use crate::widgets::hint_bar;
 use crate::widgets::spans;
@@ -105,8 +105,12 @@ pub(crate) fn render_editor_with_gutter(
 }
 
 /// Return the source text width after reserving the line-number gutter.
-pub(crate) fn source_text_width(area_width: u16, line_count: usize) -> u16 {
-    let gutter_w = (status_bar::gutter_width(line_count) as u16).max(4);
+pub(crate) fn source_text_width(
+    area_width: u16,
+    line_count: usize,
+    relative_line_numbers: bool,
+) -> u16 {
+    let gutter_w = status_bar::gutter_width(line_count, relative_line_numbers) as u16;
     area_width.saturating_sub(gutter_w.min(area_width))
 }
 
@@ -133,8 +137,7 @@ fn render_body(
     );
 
     // Compute gutter width.
-    let gutter_w = status_bar::gutter_width(line_count) as u16;
-    let gutter_w = gutter_w.max(4);
+    let gutter_w = status_bar::gutter_width(line_count, false) as u16;
     let gutter_area_width = gutter_w.min(area.width);
 
     let vp = oom_edit_core::Viewport {
@@ -272,14 +275,7 @@ pub(crate) fn render_gutter(
         if let Some(first_cell) = cells.first() {
             if let Some(severity) = gutter_trouble.severity(source_line) {
                 let marker = marker_style(severity);
-                let role_style = match marker.role {
-                    GutterMarkerRole::Error => theme.ui_style(tier, UiSlot::StatusError),
-                    GutterMarkerRole::Warning => theme.ui_style(tier, UiSlot::StatusWarning),
-                    GutterMarkerRole::Info => theme.ui_style(tier, UiSlot::StatusInfo),
-                    GutterMarkerRole::Muted => {
-                        theme.style(tier, oom_edit_core::SemanticStyle::Muted)
-                    }
-                };
+                let role_style = marker.role.style(theme, tier);
                 spans.push(ratatui::text::Span::styled(
                     marker.glyph.to_string(),
                     background.patch(role_style).add_modifier(marker.modifier),
@@ -350,7 +346,14 @@ pub fn render_status_row(
         cursor_line: cursor.0 + 1, // 1-based for display
         cursor_col: cursor.1 + 1,
         line_count: session.line_count(),
-        spell_issues: session.spell_enabled().then(|| session.diagnostics().len()),
+        spell_issues: session.spell_enabled().then(|| status_bar::SpellIssues {
+            count: session.diagnostics().len(),
+            highest_severity: session
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.severity)
+                .max_by_key(|severity| severity_priority(*severity)),
+        }),
         command_line: command_line.clone(),
     };
 
@@ -375,6 +378,7 @@ pub fn render_status_row(
             let mut flexible_width = area
                 .width
                 .saturating_sub(status_bar::STATUS_CONTENT_OFFSET)
+                .saturating_sub(status_bar::STATUS_RIGHT_GAP_COLS)
                 .saturating_sub(status_text.ruler_width);
             if !indicators.is_empty() {
                 flexible_width = flexible_width
@@ -537,19 +541,27 @@ mod tests {
             assert_eq!(current_number.fg, expected_cell_color(current.fg));
             assert_eq!(current_number.modifier, current.add_modifier);
 
-            for (row, glyph, role_style) in [
-                (0, "E", theme.ui_style(tier, UiSlot::StatusError)),
-                (1, "W", theme.ui_style(tier, UiSlot::StatusWarning)),
-                (2, "I", theme.ui_style(tier, UiSlot::StatusInfo)),
+            for (row, role_style, modifier) in [
+                (
+                    0,
+                    theme.ui_style(tier, UiSlot::StatusError),
+                    Modifier::BOLD | Modifier::UNDERLINED,
+                ),
+                (
+                    1,
+                    theme.ui_style(tier, UiSlot::StatusWarning),
+                    Modifier::BOLD,
+                ),
+                (2, theme.ui_style(tier, UiSlot::StatusInfo), Modifier::BOLD),
                 (
                     3,
-                    "H",
                     theme.style(tier, oom_edit_core::SemanticStyle::Muted),
+                    Modifier::BOLD,
                 ),
             ] {
-                let expected = background.patch(role_style).add_modifier(Modifier::BOLD);
+                let expected = background.patch(role_style).add_modifier(modifier);
                 let marker = buffer.cell((0, row)).unwrap();
-                assert_eq!(marker.symbol(), glyph);
+                assert_eq!(marker.symbol(), "•");
                 assert_eq!(marker.fg, expected_cell_color(expected.fg));
                 assert_eq!(marker.bg, expected_background);
                 assert_eq!(marker.modifier, expected.add_modifier);
@@ -565,10 +577,11 @@ mod tests {
         let marked =
             GutterTroubleSnapshot::testing(&[(72, oom_edit_core::DiagnosticSeverity::Warning)]);
         for (snapshot, expected) in [
-            (&marked, "W 73 "),
-            (&GutterTroubleSnapshot::default(), "  73 "),
+            (&marked, "•73 "),
+            (&GutterTroubleSnapshot::default(), " 73 "),
         ] {
-            let mut terminal = Terminal::new(TestBackend::new(5, 1)).unwrap();
+            let width = status_bar::gutter_width(73, false) as u16;
+            let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
             terminal
                 .draw(|frame| {
                     render_gutter(
@@ -582,7 +595,32 @@ mod tests {
                     );
                 })
                 .unwrap();
-            assert_eq!(buffer_row(&terminal, 0, 5), expected);
+            assert_eq!(buffer_row(&terminal, 0, width as usize), expected);
+        }
+
+        let marked =
+            GutterTroubleSnapshot::testing(&[(147, oom_edit_core::DiagnosticSeverity::Warning)]);
+        for (snapshot, expected) in [
+            (&marked, "•148 "),
+            (&GutterTroubleSnapshot::default(), " 148 "),
+        ] {
+            let width = status_bar::gutter_width(148, false) as u16;
+            assert_eq!(width, 5);
+            let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_gutter(
+                        frame,
+                        oom_edit_core::Mode::Insert,
+                        147,
+                        &[Some(148)],
+                        false,
+                        frame.area(),
+                        DocumentPresentation::new(&DEFAULT_DARK, Tier::TrueColor, snapshot),
+                    );
+                })
+                .unwrap();
+            assert_eq!(buffer_row(&terminal, 0, width as usize), expected);
         }
     }
 
@@ -609,10 +647,10 @@ mod tests {
                 );
             })
             .unwrap();
-        assert_eq!(buffer_row(&terminal, 0, 6), "W  -1 ");
-        assert_eq!(buffer_row(&terminal, 1, 6), "W  10 ");
-        assert_eq!(buffer_row(&terminal, 2, 6), "W+989 ");
-        assert_eq!(buffer_row(&terminal, 3, 6), "W+990 ");
+        assert_eq!(buffer_row(&terminal, 0, 6), "•  -1 ");
+        assert_eq!(buffer_row(&terminal, 1, 6), "•  10 ");
+        assert_eq!(buffer_row(&terminal, 2, 6), "•+989 ");
+        assert_eq!(buffer_row(&terminal, 3, 6), "•+990 ");
 
         let mut zero_width = Terminal::new(TestBackend::new(1, 1)).unwrap();
         zero_width
@@ -630,7 +668,7 @@ mod tests {
             .unwrap();
         assert_eq!(buffer_row(&zero_width, 0, 1), " ");
 
-        for (width, expected) in [(1, "W"), (2, "W ")] {
+        for (width, expected) in [(1, "•"), (2, "• ")] {
             let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
             terminal
                 .draw(|frame| {
@@ -678,12 +716,15 @@ mod tests {
             .ui_style(Tier::TrueColor, UiSlot::DocumentBody)
             .bg
             .unwrap();
-        assert_eq!(buffer.cell((0, 0)).unwrap().symbol(), "W");
+        assert_eq!(buffer.cell((0, 0)).unwrap().symbol(), "•");
+        let gutter_width = status_bar::gutter_width(session.line_count(), false) as u16;
+        assert_eq!(buffer.cell((gutter_width - 1, 0)).unwrap().symbol(), " ");
+        assert_eq!(buffer.cell((gutter_width, 0)).unwrap().symbol(), "m");
         for row in 1..6 {
             assert_eq!(buffer.cell((0, row)).unwrap().symbol(), " ");
         }
         for row in 0..6 {
-            for column in 0..5 {
+            for column in 0..gutter_width {
                 assert_eq!(buffer.cell((column, row)).unwrap().bg, gutter_background);
             }
             assert_eq!(buffer.cell((11, row)).unwrap().bg, body_background);
@@ -714,7 +755,7 @@ mod tests {
                     })
                     .unwrap();
 
-                let gutter = (status_bar::gutter_width(session.line_count()) as u16).max(4);
+                let gutter = status_bar::gutter_width(session.line_count(), false) as u16;
                 let cell = terminal.backend().buffer().cell((gutter + 2, 0)).unwrap();
                 assert!(cell.modifier.contains(Modifier::UNDERLINED));
                 assert!(cell.modifier.contains(Modifier::ITALIC));
@@ -789,7 +830,7 @@ mod tests {
             })
             .unwrap();
 
-        let gutter = (status_bar::gutter_width(session.line_count()) as u16).max(4);
+        let gutter = status_bar::gutter_width(session.line_count(), false) as u16;
         let cell = terminal.backend().buffer().cell((gutter + 2, 0)).unwrap();
         assert_eq!(
             Some(cell.fg),
@@ -867,7 +908,7 @@ mod tests {
 
         assert_eq!(
             middle.trim_end(),
-            "v=select  /=search  :=command  Space+h=help"
+            "v=select  /=search  :=command  ?=commands"
         );
     }
 
@@ -945,7 +986,7 @@ mod tests {
         assert_eq!(session.cursor(), (4, 2));
 
         let terminal = render_session_status(&session, 80);
-        assert!(buffer_row(&terminal, 0, 80).ends_with("5:3  83%"));
+        assert!(buffer_row(&terminal, 0, 80).ends_with("5:3  83% "));
     }
 
     #[test]
@@ -1005,9 +1046,9 @@ mod tests {
             .unwrap();
 
         let buffer = terminal.backend().buffer();
-        assert_eq!(buffer.cell((3, 0)).unwrap().symbol(), "1");
-        assert_eq!(buffer.cell((4, 0)).unwrap().symbol(), " ");
-        assert_eq!(buffer.cell((5, 0)).unwrap().symbol(), "x");
+        assert_eq!(buffer.cell((1, 0)).unwrap().symbol(), "1");
+        assert_eq!(buffer.cell((2, 0)).unwrap().symbol(), " ");
+        assert_eq!(buffer.cell((3, 0)).unwrap().symbol(), "x");
     }
 
     #[test]
@@ -1028,8 +1069,8 @@ mod tests {
                 );
             })
             .unwrap();
-        assert_eq!(&buffer_row(&terminal, 1, 14)[..5], "     ");
-        assert_eq!(&buffer_row(&terminal, 2, 14)[..5], "     ");
+        assert_eq!(&buffer_row(&terminal, 1, 14)[..3], "   ");
+        assert_eq!(&buffer_row(&terminal, 2, 14)[..3], "   ");
     }
 
     #[test]
@@ -1051,8 +1092,8 @@ mod tests {
                 );
             })
             .unwrap();
-        assert!(buffer_row(&terminal, 0, 16)[..5].contains('1'));
-        assert!(buffer_row(&terminal, 3, 16)[..5].contains('2'));
+        assert!(buffer_row(&terminal, 0, 16)[..3].contains('1'));
+        assert!(buffer_row(&terminal, 2, 16)[..3].contains('2'));
     }
 
     #[test]
@@ -1073,8 +1114,8 @@ mod tests {
                 );
             })
             .unwrap();
-        assert!(!buffer_row(&terminal, 0, 14)[..5].trim().is_empty());
-        assert!(!buffer_row(&terminal, 1, 14)[..5].trim().is_empty());
+        assert!(!buffer_row(&terminal, 0, 14)[..3].trim().is_empty());
+        assert!(!buffer_row(&terminal, 1, 14)[..3].trim().is_empty());
     }
 
     #[test]
@@ -1099,7 +1140,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             terminal.backend().cursor_position(),
-            ratatui::layout::Position::new(11, 1)
+            ratatui::layout::Position::new(7, 1)
         );
     }
 
@@ -1125,13 +1166,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             terminal.backend().cursor_position(),
-            ratatui::layout::Position::new(10, 0)
+            ratatui::layout::Position::new(8, 0)
         );
     }
 
     #[test]
     fn editor_cursor_wraps_to_blank_row_at_insert_boundary() {
-        let mut session = EditorSession::from_text(&"x".repeat(40));
+        let mut session = EditorSession::from_text(&"x".repeat(41));
         feed(&mut session, "A");
         let mut terminal = Terminal::new(TestBackend::new(44, 2)).unwrap();
         terminal
@@ -1150,7 +1191,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             terminal.backend().cursor_position(),
-            ratatui::layout::Position::new(6, 1)
+            ratatui::layout::Position::new(3, 1)
         );
     }
 
@@ -1176,7 +1217,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             terminal.backend().cursor_position(),
-            ratatui::layout::Position::new(5, 1)
+            ratatui::layout::Position::new(3, 1)
         );
     }
 
@@ -1202,7 +1243,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             terminal.backend().cursor_position(),
-            ratatui::layout::Position::new(6, 0)
+            ratatui::layout::Position::new(4, 0)
         );
     }
 
@@ -1228,7 +1269,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             terminal.backend().cursor_position(),
-            ratatui::layout::Position::new(8, 0)
+            ratatui::layout::Position::new(6, 0)
         );
     }
 

@@ -1352,12 +1352,18 @@ fn drift_hint_bar_matches_registry() {
                 )
             })
             .count();
+        let direct_aliases = commands
+            .iter()
+            .flat_map(|command| command.aliases)
+            .filter(|alias| matches!(alias, crate::command::BindingAlias::Direct { contexts, .. } if contexts.contains(ctx)))
+            .count();
         assert_eq!(
             cells.len(),
             commands
                 .len()
                 .saturating_sub(space_count)
-                .saturating_add(usize::from(space_count > 0)),
+                .saturating_add(usize::from(space_count > 0))
+                .saturating_add(direct_aliases),
             "context {ctx:?} must group eligible Space commands into one hint"
         );
         for command in commands {
@@ -1380,6 +1386,39 @@ fn drift_hint_bar_matches_registry() {
                 "context {ctx:?} command {:?} must appear exactly once",
                 command.id
             );
+            for alias in command.aliases {
+                match alias {
+                    crate::command::BindingAlias::Direct { key, contexts }
+                        if contexts.contains(ctx) =>
+                    {
+                        assert_eq!(
+                            cells
+                                .iter()
+                                .filter(|cell| cell.text == format!("{key}={label}"))
+                                .count(),
+                            1,
+                            "direct alias for {:?} must have one hint",
+                            command.id
+                        );
+                    }
+                    crate::command::BindingAlias::Space {
+                        continuation,
+                        contexts,
+                    } if contexts.contains(ctx) => {
+                        assert_eq!(
+                            cells
+                                .iter()
+                                .filter(|cell| cell.text.starts_with("Space [")
+                                    && cell.text.contains(&format!("{continuation}={label}")))
+                                .count(),
+                            1,
+                            "Space alias for {:?} must have one hint",
+                            command.id
+                        );
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 }

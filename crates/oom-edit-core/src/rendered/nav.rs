@@ -580,6 +580,42 @@ pub(crate) fn source_for_point(
     })
 }
 
+/// Resolve a display cell to the closest source-backed atom. Synthetic rows
+/// use the nearest source-backed row, so decorations never acquire provenance.
+pub(crate) fn source_backed_point(
+    point: RenderedPoint,
+    layout: &RenderedLayout,
+) -> Option<RenderedPoint> {
+    let center = point.row.min(layout.lines.len().checked_sub(1)?);
+    for distance in 0..layout.lines.len() {
+        for row in [center.checked_sub(distance), center.checked_add(distance)] {
+            let Some(row) = row.filter(|row| *row < layout.lines.len()) else {
+                continue;
+            };
+            let nearest = layout.lines[row]
+                .atoms
+                .iter()
+                .filter(|atom| atom.source.is_some())
+                .min_by_key(|atom| {
+                    if point.column < atom.columns.start {
+                        atom.columns.start - point.column
+                    } else if point.column >= atom.columns.end {
+                        point.column - atom.columns.end + 1
+                    } else {
+                        0
+                    }
+                });
+            if let Some(atom) = nearest {
+                return Some(RenderedPoint {
+                    row,
+                    column: atom.columns.start,
+                });
+            }
+        }
+    }
+    None
+}
+
 pub(crate) fn point_for_source_range(
     source_range: &Range<usize>,
     layout: &RenderedLayout,

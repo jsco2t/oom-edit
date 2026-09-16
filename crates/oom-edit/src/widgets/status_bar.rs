@@ -21,8 +21,9 @@ use ratatui::{
     Frame,
 };
 
-use oom_edit_core::{Mode, Severity};
+use oom_edit_core::{DiagnosticSeverity, Mode, Severity};
 
+use crate::gutter::marker_style;
 use crate::theme::{Theme, Tier, UiSlot};
 
 /// Status bar transient message TTL: 4 seconds.
@@ -39,6 +40,9 @@ pub const MODE_BADGE_GAP_COLS: u16 = 1;
 
 /// Fixed offset where flexible status content begins.
 pub const STATUS_CONTENT_OFFSET: u16 = MODE_BADGE_COLS + MODE_BADGE_GAP_COLS;
+
+/// Blank cell at the right edge of the status row.
+pub const STATUS_RIGHT_GAP_COLS: u16 = 1;
 
 /// Severity glyph prefix for status messages.
 fn severity_glyph(severity: Severity) -> &'static str {
@@ -87,9 +91,18 @@ pub struct StatusBar {
     /// Total line count (for percentage calculation).
     pub line_count: usize,
     /// Current spelling-issue count, or `None` when spell checking is disabled.
-    pub spell_issues: Option<usize>,
+    pub spell_issues: Option<SpellIssues>,
     /// Command-line text (when Command or rendered search is active).
     pub command_line: Option<String>,
+}
+
+/// Current spelling summary, computed from the session diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpellIssues {
+    /// Number of displayed spelling diagnostics.
+    pub count: usize,
+    /// Highest displayed severity, absent when the count is zero.
+    pub highest_severity: Option<DiagnosticSeverity>,
 }
 
 /// The rendered output of the status bar — ready for thin render.
@@ -100,7 +113,7 @@ pub struct StatusBarText {
     /// File/transient content for the flexible middle region.
     pub content: Vec<Span<'static>>,
     /// Ruler text for the fixed right region.
-    pub ruler: Span<'static>,
+    pub ruler: Line<'static>,
     /// Display width reserved for the right-pinned ruler.
     pub ruler_width: u16,
     /// Active command or rendered-search prompt, including its prefix.
@@ -150,18 +163,35 @@ impl StatusBar {
             .collect();
         let spell_indicator = self
             .spell_issues
-            .map(|issues| format!("🅂 {issues} "))
+            .map(|issues| format!("🅂 {} ", issues.count))
             .unwrap_or_default();
         let ruler_width = RULER_COLS.saturating_add(
             u16::try_from(Line::from(spell_indicator.as_str()).width()).unwrap_or(u16::MAX),
         );
-        let ruler = Span::styled(
-            format!(
-                "{spell_indicator}{}",
-                ruler_text(self.cursor_line, self.cursor_col, self.line_count)
-            ),
-            Style::default().add_modifier(ratatui::style::Modifier::DIM),
-        );
+        let mut ruler_spans = Vec::new();
+        if let Some(issues) = self.spell_issues {
+            let symbol_style = issues.highest_severity.map_or_else(
+                || {
+                    theme
+                        .ui_style(tier, UiSlot::StatusBar)
+                        .add_modifier(Modifier::BOLD)
+                },
+                |severity| {
+                    let marker = marker_style(severity);
+                    marker.role.style(theme, tier).add_modifier(marker.modifier)
+                },
+            );
+            ruler_spans.push(Span::styled("🅂", symbol_style));
+            ruler_spans.push(Span::styled(
+                format!(" {} ", issues.count),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
+        ruler_spans.push(Span::styled(
+            ruler_text(self.cursor_line, self.cursor_col, self.line_count),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+        let ruler = Line::from(ruler_spans);
 
         StatusBarText {
             badge,
@@ -191,7 +221,8 @@ pub fn render(
     let row_style = theme.ui_style(tier, UiSlot::StatusBar);
     frame.render_widget(Block::default().style(row_style), area);
 
-    let badge_width = MODE_BADGE_COLS.min(area.width);
+    let usable_width = area.width.saturating_sub(STATUS_RIGHT_GAP_COLS);
+    let badge_width = MODE_BADGE_COLS.min(usable_width);
     let badge_area = Rect::new(area.x, area.y, badge_width, 1.min(area.height));
     // The badge is composited over the dimmed status row. Explicitly remove
     // DIM so the mode label retains the intended black, bold contrast.
@@ -199,10 +230,10 @@ pub fn render(
     frame.render_widget(Block::default().style(badge_style), badge_area);
     frame.render_widget(Paragraph::new(Line::from(text.badge.clone())), badge_area);
 
-    let gap_width = MODE_BADGE_GAP_COLS.min(area.width.saturating_sub(badge_width));
+    let gap_width = MODE_BADGE_GAP_COLS.min(usable_width.saturating_sub(badge_width));
     let content_offset = badge_width.saturating_add(gap_width);
     let flexible_x = area.x.saturating_add(content_offset);
-    let flexible_width = area.width.saturating_sub(content_offset);
+    let flexible_width = usable_width.saturating_sub(content_offset);
     if flexible_width == 0 {
         return;
     }
@@ -218,7 +249,7 @@ pub fn render(
             let prompt_width = Line::from(prompt.as_str()).width() as u16;
             let col = flexible_x
                 .saturating_add(prompt_width)
-                .min(area.x.saturating_add(area.width).saturating_sub(1));
+                .min(area.x.saturating_add(usable_width).saturating_sub(1));
             frame.set_cursor_position(Position::new(col, area.y));
         }
         return;
@@ -248,7 +279,7 @@ pub fn render(
     }
     if ruler_width > 0 {
         frame.render_widget(
-            Paragraph::new(Line::from(text.ruler.clone()))
+            Paragraph::new(text.ruler.clone())
                 .alignment(Alignment::Right)
                 .style(row_style),
             ruler_area,
@@ -386,14 +417,20 @@ fn format_gutter_cell(text: &str, width: usize) -> String {
     format!("{text:>number_width$}{}", " ".repeat(GUTTER_CONTENT_GAP))
 }
 
-/// Compute the gutter width: number/sign width plus the trailing content gap.
-pub fn gutter_width(line_count: usize) -> usize {
+/// Compute the gutter width for the active line-number presentation.
+pub fn gutter_width(line_count: usize, relative_line_numbers: bool) -> usize {
     let digits = if line_count == 0 {
         1
     } else {
         line_count.to_string().len()
     };
-    digits.max(3) + 1 + GUTTER_CONTENT_GAP // +1 for the sign column in hybrid mode
+    let relative_digits = line_count.saturating_sub(1).to_string().len();
+    let number_width = if relative_line_numbers && line_count > 1 {
+        digits.max(1 + relative_digits)
+    } else {
+        digits
+    };
+    1 + number_width + GUTTER_CONTENT_GAP // leading diagnostic marker column
 }
 
 #[cfg(test)]
@@ -411,7 +448,10 @@ mod tests {
             cursor_line: 1,
             cursor_col: 1,
             line_count: 10,
-            spell_issues: Some(0),
+            spell_issues: Some(SpellIssues {
+                count: 0,
+                highest_severity: None,
+            }),
             command_line: None,
         }
     }
@@ -447,7 +487,10 @@ mod tests {
             .collect::<String>();
         assert_eq!(content, "test.md [spell off]");
 
-        bar.spell_issues = Some(0);
+        bar.spell_issues = Some(SpellIssues {
+            count: 0,
+            highest_severity: None,
+        });
         let text = bar.build(None, &DEFAULT_DARK, Tier::TrueColor);
         assert!(!text.content[0].content.contains("spell off"));
     }
@@ -455,9 +498,19 @@ mod tests {
     #[test]
     fn spelling_issue_count_is_right_pinned_and_hidden_when_disabled() {
         let mut bar = status(Mode::Normal);
-        bar.spell_issues = Some(12);
+        bar.spell_issues = Some(SpellIssues {
+            count: 12,
+            highest_severity: Some(DiagnosticSeverity::Warning),
+        });
         let text = bar.build(None, &DEFAULT_DARK, Tier::TrueColor);
-        assert_eq!(text.ruler.content.as_ref(), "🅂 12 1:1  10% Top");
+        assert_eq!(
+            text.ruler
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "🅂 12 1:1  10% Top"
+        );
         assert_eq!(
             text.ruler_width,
             RULER_COLS + Line::from("🅂 12 ").width() as u16
@@ -465,14 +518,24 @@ mod tests {
 
         bar.spell_issues = None;
         let text = bar.build(None, &DEFAULT_DARK, Tier::TrueColor);
-        assert_eq!(text.ruler.content.as_ref(), "1:1  10% Top");
+        assert_eq!(
+            text.ruler
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "1:1  10% Top"
+        );
         assert_eq!(text.ruler_width, RULER_COLS);
     }
 
     #[test]
     fn spelling_issue_indicator_renders_at_the_right_edge_with_one_separator_space() {
         let mut bar = status(Mode::Normal);
-        bar.spell_issues = Some(12);
+        bar.spell_issues = Some(SpellIssues {
+            count: 12,
+            highest_severity: Some(DiagnosticSeverity::Warning),
+        });
         let text = bar.build(None, &DEFAULT_DARK, Tier::TrueColor);
         let mut terminal = Terminal::new(TestBackend::new(60, 1)).unwrap();
         terminal
@@ -499,8 +562,92 @@ mod tests {
                     .symbol()
             })
             .collect::<String>();
-        assert!(row.ends_with("🅂 12 1:1  10% Top"), "{row:?}");
+        assert!(row.ends_with("🅂 12 1:1  10% Top "), "{row:?}");
         assert!(!row.contains("🅂 12  1:1"), "{row:?}");
+    }
+
+    #[test]
+    fn status_right_edge_stays_blank_for_ruler_and_prompt() {
+        for width in [1, 8, 9, 10, 20, 60] {
+            for prompt in [None, Some(":set wrap".to_string())] {
+                let mut bar = status(Mode::Normal);
+                bar.command_line = prompt;
+                let built = bar.build(None, &DEFAULT_DARK, Tier::TrueColor);
+                let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        render(
+                            frame,
+                            frame.area(),
+                            &built,
+                            "Space h=help",
+                            true,
+                            &DEFAULT_DARK,
+                            Tier::TrueColor,
+                        );
+                    })
+                    .unwrap();
+                assert_eq!(
+                    terminal
+                        .backend()
+                        .buffer()
+                        .cell((width - 1, 0))
+                        .unwrap()
+                        .symbol(),
+                    " "
+                );
+                if width > STATUS_CONTENT_OFFSET + STATUS_RIGHT_GAP_COLS && built.prompt_cursor {
+                    assert!(terminal.backend().cursor_position().x < width - 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn spelling_symbol_uses_gutter_severity_style_at_every_tier() {
+        for theme in [&DEFAULT_DARK, &DEFAULT_LIGHT] {
+            for tier in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
+                for severity in [DiagnosticSeverity::Warning, DiagnosticSeverity::Error] {
+                    let mut bar = status(Mode::Normal);
+                    bar.spell_issues = Some(SpellIssues {
+                        count: 2,
+                        highest_severity: Some(severity),
+                    });
+                    let built = bar.build(None, theme, tier);
+                    let marker = marker_style(severity);
+                    assert_eq!(
+                        built.ruler.spans[0].style,
+                        marker.role.style(theme, tier).add_modifier(marker.modifier)
+                    );
+                    let mut terminal = Terminal::new(TestBackend::new(60, 1)).unwrap();
+                    terminal
+                        .draw(|frame| {
+                            render(frame, frame.area(), &built, "", true, theme, tier);
+                        })
+                        .unwrap();
+                    let cell = terminal
+                        .backend()
+                        .buffer()
+                        .content()
+                        .iter()
+                        .find(|cell| cell.symbol() == "🅂")
+                        .expect("spelling symbol is visible");
+                    assert_eq!(
+                        cell.fg,
+                        marker.role.style(theme, tier).fg.unwrap_or_default()
+                    );
+                    assert!(cell.modifier.contains(marker.modifier));
+                }
+
+                let built = status(Mode::Normal).build(None, theme, tier);
+                assert_eq!(
+                    built.ruler.spans[0].style,
+                    theme
+                        .ui_style(tier, UiSlot::StatusBar)
+                        .add_modifier(Modifier::BOLD)
+                );
+            }
+        }
     }
 
     #[test]
@@ -590,23 +737,24 @@ mod tests {
                 continue;
             }
             let buffer = terminal.backend().buffer();
-            for x in 0..MODE_BADGE_COLS.min(width) {
+            for x in 0..MODE_BADGE_COLS.min(width.saturating_sub(STATUS_RIGHT_GAP_COLS)) {
                 let cell = buffer.cell((x, 0)).unwrap();
                 assert_eq!(cell.fg, badge_style.fg.unwrap());
                 assert_eq!(cell.bg, badge_style.bg.unwrap());
             }
-            if width > MODE_BADGE_COLS {
+            if width > MODE_BADGE_COLS + STATUS_RIGHT_GAP_COLS {
                 let gap = buffer.cell((MODE_BADGE_COLS, 0)).unwrap();
                 assert_eq!(gap.symbol(), " ");
                 assert_eq!(gap.fg, row_style.fg.unwrap());
                 assert_eq!(gap.bg, row_style.bg.unwrap());
             }
-            if width > STATUS_CONTENT_OFFSET {
+            if width > STATUS_CONTENT_OFFSET + STATUS_RIGHT_GAP_COLS {
                 let first_content = buffer.cell((STATUS_CONTENT_OFFSET, 0)).unwrap();
                 assert_eq!(first_content.symbol(), "S");
                 assert_eq!(first_content.fg, row_style.fg.unwrap());
                 assert_eq!(first_content.bg, row_style.bg.unwrap());
             }
+            assert_eq!(buffer.cell((width - 1, 0)).unwrap().symbol(), " ");
         }
     }
 
@@ -638,10 +786,16 @@ mod tests {
 
     #[test]
     fn gutter_width_tracks_digit_boundaries() {
-        assert_eq!(gutter_width(9), 5);
-        assert_eq!(gutter_width(10), 5);
-        assert_eq!(gutter_width(100), 5);
-        assert_eq!(gutter_width(1000), 6);
+        assert_eq!(gutter_width(0, false), 3);
+        assert_eq!(gutter_width(9, false), 3);
+        assert_eq!(gutter_width(9, true), 4);
+        assert_eq!(gutter_width(10, false), 4);
+        assert_eq!(gutter_width(99, false), 4);
+        assert_eq!(gutter_width(99, true), 5);
+        assert_eq!(gutter_width(100, false), 5);
+        assert_eq!(gutter_width(218, true), 6);
+        assert_eq!(gutter_width(1000, false), 6);
+        assert_eq!(gutter_width(1000, true), 6);
     }
 
     #[test]
@@ -666,12 +820,7 @@ mod tests {
         let relative = build_gutter(Mode::Normal, 8, 9, 4, 1000, true, 6);
         assert_eq!(relative, ["   -1 ", "   10 ", "   +1 ", "   +2 "]);
 
-        for (line_count, expected) in [
-            (9, "   9 "),
-            (10, "  10 "),
-            (999, " 999 "),
-            (1000, " 1000 "),
-        ] {
+        for (line_count, expected) in [(9, " 9 "), (10, " 10 "), (999, " 999 "), (1000, " 1000 ")] {
             let row = build_gutter(
                 Mode::Insert,
                 line_count - 1,
@@ -679,7 +828,7 @@ mod tests {
                 1,
                 line_count,
                 false,
-                gutter_width(line_count),
+                gutter_width(line_count, false),
             );
             assert_eq!(row, [expected]);
         }

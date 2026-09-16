@@ -1583,6 +1583,81 @@ impl EditorSession {
         Ok(vec![Effect::CursorMoved])
     }
 
+    /// Move the cursor to the closest source-backed rendered atom.
+    pub fn move_to_rendered_point(&mut self, point: RenderedPoint) -> Vec<Effect> {
+        let Some(layout) = self.rendered_state.layout_cache.as_ref() else {
+            return Vec::new();
+        };
+        let Some(point) = nav::source_backed_point(point, layout) else {
+            return Vec::new();
+        };
+        let offset = nav::source_for_point(point, layout)
+            .expect("source-backed point has source")
+            .start;
+        let position = self.live.position_for_byte_offset(offset);
+        self.live.jump_to(position.0, position.1);
+        self.rendered_state.cursor = RenderedCursor::at(point);
+        self.refresh_character_selection();
+        vec![Effect::CursorMoved]
+    }
+
+    /// Start or update a rendered character selection between display cells.
+    pub fn select_rendered_points(
+        &mut self,
+        anchor: RenderedPoint,
+        active: RenderedPoint,
+    ) -> Vec<Effect> {
+        if self.rendered_state.layout_cache.is_none()
+            || matches!(self.mode(), Mode::Insert | Mode::Command)
+        {
+            return Vec::new();
+        }
+        if self.mode() == Mode::Select {
+            self.finish_select(Mode::Normal, Vec::new());
+        }
+        let mut effects = self.move_to_rendered_point(anchor);
+        if effects.is_empty() {
+            return effects;
+        }
+        effects.extend(self.enter_select(SelectionShape::Character));
+        effects.extend(self.move_to_rendered_point(active));
+        effects
+    }
+
+    /// Start a rendered character selection from two source byte offsets.
+    /// This is used when a drag begins in the source Insert view.
+    pub fn select_source_offsets(
+        &mut self,
+        anchor: usize,
+        active: usize,
+        rendered_width: u16,
+    ) -> Result<Vec<Effect>, PositionError> {
+        for offset in [anchor, active] {
+            if offset > self.live.text_ref().len() {
+                return Err(PositionError::OutOfBounds);
+            }
+            if !self.live.text_ref().is_char_boundary(offset) {
+                return Err(PositionError::NotCharBoundary);
+            }
+        }
+        let mut effects = Vec::new();
+        if self.mode() == Mode::Insert {
+            effects.extend(self.handle_key(KeyInput {
+                code: KeyCode {
+                    kind: KeyCodeKind::Esc,
+                },
+                mods: Modifiers::default(),
+            }));
+        }
+        self.render_layout(rendered_width);
+        effects.extend(self.jump_to_offset(anchor)?);
+        let anchor_point = self.rendered_cursor();
+        effects.extend(self.jump_to_offset(active)?);
+        let active_point = self.rendered_cursor();
+        effects.extend(self.select_rendered_points(anchor_point, active_point));
+        Ok(effects)
+    }
+
     /// Return the current file path, if this buffer has one.
     pub fn path(&self) -> Option<&std::path::Path> {
         self.document.path()
@@ -1781,6 +1856,17 @@ impl EditorSession {
     /// assert!(!frame.lines[0].text.is_empty()); // first line has content
     /// ```
     pub fn render_source(&mut self, vp: Viewport) -> crate::style::SourceFrame {
+        self.render_source_with_atoms(vp).0
+    }
+
+    fn render_source_with_atoms(
+        &mut self,
+        vp: Viewport,
+    ) -> (
+        crate::style::SourceFrame,
+        Vec<Vec<RenderedSourceAtom>>,
+        Vec<usize>,
+    ) {
         self.live.set_viewport(vp.top_line, vp.height);
         let line_count = self.line_count();
         let (cursor_line, cursor_col) = self.cursor();
@@ -1812,6 +1898,7 @@ impl EditorSession {
         let mut lines = Vec::with_capacity(vp.height as usize);
         let mut line_numbers = Vec::with_capacity(vp.height as usize);
         let mut source_rows = Vec::with_capacity(vp.height as usize);
+        let mut source_row_offsets = Vec::with_capacity(vp.height as usize);
         let mut screen_cursor = (0usize, 0usize);
         let mut line_start = Self::source_line_start(self.live.text_ref(), start_line);
 
@@ -1851,6 +1938,7 @@ impl EditorSession {
 
                 let mut wrapped_source_start = line_start;
                 for (wrapped_row, row) in wrapped.into_iter().enumerate() {
+                    let row_start = wrapped_source_start;
                     let atoms = Self::source_atoms(&row.text, wrapped_source_start);
                     wrapped_source_start = wrapped_source_start.saturating_add(row.text.len());
                     if wrapped_row < skip {
@@ -1865,6 +1953,7 @@ impl EditorSession {
                         None
                     });
                     source_rows.push(atoms);
+                    source_row_offsets.push(row_start);
                     lines.push(row);
                 }
 
@@ -1897,6 +1986,7 @@ impl EditorSession {
                     vp.left_col,
                     vp.width,
                 ));
+                source_row_offsets.push(line_start);
                 lines.push(Self::horizontal_window(styled_line, vp.left_col, vp.width));
                 line_numbers.push(Some(doc_line + 1));
                 line_start = Self::next_source_line_start(
@@ -1915,12 +2005,14 @@ impl EditorSession {
             });
             line_numbers.push(None);
             source_rows.push(Vec::new());
+            source_row_offsets.push(self.live.text_ref().len());
         }
 
         // Truncate to exactly viewport.height (in case we over-highlighted)
         lines.truncate(vp.height as usize);
         line_numbers.truncate(vp.height as usize);
         source_rows.truncate(vp.height as usize);
+        source_row_offsets.truncate(vp.height as usize);
 
         let decorations = self
             .diagnostics_for_source_rows(&source_rows)
@@ -1941,7 +2033,7 @@ impl EditorSession {
             })
             .collect();
 
-        crate::style::SourceFrame {
+        let frame = crate::style::SourceFrame {
             lines,
             decorations,
             line_numbers,
@@ -1950,7 +2042,48 @@ impl EditorSession {
                 screen_cursor.0.min(vp.height.saturating_sub(1) as usize) as u16,
                 screen_cursor.1.min(vp.width.saturating_sub(1) as usize) as u16,
             ),
+        };
+        (frame, source_rows, source_row_offsets)
+    }
+
+    /// Return the source byte offset under a source-view viewport cell.
+    ///
+    /// Cells within a wide character resolve to its first byte. A click past
+    /// the visible text resolves to the end of that row. Window indicators
+    /// resolve to the nearest source-backed cell; empty rows use their source
+    /// row start, or logical EOF below the document.
+    pub fn source_offset_at_viewport_cell(
+        &mut self,
+        viewport: Viewport,
+        row: usize,
+        column: usize,
+    ) -> Option<usize> {
+        if row >= usize::from(viewport.height) || column >= usize::from(viewport.width) {
+            return None;
         }
+        let (_, source_rows, row_offsets) = self.render_source_with_atoms(viewport);
+        let atoms = source_rows.get(row)?;
+        let nearest = atoms
+            .iter()
+            .filter(|atom| atom.source.is_some())
+            .min_by_key(|atom| {
+                if column < atom.columns.start {
+                    atom.columns.start - column
+                } else if column >= atom.columns.end {
+                    column - atom.columns.end + 1
+                } else {
+                    0
+                }
+            });
+        if let Some(atom) = nearest {
+            let source = atom.source.as_ref()?;
+            return Some(if column >= atom.columns.end {
+                source.end
+            } else {
+                source.start
+            });
+        }
+        row_offsets.get(row).copied()
     }
 
     fn diagnostics_for_source_rows<'a>(

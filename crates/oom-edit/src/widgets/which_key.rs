@@ -48,9 +48,10 @@ pub fn build_hint(ctx: Contexts) -> Option<String> {
 /// Thin render: creates a Paragraph widget positioned in the bottom-right
 /// corner of the body area.
 pub fn render(frame: &mut Frame<'_>, area: ratatui::layout::Rect, text: &str) {
-    let hint_width = Line::from(text).width().min(area.width as usize) as u16;
+    let usable_width = area.width.saturating_sub(1);
+    let hint_width = Line::from(text).width().min(usable_width as usize) as u16;
     let hint_area = ratatui::layout::Rect::new(
-        area.x + area.width.saturating_sub(hint_width + 1),
+        area.x + usable_width.saturating_sub(hint_width),
         area.y + area.height.saturating_sub(1),
         hint_width.min(area.width),
         1,
@@ -65,6 +66,7 @@ pub fn render(frame: &mut Frame<'_>, area: ratatui::layout::Rect, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
 
     #[test]
     fn gate_rejects_zero_delay() {
@@ -97,6 +99,7 @@ mod tests {
         let hint = hint.unwrap();
         assert!(hint.contains("Space:"));
         assert!(hint.contains("h="));
+        assert!(hint.contains("?=command palette"));
     }
 
     #[test]
@@ -104,5 +107,24 @@ mod tests {
         // In OVERLAY context, no Space chords are available.
         let hint = build_hint(Contexts::OVERLAY);
         assert!(hint.is_none());
+    }
+
+    #[test]
+    fn hint_reserves_one_rightmost_cell_even_when_clipped() {
+        for width in [1, 8, 24] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+            terminal
+                .draw(|frame| render(frame, frame.area(), "Space: h=command palette"))
+                .unwrap();
+            assert_eq!(
+                terminal
+                    .backend()
+                    .buffer()
+                    .cell((width - 1, 0))
+                    .unwrap()
+                    .symbol(),
+                " "
+            );
+        }
     }
 }

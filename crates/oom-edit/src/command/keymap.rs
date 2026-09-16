@@ -5,7 +5,9 @@ use std::time::Instant;
 
 use oom_edit_core::{KeyCodeKind, KeyInput, Modifiers};
 
-use super::registry::{app_chord, space_continuations, AppCommand, CommandSpec, Contexts};
+use super::registry::{
+    app_chord, direct_command, space_continuations, AppCommand, CommandSpec, Contexts,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingAppInput {
@@ -38,10 +40,19 @@ pub fn resolve(
         PendingAppInput::Idle if is_space_key(key) && rendered_context(ctx) => {
             AppInputTransition::Pending(PendingAppInput::Space { since: now })
         }
-        PendingAppInput::Idle => AppInputTransition::Forward(key),
+        PendingAppInput::Idle => {
+            if let KeyCodeKind::Char(ch) = key.code.kind {
+                if plain_character_key(key, ch) {
+                    if let Some(command) = direct_command(ctx, ch) {
+                        return AppInputTransition::AppCommand(command);
+                    }
+                }
+            }
+            AppInputTransition::Forward(key)
+        }
         PendingAppInput::Space { .. } => {
-            if key.mods == Modifiers::default() {
-                if let KeyCodeKind::Char(continuation) = key.code.kind {
+            if let KeyCodeKind::Char(continuation) = key.code.kind {
+                if plain_character_key(key, continuation) {
                     if let Some(command) = app_chord(ctx, continuation) {
                         return AppInputTransition::AppCommand(command);
                     }
@@ -68,6 +79,10 @@ fn rendered_context(ctx: Contexts) -> bool {
 
 fn is_space_key(key: KeyInput) -> bool {
     key.mods == Modifiers::default() && key.code.kind == KeyCodeKind::Char(' ')
+}
+
+fn plain_character_key(key: KeyInput, ch: char) -> bool {
+    !key.mods.ctrl && !key.mods.alt && (!key.mods.shift || ch == '?')
 }
 
 #[cfg(test)]
@@ -147,6 +162,83 @@ mod tests {
                 AppInputTransition::AppCommand(command)
             );
         }
+    }
+
+    #[test]
+    fn question_aliases_resolve_only_in_declared_contexts() {
+        let now = Instant::now();
+        let shifted = KeyInput {
+            mods: Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            },
+            ..ch('?')
+        };
+        let controlled = KeyInput {
+            mods: Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            },
+            ..ch('?')
+        };
+        for key in [ch('?'), shifted] {
+            assert_eq!(
+                resolve(PendingAppInput::Idle, Contexts::NORMAL, key, now),
+                AppInputTransition::AppCommand(AppCommand::Help)
+            );
+            assert_eq!(
+                resolve(PendingAppInput::Idle, Contexts::SELECT, key, now),
+                AppInputTransition::Forward(key)
+            );
+            assert_eq!(
+                resolve(PendingAppInput::Idle, Contexts::INSERT, key, now),
+                AppInputTransition::Forward(key)
+            );
+            assert_eq!(
+                resolve(
+                    PendingAppInput::Space { since: now },
+                    Contexts::NORMAL,
+                    key,
+                    now
+                ),
+                AppInputTransition::AppCommand(AppCommand::Help)
+            );
+            assert_eq!(
+                resolve(
+                    PendingAppInput::Space { since: now },
+                    Contexts::SELECT,
+                    key,
+                    now
+                ),
+                AppInputTransition::AppCommand(AppCommand::Help)
+            );
+        }
+        assert_eq!(
+            resolve(PendingAppInput::Idle, Contexts::NORMAL, controlled, now),
+            AppInputTransition::Forward(controlled)
+        );
+        assert_eq!(
+            resolve(
+                PendingAppInput::Space { since: now },
+                Contexts::NORMAL,
+                controlled,
+                now
+            ),
+            AppInputTransition::Forward(controlled)
+        );
+        assert_eq!(
+            resolve(PendingAppInput::Idle, Contexts::NORMAL, ch('/'), now),
+            AppInputTransition::Forward(ch('/'))
+        );
+        assert_eq!(
+            resolve(
+                PendingAppInput::Space { since: now },
+                Contexts::NORMAL,
+                ch('x'),
+                now
+            ),
+            AppInputTransition::Forward(ch('x'))
+        );
     }
 
     #[test]
