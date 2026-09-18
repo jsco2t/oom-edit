@@ -977,6 +977,85 @@ fn fenced_layout_retains_private_full_source_regions() {
 }
 
 #[test]
+fn code_tabs_expand_at_four_column_stops_with_exact_source_bytes() {
+    let text = "```go\n\tvar wg sync.WaitGroup\n\t\tdefer wg.Done()\n```\n";
+    let layout = rendered_layout(text);
+    let first = &layout.lines[1];
+    let second = &layout.lines[2];
+    assert_eq!(first.styled.text, "▏     var wg sync.WaitGroup");
+    assert_eq!(second.styled.text, "▏         defer wg.Done()");
+    assert!(first
+        .styled
+        .spans
+        .iter()
+        .any(|span| span.style == SemanticStyle::Keyword));
+
+    let first_tab = text.find('\t').unwrap();
+    assert_eq!(first.atoms[2].columns, 2..6);
+    assert_eq!(first.atoms[2].source, Some(first_tab..first_tab + 1));
+    let first_token = text.find("var").unwrap();
+    assert_eq!(first.atoms[3].source, Some(first_token..first_token + 1));
+    assert_eq!(first.atoms[3].columns, 6..7);
+
+    let second_tab = text[first_tab + 1..].find('\t').unwrap() + first_tab + 1;
+    assert_eq!(second.atoms[2].columns, 2..6);
+    assert_eq!(second.atoms[2].source, Some(second_tab..second_tab + 1));
+    assert_eq!(second.atoms[3].columns, 6..10);
+    assert_eq!(second.atoms[3].source, Some(second_tab + 1..second_tab + 2));
+    assert!(first.atoms[..2].iter().all(|atom| atom.source.is_none()));
+    assert_eq!(&text[first.source.clone()], "\tvar wg sync.WaitGroup\n");
+}
+
+#[test]
+fn code_tab_stops_apply_to_other_languages_and_narrow_layouts() {
+    let text = "```text\n a\tb\t界\n界\tz\n```\n\n    a\tb\n";
+    for width in [8, 80] {
+        let layout = rendered_layout_at_width(text, width);
+        let fenced = &layout.lines[1];
+        assert_eq!(fenced.styled.text, "▏  a  b   界");
+        let first_tab = text.find('\t').unwrap();
+        assert!(fenced
+            .atoms
+            .iter()
+            .any(|atom| atom.source == Some(first_tab..first_tab + 1) && atom.columns == (4..6)));
+        assert_eq!(layout.lines[2].styled.text, "▏ 界  z");
+        let indented = layout
+            .lines
+            .iter()
+            .find(|line| {
+                line.kind == LineKind::Content
+                    && line.styled.text.contains('b')
+                    && line.styled.text != fenced.styled.text
+            })
+            .expect("indented code row");
+        assert!(!indented.styled.text.contains('\t'));
+        assert!(indented.styled.text.contains("a   b"));
+        let indented_tab = text.rfind('\t').unwrap();
+        assert!(indented
+            .atoms
+            .iter()
+            .any(|atom| atom.source == Some(indented_tab..indented_tab + 1)));
+    }
+}
+
+#[test]
+fn kitchen_sink_go_fence_keeps_nested_indentation() {
+    let text = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/kitchen-sink.md"),
+    )
+    .unwrap();
+    let layout = rendered_layout_at_width(&text, 100);
+    assert!(layout
+        .lines
+        .iter()
+        .any(|line| line.styled.text == "▏     var wg sync.WaitGroup"));
+    assert!(layout
+        .lines
+        .iter()
+        .any(|line| line.styled.text == "▏         defer wg.Done()"));
+}
+
+#[test]
 fn nested_fence_surface_role_survives_container_prefixes() {
     let text = "- Before fence\n  ```rust\n  let value = 1;\n  ```\n  After fence\n\n> Before quote fence\n> ```text\n> quoted code\n> ```\n> After quote fence";
     let layout = rendered_layout(text);

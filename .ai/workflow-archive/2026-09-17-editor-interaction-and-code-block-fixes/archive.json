@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "work_id": "2026-09-17-editor-interaction-and-code-block-fixes",
+  "title": "Editor interaction and code block fixes",
+  "created_at": "2026-09-18T02:35:47Z",
+  "approved_at": "2026-09-18T14:51:46Z",
+  "completed_at": "2026-09-18T15:15:10Z",
+  "archived_at": "2026-09-18T15:47:37Z",
+  "baseline_sha": "b1044df098eaa76b5d288ed7accb0d613d345c29",
+  "final_sha": "b1044df098eaa76b5d288ed7accb0d613d345c29",
+  "approved_plan_sha256": "08df664545f597c0c2b6a41ffcef22b64dce0324680ad67edf3d2f50a03ae302",
+  "acceptance_rounds": 3,
+  "prior_completed_rounds": 2,
+  "task_count": 8,
+  "tasks_completed": 8,
+  "result": "DONE",
+  "final_evidence": "evidence/final.md"
+}

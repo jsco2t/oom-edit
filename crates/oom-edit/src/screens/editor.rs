@@ -732,6 +732,38 @@ mod tests {
     }
 
     #[test]
+    fn insert_screen_draws_go_tab_indentation_and_places_cursor_after_tab() {
+        let mut session =
+            EditorSession::from_text("\tvar wg sync.WaitGroup\n\t\tdefer wg.Done()\n");
+        feed(&mut session, "i");
+        move_right(&mut session, 1);
+        let mut terminal = Terminal::new(TestBackend::new(48, 2)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_editor_with_gutter(
+                    frame,
+                    &mut session,
+                    EditorViewport::new(0, true, 0, 0),
+                    false,
+                    frame.area(),
+                    DocumentPresentation::new(
+                        &DEFAULT_DARK,
+                        Tier::TrueColor,
+                        &GutterTroubleSnapshot::default(),
+                    ),
+                );
+            })
+            .unwrap();
+        let gutter = status_bar::gutter_width(session.line_count(), false);
+        let first = buffer_row(&terminal, 0, 48);
+        let second = buffer_row(&terminal, 1, 48);
+        assert_eq!(&first[gutter..gutter + 7], "    var");
+        assert_eq!(&second[gutter..gutter + 13], "        defer");
+        assert_eq!(terminal.backend().cursor_position().x, (gutter + 4) as u16);
+        assert_eq!(terminal.backend().cursor_position().y, 0);
+    }
+
+    #[test]
     fn source_spell_decorations_reach_insert_across_every_theme_and_tier() {
         for name in crate::theme::built_in_themes() {
             for tier in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {

@@ -188,7 +188,7 @@ mod tests {
             );
             assert_eq!(
                 resolve(PendingAppInput::Idle, Contexts::SELECT, key, now),
-                AppInputTransition::Forward(key)
+                AppInputTransition::AppCommand(AppCommand::Help)
             );
             assert_eq!(
                 resolve(PendingAppInput::Idle, Contexts::INSERT, key, now),

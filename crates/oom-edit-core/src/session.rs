@@ -726,6 +726,33 @@ mod tests {
     }
 
     #[test]
+    fn source_tab_window_indicators_have_no_source_byte() {
+        let mut left = EditorSession::from_text("a\tz");
+        let (_, rows, _) = left.render_source_with_atoms(Viewport {
+            top_line: 0,
+            height: 1,
+            width: 4,
+            wrap: false,
+            left_col: 1,
+            skip_rows: 0,
+        });
+        assert_eq!(rows[0][0].source, None);
+        assert_eq!(rows[0][1].source, Some(1..2));
+
+        let mut right = EditorSession::from_text("界\tz");
+        let (_, rows, _) = right.render_source_with_atoms(Viewport {
+            top_line: 0,
+            height: 1,
+            width: 4,
+            wrap: false,
+            left_col: 0,
+            skip_rows: 0,
+        });
+        assert_eq!(rows[0].last().unwrap().source, None);
+        assert_eq!(rows[0][1].source, Some(3..4));
+    }
+
+    #[test]
     fn core_gt_and_g_upper_t_emit_typed_tab_effects() {
         let mut session = EditorSession::from_text("one\n");
         session.render_layout(20);
@@ -779,6 +806,13 @@ pub enum Effect {
         /// Force open (ignore unsaved changes).
         force: bool,
     },
+    /// Reload the current file from disk, optionally discarding unsaved edits.
+    ReloadCurrentRequested {
+        /// Whether unsaved edits may be discarded.
+        force: bool,
+    },
+    /// Reload every open tab from disk, discarding unsaved edits only on success.
+    ReloadAllRequested,
     /// Markdown and plain-text forms to write to the system clipboard.
     ClipboardWrite(crate::clipboard::ClipboardContent),
     /// Mode changed.
@@ -890,6 +924,96 @@ use crate::style::{
 use live_document::LiveDocument;
 use std::ops::Range;
 use unicode_width::UnicodeWidthChar;
+
+const SOURCE_TAB_STOP: usize = 4;
+
+fn source_character_width(character: char, column: usize) -> usize {
+    if character == '\t' {
+        SOURCE_TAB_STOP - column % SOURCE_TAB_STOP
+    } else {
+        character.width().unwrap_or(0)
+    }
+}
+
+/// Display-only source text with one source range for each visible scalar.
+/// Expanded tab spaces all retain the range of their original tab byte.
+struct SourceDisplayLine {
+    styled: crate::style::StyledLine,
+    sources: Vec<Range<usize>>,
+    source_to_display_char: Vec<usize>,
+}
+
+impl SourceDisplayLine {
+    fn new(source: &crate::style::StyledLine) -> Self {
+        let mut text = String::with_capacity(source.text.len());
+        let mut sources = Vec::new();
+        let mut source_to_display_char = vec![0];
+        let mut column = 0;
+        for (byte, character) in source.text.char_indices() {
+            let range = byte..byte + character.len_utf8();
+            let width = source_character_width(character, column);
+            if character == '\t' {
+                text.push_str(&" ".repeat(width));
+                sources.extend(std::iter::repeat_n(range, width));
+            } else {
+                text.push(character);
+                sources.push(range);
+            }
+            column += width;
+            source_to_display_char.push(sources.len());
+        }
+        let spans = source
+            .spans
+            .iter()
+            .map(|span| crate::style::Span {
+                start_col: source_to_display_char[span.start_col],
+                end_col: source_to_display_char[span.end_col],
+                style: span.style,
+            })
+            .collect();
+        Self {
+            styled: crate::style::StyledLine { text, spans },
+            sources,
+            source_to_display_char,
+        }
+    }
+
+    fn display_char(&self, source_char: usize) -> usize {
+        self.source_to_display_char
+            .get(source_char)
+            .copied()
+            .unwrap_or(self.sources.len())
+    }
+
+    fn atoms(
+        &self,
+        text: &str,
+        display_char_start: usize,
+        source_start: usize,
+    ) -> Vec<RenderedSourceAtom> {
+        let mut atoms: Vec<RenderedSourceAtom> = Vec::new();
+        let mut column = 0;
+        let end = display_char_start + text.chars().count();
+        for (character, range) in text.chars().zip(&self.sources[display_char_start..end]) {
+            let source = source_start + range.start..source_start + range.end;
+            let width = character.width().unwrap_or(0);
+            if width == 0 {
+                if let Some(previous) = atoms.last_mut() {
+                    if let Some(previous_source) = previous.source.as_mut() {
+                        previous_source.end = source.end;
+                    }
+                }
+                continue;
+            }
+            atoms.push(RenderedSourceAtom {
+                columns: column..column + width,
+                source: Some(source),
+            });
+            column += width;
+        }
+        atoms
+    }
+}
 
 /// Vim action applied after mapping a rendered cursor to source editing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1095,7 +1219,81 @@ impl ActiveSelection {
 enum SessionMode {
     CoreDriven,
     Select(ActiveSelection),
-    Command,
+    Command(CommandPrompt),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct CommandPrompt {
+    text: String,
+    traversal: CommandTraversal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+enum CommandTraversal {
+    #[default]
+    Draft,
+    Recalling {
+        draft: String,
+        index: usize,
+    },
+}
+
+impl CommandPrompt {
+    fn detach(&mut self) {
+        self.traversal = CommandTraversal::Draft;
+    }
+
+    fn up(&mut self, history: &CommandHistory) {
+        let entries = history.0.borrow();
+        if entries.is_empty() {
+            return;
+        }
+        let (draft, index) = match &self.traversal {
+            CommandTraversal::Draft => (self.text.clone(), entries.len() - 1),
+            CommandTraversal::Recalling { draft, index } => {
+                (draft.clone(), index.saturating_sub(1))
+            }
+        };
+        self.text.clone_from(&entries[index]);
+        self.traversal = CommandTraversal::Recalling { draft, index };
+    }
+
+    fn down(&mut self, history: &CommandHistory) {
+        let CommandTraversal::Recalling { draft, index } = &self.traversal else {
+            return;
+        };
+        let entries = history.0.borrow();
+        if *index + 1 < entries.len() {
+            let next = *index + 1;
+            self.text.clone_from(&entries[next]);
+            self.traversal = CommandTraversal::Recalling {
+                draft: draft.clone(),
+                index: next,
+            };
+        } else {
+            self.text.clone_from(draft);
+            self.traversal = CommandTraversal::Draft;
+        }
+    }
+}
+
+/// Process-local, bounded ex-command history shared by editor sessions.
+#[derive(Debug, Clone, Default)]
+pub struct CommandHistory(std::rc::Rc<std::cell::RefCell<std::collections::VecDeque<String>>>);
+
+impl CommandHistory {
+    /// Create an empty history handle.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn record(&self, command: String) {
+        let mut entries = self.0.borrow_mut();
+        if entries.len() == 10 {
+            entries.pop_front();
+        }
+        entries.push_back(command);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1269,8 +1467,8 @@ pub struct EditorSession {
     session_mode: SessionMode,
     /// Dirty generation at last save.
     save_point: UndoMark,
-    /// Buffer for ex-command text in Command mode.
-    command_buffer: String,
+    /// History shared with other sessions in this editor process.
+    command_history: CommandHistory,
     /// The document model — text, path, front matter, I/O state.
     document: Document,
     /// Persistent rendered navigation and Select state.
@@ -1297,7 +1495,7 @@ impl EditorSession {
             live,
             session_mode: SessionMode::CoreDriven,
             save_point,
-            command_buffer: String::new(),
+            command_history: CommandHistory::new(),
             document,
             rendered_state: RenderedState::new(),
         }
@@ -1312,16 +1510,26 @@ impl EditorSession {
     /// first bad byte.
     pub fn open(path: &std::path::Path) -> Result<Self, OpenError> {
         let (text, document) = Document::open(path)?.into_parts();
+        Ok(Self::from_opened_document(text, document))
+    }
+
+    /// Open an existing file; missing files are errors rather than new buffers.
+    pub fn open_existing(path: &std::path::Path) -> Result<Self, OpenError> {
+        let (text, document) = Document::open_existing(path)?.into_parts();
+        Ok(Self::from_opened_document(text, document))
+    }
+
+    fn from_opened_document(text: String, document: Document) -> Self {
         let mut live = LiveDocument::new(&text);
         let save_point = live.save_point();
-        Ok(Self {
+        Self {
             live,
             session_mode: SessionMode::CoreDriven,
             save_point,
-            command_buffer: String::new(),
+            command_history: CommandHistory::new(),
             document,
             rendered_state: RenderedState::new(),
-        })
+        }
     }
 
     /// Save the document to its path (or the given override path).
@@ -1392,7 +1600,7 @@ impl EditorSession {
                 }
             }
             SessionMode::Select(_) => Mode::Select,
-            SessionMode::Command => Mode::Command,
+            SessionMode::Command(_) => Mode::Command,
         }
     }
 
@@ -1690,7 +1898,38 @@ impl EditorSession {
 
     /// Return the unprefixed command-line text, or `None` outside Command mode.
     pub fn command_line(&self) -> Option<String> {
-        (self.mode() == Mode::Command).then(|| self.command_buffer.clone())
+        match &self.session_mode {
+            SessionMode::Command(prompt) => Some(prompt.text.clone()),
+            _ => None,
+        }
+    }
+
+    /// Enter Command mode with editable ex text without submitting it.
+    ///
+    /// The text is unprefixed and must be one printable command line. Hosts can
+    /// use this to hand off a selected command reference to the core grammar.
+    pub fn open_command_prompt(&mut self, prefill: &str) -> Vec<Effect> {
+        if !matches!(self.mode(), Mode::Normal | Mode::Select)
+            || prefill.trim().is_empty()
+            || prefill.starts_with(':')
+            || prefill.chars().any(char::is_control)
+        {
+            return vec![Effect::Message {
+                text: "Cannot open a command prompt with that text".to_string(),
+                severity: Severity::Warning,
+            }];
+        }
+        self.rendered_state.search.cancel();
+        self.session_mode = SessionMode::Command(CommandPrompt {
+            text: prefill.to_string(),
+            traversal: CommandTraversal::Draft,
+        });
+        vec![Effect::ModeChanged(Mode::Command)]
+    }
+
+    /// Share an in-memory ex-command history with other editor sessions.
+    pub fn set_command_history(&mut self, history: CommandHistory) {
+        self.command_history = history;
     }
 
     /// Return the active rendered-search prompt, including `/` or `?` prefix.
@@ -1758,16 +1997,41 @@ impl EditorSession {
         self.save_point = self.live.save_point();
     }
 
-    /// Insert text at the current cursor position as a single paste operation.
+    /// Insert pasted text in the active input mode.
     ///
-    /// This is used for bracketed paste (FR-5.5): the text is inserted as one
-    /// undo step with no per-character processing. The text is always inserted
-    /// in Insert mode — if not in Insert mode, no action is taken.
+    /// For bracketed paste, Insert text is inserted as one
+    /// undo step with no per-character processing. In Command mode, printable
+    /// ASCII path text can be appended to `:tabnew` after validating the whole
+    /// paste, so terminal control characters cannot form another command.
     ///
-    /// Returns `Effect::Edited` if text was inserted, `Effect::Message` if
-    /// ignored (not in Insert mode).
+    /// Returns `Effect::Edited` for Insert text or `Effect::Message` when a
+    /// paste is rejected.
     pub fn insert_paste(&mut self, text: &str) -> Vec<Effect> {
-        // Only paste in Insert mode (FR-5.5)
+        if let SessionMode::Command(prompt) = &mut self.session_mode {
+            let path = text.trim_matches(|character| matches!(character, ' ' | '\r' | '\n'));
+            let command = prompt.text.trim_end();
+            if command != "tabnew" && !command.starts_with("tabnew ") {
+                return vec![Effect::Message {
+                    text: "paste a path after :tabnew".to_string(),
+                    severity: Severity::Warning,
+                }];
+            }
+            if path.is_empty()
+                || !path.is_ascii()
+                || path.chars().any(|character| character.is_ascii_control())
+            {
+                return vec![Effect::Message {
+                    text: "pasted path must be printable ASCII on one line".to_string(),
+                    severity: Severity::Warning,
+                }];
+            }
+            if command == "tabnew" && !prompt.text.ends_with(' ') {
+                prompt.text.push(' ');
+            }
+            prompt.text.push_str(path);
+            prompt.detach();
+            return Vec::new();
+        }
         if self.mode() != Mode::Insert {
             return vec![Effect::Message {
                 text: "paste only works in insert mode".to_string(),
@@ -1787,6 +2051,35 @@ impl EditorSession {
     /// Return a specific line (0-based), or `None` if out of range.
     pub fn line(&self, idx: usize) -> Option<String> {
         self.live.line(idx)
+    }
+
+    /// Return the display-cell column before a source character in a line.
+    /// Tabs advance to four-column stops; the document text is unchanged.
+    pub fn source_display_column(&self, line: usize, source_col: usize) -> usize {
+        let Some(text) = self.line(line) else {
+            return 0;
+        };
+        text.chars().take(source_col).fold(0, |column, character| {
+            column + source_character_width(character, column)
+        })
+    }
+
+    /// Return the source character boundary at or before a display column.
+    pub fn source_column_at_display(&self, line: usize, display_col: usize) -> usize {
+        let Some(text) = self.line(line) else {
+            return 0;
+        };
+        let mut column = 0;
+        let mut source_col = 0;
+        for character in text.chars() {
+            let next = column + source_character_width(character, column);
+            if next > display_col {
+                break;
+            }
+            column = next;
+            source_col += 1;
+        }
+        source_col
     }
 
     /// Return the cursor's visual row within a document line and that line's
@@ -1809,20 +2102,30 @@ impl EditorSession {
 
         let line = self.line(doc_line).unwrap_or_default();
         let styled = crate::style::StyledLine {
-            text: line.clone(),
+            text: line,
             spans: Vec::new(),
         };
-        let mut wrapped = crate::rendered::wrap_source_line(&styled, width);
+        let display = SourceDisplayLine::new(&styled);
+        let mut wrapped = crate::rendered::wrap_source_line(&display.styled, width);
         if (doc_line, doc_col) == self.cursor()
             && self.mode() == Mode::Insert
-            && Self::cursor_needs_blank_continuation(&line, &wrapped, doc_col, width)
+            && Self::cursor_needs_blank_continuation(
+                &display.styled.text,
+                &wrapped,
+                display.display_char(doc_col),
+                width,
+            )
         {
             wrapped.push(crate::style::StyledLine {
                 text: String::new(),
                 spans: Vec::new(),
             });
         }
-        let (row, _) = Self::wrapped_cursor_position(&line, &wrapped, doc_col);
+        let (row, _) = Self::wrapped_cursor_position(
+            &display.styled.text,
+            &wrapped,
+            display.display_char(doc_col),
+        );
         (row, wrapped.len().max(1))
     }
 
@@ -1905,13 +2208,14 @@ impl EditorSession {
         if vp.wrap {
             for (offset, styled_line) in highlighted.iter().enumerate() {
                 let doc_line = start_line + offset;
-                let mut wrapped = crate::rendered::wrap_source_line(styled_line, vp.width);
+                let display = SourceDisplayLine::new(styled_line);
+                let mut wrapped = crate::rendered::wrap_source_line(&display.styled, vp.width);
                 if doc_line == cursor_line
                     && self.mode() == Mode::Insert
                     && Self::cursor_needs_blank_continuation(
-                        &styled_line.text,
+                        &display.styled.text,
                         &wrapped,
-                        cursor_col,
+                        display.display_char(cursor_col),
                         vp.width,
                     )
                 {
@@ -1928,19 +2232,28 @@ impl EditorSession {
                 let first_screen_row = lines.len();
 
                 if doc_line == cursor_line {
-                    let (wrapped_row, wrapped_col) =
-                        Self::wrapped_cursor_position(&styled_line.text, &wrapped, cursor_col);
+                    let (wrapped_row, wrapped_col) = Self::wrapped_cursor_position(
+                        &display.styled.text,
+                        &wrapped,
+                        display.display_char(cursor_col),
+                    );
                     screen_cursor = (
                         first_screen_row + wrapped_row.saturating_sub(skip),
                         wrapped_col,
                     );
                 }
 
-                let mut wrapped_source_start = line_start;
+                let mut display_char_start = 0;
                 for (wrapped_row, row) in wrapped.into_iter().enumerate() {
-                    let row_start = wrapped_source_start;
-                    let atoms = Self::source_atoms(&row.text, wrapped_source_start);
-                    wrapped_source_start = wrapped_source_start.saturating_add(row.text.len());
+                    let display_char_end = display_char_start + row.text.chars().count();
+                    let row_start = display
+                        .sources
+                        .get(display_char_start)
+                        .map_or(line_start + styled_line.text.len(), |range| {
+                            line_start + range.start
+                        });
+                    let atoms = display.atoms(&row.text, display_char_start, line_start);
+                    display_char_start = display_char_end;
                     if wrapped_row < skip {
                         continue;
                     }
@@ -1972,22 +2285,46 @@ impl EditorSession {
                     break;
                 }
                 let doc_line = start_line + offset;
+                let display = SourceDisplayLine::new(styled_line);
+                let left_display_char = display.display_char(vp.left_col);
+                // Expanded tabs can make a character-count window wider than
+                // the viewport when other wide glyphs share the line.
+                let window_width = if styled_line.text.contains('\t') {
+                    Self::source_window_character_count(
+                        &display.styled.text,
+                        left_display_char,
+                        vp.width,
+                    )
+                } else {
+                    vp.width
+                };
+                let show_left_indicator = left_display_char > 0
+                    && !(styled_line.text.contains('\t')
+                        && doc_line == cursor_line
+                        && vp.left_col == cursor_col);
                 if doc_line == cursor_line {
                     screen_cursor = (
                         lines.len(),
-                        cursor_col
-                            .saturating_sub(vp.left_col)
+                        display
+                            .display_char(cursor_col)
+                            .saturating_sub(left_display_char)
                             .min(vp.width.saturating_sub(1) as usize),
                     );
                 }
                 source_rows.push(Self::horizontal_window_atoms(
-                    &styled_line.text,
+                    &display,
                     line_start,
-                    vp.left_col,
-                    vp.width,
+                    left_display_char,
+                    window_width,
+                    show_left_indicator,
                 ));
                 source_row_offsets.push(line_start);
-                lines.push(Self::horizontal_window(styled_line, vp.left_col, vp.width));
+                lines.push(Self::horizontal_window(
+                    &display.styled,
+                    left_display_char,
+                    window_width,
+                    show_left_indicator,
+                ));
                 line_numbers.push(Some(doc_line + 1));
                 line_start = Self::next_source_line_start(
                     self.live.text_ref(),
@@ -2161,36 +2498,14 @@ impl EditorSession {
         end + usize::from(text.as_bytes().get(end) == Some(&b'\n'))
     }
 
-    fn source_atoms(text: &str, source_start: usize) -> Vec<RenderedSourceAtom> {
-        let mut atoms: Vec<RenderedSourceAtom> = Vec::new();
-        let mut column = 0usize;
-        for (byte, character) in text.char_indices() {
-            let source = source_start + byte..source_start + byte + character.len_utf8();
-            let width = character.width().unwrap_or(0);
-            if width == 0 {
-                if let Some(previous) = atoms.last_mut() {
-                    if let Some(previous_source) = previous.source.as_mut() {
-                        previous_source.end = source.end;
-                    }
-                }
-                continue;
-            }
-            atoms.push(RenderedSourceAtom {
-                columns: column..column + width,
-                source: Some(source),
-            });
-            column += width;
-        }
-        atoms
-    }
-
     fn horizontal_window_atoms(
-        text: &str,
+        display: &SourceDisplayLine,
         source_start: usize,
         left_col: usize,
         width: u16,
+        show_left_indicator: bool,
     ) -> Vec<RenderedSourceAtom> {
-        let chars: Vec<(usize, char)> = text.char_indices().collect();
+        let chars: Vec<char> = display.styled.text.chars().collect();
         let width = usize::from(width);
         if width == 0 || left_col >= chars.len() {
             return Vec::new();
@@ -2199,16 +2514,17 @@ impl EditorSession {
         let right_clipped = chars.len() > end_col;
         let mut atoms: Vec<RenderedSourceAtom> = Vec::new();
         let mut display_column = 0usize;
-        for (window_index, &(byte, character)) in chars[left_col..end_col].iter().enumerate() {
-            let synthetic = (left_col > 0 && window_index == 0)
+        for (window_index, &character) in chars[left_col..end_col].iter().enumerate() {
+            let synthetic = (show_left_indicator && window_index == 0)
                 || (right_clipped && window_index + 1 == end_col - left_col);
             let display_width = if synthetic {
                 1
             } else {
                 character.width().unwrap_or(0)
             };
-            let source = (!synthetic)
-                .then_some(source_start + byte..source_start + byte + character.len_utf8());
+            let range = &display.sources[left_col + window_index];
+            let source =
+                (!synthetic).then_some(source_start + range.start..source_start + range.end);
             if display_width == 0 {
                 if let (Some(previous), Some(source)) = (atoms.last_mut(), source) {
                     if let Some(previous_source) = previous.source.as_mut() {
@@ -2224,6 +2540,26 @@ impl EditorSession {
             display_column += display_width;
         }
         atoms
+    }
+
+    fn source_window_character_count(text: &str, left_char: usize, width: u16) -> u16 {
+        if width == 0 {
+            return 0;
+        }
+        let mut cells = 0;
+        let mut characters = 0;
+        for character in text.chars().skip(left_char) {
+            let character_width = character.width().unwrap_or(0);
+            if characters > 0 && cells + character_width > usize::from(width) {
+                break;
+            }
+            if character_width > usize::from(width) {
+                return 1;
+            }
+            cells += character_width;
+            characters += 1;
+        }
+        characters.min(usize::from(u16::MAX)) as u16
     }
 
     fn wrapped_cursor_position(
@@ -2279,6 +2615,7 @@ impl EditorSession {
         styled_line: &crate::style::StyledLine,
         left_col: usize,
         width: u16,
+        show_left_indicator: bool,
     ) -> crate::style::StyledLine {
         let chars: Vec<char> = styled_line.text.chars().collect();
         let width = width as usize;
@@ -2306,7 +2643,7 @@ impl EditorSession {
             .collect();
         let mut window = crate::style::StyledLine { text, spans };
 
-        if left_col > 0 {
+        if show_left_indicator {
             Self::replace_window_character(&mut window, 0, '«', crate::style::SemanticStyle::Muted);
         }
         if chars.len() > left_col.saturating_add(width) {
@@ -2387,7 +2724,7 @@ impl EditorSession {
             let source_anchor = self.live.cursor();
             let selection = match &self.session_mode {
                 SessionMode::Select(selection) => Some(selection.clone()),
-                SessionMode::CoreDriven | SessionMode::Command => None,
+                SessionMode::CoreDriven | SessionMode::Command(_) => None,
             };
             let character_selection = selection
                 .as_ref()
@@ -2529,17 +2866,21 @@ impl EditorSession {
     /// Handle keys in Command mode (ex-command entry).
     fn handle_command_mode_key(&mut self, key: KeyInput) -> Vec<Effect> {
         let mut effects = Vec::new();
+        let SessionMode::Command(prompt) = &mut self.session_mode else {
+            return effects;
+        };
         match key.code.kind {
             KeyCodeKind::Esc => {
                 // Cancel command-line and return to Normal
-                self.command_buffer.clear();
                 self.session_mode = SessionMode::CoreDriven;
                 effects.push(Effect::ModeChanged(Mode::Normal));
             }
             KeyCodeKind::Enter => {
                 // Execute the command from the buffer
-                let cmd = self.command_buffer.trim().to_string();
-                self.command_buffer.clear();
+                let cmd = prompt.text.trim().to_string();
+                if !cmd.is_empty() {
+                    self.command_history.record(cmd.clone());
+                }
                 effects.extend(self.process_ex_command(&cmd));
                 // Only default to Normal if the ex command didn't already change mode
                 if !effects.iter().any(|e| matches!(e, Effect::ModeChanged(_))) {
@@ -2549,13 +2890,21 @@ impl EditorSession {
             }
             KeyCodeKind::Backspace => {
                 // Remove last character from command buffer
-                self.command_buffer.pop();
+                prompt.text.pop();
+                prompt.detach();
+            }
+            KeyCodeKind::Up if key.mods == Modifiers::default() => {
+                prompt.up(&self.command_history);
+            }
+            KeyCodeKind::Down if key.mods == Modifiers::default() => {
+                prompt.down(&self.command_history);
             }
             _ => {
                 // Collect printable characters in the command buffer
                 if let KeyCodeKind::Char(c) = key.code.kind {
                     if !key.mods.ctrl && !key.mods.alt && !key.mods.shift {
-                        self.command_buffer.push(c);
+                        prompt.text.push(c);
+                        prompt.detach();
                     }
                 }
             }
@@ -2626,9 +2975,8 @@ impl EditorSession {
                     return Vec::new();
                 }
                 KeyCodeKind::Char(':') => {
-                    self.command_buffer.clear();
                     self.rendered_state.search.cancel();
-                    self.session_mode = SessionMode::Command;
+                    self.session_mode = SessionMode::Command(CommandPrompt::default());
                     return vec![Effect::ModeChanged(Mode::Command)];
                 }
                 KeyCodeKind::Char('i') => {
@@ -3168,7 +3516,7 @@ impl EditorSession {
     fn switch_or_cancel_selection_shape(&mut self, shape: SelectionShape) -> Vec<Effect> {
         let current = match &self.session_mode {
             SessionMode::Select(selection) => selection.kind.shape(),
-            SessionMode::CoreDriven | SessionMode::Command => return Vec::new(),
+            SessionMode::CoreDriven | SessionMode::Command(_) => return Vec::new(),
         };
         if current == shape {
             self.finish_select(Mode::Normal, Vec::new())
@@ -3400,9 +3748,23 @@ impl EditorSession {
                 }
             }
             "q" => vec![Effect::QuitRequested { force: args.1 }],
-            "e" => vec![Effect::OpenRequested {
-                path: args.0.map(std::path::PathBuf::from).unwrap_or_default(),
-                force: args.1,
+            "e" => match args.0 {
+                Some(path) => vec![Effect::OpenRequested {
+                    path: std::path::PathBuf::from(path),
+                    force: args.1,
+                }],
+                None => vec![Effect::ReloadCurrentRequested { force: args.1 }],
+            },
+            "reload" | "reload-all" if args.0.is_none() && !args.1 => {
+                if base == "reload" {
+                    vec![Effect::ReloadCurrentRequested { force: true }]
+                } else {
+                    vec![Effect::ReloadAllRequested]
+                }
+            }
+            "reload" | "reload-all" => vec![Effect::Message {
+                text: format!("Unexpected arguments for :{base}"),
+                severity: Severity::Warning,
             }],
             "saveas" => vec![Effect::SaveRequested {
                 path: args.0.map(std::path::PathBuf::from),
@@ -3517,29 +3879,12 @@ impl EditorSession {
 
     /// Parse an ex command into (base_command, (path_arg, force_flag)).
     fn parse_ex_command(cmd: &str) -> (&str, (Option<&str>, bool)) {
-        let cmd = cmd.trim_start_matches(':');
+        let cmd = cmd.trim_start_matches(':').trim_start();
 
-        // Special case: substitute commands like "s/pat/rep/" or ":%s/pat/rep/g"
-        // have no whitespace separator between base and args. Detect and extract base.
-        let (base, rest_str) = if cmd.starts_with("s/") || cmd.starts_with("substitute/") {
-            if cmd.starts_with("substitute/") {
-                // "substitute/pat/rep/" → base="substitute", rest="/pat/rep/"
-                ("substitute", Some(&cmd[10..]))
-            } else {
-                // "s/pat/rep/" → base="s", rest="/pat/rep/"
-                ("s", Some(&cmd[1..]))
-            }
-        } else if cmd.contains("s/") || cmd.contains("substitute/") {
-            // Might be a substitute with range prefix like "%s/pat/rep/g" or "1,2s/pat/rep/"
-            // Find the 's/' or 'substitute/' after any range prefix
-            if let Some(s_pos) = cmd.find("substitute/") {
-                ("substitute", Some(&cmd[s_pos + 10..]))
-            } else if let Some(s_pos) = cmd.find("s/") {
-                ("s", Some(&cmd[s_pos + 1..]))
-            } else {
-                let mut parts = cmd.splitn(2, char::is_whitespace);
-                (parts.next().unwrap_or(cmd), parts.next())
-            }
+        // Only a leading range can introduce substitute syntax. Path arguments
+        // may contain the same bytes and must remain literal.
+        let (base, rest_str) = if let Some((base, _, args)) = Self::substitute_parts(cmd) {
+            (base, Some(args))
         } else {
             let mut parts = cmd.splitn(2, char::is_whitespace);
             let b = parts.next().unwrap_or(cmd);
@@ -3553,28 +3898,35 @@ impl EditorSession {
             (base, false)
         };
 
-        // Check for ! in args (e.g., :w!)
-        let (args, force) = if let Some(a) = rest_str {
-            if a.trim().ends_with('!') {
-                (Some(&a[..a.trim().len() - 1]), true)
-            } else {
-                (rest_str, force)
-            }
-        } else {
-            (rest_str, force)
-        };
-
-        // Extract path argument (first word of rest)
-        let path = args.and_then(|a| {
+        let path = rest_str.and_then(|a| {
             let a = a.trim();
             if a.is_empty() {
                 None
             } else {
-                a.split_whitespace().next()
+                Some(a)
             }
         });
 
         (base, (path, force))
+    }
+
+    fn substitute_parts(command: &str) -> Option<(&'static str, &str, &str)> {
+        for (prefix, base) in [("substitute/", "substitute"), ("s/", "s")] {
+            if let Some(position) = command.find(prefix) {
+                let range = &command[..position];
+                let valid_range = range.is_empty()
+                    || range == "%"
+                    || range
+                        .chars()
+                        .all(|character| character.is_ascii_digit() || character == ',')
+                        && range.split(',').all(|part| !part.is_empty())
+                        && range.matches(',').count() <= 1;
+                if valid_range {
+                    return Some((base, range, &command[position + base.len()..]));
+                }
+            }
+        }
+        None
     }
 
     /// Resolve a substitute command's optional 1-based line range.
@@ -3584,13 +3936,7 @@ impl EditorSession {
         cursor_row: usize,
         line_count: usize,
     ) -> Option<(usize, usize)> {
-        let command = command.trim_start_matches(':');
-        let substitute_pos = if command.starts_with("substitute/") || command.starts_with("s/") {
-            0
-        } else {
-            command.find("substitute/").or_else(|| command.find("s/"))?
-        };
-        let prefix = command[..substitute_pos].trim();
+        let (_, prefix, _) = Self::substitute_parts(command.trim_start_matches(':'))?;
         let last_row = line_count.saturating_sub(1);
 
         if prefix.is_empty() {

@@ -11,6 +11,7 @@
 //!    transition. App commands execute here; every other key falls through.
 //! 3. Everything else → active session's `handle_key(key)`, then drain `Effect`s.
 
+use std::path::PathBuf;
 use std::time::Instant;
 
 use crossterm::event::{
@@ -21,7 +22,8 @@ use ratatui::Frame;
 
 use oom_edit_core::ClipboardSink;
 use oom_edit_core::{
-    EditorSession, Effect, KeyCode, KeyCodeKind, KeyInput, Modifiers, RenderedPoint, Viewport,
+    CommandHistory, EditorSession, Effect, KeyCode, KeyCodeKind, KeyInput, Modifiers,
+    RenderedPoint, Viewport,
 };
 
 use crossterm::event::MouseEventKind;
@@ -35,7 +37,9 @@ use crate::gutter::{GutterTroubleItem, GutterTroubleSnapshot, PendingGutterTroub
 use crate::lifecycle::{
     CloseTabRequest, DirtyClosePolicy, LifecycleAction, SaveContinuation, SaveRequest,
 };
-use crate::overlay::{Overlay, SpellSuggestAction, TroubleAction, TroubleEntry, TroubleProgress};
+use crate::overlay::{
+    Overlay, PaletteAction, SpellSuggestAction, TroubleAction, TroubleEntry, TroubleProgress,
+};
 use crate::screens::editor::{
     render_editor_with_gutter, render_status_row, source_text_width, DocumentPresentation,
     EditorViewport,
@@ -172,6 +176,7 @@ pub(crate) struct AppServices {
     clipboard_sink: Box<dyn ClipboardSink>,
     config_store: Box<dyn ConfigStore>,
     spell_host: SpellHost,
+    launch_dir: PathBuf,
 }
 
 impl AppServices {
@@ -179,11 +184,13 @@ impl AppServices {
         clipboard_sink: Box<dyn ClipboardSink>,
         config_store: Box<dyn ConfigStore>,
         spell_host: SpellHost,
+        launch_dir: PathBuf,
     ) -> Self {
         Self {
             clipboard_sink,
             config_store,
             spell_host,
+            launch_dir,
         }
     }
 }
@@ -301,6 +308,8 @@ pub struct App {
     /// The tab stack. Each tab is an independent [`EditorSession`] with its own
     /// scroll position and UI state.
     tabs: Vec<TabEntry>,
+    /// One in-memory ex history shared by all tabs in this App.
+    command_history: CommandHistory,
     /// Index of the currently active tab.
     active_tab: usize,
     /// Whether the app should quit.
@@ -356,6 +365,8 @@ pub struct App {
     clipboard_sink: Box<dyn ClipboardSink>,
     /// Configured representation for outgoing clipboard writes.
     clipboard_copy_format: ClipboardCopyFormat,
+    /// Directory captured before terminal startup for relative ex paths.
+    launch_dir: PathBuf,
     #[cfg(test)]
     scroll_follow_count: usize,
 }
@@ -395,6 +406,7 @@ impl App {
                 clipboard_sink,
                 config_store,
                 SpellHost::testing("a\nan\nand\nknown\nspell\ntext\nthe\nword\n"),
+                PathBuf::from("/"),
             ),
             initial_time,
         )
@@ -418,9 +430,12 @@ impl App {
         let is_light = resolved_theme.is_light();
         let tier = resolved_theme.capability;
         let theme_name = resolved_theme.name;
-        let session = Self::seed_spell_config(session, spell_enabled_default);
+        let command_history = CommandHistory::new();
+        let mut session = Self::seed_spell_config(session, spell_enabled_default);
+        session.set_command_history(command_history.clone());
         Self {
             tabs: vec![TabEntry::new(session)],
+            command_history,
             active_tab: 0,
             should_quit: false,
             status_message: String::new(),
@@ -447,6 +462,7 @@ impl App {
             tier,
             clipboard_sink: services.clipboard_sink,
             clipboard_copy_format,
+            launch_dir: services.launch_dir,
             #[cfg(test)]
             scroll_follow_count: 0,
         }
@@ -454,6 +470,12 @@ impl App {
 
     fn seed_spell_config(mut session: EditorSession, enabled: bool) -> EditorSession {
         session.set_spell_enabled(enabled);
+        session
+    }
+
+    fn prepare_session(&self, session: EditorSession) -> EditorSession {
+        let mut session = Self::seed_spell_config(session, self.spell_enabled_default);
+        session.set_command_history(self.command_history.clone());
         session
     }
 
@@ -1029,6 +1051,9 @@ impl App {
         }
 
         if let Event::Paste(text) = event {
+            if self.overlay.is_some() {
+                return;
+            }
             let effects = self
                 .tabs
                 .get_mut(self.active_tab)
@@ -1108,17 +1133,23 @@ impl App {
                 }
 
                 if matches!(key_input.code.kind, KeyCodeKind::Enter) {
-                    if let Some(cmd) = self.overlay.selected_command() {
-                        self.overlay.close();
-                        self.pending_input = PendingAppInput::Idle;
-                        self.execute_command(cmd);
-                    } else {
-                        self.overlay.close();
-                        self.pending_input = PendingAppInput::Idle;
-                        self.set_transient(
-                            "reference entry".to_string(),
-                            oom_edit_core::Severity::Info,
-                        );
+                    match self.overlay.selected_action() {
+                        Some(PaletteAction::App(cmd)) => {
+                            self.overlay.close();
+                            self.pending_input = PendingAppInput::Idle;
+                            self.execute_command(cmd);
+                        }
+                        Some(PaletteAction::ExPrefill(prefill)) => {
+                            self.overlay.close();
+                            self.pending_input = PendingAppInput::Idle;
+                            if let Some(entry) = self.tabs.get_mut(self.active_tab) {
+                                let effects = entry.session.open_command_prompt(prefill);
+                                for effect in effects {
+                                    self.handle_effect(effect);
+                                }
+                            }
+                        }
+                        None => {}
                     }
                     return;
                 }
@@ -1179,7 +1210,7 @@ impl App {
     fn open_tab(&mut self, path: &std::path::Path) {
         match EditorSession::open(path) {
             Ok(session) => {
-                let session = Self::seed_spell_config(session, self.spell_enabled_default);
+                let session = self.prepare_session(session);
                 let idx = self.tabs.len();
                 self.tabs.push(TabEntry::new(session));
                 self.active_tab = idx;
@@ -1640,6 +1671,9 @@ impl App {
                     self.replace_tab_from_disk(target, &path, false);
                 }
             }
+            LifecycleAction::ReloadTabs { targets, force } => {
+                self.execute_reload(targets, force);
+            }
             LifecycleAction::OpenTab { path } => self.open_tab(&path),
             LifecycleAction::QuitAll { force } => {
                 if !force && self.any_tab_dirty() {
@@ -1731,9 +1765,14 @@ impl App {
             self.invalid_lifecycle_target(target);
             return;
         }
-        match EditorSession::open(path) {
+        let opened = if reloading {
+            EditorSession::open_existing(path)
+        } else {
+            EditorSession::open(path)
+        };
+        match opened {
             Ok(session) => {
-                let session = Self::seed_spell_config(session, self.spell_enabled_default);
+                let session = self.prepare_session(session);
                 self.tabs[target] = TabEntry::new(session);
                 self.pending_scroll_follow = true;
                 self.set_transient(
@@ -1753,6 +1792,54 @@ impl App {
                 oom_edit_core::Severity::Error,
             ),
         }
+    }
+
+    fn execute_reload(&mut self, targets: Vec<usize>, force: bool) {
+        let mut replacements = Vec::with_capacity(targets.len());
+        for target in targets {
+            let Some(entry) = self.tabs.get(target) else {
+                self.invalid_lifecycle_target(target);
+                return;
+            };
+            if entry.session.is_dirty() && !force {
+                self.set_transient(
+                    "No write since last change (use :e! to override)".to_string(),
+                    oom_edit_core::Severity::Error,
+                );
+                return;
+            }
+            let Some(path) = entry.session.path() else {
+                self.set_transient(
+                    format!("Reload error: tab {} has no file path", target + 1),
+                    oom_edit_core::Severity::Error,
+                );
+                return;
+            };
+            match EditorSession::open_existing(path) {
+                Ok(session) => replacements.push((target, session)),
+                Err(error) => {
+                    self.set_transient(
+                        format!(
+                            "Reload error for tab {} ({}): {error}",
+                            target + 1,
+                            path.display()
+                        ),
+                        oom_edit_core::Severity::Error,
+                    );
+                    return;
+                }
+            }
+        }
+        let count = replacements.len();
+        for (target, session) in replacements {
+            let session = self.prepare_session(session);
+            self.tabs[target] = TabEntry::new(session);
+        }
+        self.pending_scroll_follow = true;
+        self.set_transient(
+            format!("Reloaded {count} tab(s) from disk"),
+            oom_edit_core::Severity::Info,
+        );
     }
 
     fn invalid_lifecycle_target(&mut self, target: usize) {
@@ -1795,6 +1882,18 @@ impl App {
                     target: self.active_tab,
                     path,
                     force,
+                });
+            }
+            Effect::ReloadCurrentRequested { force } => {
+                self.execute_lifecycle(LifecycleAction::ReloadTabs {
+                    targets: vec![self.active_tab],
+                    force,
+                });
+            }
+            Effect::ReloadAllRequested => {
+                self.execute_lifecycle(LifecycleAction::ReloadTabs {
+                    targets: (0..self.tabs.len()).collect(),
+                    force: true,
                 });
             }
             Effect::ClipboardWrite(content) => {
@@ -1842,6 +1941,11 @@ impl App {
                 self.overlay = Overlay::open_palette(self.mode_context());
             }
             Effect::TabNewRequested { path } => {
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    self.launch_dir.join(path)
+                };
                 self.execute_lifecycle(LifecycleAction::OpenTab { path });
             }
             Effect::TabCloseRequested { index, force } => {
@@ -1998,12 +2102,39 @@ impl App {
                 left_col = 0;
             } else {
                 let margin = HSCROLLOFF.min(viewport_width.saturating_sub(1) / 2);
-                if cursor_col < left_col.saturating_add(margin) {
-                    left_col = cursor_col.saturating_sub(margin);
+                let source_line = entry.session.line(cursor_line).unwrap_or_default();
+                if !source_line.contains('\t') {
+                    if cursor_col < left_col.saturating_add(margin) {
+                        left_col = cursor_col.saturating_sub(margin);
+                    } else {
+                        let right_margin = viewport_width.saturating_sub(margin + 1);
+                        if cursor_col > left_col.saturating_add(right_margin) {
+                            left_col = cursor_col.saturating_sub(right_margin);
+                        }
+                    }
                 } else {
-                    let right_margin = viewport_width.saturating_sub(margin + 1);
-                    if cursor_col > left_col.saturating_add(right_margin) {
-                        left_col = cursor_col.saturating_sub(right_margin);
+                    left_col = left_col.min(source_line.chars().count());
+                    let cursor_display =
+                        entry.session.source_display_column(cursor_line, cursor_col);
+                    let left_display = entry.session.source_display_column(cursor_line, left_col);
+                    if cursor_display < left_display.saturating_add(margin) {
+                        left_col = entry.session.source_column_at_display(
+                            cursor_line,
+                            cursor_display.saturating_sub(margin),
+                        );
+                    } else {
+                        let right_margin = viewport_width.saturating_sub(margin + 1);
+                        if cursor_display > left_display.saturating_add(right_margin) {
+                            let desired = cursor_display.saturating_sub(right_margin);
+                            left_col = entry.session.source_column_at_display(cursor_line, desired);
+                            while left_col < cursor_col
+                                && cursor_display.saturating_sub(
+                                    entry.session.source_display_column(cursor_line, left_col),
+                                ) >= viewport_width
+                            {
+                                left_col += 1;
+                            }
+                        }
                     }
                 }
             }
@@ -2944,6 +3075,7 @@ mod tests {
                 clipboard_sink,
                 Box::new(crate::config::DisabledConfigStore),
                 SpellHost::testing("a\nan\nand\nknown\nspell\ntext\nthe\nword\n"),
+                PathBuf::from("/"),
             ),
             Instant::now(),
         )
@@ -2971,6 +3103,7 @@ mod tests {
                 Box::new(RecordingClipboardSink::default()),
                 Box::new(crate::config::DisabledConfigStore),
                 spell_host,
+                PathBuf::from("/"),
             ),
             Instant::now(),
         )
@@ -4042,6 +4175,7 @@ mod tests {
                 Box::new(RecordingClipboardSink::default()),
                 Box::new(crate::config::DisabledConfigStore),
                 crate::spell_host::SpellHost::testing_unavailable("configured list failed"),
+                PathBuf::from("/"),
             ),
             initial,
         );
@@ -4146,8 +4280,8 @@ mod tests {
             .collect();
         let mut app = test_app(EditorSession::open(&paths[0]).unwrap());
         for path in &paths[1..] {
-            app.tabs
-                .push(TabEntry::new(EditorSession::open(path).unwrap()));
+            let session = app.prepare_session(EditorSession::open(path).unwrap());
+            app.tabs.push(TabEntry::new(session));
         }
         app
     }
@@ -4178,6 +4312,78 @@ mod tests {
         {
             app.handle_event(&Event::Key(KeyEvent::new(key, KeyModifiers::NONE)));
         }
+    }
+
+    #[test]
+    fn tabnew_resolves_relative_and_absolute_paths_from_launch_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("examples")).unwrap();
+        let relative_target = dir.path().join("examples/kitchen-sink.md");
+        let absolute_target = dir.path().join("absolute file.md");
+        std::fs::write(&relative_target, "relative contents\n").unwrap();
+        std::fs::write(&absolute_target, "absolute contents\n").unwrap();
+
+        let mut app = test_app(EditorSession::from_text("original\n"));
+        app.launch_dir = dir.path().to_path_buf();
+        type_ex(&mut app, "tabnew ./examples/kitchen-sink.md");
+        assert_eq!(app.tab_count(), 2);
+        assert_eq!(app.session().unwrap().document(), "relative contents\n");
+        assert_eq!(
+            app.session().unwrap().path(),
+            Some(dir.path().join("./examples/kitchen-sink.md").as_path())
+        );
+
+        type_ex(&mut app, &format!("tabnew {}", absolute_target.display()));
+        assert_eq!(app.tab_count(), 3);
+        assert_eq!(app.session().unwrap().document(), "absolute contents\n");
+        assert_eq!(
+            app.session().unwrap().path(),
+            Some(absolute_target.as_path())
+        );
+    }
+
+    #[test]
+    fn tabnew_paste_uses_sanitized_ascii_path_without_leaking_through_overlays() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("examples")).unwrap();
+        let target = dir.path().join("examples/spaced file.md");
+        std::fs::write(&target, "pasted contents\n").unwrap();
+        let mut app = test_app(EditorSession::from_text("original\n"));
+        app.launch_dir = dir.path().to_path_buf();
+
+        type_chars(&mut app, ":tabnew".chars());
+        app.handle_event(&Event::Paste("./examples/spaced file.md\n".to_string()));
+        assert_eq!(
+            app.session().unwrap().command_line().as_deref(),
+            Some("tabnew ./examples/spaced file.md")
+        );
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.tab_count(), 2);
+        assert_eq!(app.session().unwrap().document(), "pasted contents\n");
+
+        type_chars(&mut app, ":tabnew".chars());
+        let before = app.session().unwrap().command_line();
+        app.handle_event(&Event::Paste("invalid\n:qa!".to_string()));
+        assert_eq!(app.session().unwrap().command_line(), before);
+        assert_eq!(app.tab_count(), 2);
+        assert_eq!(app.session().unwrap().document(), "pasted contents\n");
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('?'),
+            KeyModifiers::NONE,
+        )));
+        app.handle_event(&Event::Paste("./examples/spaced file.md".to_string()));
+        let Overlay::Palette(ref palette) = app.overlay else {
+            panic!("palette should retain modal ownership");
+        };
+        assert_eq!(palette.filter_text(), "");
+        assert_eq!(app.session().unwrap().document(), "pasted contents\n");
     }
 
     fn type_chars(app: &mut App, characters: impl IntoIterator<Item = char>) {
@@ -4931,6 +5137,55 @@ mod tests {
     }
 
     #[test]
+    fn source_scroll_follow_uses_tab_display_cells_and_resets_on_short_line() {
+        let mut app = test_app(EditorSession::from_text("\t\tabcdefghij\nx\n"));
+        app.wrap_enabled = false;
+        app.viewport_width = 6;
+        enter_insert(&mut app);
+        for _ in 0..4 {
+            press(&mut app, CrosstermKeyCode::Right);
+        }
+        let (line, source_col) = app.session().unwrap().cursor();
+        let cursor_display = app
+            .session()
+            .unwrap()
+            .source_display_column(line, source_col);
+        let left_display = app
+            .session()
+            .unwrap()
+            .source_display_column(line, app.left_col());
+        assert!(app.left_col() > 0);
+        assert!(cursor_display >= left_display);
+        assert!(cursor_display - left_display < app.viewport_width);
+
+        press(&mut app, CrosstermKeyCode::Down);
+        assert_eq!(app.session().unwrap().cursor().0, 1);
+        assert_eq!(app.left_col(), 0);
+
+        let mut narrow = test_app(EditorSession::from_text("\tabc"));
+        narrow.wrap_enabled = false;
+        narrow.viewport_width = 4;
+        enter_insert(&mut narrow);
+        press(&mut narrow, CrosstermKeyCode::Home);
+        press(&mut narrow, CrosstermKeyCode::Right);
+        assert_eq!(narrow.left_col(), 1);
+        let left_col = narrow.left_col();
+        let frame = narrow
+            .session_mut()
+            .unwrap()
+            .render_source(oom_edit_core::Viewport {
+                top_line: 0,
+                height: 1,
+                width: 4,
+                wrap: false,
+                left_col,
+                skip_rows: 0,
+            });
+        assert_eq!(frame.lines[0].text, "abc");
+        assert_eq!(frame.cursor, (0, 0));
+    }
+
+    #[test]
     fn rendered_horizontal_follow_moves_both_directions_and_resets_for_short_rows() {
         let table = concat!(
             "| first naturally wide column | second naturally wide column | third naturally wide column |\n",
@@ -5471,21 +5726,40 @@ mod tests {
             )));
             assert!(prefixed.overlay.is_palette());
 
-            let mut selected = test_app(EditorSession::from_text("hello"));
-            selected.handle_event(&Event::Key(KeyEvent::new(
-                CrosstermKeyCode::Char('v'),
-                KeyModifiers::NONE,
-            )));
-            selected.handle_event(&Event::Key(KeyEvent::new(
-                CrosstermKeyCode::Char(' '),
-                KeyModifiers::NONE,
-            )));
-            selected.handle_event(&Event::Key(KeyEvent::new(
-                CrosstermKeyCode::Char('?'),
-                modifiers,
-            )));
-            assert!(selected.overlay.is_palette());
-            assert_eq!(selected.session().unwrap().mode(), Mode::Select);
+            for (mode_key, mode_modifiers) in [
+                (CrosstermKeyCode::Char('v'), KeyModifiers::NONE),
+                (CrosstermKeyCode::Char('V'), KeyModifiers::NONE),
+                (CrosstermKeyCode::Char('v'), KeyModifiers::CONTROL),
+            ] {
+                let mut selected = test_app(EditorSession::from_text("hello"));
+                selected.handle_event(&Event::Key(KeyEvent::new(mode_key, mode_modifiers)));
+                assert_eq!(selected.session().unwrap().mode(), Mode::Select);
+                selected.handle_event(&Event::Key(KeyEvent::new(
+                    CrosstermKeyCode::Char('?'),
+                    modifiers,
+                )));
+                assert!(selected.overlay.is_palette());
+                assert_eq!(selected.session().unwrap().mode(), Mode::Select);
+                let Overlay::Palette(ref palette) = selected.overlay else {
+                    panic!("expected palette in Select mode");
+                };
+                assert_eq!(palette.selected_command(), Some(AppCommand::Help));
+                for character in "help".chars() {
+                    selected.handle_event(&Event::Key(KeyEvent::new(
+                        CrosstermKeyCode::Char(character),
+                        KeyModifiers::NONE,
+                    )));
+                }
+                selected.handle_event(&Event::Key(KeyEvent::new(
+                    CrosstermKeyCode::Enter,
+                    KeyModifiers::NONE,
+                )));
+                let Overlay::Palette(ref reopened) = selected.overlay else {
+                    panic!("Enter should execute Help in Select mode");
+                };
+                assert_eq!(reopened.filter_text(), "");
+                assert_eq!(selected.session().unwrap().mode(), Mode::Select);
+            }
         }
 
         let mut search = test_app(EditorSession::from_text("hello"));
@@ -5823,7 +6097,7 @@ mod tests {
             KeyModifiers::NONE,
         )));
         assert_eq!(completed.pending_input, PendingAppInput::Idle);
-        assert!(!completed.overlay.is_some());
+        assert!(completed.overlay.is_palette());
     }
 
     /// T12: Space in Insert mode self-inserts (routing order proof).
@@ -5918,7 +6192,7 @@ mod tests {
         assert!(app.overlay.is_palette());
     }
 
-    /// T12: Palette reference entry — Enter on Vim reference shows status.
+    /// Enter on reference-only guidance leaves the palette open.
     #[test]
     fn app_palette_reference_entry() {
         let session = EditorSession::from_text("hello");
@@ -5927,18 +6201,145 @@ mod tests {
         open_palette_with_space_h(&mut app);
         assert!(app.overlay.is_palette(), "palette should be open");
 
-        // The first registry row is a visibility-only core reference.
+        for character in "R-N4".chars() {
+            app.handle_event(&Event::Key(KeyEvent::new(
+                CrosstermKeyCode::Char(character),
+                KeyModifiers::NONE,
+            )));
+        }
 
-        // Enter on a reference entry should show "reference entry" status.
+        // A reference-only filter has no executable row.
         let enter = KeyEvent::new(CrosstermKeyCode::Enter, KeyModifiers::NONE);
         app.handle_event(&Event::Key(enter));
 
-        // Palette should be closed and transient should show reference entry.
-        assert!(!app.overlay.is_some(), "palette should be closed");
+        assert!(app.overlay.is_palette());
+        assert_eq!(app.session().unwrap().mode(), Mode::Normal);
+        assert_eq!(app.session().unwrap().document(), "hello");
+    }
+
+    #[test]
+    fn palette_wq_prefills_command_before_save_and_quit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("one.md");
+        let mut app = file_backed_app(dir.path(), &[("one.md", "one\n")]);
+        dirty_tab(&mut app, 0, "dirty ");
+        open_palette_with_space_h(&mut app);
+        type_chars(&mut app, ":wq".chars());
+        press(&mut app, CrosstermKeyCode::Enter);
+        assert!(!app.overlay.is_some());
+        assert_eq!(app.session().unwrap().mode(), Mode::Command);
+        assert_eq!(app.session().unwrap().command_line().as_deref(), Some("wq"));
+        assert_eq!(app.session().unwrap().document(), "dirty one\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\n");
+        assert!(!app.should_quit);
+
+        press(&mut app, CrosstermKeyCode::Enter);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "dirty one\n");
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn palette_ex_templates_prefill_editable_paths_and_cancel_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.md");
+        let second = dir.path().join("second.md");
+        let third = dir.path().join("third.md");
+        std::fs::write(&first, "first\n").unwrap();
+        std::fs::write(&second, "second\n").unwrap();
+        std::fs::write(&third, "third\n").unwrap();
+        let mut app = test_app(EditorSession::open(&first).unwrap());
+
+        open_palette_with_space_h(&mut app);
+        type_chars(&mut app, ":e {path}".chars());
+        for _ in 0..crate::command::COMMANDS.len() + crate::overlay::palette::VIM_REFERENCE.len() {
+            if app.overlay.selected_action() == Some(PaletteAction::ExPrefill("e ")) {
+                break;
+            }
+            press(&mut app, CrosstermKeyCode::Down);
+        }
         assert_eq!(
-            app.transient.as_ref().map(|t| t.text.as_str()),
-            Some("reference entry")
+            app.overlay.selected_action(),
+            Some(PaletteAction::ExPrefill("e "))
         );
+        press(&mut app, CrosstermKeyCode::Enter);
+        assert_eq!(app.session().unwrap().command_line().as_deref(), Some("e "));
+        assert_eq!(app.session().unwrap().document(), "first\n");
+        type_chars(&mut app, second.to_string_lossy().chars());
+        press(&mut app, CrosstermKeyCode::Enter);
+        assert_eq!(app.session().unwrap().document(), "second\n");
+        assert_eq!(app.session().unwrap().path(), Some(second.as_path()));
+
+        open_palette_with_space_h(&mut app);
+        type_chars(&mut app, ":tabnew {path}".chars());
+        for _ in 0..crate::command::COMMANDS.len() + crate::overlay::palette::VIM_REFERENCE.len() {
+            if app.overlay.selected_action() == Some(PaletteAction::ExPrefill("tabnew ")) {
+                break;
+            }
+            press(&mut app, CrosstermKeyCode::Down);
+        }
+        assert_eq!(
+            app.overlay.selected_action(),
+            Some(PaletteAction::ExPrefill("tabnew "))
+        );
+        press(&mut app, CrosstermKeyCode::Enter);
+        assert_eq!(
+            app.session().unwrap().command_line().as_deref(),
+            Some("tabnew ")
+        );
+        app.handle_event(&Event::Paste(third.to_string_lossy().to_string()));
+        assert_eq!(
+            app.session().unwrap().command_line().as_deref(),
+            Some(format!("tabnew {}", third.display()).as_str())
+        );
+        press(&mut app, CrosstermKeyCode::Enter);
+        assert_eq!(app.tab_count(), 2);
+        assert_eq!(app.session().unwrap().document(), "third\n");
+
+        open_palette_with_space_h(&mut app);
+        type_chars(&mut app, ":wq".chars());
+        press(&mut app, CrosstermKeyCode::Enter);
+        press(&mut app, CrosstermKeyCode::Esc);
+        assert_eq!(app.session().unwrap().mode(), Mode::Normal);
+        press(&mut app, CrosstermKeyCode::Char(':'));
+        press(&mut app, CrosstermKeyCode::Up);
+        assert_eq!(
+            app.session().unwrap().command_line().as_deref(),
+            Some(format!("tabnew {}", third.display()).as_str())
+        );
+    }
+
+    #[test]
+    fn palette_ex_handoff_accepts_normal_and_all_select_shapes() {
+        for selection in [
+            None,
+            Some((CrosstermKeyCode::Char('v'), KeyModifiers::NONE)),
+            Some((CrosstermKeyCode::Char('V'), KeyModifiers::NONE)),
+            Some((CrosstermKeyCode::Char('v'), KeyModifiers::CONTROL)),
+        ] {
+            let mut app = test_app(EditorSession::from_text("hello\n"));
+            if let Some((code, modifiers)) = selection {
+                app.handle_event(&Event::Key(KeyEvent::new(code, modifiers)));
+                assert_eq!(app.session().unwrap().mode(), Mode::Select);
+            }
+            press(&mut app, CrosstermKeyCode::Char('?'));
+            assert!(app.overlay.is_palette());
+            type_chars(&mut app, ":wq".chars());
+            press(&mut app, CrosstermKeyCode::Enter);
+            assert!(!app.overlay.is_some());
+            assert_eq!(app.session().unwrap().mode(), Mode::Command);
+            assert_eq!(app.session().unwrap().command_line().as_deref(), Some("wq"));
+            assert_eq!(app.session().unwrap().document(), "hello\n");
+        }
+    }
+
+    #[test]
+    fn disabled_palette_command_does_not_close_or_mutate_the_editor() {
+        let mut app = test_app(EditorSession::from_text("hello\n"));
+        app.overlay = Overlay::open_palette(Contexts::COMMAND);
+        type_chars(&mut app, "save".chars());
+        press(&mut app, CrosstermKeyCode::Enter);
+        assert!(app.overlay.is_palette());
+        assert_eq!(app.session().unwrap().document(), "hello\n");
     }
 
     /// T12: Which-key delay gate — hint doesn't show before 150ms.
@@ -6252,6 +6653,7 @@ mod tests {
                     Box::new(RecordingClipboardSink::default()),
                     Box::new(crate::config::FileConfigStore::new(config_path.clone())),
                     SpellHost::testing("custom\ntheme\n"),
+                    PathBuf::from("/"),
                 ),
                 Instant::now(),
             );
@@ -6751,6 +7153,141 @@ mod tests {
         assert!(app.tabs[0].session.is_dirty());
         assert!(!app.overlay.is_some());
         assert!(app.transient.as_ref().unwrap().text.contains(":e!"));
+    }
+
+    #[test]
+    fn reload_current_discards_dirty_only_with_explicit_force_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = file_backed_app(dir.path(), &[("one.md", "first\n")]);
+        dirty_tab(&mut app, 0, "dirty ");
+        std::fs::write(dir.path().join("one.md"), "new disk\n").unwrap();
+        type_ex(&mut app, "e");
+        assert_eq!(app.tabs[0].session.document(), "dirty first\n");
+        type_ex(&mut app, "e!");
+        assert_eq!(app.tabs[0].session.document(), "new disk\n");
+        assert!(!app.tabs[0].session.is_dirty());
+        dirty_tab(&mut app, 0, "again ");
+        std::fs::write(dir.path().join("one.md"), "newer disk\n").unwrap();
+        type_ex(&mut app, "reload");
+        assert_eq!(app.tabs[0].session.document(), "newer disk\n");
+        assert!(!app.tabs[0].session.is_dirty());
+    }
+
+    #[test]
+    fn reload_all_commits_every_tab_and_preserves_identity_and_active_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = file_backed_app(dir.path(), &[("one.md", "one\n"), ("two.md", "two\n")]);
+        app.active_tab = 1;
+        dirty_tab(&mut app, 0, "dirty ");
+        std::fs::write(dir.path().join("one.md"), "fresh one\n").unwrap();
+        std::fs::write(dir.path().join("two.md"), "fresh two\n").unwrap();
+        type_ex(&mut app, "reload-all");
+        assert_eq!(app.tab_count(), 2);
+        assert_eq!(app.active_tab, 1);
+        assert_eq!(app.tabs[0].session.document(), "fresh one\n");
+        assert_eq!(app.tabs[1].session.document(), "fresh two\n");
+        assert_eq!(
+            app.tabs[0].session.path(),
+            Some(dir.path().join("one.md").as_path())
+        );
+        assert_eq!(
+            app.tabs[1].session.path(),
+            Some(dir.path().join("two.md").as_path())
+        );
+        assert!(app.tabs.iter().all(|tab| !tab.session.is_dirty()));
+    }
+
+    #[test]
+    fn failed_reload_all_retains_all_tabs_and_dirty_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        for invalid in ["missing", "invalid_utf8", "unnamed", "unreadable"] {
+            let mut app = file_backed_app(dir.path(), &[("one.md", "one\n"), ("two.md", "two\n")]);
+            dirty_tab(&mut app, 0, "dirty ");
+            std::fs::write(dir.path().join("one.md"), "new one\n").unwrap();
+            match invalid {
+                "missing" => std::fs::remove_file(dir.path().join("two.md")).unwrap(),
+                "invalid_utf8" => std::fs::write(dir.path().join("two.md"), [0xff]).unwrap(),
+                "unnamed" => app.tabs[1] = TabEntry::new(EditorSession::from_text("unnamed\n")),
+                "unreadable" => {
+                    std::fs::remove_file(dir.path().join("two.md")).unwrap();
+                    std::fs::create_dir(dir.path().join("two.md")).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let second_before = app.tabs[1].session.document();
+            type_ex(&mut app, "reload-all");
+            assert_eq!(app.tabs[0].session.document(), "dirty one\n", "{invalid}");
+            assert!(app.tabs[0].session.is_dirty(), "{invalid}");
+            assert_eq!(app.tabs[1].session.document(), second_before, "{invalid}");
+            assert!(app
+                .transient
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("Reload error"));
+        }
+    }
+
+    #[test]
+    fn missing_current_file_is_not_replaced_by_empty_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = file_backed_app(dir.path(), &[("one.md", "one\n")]);
+        dirty_tab(&mut app, 0, "dirty ");
+        std::fs::remove_file(dir.path().join("one.md")).unwrap();
+        type_ex(&mut app, "e!");
+        assert_eq!(app.tabs[0].session.document(), "dirty one\n");
+        assert!(app.tabs[0].session.is_dirty());
+        assert!(app
+            .transient
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("Reload error"));
+    }
+
+    #[test]
+    fn ex_history_is_shared_across_tabs_and_reloads_but_not_apps() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = file_backed_app(dir.path(), &[("one.md", "one\n"), ("two.md", "two\n")]);
+        type_ex(&mut app, "unknown-command");
+        app.active_tab = 1;
+        press(&mut app, CrosstermKeyCode::Char(':'));
+        press(&mut app, CrosstermKeyCode::Up);
+        assert_eq!(
+            app.tabs[1].session.command_line().as_deref(),
+            Some("unknown-command")
+        );
+        press(&mut app, CrosstermKeyCode::Esc);
+        type_ex(&mut app, "reload-all");
+        press(&mut app, CrosstermKeyCode::Char(':'));
+        press(&mut app, CrosstermKeyCode::Up);
+        assert_eq!(
+            app.tabs[1].session.command_line().as_deref(),
+            Some("reload-all")
+        );
+        press(&mut app, CrosstermKeyCode::Up);
+        assert_eq!(
+            app.tabs[1].session.command_line().as_deref(),
+            Some("unknown-command")
+        );
+        press(&mut app, CrosstermKeyCode::Esc);
+        let third = dir.path().join("three.md");
+        std::fs::write(&third, "three\n").unwrap();
+        app.open_tab(&third);
+        press(&mut app, CrosstermKeyCode::Char(':'));
+        press(&mut app, CrosstermKeyCode::Up);
+        assert_eq!(
+            app.tabs[2].session.command_line().as_deref(),
+            Some("reload-all")
+        );
+
+        let mut fresh_app = file_backed_app(dir.path(), &[("fresh.md", "fresh\n")]);
+        press(&mut fresh_app, CrosstermKeyCode::Char(':'));
+        press(&mut fresh_app, CrosstermKeyCode::Up);
+        assert_eq!(
+            fresh_app.tabs[0].session.command_line().as_deref(),
+            Some("")
+        );
     }
 
     #[test]

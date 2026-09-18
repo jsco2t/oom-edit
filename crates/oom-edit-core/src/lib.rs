@@ -75,7 +75,7 @@ pub use document::LineEnding;
 pub use error::{FmError, OpenError, SaveError};
 pub use frontmatter::{FrontMatter, Num, Value};
 pub use input::{KeyCode, KeyCodeKind, KeyInput, Modifiers};
-pub use session::EditorSession;
+pub use session::{CommandHistory, EditorSession};
 pub use session::{Effect, Mode, Severity, Viewport};
 pub use spell::{
     DecorationKind, Diagnostic, DiagnosticDecorationRow, DiagnosticProvider, DiagnosticSeverity,

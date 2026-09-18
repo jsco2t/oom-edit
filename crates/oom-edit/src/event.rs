@@ -506,6 +506,7 @@ mod tests {
                 Box::new(RecordingClipboardSink::default()),
                 Box::new(crate::config::DisabledConfigStore),
                 crate::spell_host::SpellHost::testing(words),
+                std::path::PathBuf::from("/"),
             ),
             initial,
         )

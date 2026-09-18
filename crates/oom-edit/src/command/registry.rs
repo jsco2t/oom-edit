@@ -63,6 +63,7 @@ pub enum BindingRole {
     },
     CoreEx {
         display: &'static str,
+        prefill: Option<&'static str>,
     },
 }
 
@@ -303,7 +304,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         aliases: &[
             BindingAlias::Direct {
                 key: '?',
-                contexts: Contexts::NORMAL,
+                contexts: RENDERED,
             },
             BindingAlias::Space {
                 continuation: '?',
@@ -413,7 +414,8 @@ pub static COMMANDS: &[CommandSpec] = &[
         "enable or disable spelling",
         Contexts::COMMAND,
         BindingRole::CoreEx {
-            display: ":set spell / :set nospell"
+            display: ":set spell / :set nospell",
+            prefill: None,
         },
         "SP-1:set-toggle"
     ),
@@ -457,7 +459,8 @@ pub static COMMANDS: &[CommandSpec] = &[
         "open path in new tab",
         RENDERED,
         BindingRole::CoreEx {
-            display: ":tabnew {path}"
+            display: ":tabnew {path}",
+            prefill: Some("tabnew "),
         },
         None
     ),
@@ -467,7 +470,8 @@ pub static COMMANDS: &[CommandSpec] = &[
         "close tab",
         RENDERED,
         BindingRole::CoreEx {
-            display: ":tabclose"
+            display: ":tabclose",
+            prefill: Some("tabclose"),
         },
         None
     ),
@@ -476,7 +480,10 @@ pub static COMMANDS: &[CommandSpec] = &[
         "quit-all",
         "quit all tabs",
         Contexts::COMMAND,
-        BindingRole::CoreEx { display: ":qa" },
+        BindingRole::CoreEx {
+            display: ":qa",
+            prefill: Some("qa")
+        },
         None
     ),
 ];
@@ -499,7 +506,9 @@ pub fn rendered_binding_for(spec: &CommandSpec, ctx: Contexts) -> String {
             format!("Space {}", keys.join("/"))
         }
         BindingRole::AppSpaceDigit => "Space 1-9".to_string(),
-        BindingRole::CoreKey { display } | BindingRole::CoreEx { display } => display.to_string(),
+        BindingRole::CoreKey { display } | BindingRole::CoreEx { display, .. } => {
+            display.to_string()
+        }
     };
     let mut bindings = Vec::with_capacity(spec.aliases.len() + 1);
     for alias in spec.aliases {
@@ -649,7 +658,7 @@ mod tests {
             &[
                 BindingAlias::Direct {
                     key: '?',
-                    contexts: Contexts::NORMAL
+                    contexts: RENDERED
                 },
                 BindingAlias::Space {
                     continuation: '?',
@@ -658,12 +667,18 @@ mod tests {
             ]
         );
         assert_eq!(rendered_binding(help), "? / Space h/?");
-        assert_eq!(rendered_binding_for(help, Contexts::SELECT), "Space h/?");
+        assert_eq!(
+            rendered_binding_for(help, Contexts::SELECT),
+            "? / Space h/?"
+        );
         assert_eq!(
             direct_command(Contexts::NORMAL, '?'),
             Some(AppCommand::Help)
         );
-        assert_eq!(direct_command(Contexts::SELECT, '?'), None);
+        assert_eq!(
+            direct_command(Contexts::SELECT, '?'),
+            Some(AppCommand::Help)
+        );
         assert_eq!(app_chord(Contexts::NORMAL, '?'), Some(AppCommand::Help));
         assert_eq!(app_chord(Contexts::SELECT, '?'), Some(AppCommand::Help));
     }
@@ -736,6 +751,7 @@ mod tests {
                 "spell-set",
                 BindingRole::CoreEx {
                     display: ":set spell / :set nospell",
+                    prefill: None,
                 },
                 Some("SP-1:set-toggle"),
             ),
@@ -994,6 +1010,7 @@ mod tests {
                 Contexts::COMMAND,
                 BindingRole::CoreEx {
                     display: ":set spell / :set nospell",
+                    prefill: None,
                 },
                 None,
             ),
@@ -1038,6 +1055,7 @@ mod tests {
                 RENDERED,
                 BindingRole::CoreEx {
                     display: ":tabnew {path}",
+                    prefill: Some("tabnew "),
                 },
                 None,
             ),
@@ -1048,6 +1066,7 @@ mod tests {
                 RENDERED,
                 BindingRole::CoreEx {
                     display: ":tabclose",
+                    prefill: Some("tabclose"),
                 },
                 None,
             ),
@@ -1056,7 +1075,10 @@ mod tests {
                 "quit-all",
                 "quit all tabs",
                 Contexts::COMMAND,
-                BindingRole::CoreEx { display: ":qa" },
+                BindingRole::CoreEx {
+                    display: ":qa",
+                    prefill: Some("qa"),
+                },
                 None,
             ),
         ];
@@ -1112,13 +1134,32 @@ mod tests {
     }
 
     #[test]
-    fn core_binding_descriptors_are_visibility_only() {
+    fn core_binding_descriptors_never_dispatch_app_commands() {
         for spec in COMMANDS {
             if matches!(
                 spec.binding,
                 BindingRole::CoreKey { .. } | BindingRole::CoreEx { .. }
             ) {
                 assert!(!matches!(spec.binding, BindingRole::AppChord { .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn core_ex_prefills_are_safe_single_command_inputs() {
+        for spec in COMMANDS {
+            if let BindingRole::CoreEx { display, prefill } = spec.binding {
+                assert!(display.starts_with(':'));
+                if let Some(text) = prefill {
+                    assert!(!text.is_empty());
+                    assert!(!text.starts_with(':'));
+                    assert!(!text.chars().any(char::is_control));
+                    assert!(!text.contains('{') && !text.contains('}'));
+                    assert!(
+                        !display.contains(" / :"),
+                        "combined commands need one choice"
+                    );
+                }
             }
         }
     }

@@ -126,6 +126,7 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         None => EditorSession::from_text(""),
     };
 
+    let launch_dir = std::env::current_dir()?;
     let app = App::new_with_spell(
         session,
         theme_catalog,
@@ -140,6 +141,7 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             Box::new(crate::clipboard::Osc52Clipboard::stdout()),
             Box::new(crate::config::FileConfigStore::production()),
             spell_host,
+            launch_dir,
         ),
         std::time::Instant::now(),
     );

@@ -1,0 +1,128 @@
+{
+  "schema_version": 2,
+  "work_id": "2026-09-17-editor-interaction-and-code-block-fixes",
+  "title": "Editor interaction and code block fixes",
+  "phase": "DONE",
+  "created_at": "2026-09-18T02:35:47Z",
+  "updated_at": "2026-09-18T15:47:37Z",
+  "approved_at": "2026-09-18T14:51:46Z",
+  "completed_at": "2026-09-18T15:15:10Z",
+  "archived_at": "2026-09-18T15:47:37Z",
+  "baseline_sha": "b1044df098eaa76b5d288ed7accb0d613d345c29",
+  "final_sha": "b1044df098eaa76b5d288ed7accb0d613d345c29",
+  "plan_revision": 3,
+  "acceptance_round": 3,
+  "completed_rounds": [
+    {
+      "round": 1,
+      "plan_revision": 1,
+      "approved_at": "2026-09-18T02:41:19Z",
+      "completed_at": "2026-09-18T03:23:13Z",
+      "approved_plan_sha256": "7823117e914251de9c43c2a136224247537a60a3ac1df062e2a738c1b947ac78",
+      "final_sha": "b1044df098eaa76b5d288ed7accb0d613d345c29",
+      "task_ids": [
+        "001",
+        "002",
+        "003",
+        "004",
+        "005"
+      ],
+      "final_evidence": "evidence/final-round-001.md"
+    },
+    {
+      "round": 2,
+      "plan_revision": 2,
+      "approved_at": "2026-09-18T03:42:41Z",
+      "completed_at": "2026-09-18T04:03:04Z",
+      "approved_plan_sha256": "0e8a22fcc5784faf925c038167b498298840f09c4777a3706422e40fa811920f",
+      "final_sha": "b1044df098eaa76b5d288ed7accb0d613d345c29",
+      "task_ids": [
+        "006",
+        "007"
+      ],
+      "final_evidence": "evidence/final-round-002.md"
+    }
+  ],
+  "approved_plan_sha256": "08df664545f597c0c2b6a41ffcef22b64dce0324680ad67edf3d2f50a03ae302",
+  "current_task": null,
+  "tasks": [
+    {
+      "id": "001",
+      "path": "tasks/001-help-in-select-and-palette-actions.md",
+      "round": 1,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/001.md"
+    },
+    {
+      "id": "002",
+      "path": "tasks/002-render-code-tabs.md",
+      "round": 1,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/002.md"
+    },
+    {
+      "id": "003",
+      "path": "tasks/003-tabnew-paths-and-paste.md",
+      "round": 1,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/003.md"
+    },
+    {
+      "id": "004",
+      "path": "tasks/004-reload-commands.md",
+      "round": 1,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/004.md"
+    },
+    {
+      "id": "005",
+      "path": "tasks/005-session-command-history.md",
+      "round": 1,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/005.md"
+    },
+    {
+      "id": "006",
+      "path": "tasks/006-palette-list-navigation.md",
+      "round": 2,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/006.md"
+    },
+    {
+      "id": "007",
+      "path": "tasks/007-palette-ex-command-handoff.md",
+      "round": 2,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/007.md"
+    },
+    {
+      "id": "008",
+      "path": "tasks/008-source-insert-code-tabs.md",
+      "round": 3,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/008.md"
+    }
+  ],
+  "task_retry_limit": 3,
+  "final_retry_limit": 2,
+  "final_attempts": 1,
+  "stop_continuations": 0,
+  "max_stop_continuations": 50,
+  "block_reason": null
+}

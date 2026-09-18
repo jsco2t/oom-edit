@@ -20,7 +20,7 @@ mod table;
 mod wrap;
 
 use std::ops::Range;
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::style::{
     JumpTarget, LineKind, RenderedLayout, RenderedLine, RenderedLineRole, SemanticStyle, Span,
@@ -465,7 +465,7 @@ impl<'a> RenderedLayoutBuilder<'a> {
                 .get(index)
                 .cloned()
                 .unwrap_or_else(|| content_span.clone());
-            let mut mapped = mapped_from_styled(line.clone(), Some(line_source.start));
+            let mut mapped = mapped_code_from_styled(line.clone(), line_source.start);
             mapped.prepend_generated("▏ ", SemanticStyle::Muted);
             self.make_content_line(mapped, line_source);
         }
@@ -529,7 +529,10 @@ impl<'a> RenderedLayoutBuilder<'a> {
                 .get(index)
                 .cloned()
                 .unwrap_or_else(|| source.clone());
-            self.make_source_content_line(line, source_line.clone(), source_line.start);
+            self.make_content_line(
+                mapped_code_from_styled(line, source_line.start),
+                source_line,
+            );
         }
     }
 
@@ -1104,9 +1107,22 @@ fn append_leaf(line: &mut MappedLine, leaf: &InlineLeaf, style: SemanticStyle) {
 }
 
 fn mapped_from_styled(styled: StyledLine, visible_start: Option<usize>) -> MappedLine {
+    mapped_from_styled_with_tab_stops(styled, visible_start, None)
+}
+
+fn mapped_code_from_styled(styled: StyledLine, visible_start: usize) -> MappedLine {
+    mapped_from_styled_with_tab_stops(styled, Some(visible_start), Some(4))
+}
+
+fn mapped_from_styled_with_tab_stops(
+    styled: StyledLine,
+    visible_start: Option<usize>,
+    tab_stop: Option<usize>,
+) -> MappedLine {
     let mut mapped = MappedLine::default();
     let mut char_offset = 0;
     let mut byte_offset = 0;
+    let mut display_column = 0;
     for group in display_groups(&styled.text) {
         let char_len = group.chars().count();
         let style = styled
@@ -1119,7 +1135,12 @@ fn mapped_from_styled(styled: StyledLine, visible_start: Option<usize>) -> Mappe
             visible_start.map(|start| start + byte_offset..start + byte_offset + group.len());
         byte_offset += group.len();
         char_offset += char_len;
-        mapped.push(group, style, source);
+        let visible = match tab_stop {
+            Some(stop) if group == "\t" => " ".repeat(stop - display_column % stop),
+            _ => group,
+        };
+        display_column += visible.width();
+        mapped.push(visible, style, source);
     }
     mapped
 }
@@ -1127,7 +1148,9 @@ fn mapped_from_styled(styled: StyledLine, visible_start: Option<usize>) -> Mappe
 fn display_groups(text: &str) -> Vec<String> {
     let mut groups: Vec<String> = Vec::new();
     for character in text.chars() {
-        if character.width().unwrap_or(0) == 0 {
+        if character == '\t' {
+            groups.push(character.to_string());
+        } else if character.width().unwrap_or(0) == 0 {
             if let Some(previous) = groups.last_mut() {
                 previous.push(character);
             } else {
