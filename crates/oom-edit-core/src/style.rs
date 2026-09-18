@@ -117,6 +117,8 @@ pub struct SourceDecoration {
 }
 
 /// The full rendered source frame for the Insert-mode viewport.
+/// Display-only spaces replace source tabs at four-column stops; document
+/// text and source offsets still refer to the original tab bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceFrame {
     /// Exactly `viewport.height` lines (padded with empty StyledLines if the

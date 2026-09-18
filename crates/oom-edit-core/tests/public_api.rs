@@ -1,7 +1,7 @@
 //! Downstream-style guards for the curated root facade.
 
 use oom_edit_core::{
-    ClipboardContent, ClipboardError, ClipboardSink, DecorationKind, Diagnostic,
+    ClipboardContent, ClipboardError, ClipboardSink, CommandHistory, DecorationKind, Diagnostic,
     DiagnosticDecorationRow, DiagnosticProvider, DiagnosticSeverity, EditorSession, Effect,
     FmError, FrontMatter, JumpTarget, KeyCode, KeyCodeKind, KeyInput, LineEnding, LineKind, Mode,
     Modifiers, Num, OpenError, PositionError, RecordingClipboardSink, RenderedLayout, RenderedLine,
@@ -57,6 +57,11 @@ fn assert_no_exported_macros(path: &Path) {
 #[test]
 fn public_facade_types_are_available_at_crate_root() {
     let mut session = EditorSession::from_text("# root\n");
+    let _: Vec<Effect> = session.open_command_prompt("wq");
+    session.set_command_history(CommandHistory::new());
+    let _: Result<EditorSession, OpenError> = EditorSession::open_existing(Path::new("/missing"));
+    let _: Effect = Effect::ReloadCurrentRequested { force: true };
+    let _: Effect = Effect::ReloadAllRequested;
     let _: Mode = session.mode();
     let _: &FrontMatter = session.front_matter();
     let _: LineEnding = session.line_ending();
@@ -78,6 +83,26 @@ fn public_facade_types_are_available_at_crate_root() {
         left_col: 0,
         skip_rows: 0,
     });
+    let _: usize = session.source_display_column(0, 1);
+    let _: usize = session.source_column_at_display(0, 1);
+    let _: Option<usize> = session.source_offset_at_viewport_cell(
+        Viewport {
+            top_line: 0,
+            height: 2,
+            width: 20,
+            wrap: true,
+            left_col: 0,
+            skip_rows: 0,
+        },
+        0,
+        0,
+    );
+    let _: Vec<Effect> = session.move_to_rendered_point(RenderedPoint { row: 0, column: 0 });
+    let _: Vec<Effect> = session.select_rendered_points(
+        RenderedPoint { row: 0, column: 0 },
+        RenderedPoint { row: 0, column: 1 },
+    );
+    let _: Result<Vec<Effect>, PositionError> = session.select_source_offsets(0, 1, 20);
 
     let mut clipboard = RecordingClipboardSink::default();
     ClipboardSink::copy(&mut clipboard, "root").unwrap();
@@ -89,6 +114,7 @@ fn public_facade_types_are_available_at_crate_root() {
     let _nameable = std::any::TypeId::of::<(
         ClipboardContent,
         ClipboardError,
+        CommandHistory,
         DecorationKind,
         Diagnostic,
         DiagnosticDecorationRow,
@@ -136,7 +162,7 @@ fn public_facade_remains_curated_without_partial_spell_reexports() {
             "pub use error::{FmError, OpenError, SaveError};",
             "pub use frontmatter::{FrontMatter, Num, Value};",
             "pub use input::{KeyCode, KeyCodeKind, KeyInput, Modifiers};",
-            "pub use session::EditorSession;",
+            "pub use session::{CommandHistory, EditorSession};",
             "pub use session::{Effect, Mode, Severity, Viewport};",
             "pub use spell::{ DecorationKind, Diagnostic, DiagnosticDecorationRow, DiagnosticProvider, DiagnosticSeverity, PositionError, TextPosition, };",
             "pub use style::{ JumpTarget, LineKind, RenderedLayout, RenderedLine, RenderedLineRole, RenderedPoint, RenderedSearch, RenderedSelection, RenderedSelectionRow, RenderedSourceAtom, SearchDirection, SelectionShape, SemanticStyle, SourceDecoration, SourceFrame, Span, StyledLine, TargetKind, };",

@@ -3,7 +3,9 @@
 use std::collections::BTreeMap;
 
 use oom_edit_core::DiagnosticSeverity;
-use ratatui::style::Modifier;
+use ratatui::style::{Modifier, Style};
+
+use crate::theme::{Theme, Tier, UiSlot};
 
 /// One compact, sorted marker row retained by a completed snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -140,7 +142,7 @@ impl PendingGutterTroubleBuild {
     }
 }
 
-fn severity_priority(severity: DiagnosticSeverity) -> u8 {
+pub(crate) fn severity_priority(severity: DiagnosticSeverity) -> u8 {
     match severity {
         DiagnosticSeverity::Error => 4,
         DiagnosticSeverity::Warning => 3,
@@ -157,6 +159,17 @@ pub(crate) enum GutterMarkerRole {
     Muted,
 }
 
+impl GutterMarkerRole {
+    pub(crate) fn style(self, theme: &Theme, tier: Tier) -> Style {
+        match self {
+            Self::Error => theme.ui_style(tier, UiSlot::StatusError),
+            Self::Warning => theme.ui_style(tier, UiSlot::StatusWarning),
+            Self::Info => theme.ui_style(tier, UiSlot::StatusInfo),
+            Self::Muted => theme.style(tier, oom_edit_core::SemanticStyle::Muted),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct GutterMarkerStyle {
     pub(crate) glyph: char,
@@ -165,16 +178,20 @@ pub(crate) struct GutterMarkerStyle {
 }
 
 pub(crate) fn marker_style(severity: DiagnosticSeverity) -> GutterMarkerStyle {
-    let (glyph, role) = match severity {
-        DiagnosticSeverity::Error => ('E', GutterMarkerRole::Error),
-        DiagnosticSeverity::Warning => ('W', GutterMarkerRole::Warning),
-        DiagnosticSeverity::Info => ('I', GutterMarkerRole::Info),
-        DiagnosticSeverity::Hint => ('H', GutterMarkerRole::Muted),
+    let role = match severity {
+        DiagnosticSeverity::Error => GutterMarkerRole::Error,
+        DiagnosticSeverity::Warning => GutterMarkerRole::Warning,
+        DiagnosticSeverity::Info => GutterMarkerRole::Info,
+        DiagnosticSeverity::Hint => GutterMarkerRole::Muted,
     };
     GutterMarkerStyle {
-        glyph,
+        glyph: '•',
         role,
-        modifier: Modifier::BOLD,
+        modifier: if severity == DiagnosticSeverity::Error {
+            Modifier::BOLD | Modifier::UNDERLINED
+        } else {
+            Modifier::BOLD
+        },
     }
 }
 
@@ -226,18 +243,35 @@ mod tests {
 
     #[test]
     fn marker_glyph_role_and_modifier_mapping_is_exhaustive() {
-        for (severity, glyph, role) in [
-            (DiagnosticSeverity::Error, 'E', GutterMarkerRole::Error),
-            (DiagnosticSeverity::Warning, 'W', GutterMarkerRole::Warning),
-            (DiagnosticSeverity::Info, 'I', GutterMarkerRole::Info),
-            (DiagnosticSeverity::Hint, 'H', GutterMarkerRole::Muted),
+        assert_eq!(ratatui::text::Line::from("•").width(), 1);
+        for (severity, role, modifier) in [
+            (
+                DiagnosticSeverity::Error,
+                GutterMarkerRole::Error,
+                Modifier::BOLD | Modifier::UNDERLINED,
+            ),
+            (
+                DiagnosticSeverity::Warning,
+                GutterMarkerRole::Warning,
+                Modifier::BOLD,
+            ),
+            (
+                DiagnosticSeverity::Info,
+                GutterMarkerRole::Info,
+                Modifier::BOLD,
+            ),
+            (
+                DiagnosticSeverity::Hint,
+                GutterMarkerRole::Muted,
+                Modifier::BOLD,
+            ),
         ] {
             assert_eq!(
                 marker_style(severity),
                 GutterMarkerStyle {
-                    glyph,
+                    glyph: '•',
                     role,
-                    modifier: Modifier::BOLD,
+                    modifier,
                 }
             );
         }

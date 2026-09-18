@@ -50,6 +50,113 @@ fn long_line(len: usize) -> String {
 }
 
 #[test]
+fn insert_source_expands_the_kitchen_sink_go_tabs_without_rewriting_text() {
+    let source = include_str!("../../../examples/kitchen-sink.md");
+    let mut session = EditorSession::from_text(source);
+    enter_insert(&mut session);
+    let one_tab = source
+        .lines()
+        .position(|line| line == "\tvar wg sync.WaitGroup")
+        .unwrap();
+    let two_tabs = source
+        .lines()
+        .position(|line| line == "\t\tdefer wg.Done()")
+        .unwrap();
+    let first = session.render_source(Viewport {
+        top_line: one_tab,
+        ..viewport(80, 1, true, 0, 0)
+    });
+    let second = session.render_source(Viewport {
+        top_line: two_tabs,
+        ..viewport(80, 1, true, 0, 0)
+    });
+    assert_eq!(first.lines[0].text, "    var wg sync.WaitGroup");
+    assert_eq!(second.lines[0].text, "        defer wg.Done()");
+    assert!(first.lines[0].spans.iter().any(|span| {
+        span.style == SemanticStyle::Keyword && span.start_col <= 4 && span.end_col >= 7
+    }));
+    assert_eq!(session.document(), source);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("kitchen-sink.md");
+    session.save(Some(&path), false).unwrap();
+    assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+}
+
+#[test]
+fn source_tab_stops_follow_display_width_and_keep_source_bytes() {
+    let source = " a\t\tvalue\n界\titem\n";
+    let mut session = EditorSession::from_text(source);
+    enter_insert(&mut session);
+    let frame = session.render_source(viewport(40, 2, true, 0, 0));
+    assert_eq!(frame.lines[0].text, " a      value");
+    assert_eq!(frame.lines[1].text, "界  item");
+    assert_eq!(session.source_display_column(0, 4), 8);
+    assert_eq!(session.source_display_column(1, 2), 4);
+    assert_eq!(session.source_column_at_display(0, 6), 3);
+    assert_eq!(session.document(), source);
+}
+
+#[test]
+fn wrapped_tab_cells_and_cursor_keep_the_original_source_offset() {
+    let mut session = EditorSession::from_text("a\tz");
+    enter_insert(&mut session);
+    move_right(&mut session, 2);
+    let vp = viewport(3, 3, true, 0, 0);
+    let frame = session.render_source(vp);
+    assert_eq!(frame.lines[0].text, "a  ");
+    assert_eq!(frame.lines[1].text, " z");
+    assert_eq!(frame.cursor, (1, 1));
+    for (row, column) in [(0, 1), (0, 2), (1, 0)] {
+        assert_eq!(
+            session.source_offset_at_viewport_cell(vp, row, column),
+            Some(1)
+        );
+    }
+    assert_eq!(session.source_offset_at_viewport_cell(vp, 1, 1), Some(2));
+    assert_eq!(session.visual_row_info(0, 2, 3, true), (1, 2));
+}
+
+#[test]
+fn horizontal_source_window_clips_expanded_tabs_without_claiming_indicators() {
+    let mut session = EditorSession::from_text("a\tz");
+    enter_insert(&mut session);
+    move_right(&mut session, 2);
+    let vp = viewport(4, 1, false, 1, 0);
+    let frame = session.render_source(vp);
+    assert_eq!(frame.lines[0].text, "«  z");
+    assert_eq!(frame.cursor, (0, 3));
+    assert_eq!(session.source_offset_at_viewport_cell(vp, 0, 0), Some(1));
+    assert_eq!(session.source_offset_at_viewport_cell(vp, 0, 1), Some(1));
+    assert_eq!(session.source_offset_at_viewport_cell(vp, 0, 2), Some(1));
+    assert_eq!(session.source_offset_at_viewport_cell(vp, 0, 3), Some(2));
+}
+
+#[test]
+fn tab_after_wide_character_clips_at_cell_width_in_nowrap() {
+    let mut session = EditorSession::from_text("界\tz");
+    let vp = viewport(4, 1, false, 0, 0);
+    let frame = session.render_source(vp);
+    assert_eq!(frame.lines[0].text, "界 »");
+    assert_eq!(session.source_offset_at_viewport_cell(vp, 0, 0), Some(0));
+    assert_eq!(session.source_offset_at_viewport_cell(vp, 0, 1), Some(0));
+    assert_eq!(session.source_offset_at_viewport_cell(vp, 0, 2), Some(3));
+    assert_eq!(session.source_offset_at_viewport_cell(vp, 0, 3), Some(4));
+
+    let wrapped = viewport(4, 2, true, 0, 0);
+    let frame = session.render_source(wrapped);
+    assert_eq!(frame.lines[0].text, "界  ");
+    assert_eq!(frame.lines[1].text, "z");
+    assert_eq!(
+        session.source_offset_at_viewport_cell(wrapped, 0, 3),
+        Some(3)
+    );
+    assert_eq!(
+        session.source_offset_at_viewport_cell(wrapped, 1, 0),
+        Some(4)
+    );
+}
+
+#[test]
 fn render_source_wraps_long_line() {
     let mut session = EditorSession::from_text(&long_line(100));
     let frame = session.render_source(viewport(40, 3, true, 0, 0));

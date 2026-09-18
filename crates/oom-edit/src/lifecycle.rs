@@ -1,6 +1,6 @@
 //! Closed App-owned lifecycle requests.
 //!
-//! Every target-relative request captures exactly one tab index. A save
+//! Target-relative requests capture their tab indices when created. A save
 //! continuation is relative to that same target, so the type cannot encode
 //! "save tab A, close tab B".
 
@@ -41,6 +41,10 @@ pub(crate) enum LifecycleAction {
     ReplaceTab {
         target: usize,
         path: PathBuf,
+        force: bool,
+    },
+    ReloadTabs {
+        targets: Vec<usize>,
         force: bool,
     },
     OpenTab {

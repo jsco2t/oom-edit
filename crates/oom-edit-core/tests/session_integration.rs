@@ -2,7 +2,7 @@
 
 use oom_edit_core::{
     ClipboardContent, EditorSession, Effect, KeyCode, KeyCodeKind, KeyInput, Mode, Modifiers,
-    RenderedLineRole, SelectionShape, SemanticStyle, Viewport,
+    RenderedLineRole, RenderedPoint, SelectionShape, SemanticStyle, Viewport,
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -20,6 +20,179 @@ fn special(kind: KeyCodeKind) -> KeyInput {
         code: KeyCode { kind },
         mods: Modifiers::default(),
     }
+}
+
+#[test]
+fn pointer_move_and_drag_follow_rendered_source_atoms() {
+    let source = "one **two** three\n\n| A | B |\n|---|---|\n| same | same |\n";
+    let mut session = EditorSession::from_text(source);
+    let layout = session.render_layout(18).clone();
+    let two = source.find("two").unwrap();
+    let start = layout
+        .lines
+        .iter()
+        .enumerate()
+        .flat_map(|(row, line)| {
+            line.atoms.iter().filter_map(move |atom| {
+                (atom.source.as_ref().is_some_and(|range| range.start == two)).then_some(
+                    RenderedPoint {
+                        row,
+                        column: atom.columns.start,
+                    },
+                )
+            })
+        })
+        .next()
+        .unwrap();
+    let end = layout
+        .lines
+        .iter()
+        .enumerate()
+        .flat_map(|(row, line)| {
+            line.atoms.iter().filter_map(move |atom| {
+                (atom
+                    .source
+                    .as_ref()
+                    .is_some_and(|range| range.start == two + 2))
+                .then_some(RenderedPoint {
+                    row,
+                    column: atom.columns.start,
+                })
+            })
+        })
+        .next()
+        .unwrap();
+    session.move_to_rendered_point(start);
+    assert_eq!(session.cursor(), (0, 6));
+    session.select_rendered_points(start, end);
+    assert_eq!(session.mode(), Mode::Select);
+    assert_eq!(
+        session.rendered_selection().unwrap().source_ranges,
+        vec![two..two + 3]
+    );
+    assert_eq!(session.rendered_cursor(), end);
+
+    let repeated = source.rfind("same").unwrap();
+    let repeated_point = layout
+        .lines
+        .iter()
+        .enumerate()
+        .flat_map(|(row, line)| {
+            line.atoms.iter().filter_map(move |atom| {
+                (atom
+                    .source
+                    .as_ref()
+                    .is_some_and(|range| range.start == repeated))
+                .then_some(RenderedPoint {
+                    row,
+                    column: atom.columns.start,
+                })
+            })
+        })
+        .next()
+        .unwrap();
+    session.move_to_rendered_point(repeated_point);
+    assert_eq!(
+        session.position_for_offset(repeated).unwrap().line,
+        session.cursor().0
+    );
+    assert_eq!(session.rendered_cursor(), repeated_point);
+}
+
+#[test]
+fn pointer_mapping_handles_synthetic_cells_wide_unicode_and_source_windows() {
+    let mut session = EditorSession::from_text("ab界cd\nnext\n");
+    let layout = session.render_layout(4).clone();
+    let wide = layout
+        .lines
+        .iter()
+        .enumerate()
+        .flat_map(|(row, line)| {
+            line.atoms.iter().filter_map(move |atom| {
+                (atom.source.as_ref().is_some_and(|range| range.start == 2)).then_some(
+                    RenderedPoint {
+                        row,
+                        column: atom.columns.start + 1,
+                    },
+                )
+            })
+        })
+        .next()
+        .unwrap();
+    session.move_to_rendered_point(wide);
+    assert_eq!(session.cursor(), (0, 2));
+    let far = RenderedPoint {
+        row: usize::MAX,
+        column: usize::MAX,
+    };
+    session.move_to_rendered_point(far);
+    assert!(session.cursor().0 <= 1);
+
+    let viewport = Viewport {
+        top_line: 0,
+        height: 3,
+        width: 3,
+        wrap: true,
+        left_col: 0,
+        skip_rows: 1,
+    };
+    assert_eq!(
+        session.source_offset_at_viewport_cell(viewport, 0, 0),
+        Some(2)
+    );
+    assert_eq!(
+        session.source_offset_at_viewport_cell(viewport, 0, 1),
+        Some(2)
+    );
+    assert_eq!(
+        session.source_offset_at_viewport_cell(viewport, 2, 0),
+        Some(8)
+    );
+    assert_eq!(session.source_offset_at_viewport_cell(viewport, 3, 0), None);
+    let nowrap = Viewport {
+        wrap: false,
+        left_col: 2,
+        skip_rows: 0,
+        ..viewport
+    };
+    assert_eq!(
+        session.source_offset_at_viewport_cell(nowrap, 0, 0),
+        Some(5)
+    );
+    assert_eq!(
+        session.source_offset_at_viewport_cell(nowrap, 0, 1),
+        Some(5)
+    );
+    assert_eq!(
+        session.source_offset_at_viewport_cell(nowrap, 0, 2),
+        Some(6)
+    );
+}
+
+#[test]
+fn source_pointer_drag_enters_select_with_utf8_safe_ranges() {
+    let mut session = EditorSession::from_text("a界b\n");
+    session.handle_key(key('i'));
+    assert_eq!(session.mode(), Mode::Insert);
+    let error = session.select_source_offsets(2, 4, 20).unwrap_err();
+    assert_eq!(error, oom_edit_core::PositionError::NotCharBoundary);
+    assert_eq!(session.mode(), Mode::Insert);
+    session.select_source_offsets(1, 4, 20).unwrap();
+    assert_eq!(session.mode(), Mode::Select);
+    assert_eq!(
+        session.rendered_selection().unwrap().source_ranges,
+        vec![1..5]
+    );
+}
+
+#[test]
+fn insert_escape_accepts_multibyte_unicode_line_ending() {
+    let mut session = EditorSession::from_text("a\u{85}b");
+    session.handle_key(key('i'));
+    session.handle_key(key('Ω'));
+    session.handle_key(special(KeyCodeKind::Esc));
+    assert_eq!(session.mode(), Mode::Normal);
+    assert!(session.document().contains('Ω'));
 }
 
 fn ctrl(ch: char) -> KeyInput {
@@ -1727,6 +1900,296 @@ fn command_help_and_line_jump_return_to_rendered_normal() {
     }
     session.handle_key(special(KeyCodeKind::Enter));
     assert_eq!((session.mode(), session.cursor()), (Mode::Normal, (2, 0)));
+}
+
+#[test]
+fn ex_paths_are_literal_and_substitute_only_parses_at_the_command_prefix() {
+    let mut session = EditorSession::from_text("alpha\nalpha\n");
+    session.render_layout(60);
+    for (command, expected) in [
+        (
+            "tabnew ./examples/kitchen-sink.md",
+            "./examples/kitchen-sink.md",
+        ),
+        (
+            "tabnew /tmp/notes/spaced file!.md",
+            "/tmp/notes/spaced file!.md",
+        ),
+    ] {
+        for character in format!(":{command}").chars() {
+            session.handle_key(key(character));
+        }
+        let effects = session.handle_key(special(KeyCodeKind::Enter));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::TabNewRequested { path } if path == std::path::Path::new(expected)
+        )));
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Message { text, .. } if text.contains("substitute range")
+        )));
+    }
+
+    for character in ":e ./examples/kitchen-sink.md".chars() {
+        session.handle_key(key(character));
+    }
+    let effects = session.handle_key(special(KeyCodeKind::Enter));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::OpenRequested { path, force: false }
+            if path == std::path::Path::new("./examples/kitchen-sink.md")
+    )));
+
+    for character in ":w /tmp/notes/spaced file.md".chars() {
+        session.handle_key(key(character));
+    }
+    let effects = session.handle_key(special(KeyCodeKind::Enter));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SaveRequested { path: Some(path), .. }
+            if path == std::path::Path::new("/tmp/notes/spaced file.md")
+    )));
+
+    for character in ":%s/alpha/beta/g".chars() {
+        session.handle_key(key(character));
+    }
+    session.handle_key(special(KeyCodeKind::Enter));
+    assert_eq!(session.document(), "beta\nbeta\n");
+}
+
+#[test]
+fn reload_commands_emit_explicit_effects_without_empty_open_paths() {
+    let mut session = EditorSession::from_text("current\n");
+    session.render_layout(60);
+    for (command, expected) in [
+        ("e", Effect::ReloadCurrentRequested { force: false }),
+        ("e!", Effect::ReloadCurrentRequested { force: true }),
+        ("reload", Effect::ReloadCurrentRequested { force: true }),
+        ("reload-all", Effect::ReloadAllRequested),
+    ] {
+        for character in format!(":{command}").chars() {
+            session.handle_key(key(character));
+        }
+        let effects = session.handle_key(special(KeyCodeKind::Enter));
+        assert!(effects.contains(&expected), "{command}: {effects:?}");
+    }
+    for character in ":reload extra".chars() {
+        session.handle_key(key(character));
+    }
+    let effects = session.handle_key(special(KeyCodeKind::Enter));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Message {
+            severity: oom_edit_core::Severity::Warning,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn ex_history_keeps_ten_submissions_and_restores_draft_after_navigation() {
+    let mut session = EditorSession::from_text("text\n");
+    session.render_layout(60);
+    for number in 0..12 {
+        for character in format!(":unknown{number}").chars() {
+            session.handle_key(key(character));
+        }
+        session.handle_key(special(KeyCodeKind::Enter));
+    }
+    for character in ":draft".chars() {
+        session.handle_key(key(character));
+    }
+    session.handle_key(special(KeyCodeKind::Up));
+    assert_eq!(session.command_line().as_deref(), Some("unknown11"));
+    for _ in 0..20 {
+        session.handle_key(special(KeyCodeKind::Up));
+    }
+    assert_eq!(session.command_line().as_deref(), Some("unknown2"));
+    for _ in 0..9 {
+        session.handle_key(special(KeyCodeKind::Down));
+    }
+    assert_eq!(session.command_line().as_deref(), Some("unknown11"));
+    session.handle_key(special(KeyCodeKind::Down));
+    assert_eq!(session.command_line().as_deref(), Some("draft"));
+    session.handle_key(special(KeyCodeKind::Down));
+    assert_eq!(session.command_line().as_deref(), Some("draft"));
+    session.handle_key(special(KeyCodeKind::Esc));
+    assert_eq!(session.mode(), Mode::Normal);
+    session.handle_key(key(':'));
+    session.handle_key(special(KeyCodeKind::Up));
+    assert_eq!(session.command_line().as_deref(), Some("unknown11"));
+}
+
+#[test]
+fn ex_history_detaches_on_edits_and_does_not_persist_to_new_session() {
+    let mut session = EditorSession::from_text("text\n");
+    session.render_layout(60);
+    for character in ":unknown".chars() {
+        session.handle_key(key(character));
+    }
+    session.handle_key(special(KeyCodeKind::Enter));
+    session.handle_key(key(':'));
+    session.handle_key(special(KeyCodeKind::Up));
+    session.handle_key(special(KeyCodeKind::Backspace));
+    session.handle_key(key('x'));
+    assert_eq!(session.command_line().as_deref(), Some("unknowx"));
+    session.handle_key(special(KeyCodeKind::Up));
+    assert_eq!(session.command_line().as_deref(), Some("unknown"));
+    session.handle_key(special(KeyCodeKind::Down));
+    assert_eq!(session.command_line().as_deref(), Some("unknowx"));
+    session.handle_key(special(KeyCodeKind::Enter));
+    session.handle_key(key(':'));
+    session.handle_key(special(KeyCodeKind::Up));
+    assert_eq!(session.command_line().as_deref(), Some("unknowx"));
+    session.handle_key(special(KeyCodeKind::Esc));
+
+    let mut fresh = EditorSession::from_text("text\n");
+    fresh.render_layout(60);
+    fresh.handle_key(key(':'));
+    fresh.handle_key(special(KeyCodeKind::Up));
+    assert_eq!(fresh.command_line().as_deref(), Some(""));
+}
+
+#[test]
+fn ex_history_keeps_duplicates_and_paste_detaches_recalled_path() {
+    let mut session = EditorSession::from_text("text\n");
+    session.render_layout(60);
+    for _ in 0..2 {
+        for character in ":tabnew ./old".chars() {
+            session.handle_key(key(character));
+        }
+        session.handle_key(special(KeyCodeKind::Enter));
+    }
+    session.handle_key(key(':'));
+    session.handle_key(special(KeyCodeKind::Up));
+    assert_eq!(session.command_line().as_deref(), Some("tabnew ./old"));
+    session.insert_paste("-edited.md");
+    assert_eq!(
+        session.command_line().as_deref(),
+        Some("tabnew ./old-edited.md")
+    );
+    session.handle_key(special(KeyCodeKind::Up));
+    assert_eq!(session.command_line().as_deref(), Some("tabnew ./old"));
+    session.handle_key(special(KeyCodeKind::Down));
+    assert_eq!(
+        session.command_line().as_deref(),
+        Some("tabnew ./old-edited.md")
+    );
+    session.handle_key(special(KeyCodeKind::Esc));
+    session.handle_key(key(':'));
+    session.handle_key(special(KeyCodeKind::Up));
+    session.handle_key(special(KeyCodeKind::Up));
+    session.handle_key(special(KeyCodeKind::Down));
+    assert_eq!(session.command_line().as_deref(), Some("tabnew ./old"));
+    session.handle_key(special(KeyCodeKind::Down));
+    assert_eq!(session.command_line().as_deref(), Some(""));
+    session.handle_key(special(KeyCodeKind::Enter));
+    session.handle_key(key(':'));
+    session.handle_key(special(KeyCodeKind::Up));
+    assert_eq!(session.command_line().as_deref(), Some("tabnew ./old"));
+}
+
+#[test]
+fn prefilled_command_prompt_waits_for_submission_and_preserves_history_rules() {
+    let mut session = EditorSession::from_text("unchanged\n");
+    session.render_layout(60);
+    let effects = session.open_command_prompt("wq");
+    assert_eq!(effects, vec![Effect::ModeChanged(Mode::Command)]);
+    assert_eq!(session.command_line().as_deref(), Some("wq"));
+    assert_eq!(session.document(), "unchanged\n");
+    let rejected = session.open_command_prompt("q");
+    assert!(rejected
+        .iter()
+        .any(|effect| matches!(effect, Effect::Message { .. })));
+    assert_eq!(session.command_line().as_deref(), Some("wq"));
+    let effects = session.handle_key(special(KeyCodeKind::Enter));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SaveRequested {
+            then_quit: true,
+            ..
+        }
+    )));
+    session.handle_key(key(':'));
+    session.handle_key(special(KeyCodeKind::Up));
+    assert_eq!(session.command_line().as_deref(), Some("wq"));
+    session.handle_key(special(KeyCodeKind::Esc));
+
+    session.open_command_prompt("q!");
+    session.handle_key(special(KeyCodeKind::Esc));
+    session.handle_key(key(':'));
+    session.handle_key(special(KeyCodeKind::Up));
+    assert_eq!(session.command_line().as_deref(), Some("wq"));
+
+    for invalid in [":q", "q\nqa!", "q\0"] {
+        let mut fresh = EditorSession::from_text("unchanged\n");
+        let effects = fresh.open_command_prompt(invalid);
+        assert!(effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Message { .. })));
+        assert_eq!(fresh.mode(), Mode::Normal);
+        assert_eq!(fresh.document(), "unchanged\n");
+    }
+}
+
+#[test]
+fn prefilled_command_prompt_accepts_rendered_selection() {
+    for selection in [
+        key('v'),
+        key('V'),
+        KeyInput {
+            code: KeyCode {
+                kind: KeyCodeKind::Char('v'),
+            },
+            mods: Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            },
+        },
+    ] {
+        let mut session = EditorSession::from_text("one two\n");
+        session.render_layout(60);
+        session.handle_key(selection);
+        assert_eq!(session.mode(), Mode::Select);
+        assert_eq!(
+            session.open_command_prompt("e "),
+            vec![Effect::ModeChanged(Mode::Command)]
+        );
+        assert_eq!(session.command_line().as_deref(), Some("e "));
+        session.handle_key(special(KeyCodeKind::Esc));
+        assert_eq!(session.document(), "one two\n");
+    }
+}
+
+#[test]
+fn command_paste_accepts_one_ascii_path_and_rejects_control_input_atomically() {
+    let mut session = EditorSession::from_text("keep\n");
+    session.render_layout(60);
+    for character in ":tabnew".chars() {
+        session.handle_key(key(character));
+    }
+    assert!(session
+        .insert_paste(" ./examples/kitchen-sink.md\r\n")
+        .is_empty());
+    assert_eq!(
+        session.command_line().as_deref(),
+        Some("tabnew ./examples/kitchen-sink.md")
+    );
+    for invalid in ["bad\n:qa!", "bad\0path", "café.md", "bad\tpath"] {
+        let before = session.command_line();
+        let effects = session.insert_paste(invalid);
+        assert!(effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Message { .. })));
+        assert_eq!(session.command_line(), before);
+        assert_eq!(session.document(), "keep\n");
+    }
+    let effects = session.handle_key(special(KeyCodeKind::Enter));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::TabNewRequested { path }
+            if path == std::path::Path::new("./examples/kitchen-sink.md")
+    )));
 }
 
 #[test]

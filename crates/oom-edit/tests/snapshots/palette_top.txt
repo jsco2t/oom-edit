@@ -1,24 +1,24 @@
-   1 ┌─ metadata ──────────────────────────────────────────────────────────────┐
-   2 │ title: Kitchen Sink                                                     │
-   3 │ a┌ Command Palette ─────────────────────────────────────────────┐       │
-   4 └──│>                                                             │───────┘
+  1 ┌─ metadata ───────────────────────────────────────────────────────────────┐
+  2 │ title: Kitchen Sink                                                      │
+  3 │ au┌ Command Palette ─────────────────────────────────────────────┐       │
+  4 └───│>                                                             │───────┘
         │                                                              │
-   6 █ H│▸ v              character-wise selection       select-charac…│
+  6 █ He│· v              character-wise selection       select-charac…│
         │· V              line-wise selection            select-line   │
-   8 Som│· Ctrl-V         block-wise selection           select-block  │
+  8 Some│· Ctrl-V         block-wise selection           select-block  │
         │· Esc / Ctrl-C   cancel selection               cancel-select │
-  10 ┃ A│· "{register}    select register                select-regist…│
+ 10 ┃ A │· "{register}    select register                select-regist…│
         │· y              yank (Markdown by default) to… select-yank   │
-     ▏ r│· Y              yank and send plain text to c… select-yank-p…│
-  13 ▏ f│· d / x          delete selection               select-delete │
-  14 ▏  │· c              change selection               select-change │
-  15 ▏ }│· >              indent selection               select-indent │
-     ▏  │· <              outdent selection              select-outdent│
+    ▏ ru│· Y              yank and send plain text to c… select-yank-p…│
+ 13 ▏ fn│· d / x          delete selection               select-delete │
+ 14 ▏   │· c              change selection               select-change │
+ 15 ▏ } │· >              indent selection               select-indent │
+    ▏   │· <              outdent selection              select-outdent│
         │· o              swap selection endpoint        select-swap-a…│
-  18 ───│· /              search rendered text           search        │────────
+ 18 ────│· /              search rendered text           search        │────────
         │· :              enter Command mode             command       │
-  20 Ano│  help           command palette                Space h       │
+ 20 Anot│▸ help           command palette                ? / Space h/? │
         └──────────────────────────────────────────────────────────────┘
-  22 More text here.
+ 22 More text here.
 
- NORMAL  ↑↓ navigate · type to filter · Enter execute · Esc close
+ NORMAL  ↑↓ navigate · type to filter · Enter run/open ex · Esc close

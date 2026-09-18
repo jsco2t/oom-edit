@@ -13,50 +13,101 @@ use ratatui::{
     Frame,
 };
 
-use crate::command::{rendered_binding, AppCommand, BindingRole, Contexts};
+#[cfg(test)]
+use crate::command::rendered_binding;
+use crate::command::{rendered_binding_for, AppCommand, BindingRole, Contexts};
 use crate::theme::{Theme, Tier, UiSlot};
 
 // ── Vim reference table ─────────────────────────────────────────────────────
 
 /// Static reference entries for the supported four-mode interaction model.
-/// Format: `(keys, description, row-id)`.
-pub static VIM_REFERENCE: &[(&str, &str, &str)] = &[
-    ("j/k, ↑/↓", "Move by rendered row.", "R-N1"),
-    ("gg / G", "Jump to the first / last rendered row.", "R-N2"),
-    ("Tab / S-Tab", "Move between rendered jump targets.", "R-N3"),
-    ("/pattern⏎", "Search rendered text forward.", "R-N4"),
-    ("?pattern⏎", "Search rendered text backward.", "R-N4"),
-    ("n / N", "Repeat the rendered search.", "R-N4"),
-    ("i/a/I/A/o/O", "Enter source Insert mode.", "R-I1"),
-    ("Esc", "Return from Insert to rendered Normal.", "R-I2"),
-    ("u / <C-r>", "Undo / redo.", "R-E1"),
-    (":w", "Save (atomic).", "V-X1"),
+/// Format: `(keys, description, row-id, editable ex prefill)`.
+pub static VIM_REFERENCE: &[(&str, &str, &str, Option<&str>)] = &[
+    ("j/k, ↑/↓", "Move by rendered row.", "R-N1", None),
+    (
+        "gg / G",
+        "Jump to the first / last rendered row.",
+        "R-N2",
+        None,
+    ),
+    (
+        "Tab / S-Tab",
+        "Move between rendered jump targets.",
+        "R-N3",
+        None,
+    ),
+    ("/pattern⏎", "Search rendered text forward.", "R-N4", None),
+    ("n / N", "Repeat the rendered search.", "R-N4", None),
+    ("i/a/I/A/o/O", "Enter source Insert mode.", "R-I1", None),
+    (
+        "Esc",
+        "Return from Insert to rendered Normal.",
+        "R-I2",
+        None,
+    ),
+    ("u / <C-r>", "Undo / redo.", "R-E1", None),
+    (":w", "Save (atomic).", "V-X1", Some("w")),
     (
         ":w {path}",
         "Save a copy to path without retargeting buffer.",
         "V-X1",
+        Some("w "),
     ),
-    (":q", "Quit; refuses if dirty.", "V-X2"),
-    (":q!", "Quit; discards changes.", "V-X2"),
-    (":wq", "Save then quit.", "V-X3"),
-    (":x", "Save then quit (if changed).", "V-X3"),
+    (":q", "Quit; refuses if dirty.", "V-X2", Some("q")),
+    (":q!", "Quit; discards changes.", "V-X2", Some("q!")),
+    (":wq", "Save then quit.", "V-X3", Some("wq")),
+    (":x", "Save then quit (if changed).", "V-X3", Some("x")),
     (
         ":e {path}",
         "Open file; refuses if dirty without !.",
         "V-X4",
+        Some("e "),
     ),
-    (":e!", "Reload current file from disk.", "V-X4"),
+    (":e!", "Reload current file from disk.", "V-X4", Some("e!")),
+    (
+        ":reload",
+        "Reload current file from disk.",
+        "V-X4",
+        Some("reload"),
+    ),
+    (
+        ":reload-all",
+        "Reload every open tab from disk.",
+        "V-X4",
+        Some("reload-all"),
+    ),
     (
         ":saveas {path}",
         "Save to path and retarget buffer.",
         "V-X5",
+        Some("saveas "),
     ),
-    (":{number}", "Jump to line.", "V-X6"),
-    (":s/pat/rep/", "Substitute on current line.", "V-X7"),
-    (":s/pat/rep/g", "Substitute all on current line.", "V-X7"),
-    (":%s/pat/rep/g", "Substitute all in document.", "V-X7"),
-    (":noh", "Clear search-match highlighting.", "V-X8"),
-    (":help", "Open the command palette.", "V-X8"),
+    (":{number}", "Jump to line.", "V-X6", None),
+    (
+        ":s/pat/rep/",
+        "Substitute on current line.",
+        "V-X7",
+        Some("s/"),
+    ),
+    (
+        ":s/pat/rep/g",
+        "Substitute all on current line.",
+        "V-X7",
+        Some("s/"),
+    ),
+    (
+        ":%s/pat/rep/g",
+        "Substitute all in document.",
+        "V-X7",
+        Some("%s/"),
+    ),
+    (
+        ":noh",
+        "Clear search-match highlighting.",
+        "V-X8",
+        Some("noh"),
+    ),
+    (":help", "Open the command palette.", "V-X8", Some("help")),
 ];
 
 // ── Palette state ───────────────────────────────────────────────────────────
@@ -87,12 +138,14 @@ impl Default for PaletteState {
 impl PaletteState {
     /// Create a palette whose command availability reflects `context`.
     pub fn new(context: Contexts) -> Self {
-        Self {
+        let mut state = Self {
             filter: String::new(),
             selected: 0,
             context,
             last_was_reference: false,
-        }
+        };
+        state.select_first_action();
+        state
     }
 
     /// Get the current filter text (test-only).
@@ -118,7 +171,15 @@ pub(crate) enum PaletteRow {
         keys: String,
         desc: String,
         row_id: String,
+        prefill: Option<&'static str>,
     },
+}
+
+/// What Enter can do with the focused palette row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaletteAction {
+    App(AppCommand),
+    ExPrefill(&'static str),
 }
 
 impl PaletteState {
@@ -129,7 +190,7 @@ impl PaletteState {
         // App commands section.
         for spec in crate::command::COMMANDS {
             let enabled = spec.contexts.contains(ctx);
-            let keys = rendered_binding(spec);
+            let keys = rendered_binding_for(spec, ctx);
             match spec.binding {
                 BindingRole::AppChord { command, .. } => rows.push(PaletteRow::Command {
                     id: command,
@@ -138,24 +199,30 @@ impl PaletteState {
                     keys,
                     disabled: !enabled,
                 }),
-                BindingRole::AppSpaceDigit
-                | BindingRole::CoreKey { .. }
-                | BindingRole::CoreEx { .. } => {
+                BindingRole::AppSpaceDigit | BindingRole::CoreKey { .. } => {
                     rows.push(PaletteRow::Reference {
                         keys,
                         desc: spec.desc.to_string(),
                         row_id: spec.conformance_id.unwrap_or(spec.name).to_string(),
+                        prefill: None,
                     });
                 }
+                BindingRole::CoreEx { prefill, .. } => rows.push(PaletteRow::Reference {
+                    keys,
+                    desc: spec.desc.to_string(),
+                    row_id: spec.conformance_id.unwrap_or(spec.name).to_string(),
+                    prefill,
+                }),
             }
         }
 
         // Vim reference section.
-        for (keys, desc, row_id) in VIM_REFERENCE {
+        for (keys, desc, row_id, prefill) in VIM_REFERENCE {
             rows.push(PaletteRow::Reference {
                 keys: keys.to_string(),
                 desc: desc.to_string(),
                 row_id: row_id.to_string(),
+                prefill: *prefill,
             });
         }
 
@@ -176,9 +243,9 @@ impl PaletteState {
                 PaletteRow::Command {
                     name, desc, keys, ..
                 } => format!("{} {} {}", name, desc, keys).to_lowercase(),
-                PaletteRow::Reference { keys, desc, row_id } => {
-                    format!("{} {} {}", keys, desc, row_id).to_lowercase()
-                }
+                PaletteRow::Reference {
+                    keys, desc, row_id, ..
+                } => format!("{} {} {}", keys, desc, row_id).to_lowercase(),
             };
 
             if fuzzy_match(&lower, &searchable) {
@@ -187,6 +254,28 @@ impl PaletteState {
         }
 
         indices
+    }
+
+    fn action_positions(&self, rows: &[PaletteRow]) -> Vec<usize> {
+        self.filter_rows(rows)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(position, row_index)| {
+                matches!(
+                    rows[row_index],
+                    PaletteRow::Command {
+                        disabled: false,
+                        ..
+                    }
+                )
+                .then_some(position)
+            })
+            .collect()
+    }
+
+    fn select_first_action(&mut self) {
+        let rows = self.build_rows(self.context);
+        self.selected = self.action_positions(&rows).first().copied().unwrap_or(0);
     }
 
     /// Get the visible (filtered) row at the selected index.
@@ -227,20 +316,21 @@ impl PaletteState {
             KeyCodeKind::Down | KeyCodeKind::Tab => {
                 let rows = self.build_rows(self.context);
                 let visible_count = self.filter_rows(&rows).len();
-                if self.selected.saturating_add(1) < visible_count {
-                    self.selected += 1;
-                }
+                self.selected = self
+                    .selected
+                    .saturating_add(1)
+                    .min(visible_count.saturating_sub(1));
                 return true;
             }
             KeyCodeKind::Char(c) if !key.mods.ctrl && !key.mods.alt => {
                 // Append to filter.
                 self.filter.push(*c);
-                self.selected = 0;
+                self.select_first_action();
                 return true;
             }
             KeyCodeKind::Backspace => {
                 self.filter.pop();
-                self.selected = 0;
+                self.select_first_action();
                 return true;
             }
             _ => {}
@@ -315,10 +405,31 @@ impl PaletteState {
     /// Hint string.
     #[allow(dead_code)]
     pub fn hints(&self) -> &'static str {
-        "↑↓ navigate · type to filter · Enter execute · Esc close"
+        "↑↓ navigate · type to filter · Enter run/open ex · Esc close"
+    }
+
+    pub(crate) fn selected_action(&self) -> Option<PaletteAction> {
+        let all_rows = self.build_rows(self.context);
+        let visible_indices = self.filter_rows(&all_rows);
+        match visible_indices
+            .get(self.selected)
+            .and_then(|&row_idx| all_rows.get(row_idx))?
+        {
+            PaletteRow::Command {
+                id,
+                disabled: false,
+                ..
+            } => Some(PaletteAction::App(*id)),
+            PaletteRow::Reference {
+                prefill: Some(text),
+                ..
+            } => Some(PaletteAction::ExPrefill(text)),
+            _ => None,
+        }
     }
 
     /// Get the command to execute (if the selected row is a Command).
+    #[cfg(test)]
     pub fn selected_command(&self) -> Option<AppCommand> {
         let all_rows = self.build_rows(self.context);
         let visible_indices = self.filter_rows(&all_rows);
@@ -394,10 +505,14 @@ fn palette_line(row: &PaletteRow, selected: bool, width: u16) -> String {
             disabled,
             ..
         } => (
-            if selected {
+            if *disabled {
+                if selected {
+                    "×›"
+                } else {
+                    "× "
+                }
+            } else if selected {
                 "▸ "
-            } else if *disabled {
-                "× "
             } else {
                 "  "
             },
@@ -405,8 +520,18 @@ fn palette_line(row: &PaletteRow, selected: bool, width: u16) -> String {
             desc.as_str(),
             keys.as_str(),
         ),
-        PaletteRow::Reference { keys, desc, row_id } => (
-            if selected { "▸ " } else { "· " },
+        PaletteRow::Reference {
+            keys,
+            desc,
+            row_id,
+            prefill,
+        } => (
+            match (selected, prefill.is_some()) {
+                (true, true) => "↳ ",
+                (false, true) => "◦ ",
+                (true, false) => "› ",
+                (false, false) => "· ",
+            },
             keys.as_str(),
             desc.as_str(),
             row_id.as_str(),
@@ -575,6 +700,7 @@ mod tests {
             keys: "/pattern⏎".to_string(),
             desc: "Search rendered text forward.".to_string(),
             row_id: "R-N4".to_string(),
+            prefill: None,
         };
         for width in [40, 80] {
             let command = palette_line(&command, false, width);
@@ -675,28 +801,112 @@ mod tests {
             ..PaletteState::default()
         };
         let rows = palette.build_rows(Contexts::ALL);
-        assert_eq!(palette.filter_rows(&rows).len(), 3);
+        assert!(palette.filter_rows(&rows).len() >= 2);
 
         let down = key(KeyCodeKind::Down);
         for _ in 0..5 {
             assert!(palette.handle_key(&down));
         }
-        assert_eq!(palette.selected, 2);
+        assert_eq!(palette.selected_command(), None);
 
         assert!(palette.handle_key(&key(KeyCodeKind::Tab)));
-        assert_eq!(palette.selected, 2);
+        assert_eq!(palette.selected_command(), None);
     }
 
     #[test]
     fn palette_selects_an_executable_app_command() {
-        let palette = PaletteState {
-            filter: "help".to_string(),
-            ..PaletteState::new(Contexts::ALL)
-        };
+        let mut palette = PaletteState::new(Contexts::ALL);
+        for character in "help".chars() {
+            palette.handle_key(&key(KeyCodeKind::Char(character)));
+        }
         let rows = palette.build_rows(Contexts::ALL);
         let visible_rows = palette.filter_rows(&rows);
         assert_eq!(visible_rows.len(), 3);
         assert_eq!(palette.selected_command(), Some(AppCommand::Help));
+    }
+
+    #[test]
+    fn palette_focus_traverses_actions_references_and_disabled_rows_in_each_mode() {
+        for context in [Contexts::NORMAL, Contexts::SELECT] {
+            let mut palette = PaletteState::new(context);
+            assert_eq!(palette.selected_command(), Some(AppCommand::Help));
+            let rows = palette.build_rows(context);
+            let focused = &rows[palette.selected];
+            assert!(palette_line(focused, true, 60).starts_with("▸ "));
+
+            let help_index = palette.selected;
+            for _ in 0..help_index {
+                palette.handle_key(&key(KeyCodeKind::Up));
+            }
+            assert_eq!(palette.selected, 0);
+            assert_eq!(palette.selected_command(), None);
+            assert!(palette_line(&rows[0], true, 60).starts_with("› "));
+            palette.handle_key(&key(KeyCodeKind::BackTab));
+            assert_eq!(palette.selected, 0);
+            for _ in 0..help_index {
+                palette.handle_key(&key(KeyCodeKind::Tab));
+            }
+            assert_eq!(palette.selected_command(), Some(AppCommand::Help));
+            palette.handle_key(&key(KeyCodeKind::Down));
+            assert_eq!(palette.selected_command(), Some(AppCommand::Save));
+            palette.handle_key(&key(KeyCodeKind::Up));
+            assert_eq!(palette.selected_command(), Some(AppCommand::Help));
+            for _ in 0..rows.len() + 5 {
+                palette.handle_key(&key(KeyCodeKind::Down));
+            }
+            assert_eq!(palette.selected, rows.len() - 1);
+            assert_eq!(palette.selected_command(), None);
+            assert!(palette_line(&rows[palette.selected], true, 60).starts_with("↳ "));
+            palette.handle_key(&key(KeyCodeKind::Tab));
+            assert_eq!(palette.selected, rows.len() - 1);
+            palette.handle_key(&key(KeyCodeKind::BackTab));
+            assert_eq!(palette.selected, rows.len() - 2);
+        }
+
+        let mut command_context = PaletteState::new(Contexts::COMMAND);
+        let rows = command_context.build_rows(Contexts::COMMAND);
+        let disabled_index = rows
+            .iter()
+            .position(|row| matches!(row, PaletteRow::Command { disabled: true, .. }))
+            .unwrap();
+        for _ in 0..disabled_index {
+            command_context.handle_key(&key(KeyCodeKind::Down));
+        }
+        assert_eq!(command_context.selected, disabled_index);
+        assert_eq!(command_context.selected_command(), None);
+        assert!(palette_line(&rows[disabled_index], true, 60).starts_with("×›"));
+    }
+
+    #[test]
+    fn palette_scrolls_to_focused_row_below_the_visible_list() {
+        for (width, height) in [(40, 12), (80, 24)] {
+            let mut palette = PaletteState::new(Contexts::NORMAL);
+            let count = palette.build_rows(Contexts::NORMAL).len();
+            for _ in 0..count {
+                palette.handle_key(&key(KeyCodeKind::Down));
+            }
+            assert_eq!(palette.selected, count - 1);
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| palette.render(frame, &DEFAULT_DARK, Tier::TrueColor))
+                .unwrap();
+            let area = palette_area(Rect::new(0, 0, width, height));
+            let buffer = terminal.backend().buffer();
+            let visible: String = (area.y..area.bottom())
+                .flat_map(|y| {
+                    (area.x..area.right())
+                        .map(move |x| buffer.cell((x, y)).unwrap().symbol().to_string())
+                })
+                .collect();
+            assert!(
+                visible.contains(":help"),
+                "last row is not visible at {width}×{height}"
+            );
+            assert!(
+                visible.contains('↳'),
+                "focused ex row has no visible marker"
+            );
+        }
     }
 
     #[test]
@@ -746,6 +956,27 @@ mod tests {
     }
 
     #[test]
+    fn palette_help_row_lists_only_contextual_question_shortcuts() {
+        let palette = PaletteState::new(Contexts::NORMAL);
+        let help_keys = |context| {
+            palette
+                .build_rows(context)
+                .into_iter()
+                .find_map(|row| match row {
+                    PaletteRow::Command {
+                        id: AppCommand::Help,
+                        keys,
+                        ..
+                    } => Some(keys),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(help_keys(Contexts::NORMAL), "? / Space h/?");
+        assert_eq!(help_keys(Contexts::SELECT), "? / Space h/?");
+    }
+
+    #[test]
     fn selected_disabled_palette_command_is_not_executable() {
         let palette = PaletteState {
             filter: "select-yank".to_string(),
@@ -764,23 +995,66 @@ mod tests {
         assert!(palette.filter_rows(&rows).is_empty());
 
         assert!(palette.handle_key(&key(KeyCodeKind::Down)));
-        assert_eq!(palette.selected, 0);
+        assert_eq!(palette.selected_command(), None);
     }
 
     #[test]
     fn vim_reference_has_entries() {
         assert!(!VIM_REFERENCE.is_empty());
-        // Check that every entry has all three fields.
-        for (keys, desc, row_id) in VIM_REFERENCE {
+        // Check that every entry has its required display fields.
+        for (keys, desc, row_id, prefill) in VIM_REFERENCE {
             assert!(!keys.is_empty(), "keys should not be empty");
             assert!(!desc.is_empty(), "desc should not be empty");
             assert!(!row_id.is_empty(), "row_id should not be empty");
+            if let Some(text) = prefill {
+                assert!(
+                    keys.starts_with(':'),
+                    "ex prefill requires an ex row: {keys}"
+                );
+                assert!(!text.is_empty());
+                assert!(!text.starts_with(':'));
+                assert!(!text.chars().any(char::is_control));
+                assert!(
+                    !text.contains('{') && !text.contains('}'),
+                    "placeholder leaked into {keys}"
+                );
+            }
         }
     }
 
     #[test]
+    fn palette_ex_rows_have_explicit_prefills_and_ambiguous_rows_stay_read_only() {
+        let mut palette = PaletteState::new(Contexts::NORMAL);
+        let rows = palette.build_rows(Contexts::NORMAL);
+        for (keys, expected) in [
+            (":wq", Some("wq")),
+            (":q!", Some("q!")),
+            (":e {path}", Some("e ")),
+            (":tabnew {path}", Some("tabnew ")),
+            (":tabclose", Some("tabclose")),
+            (":set spell / :set nospell", None),
+            (":{number}", None),
+        ] {
+            palette.selected = rows
+                .iter()
+                .position(|row| matches!(row, PaletteRow::Reference { keys: row_keys, .. } if row_keys == keys))
+                .unwrap();
+            assert_eq!(
+                palette.selected_action(),
+                expected.map(PaletteAction::ExPrefill),
+                "{keys}"
+            );
+        }
+        palette.selected = rows
+            .iter()
+            .position(|row| matches!(row, PaletteRow::Reference { keys, .. } if keys == "j/k, ↑/↓"))
+            .unwrap();
+        assert_eq!(palette.selected_action(), None);
+    }
+
+    #[test]
     fn vim_reference_covers_all_sections() {
-        let row_ids: Vec<&str> = VIM_REFERENCE.iter().map(|(_, _, id)| *id).collect();
+        let row_ids: Vec<&str> = VIM_REFERENCE.iter().map(|(_, _, id, _)| *id).collect();
         let sections = ["R-N", "R-I", "R-E", "V-X"];
         for section in sections {
             assert!(

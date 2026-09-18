@@ -725,6 +725,30 @@ fn source_frame_decorations_use_display_cells_and_preserve_semantic_spans() {
     assert!(disabled.decorations.is_empty());
 }
 
+#[test]
+fn source_tab_expansion_keeps_spell_decoration_on_the_visible_word() {
+    let engine = engine("known\n");
+    let mut session = EditorSession::from_text("#\twrng known\n");
+    drain(&mut session, &engine, 5);
+    let frame = session.render_source(Viewport {
+        top_line: 0,
+        height: 1,
+        width: 24,
+        wrap: true,
+        left_col: 0,
+        skip_rows: 0,
+    });
+    assert_eq!(frame.lines[0].text, "#   wrng known");
+    assert!(frame.lines[0]
+        .spans
+        .iter()
+        .any(|span| span.style == SemanticStyle::Heading1 && span.end_col >= 8));
+    assert!(frame
+        .decorations
+        .iter()
+        .any(|decoration| decoration.row == 0 && decoration.columns == (4..8)));
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 48,

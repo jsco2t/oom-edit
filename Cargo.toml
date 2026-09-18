@@ -20,4 +20,5 @@ doc_markdown = "allow"
 [patch.crates-io]
 dirs-sys = { path = "crates/dirs-sys-patched" }
 hjkl-buffer = { path = "patches/hjkl-buffer" }
+hjkl-engine = { path = "patches/hjkl-engine" }
 tree-sitter-md = { path = "patches/tree-sitter-md" }

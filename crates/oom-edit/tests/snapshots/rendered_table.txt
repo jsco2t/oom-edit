@@ -1,11 +1,11 @@
-     ─────────────────┬──────────────────────────┐
-   1  naturally wide  │     Right naturally wide │
-                      │ column                   │
-     ─────────────────┼──────────────────────────┤
-   3 京 東 京 東 京 東 京    │   final repeated content │
-     -----------------│--------------------------│
-   4  column content  │       second final value │
-     ─────────────────┴──────────────────────────┘
+   ───────────────────┬──────────────────────────┐
+ 1 er naturally wide  │     Right naturally wide │
+   n                  │ column                   │
+   ───────────────────┼──────────────────────────┤
+ 3 東 京 東 京 東 京 東 京    │   final repeated content │
+   -------------------│--------------------------│
+ 4 ed column content  │       second final value │
+   ───────────────────┴──────────────────────────┘
 
 
 
@@ -21,4 +21,4 @@
 
 
 
- NORMAL  v=select                🅂 0 1:83  20% Top
+ NORMAL  v=select               🅂 0 1:83  20% Top

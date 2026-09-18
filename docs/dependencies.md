@@ -93,6 +93,7 @@ dependencies, and add no package or transitive code to the resolved Cargo graph.
 | --- | --- | --- | --- | --- |
 | `dirs-sys` | `0.5.0` (local fork) | MIT OR Apache-2.0 | Removed transitive dependency on `option-ext` (MPL-2.0, copyleft). Hand-rolled the 3-line `OptionExt::contains` utility locally. | `crates/dirs-sys-patched/` + `[patch.crates-io]` in root `Cargo.toml` |
 | `hjkl-buffer` | `0.39.0` (local fork) | MIT | Exposes the current undo node's stable sequence through one read-only accessor. Dirty tracking cannot derive this identity from undo depth, while serializing the full undo tree on each history key violates the editor latency budget. | `patches/hjkl-buffer/` + `[patch.crates-io]` in root `Cargo.toml` |
+| `hjkl-engine` | `0.39.0` (local fork) | MIT | Uses Ropey character boundaries to strip CRLF and Unicode line separators from row snapshots. Upstream subtracts one byte, which can split NEL and panic on Insert exit. | `patches/hjkl-engine/` + `[patch.crates-io]` in root `Cargo.toml` |
 | `tree-sitter-md` | `0.5.3` (local fork) | MIT | Replaces two unsafe `isdigit` calls in the Markdown external scanner with explicit ASCII digit checks. `TSLexer::lookahead` is a full Unicode code point, while C character-classification functions only accept `EOF` or values representable as `unsigned char`; glibc can segfault on valid high Unicode input. | `patches/tree-sitter-md/` + `[patch.crates-io]` in root `Cargo.toml` |
 
 The `hjkl-buffer` patch does not change the dependency graph or existing engine
@@ -114,10 +115,18 @@ bug is reachable with valid Markdown in production. The pinned release and
 current upstream source both contain the unsafe calls, so no released upgrade
 is available. The license and transitive dependency tree are unchanged.
 
-Both forks replace crates.io packages through `[patch.crates-io]`; they are
+The `hjkl-engine` patch changes only the two rope row-string helpers and adds
+focused tests. Ropey treats NEL and Unicode separators as line breaks, so
+subtracting one byte from the next line start can split a UTF-8 character.
+Character-index conversion preserves the exact boundary. The fixed helper is
+used by the existing Insert-exit session finalizer; there is no reliable
+application-level replacement for that engine-owned lifecycle. The pinned
+license and transitive dependency tree are unchanged.
+
+All three forks replace crates.io packages through `[patch.crates-io]`; they are
 maintained source inputs, not generated `vendor/` entries. Consequently,
-`make vendor` intentionally omits `vendor/hjkl-buffer` and
-`vendor/tree-sitter-md`. Their exact upstream provenance, reviewed deltas,
+`make vendor` intentionally omits `vendor/hjkl-buffer`,
+`vendor/hjkl-engine`, and `vendor/tree-sitter-md`. Their exact upstream provenance, reviewed deltas,
 removal criteria, and update procedure are recorded in the
 [patch maintenance record](../patches/README.md). These patches do not add new
 third-party packages, so their popularity baseline is the one already accepted

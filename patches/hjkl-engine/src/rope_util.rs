@@ -6,20 +6,31 @@
 //! them here removes the last real engine-core → `vim::` call so `vim.rs` can
 //! relocate into `hjkl-vim` (#267 / #265).
 
-/// Return row `r` from a rope as an owned `String`, stripping the
-/// trailing `\n` that ropey includes on non-final lines.
+/// Return row `r` from a rope as an owned `String`, stripping its line break.
 pub fn rope_line_to_str(rope: &ropey::Rope, r: usize) -> String {
     let s = rope.line(r).to_string();
-    // ropey includes the newline; strip it so callers see bare content.
-    if s.ends_with('\n') {
-        s[..s.len() - 1].to_string()
-    } else {
-        s
+    strip_line_break(&s).to_string()
+}
+
+fn strip_line_break(text: &str) -> &str {
+    if let Some(stripped) = text.strip_suffix("\r\n") {
+        return stripped;
+    }
+    match text.chars().last() {
+        Some(last)
+            if matches!(
+                last,
+                '\n' | '\r' | '\u{000B}' | '\u{000C}' | '\u{0085}' | '\u{2028}' | '\u{2029}'
+            ) =>
+        {
+            &text[..text.len() - last.len_utf8()]
+        }
+        _ => text,
     }
 }
 
-/// Join rows `lo..=hi` from a rope into a single `String` separated by
-/// `\n`. Callers must ensure `lo <= hi < rope.len_lines()`.
+/// Join rows `lo..=hi` from a rope, preserving internal line breaks and
+/// stripping the trailing break. Callers must ensure `lo <= hi < rope.len_lines()`.
 pub fn rope_row_range_str(rope: &ropey::Rope, lo: usize, hi: usize) -> String {
     let n = rope.len_lines();
     let lo = lo.min(n.saturating_sub(1));
@@ -29,12 +40,14 @@ pub fn rope_row_range_str(rope: &ropey::Rope, lo: usize, hi: usize) -> String {
     }
     // Use byte-slice to grab the full range in one rope walk.
     let start_byte = rope.line_to_byte(lo);
-    // End byte: start of line hi+1, minus the newline separator, or
-    // len_bytes() when hi is the last line.
+    // Ropey counts Unicode line breaks and CRLF as one separator. Convert
+    // from character boundaries so a multibyte separator stays intact.
     let end_byte = if hi + 1 < n {
-        // line_to_byte(hi+1) points at the \n-terminated start of
-        // the next line; step back one byte to drop that trailing \n.
-        rope.line_to_byte(hi + 1).saturating_sub(1)
+        let next_line_char = rope.line_to_char(hi + 1);
+        let crlf = next_line_char >= 2
+            && rope.char(next_line_char - 1) == '\n'
+            && rope.char(next_line_char - 2) == '\r';
+        rope.char_to_byte(next_line_char - if crlf { 2 } else { 1 })
     } else {
         rope.len_bytes()
     };
@@ -68,6 +81,15 @@ mod tests {
     }
 
     #[test]
+    fn line_to_str_strips_multibyte_line_breaks() {
+        let rope = Rope::from_str("a\u{85}b\u{2028}c\r\nd");
+        assert_eq!(rope_line_to_str(&rope, 0), "a");
+        assert_eq!(rope_line_to_str(&rope, 1), "b");
+        assert_eq!(rope_line_to_str(&rope, 2), "c");
+        assert_eq!(rope_line_to_str(&rope, 3), "d");
+    }
+
+    #[test]
     fn row_range_str_joins_inclusive() {
         let rope = Rope::from_str("a\nb\nc\n");
         assert_eq!(rope_row_range_str(&rope, 0, 1), "a\nb");
@@ -78,6 +100,15 @@ mod tests {
     fn row_range_str_single_row() {
         let rope = Rope::from_str("a\nb\nc");
         assert_eq!(rope_row_range_str(&rope, 1, 1), "b");
+    }
+
+    #[test]
+    fn row_range_str_preserves_boundaries_around_unicode_line_breaks() {
+        let rope = Rope::from_str("a\u{85}b\u{2028}c\r\nd");
+        assert_eq!(rope_row_range_str(&rope, 0, 0), "a");
+        assert_eq!(rope_row_range_str(&rope, 0, 1), "a\u{85}b");
+        assert_eq!(rope_row_range_str(&rope, 1, 2), "b\u{2028}c");
+        assert_eq!(rope_row_range_str(&rope, 2, 3), "c\r\nd");
     }
 
     #[test]

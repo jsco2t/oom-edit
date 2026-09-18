@@ -106,9 +106,9 @@ pub(crate) fn render_rendered_with_settings(
     );
     let mode = session.mode();
     let source_cursor_line = session.cursor().0;
-    let gutter_width = (status_bar::gutter_width(session.line_count()) as u16)
-        .max(4)
-        .min(area.width);
+    let gutter_width =
+        (status_bar::gutter_width(session.line_count(), settings.relative_line_numbers) as u16)
+            .min(area.width);
     let text_width = area.width.saturating_sub(gutter_width);
     let surface_width = viewport
         .left
@@ -462,15 +462,16 @@ mod tests {
                 .bg
                 .unwrap();
             let mut markers = 0;
+            let gutter_width = status_bar::gutter_width(session.line_count(), false) as u16;
             for row in 0..12 {
                 let expected = if line_numbers.get(row).copied().flatten().is_some() {
                     markers += 1;
-                    "W"
+                    "•"
                 } else {
                     " "
                 };
                 assert_eq!(buffer.cell((0, row as u16)).unwrap().symbol(), expected);
-                for column in 0..5 {
+                for column in 0..gutter_width {
                     assert_eq!(
                         buffer.cell((column, row as u16)).unwrap().bg,
                         gutter_background
@@ -585,7 +586,7 @@ mod tests {
 
         let unscrolled = render(0);
         let scrolled = render(12);
-        let gutter_width = 4;
+        let gutter_width = status_bar::gutter_width(1, false) as u16;
         for y in 0..8 {
             for x in 0..gutter_width {
                 assert_eq!(unscrolled[(x, y)], scrolled[(x, y)]);
@@ -628,7 +629,7 @@ mod tests {
             let active = session.rendered_cursor();
             assert_eq!(active.row, 0);
             assert!(active.column >= 4);
-            let gutter = (status_bar::gutter_width(session.line_count()) as u16).max(4);
+            let gutter = status_bar::gutter_width(session.line_count(), false) as u16;
             let position = ratatui::layout::Position::new(
                 gutter + (active.column - 4) as u16,
                 active.row as u16,
@@ -675,7 +676,7 @@ mod tests {
                         );
                     })
                     .unwrap();
-                let gutter = (status_bar::gutter_width(session.line_count()) as u16).max(4);
+                let gutter = status_bar::gutter_width(session.line_count(), false) as u16;
                 let cell = terminal
                     .backend()
                     .buffer()
@@ -734,7 +735,7 @@ mod tests {
                     );
                 })
                 .unwrap();
-            let gutter = (status_bar::gutter_width(session.line_count()) as u16).max(4);
+            let gutter = status_bar::gutter_width(session.line_count(), false) as u16;
             let cell = terminal
                 .backend()
                 .buffer()
@@ -788,7 +789,7 @@ mod tests {
                 );
             })
             .unwrap();
-        let gutter = (status_bar::gutter_width(wide.line_count()) as u16).max(4);
+        let gutter = status_bar::gutter_width(wide.line_count(), false) as u16;
         for column in 5..9 {
             let cell = wide_terminal
                 .backend()
@@ -822,16 +823,16 @@ mod tests {
                 );
             })
             .unwrap();
-        let gutter = (status_bar::gutter_width(wrapped.line_count()) as u16).max(4);
+        let gutter = status_bar::gutter_width(wrapped.line_count(), false) as u16;
         assert_eq!(
             wrapped
                 .diagnostic_decoration_rows(0..usize::MAX)
                 .into_iter()
                 .map(|row| (row.row, row.columns))
                 .collect::<Vec<_>>(),
-            [(0, 0..6), (1, 0..5)]
+            [(0, 0..8), (1, 0..3)]
         );
-        for (row, columns) in [(0, 0..6), (1, 0..5)] {
+        for (row, columns) in [(0, 0..8), (1, 0..3)] {
             for column in columns {
                 let cell = wrapped_terminal
                     .backend()
@@ -947,7 +948,7 @@ mod tests {
                     .iter()
                     .position(|line| line.styled.text.starts_with("│-"))
                     .unwrap();
-                let gutter = (status_bar::gutter_width(session.line_count()) as u16).max(4);
+                let gutter = status_bar::gutter_width(session.line_count(), false) as u16;
                 let dash = terminal
                     .backend()
                     .buffer()
@@ -998,7 +999,7 @@ mod tests {
             })
             .unwrap();
 
-        let gutter_width = status_bar::gutter_width(normal.line_count()) as u16;
+        let gutter_width = status_bar::gutter_width(normal.line_count(), false) as u16;
         let normal_line_cell = normal_terminal
             .backend()
             .buffer()
@@ -1062,7 +1063,7 @@ mod tests {
                     })
                     .unwrap();
 
-                let gutter = status_bar::gutter_width(session.line_count()) as u16;
+                let gutter = status_bar::gutter_width(session.line_count(), false) as u16;
                 let cursor_cell = terminal
                     .backend()
                     .buffer()
@@ -1121,7 +1122,7 @@ mod tests {
                 );
             })
             .unwrap();
-        let gutter = status_bar::gutter_width(session.line_count()) as u16;
+        let gutter = status_bar::gutter_width(session.line_count(), false) as u16;
         let buffer = terminal.backend().buffer();
         for column in interval.clone() {
             assert!(buffer
@@ -1171,7 +1172,7 @@ mod tests {
                 );
             })
             .unwrap();
-        let gutter = (status_bar::gutter_width(session.line_count()) as u16).max(4);
+        let gutter = status_bar::gutter_width(session.line_count(), false) as u16;
         for interval in &selected.columns {
             for column in interval.clone() {
                 assert!(terminal
@@ -1223,7 +1224,7 @@ mod tests {
                 );
             })
             .unwrap();
-        let gutter = status_bar::gutter_width(session.line_count()) as u16;
+        let gutter = status_bar::gutter_width(session.line_count(), false) as u16;
         let buffer = terminal.backend().buffer();
         for row in 0..3 {
             for column in 0..2 {
@@ -1271,7 +1272,7 @@ mod tests {
             })
             .unwrap();
         let selection = session.rendered_selection().unwrap();
-        let gutter = status_bar::gutter_width(session.line_count()) as u16;
+        let gutter = status_bar::gutter_width(session.line_count(), false) as u16;
         let buffer = terminal.backend().buffer();
         for row in &selection.rows {
             assert!(buffer
@@ -1328,7 +1329,7 @@ mod tests {
                 );
             })
             .unwrap();
-        let gutter = status_bar::gutter_width(session.line_count()) as u16;
+        let gutter = status_bar::gutter_width(session.line_count(), false) as u16;
         let cell = terminal
             .backend()
             .buffer()
@@ -1369,7 +1370,7 @@ mod tests {
             })
             .unwrap();
 
-        let gutter = status_bar::gutter_width(session.line_count()) as u16;
+        let gutter = status_bar::gutter_width(session.line_count(), false) as u16;
         let buffer = terminal.backend().buffer();
         let panel = DEFAULT_DARK.ui_style(Tier::TrueColor, UiSlot::MetadataPanel);
         let cursor_line = DEFAULT_DARK.ui_style(Tier::TrueColor, UiSlot::CursorLine);
@@ -1440,7 +1441,7 @@ mod tests {
             let terminal_width = 36;
             let terminal_height = 10;
             let mut session = EditorSession::from_text(text);
-            let gutter = status_bar::gutter_width(session.line_count()) as u16;
+            let gutter = status_bar::gutter_width(session.line_count(), false) as u16;
             let text_width = terminal_width - gutter;
             let (fence_rows, body_row, keyword_column, string_column, document_rows) = {
                 let layout = session.render_layout(text_width);
@@ -1552,7 +1553,7 @@ mod tests {
         let terminal_width = 40;
         let terminal_height = 10;
         let mut session = EditorSession::from_text(text);
-        let gutter = status_bar::gutter_width(session.line_count()) as u16;
+        let gutter = status_bar::gutter_width(session.line_count(), false) as u16;
         let text_width = terminal_width - gutter;
         let (first_body_row, passive_fence_row, layout_len) = {
             let layout = session.render_layout(text_width);
@@ -1685,32 +1686,37 @@ mod tests {
             .unwrap();
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer.cell((0, 0)).unwrap().symbol(), " ");
-        assert_eq!(buffer.cell((3, 0)).unwrap().symbol(), "1");
-        assert_eq!(buffer.cell((3, 1)).unwrap().symbol(), " ");
+        assert_eq!(buffer.cell((1, 0)).unwrap().symbol(), "1");
+        assert_eq!(buffer.cell((1, 1)).unwrap().symbol(), " ");
     }
 
     #[test]
     fn rendered_body_starts_after_the_compact_gutter() {
-        let mut session = EditorSession::from_text("plain text\n");
-        let mut terminal = Terminal::new(TestBackend::new(20, 2)).unwrap();
-        terminal
-            .draw(|frame| {
-                render_rendered(
-                    frame,
-                    &mut session,
-                    RenderedViewport::new(0, 0),
-                    false,
-                    frame.area(),
-                    &DEFAULT_DARK,
-                    Tier::TrueColor,
-                );
-            })
-            .unwrap();
+        let marked = GutterTroubleSnapshot::testing(&[(0, DiagnosticSeverity::Warning)]);
+        for (snapshot, expected_marker) in
+            [(&marked, "•"), (&GutterTroubleSnapshot::default(), " ")]
+        {
+            let mut session = EditorSession::from_text("plain text\n");
+            let mut terminal = Terminal::new(TestBackend::new(20, 2)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_rendered_with_settings(
+                        frame,
+                        &mut session,
+                        RenderedViewport::new(0, 0),
+                        RenderedSettings::new(false),
+                        frame.area(),
+                        DocumentPresentation::new(&DEFAULT_DARK, Tier::TrueColor, snapshot),
+                    );
+                })
+                .unwrap();
 
-        assert_eq!(status_bar::gutter_width(session.line_count()), 5);
-        let buffer = terminal.backend().buffer();
-        assert_eq!(buffer.cell((4, 0)).unwrap().symbol(), " ");
-        assert_eq!(buffer.cell((5, 0)).unwrap().symbol(), "p");
+            assert_eq!(status_bar::gutter_width(session.line_count(), false), 3);
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer.cell((0, 0)).unwrap().symbol(), expected_marker);
+            assert_eq!(buffer.cell((2, 0)).unwrap().symbol(), " ");
+            assert_eq!(buffer.cell((3, 0)).unwrap().symbol(), "p");
+        }
     }
 
     #[test]
@@ -1734,7 +1740,7 @@ mod tests {
             })
             .unwrap();
 
-        let gutter_width = status_bar::gutter_width(session.line_count());
+        let gutter_width = status_bar::gutter_width(session.line_count(), false);
         let buffer = terminal.backend().buffer();
         assert!((0..30).any(|row| {
             (0..gutter_width)

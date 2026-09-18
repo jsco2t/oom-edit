@@ -639,8 +639,6 @@ dependencies = [
 [[package]]
 name = "hjkl-engine"
 version = "0.39.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fae8e2de24aacf87fe7449d2ecc58727e98552f205245eb291622285eece3cc8"
 dependencies = [
  "bitflags 2.13.1",
  "hjkl-buffer",

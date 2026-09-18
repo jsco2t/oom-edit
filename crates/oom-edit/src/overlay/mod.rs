@@ -14,13 +14,16 @@ pub mod trouble;
 pub use confirm::{
     ConfirmOverwrite, ConfirmQuit, ConfirmationResolution, DirtyCloseChoice, ExternalSaveChoice,
 };
+pub(crate) use palette::PaletteAction;
 pub use palette::PaletteState;
 pub(crate) use spell_suggest::SpellSuggestAction;
 pub use spell_suggest::SpellSuggestState;
 pub use trouble::TroubleState;
 pub(crate) use trouble::{TroubleAction, TroubleEntry, TroubleProgress};
 
-use crate::command::{AppCommand, Contexts};
+#[cfg(test)]
+use crate::command::AppCommand;
+use crate::command::Contexts;
 use crate::lifecycle::{CloseTabRequest, SaveRequest};
 use crate::theme::{Theme, Tier};
 
@@ -52,11 +55,6 @@ impl Overlay {
     #[allow(dead_code)]
     pub fn is_palette(&self) -> bool {
         matches!(self, Overlay::Palette(_))
-    }
-
-    /// Is the spelling-suggestion modal open?
-    pub(crate) fn is_spell_suggest(&self) -> bool {
-        matches!(self, Overlay::SpellSuggest(_))
     }
 
     /// Is the provider-neutral diagnostics modal open?
@@ -147,9 +145,18 @@ impl Overlay {
     }
 
     /// Get the command to execute (if the selected row is a Command).
+    #[cfg(test)]
     pub fn selected_command(&self) -> Option<AppCommand> {
         if let Overlay::Palette(p) = self {
             p.selected_command()
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn selected_action(&self) -> Option<PaletteAction> {
+        if let Overlay::Palette(p) = self {
+            p.selected_action()
         } else {
             None
         }

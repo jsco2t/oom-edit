@@ -63,6 +63,20 @@ pub enum BindingRole {
     },
     CoreEx {
         display: &'static str,
+        prefill: Option<&'static str>,
+    },
+}
+
+/// An additional executable key for the same registry command row.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum BindingAlias {
+    Direct {
+        key: char,
+        contexts: Contexts,
+    },
+    Space {
+        continuation: char,
+        contexts: Contexts,
     },
 }
 
@@ -107,6 +121,7 @@ pub struct CommandSpec {
     pub desc: &'static str,
     pub contexts: Contexts,
     pub binding: BindingRole,
+    pub aliases: &'static [BindingAlias],
     /// Core conformance requirement backing a non-executable reference row.
     pub conformance_id: Option<&'static str>,
     /// Purpose-specific order for the compact hint bar only.
@@ -125,6 +140,7 @@ macro_rules! row {
             desc: $desc,
             contexts: $contexts,
             binding: $binding,
+            aliases: &[],
             conformance_id: None,
             quick_bar_order: $quick,
             quick_label: $quick_label,
@@ -143,6 +159,7 @@ macro_rules! conformance_row {
             desc: $desc,
             contexts: $contexts,
             binding: $binding,
+            aliases: &[],
             conformance_id: Some($conformance),
             quick_bar_order: None,
             quick_label: None,
@@ -259,6 +276,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         desc: "search rendered text",
         contexts: Contexts::NORMAL,
         binding: BindingRole::CoreKey { display: "/" },
+        aliases: &[],
         conformance_id: None,
         quick_bar_order: Some(5),
         quick_label: Some("search"),
@@ -269,22 +287,34 @@ pub static COMMANDS: &[CommandSpec] = &[
         desc: "enter Command mode",
         contexts: Contexts::NORMAL,
         binding: BindingRole::CoreKey { display: ":" },
+        aliases: &[],
         conformance_id: None,
         quick_bar_order: Some(6),
         quick_label: Some("command"),
     },
-    row!(
-        Help,
-        "help",
-        "command palette",
-        RENDERED,
-        BindingRole::AppChord {
+    CommandSpec {
+        id: RegistryEntryId::Help,
+        name: "help",
+        desc: "command palette",
+        contexts: RENDERED,
+        binding: BindingRole::AppChord {
             continuation: 'h',
-            command: AppCommand::Help
+            command: AppCommand::Help,
         },
-        Some(10),
-        Some("commands")
-    ),
+        aliases: &[
+            BindingAlias::Direct {
+                key: '?',
+                contexts: RENDERED,
+            },
+            BindingAlias::Space {
+                continuation: '?',
+                contexts: RENDERED,
+            },
+        ],
+        conformance_id: None,
+        quick_bar_order: Some(10),
+        quick_label: Some("commands"),
+    },
     row!(
         Save,
         "save",
@@ -384,7 +414,8 @@ pub static COMMANDS: &[CommandSpec] = &[
         "enable or disable spelling",
         Contexts::COMMAND,
         BindingRole::CoreEx {
-            display: ":set spell / :set nospell"
+            display: ":set spell / :set nospell",
+            prefill: None,
         },
         "SP-1:set-toggle"
     ),
@@ -428,7 +459,8 @@ pub static COMMANDS: &[CommandSpec] = &[
         "open path in new tab",
         RENDERED,
         BindingRole::CoreEx {
-            display: ":tabnew {path}"
+            display: ":tabnew {path}",
+            prefill: Some("tabnew "),
         },
         None
     ),
@@ -438,7 +470,8 @@ pub static COMMANDS: &[CommandSpec] = &[
         "close tab",
         RENDERED,
         BindingRole::CoreEx {
-            display: ":tabclose"
+            display: ":tabclose",
+            prefill: Some("tabclose"),
         },
         None
     ),
@@ -447,17 +480,46 @@ pub static COMMANDS: &[CommandSpec] = &[
         "quit-all",
         "quit all tabs",
         Contexts::COMMAND,
-        BindingRole::CoreEx { display: ":qa" },
+        BindingRole::CoreEx {
+            display: ":qa",
+            prefill: Some("qa")
+        },
         None
     ),
 ];
 
 pub fn rendered_binding(spec: &CommandSpec) -> String {
-    match spec.binding {
-        BindingRole::AppChord { continuation, .. } => format!("Space {continuation}"),
+    rendered_binding_for(spec, spec.contexts)
+}
+
+pub fn rendered_binding_for(spec: &CommandSpec, ctx: Contexts) -> String {
+    let primary = match spec.binding {
+        BindingRole::AppChord { continuation, .. } => {
+            let mut keys = vec![continuation.to_string()];
+            keys.extend(spec.aliases.iter().filter_map(|alias| match alias {
+                BindingAlias::Space {
+                    continuation,
+                    contexts,
+                } if contexts.contains(ctx) => Some(continuation.to_string()),
+                _ => None,
+            }));
+            format!("Space {}", keys.join("/"))
+        }
         BindingRole::AppSpaceDigit => "Space 1-9".to_string(),
-        BindingRole::CoreKey { display } | BindingRole::CoreEx { display } => display.to_string(),
+        BindingRole::CoreKey { display } | BindingRole::CoreEx { display, .. } => {
+            display.to_string()
+        }
+    };
+    let mut bindings = Vec::with_capacity(spec.aliases.len() + 1);
+    for alias in spec.aliases {
+        if let BindingAlias::Direct { key, contexts } = alias {
+            if contexts.contains(ctx) {
+                bindings.push(key.to_string());
+            }
+        }
     }
+    bindings.push(primary);
+    bindings.join(" / ")
 }
 
 pub fn commands_for(ctx: Contexts) -> Vec<&'static CommandSpec> {
@@ -474,26 +536,68 @@ pub fn app_chord(ctx: Contexts, continuation: char) -> Option<AppCommand> {
         if !spec.contexts.contains(ctx) {
             return None;
         }
-        match spec.binding {
+        let primary = match spec.binding {
             BindingRole::AppChord {
                 continuation: key,
                 command,
             } if key == continuation => Some(command),
             _ => None,
-        }
+        };
+        primary.or_else(|| {
+            spec.aliases
+                .iter()
+                .find_map(|alias| match (alias, spec.binding) {
+                    (
+                        BindingAlias::Space {
+                            continuation: key,
+                            contexts,
+                        },
+                        BindingRole::AppChord { command, .. },
+                    ) if *key == continuation && contexts.contains(ctx) => Some(command),
+                    _ => None,
+                })
+        })
+    })
+}
+
+pub fn direct_command(ctx: Contexts, key: char) -> Option<AppCommand> {
+    COMMANDS.iter().find_map(|spec| {
+        spec.aliases
+            .iter()
+            .find_map(|alias| match (alias, spec.binding) {
+                (
+                    BindingAlias::Direct {
+                        key: alias_key,
+                        contexts,
+                    },
+                    BindingRole::AppChord { command, .. },
+                ) if *alias_key == key && contexts.contains(ctx) => Some(command),
+                _ => None,
+            })
     })
 }
 
 pub fn space_continuations(ctx: Contexts) -> Vec<(char, &'static CommandSpec)> {
-    COMMANDS
-        .iter()
-        .filter_map(|spec| match spec.binding {
-            BindingRole::AppChord { continuation, .. } if spec.contexts.contains(ctx) => {
-                Some((continuation, spec))
+    let mut continuations = Vec::new();
+    for spec in COMMANDS {
+        if let BindingRole::AppChord { continuation, .. } = spec.binding {
+            if spec.contexts.contains(ctx) {
+                continuations.push((continuation, spec));
             }
-            _ => None,
-        })
-        .collect()
+            for alias in spec.aliases {
+                if let BindingAlias::Space {
+                    continuation,
+                    contexts,
+                } = alias
+                {
+                    if contexts.contains(ctx) {
+                        continuations.push((*continuation, spec));
+                    }
+                }
+            }
+        }
+    }
+    continuations
 }
 
 #[cfg(test)]
@@ -512,6 +616,71 @@ mod tests {
             assert!(!rendered_binding(spec).is_empty());
         }
         assert_eq!(COMMANDS.len(), 32);
+    }
+
+    #[test]
+    fn app_aliases_are_unique_contextual_and_keep_one_command_row() {
+        let mut direct = HashSet::new();
+        let mut space = HashSet::new();
+        for spec in COMMANDS {
+            for ctx in Contexts::each_bit() {
+                if let BindingRole::AppChord { continuation, .. } = spec.binding {
+                    if spec.contexts.contains(ctx) {
+                        assert!(space.insert((ctx.0, continuation)));
+                    }
+                }
+                for alias in spec.aliases {
+                    match alias {
+                        BindingAlias::Direct { key, contexts } if contexts.contains(ctx) => {
+                            assert!(spec.contexts.contains(ctx));
+                            assert!(matches!(spec.binding, BindingRole::AppChord { .. }));
+                            assert!(direct.insert((ctx.0, *key)));
+                        }
+                        BindingAlias::Space {
+                            continuation,
+                            contexts,
+                        } if contexts.contains(ctx) => {
+                            assert!(spec.contexts.contains(ctx));
+                            assert!(matches!(spec.binding, BindingRole::AppChord { .. }));
+                            assert!(space.insert((ctx.0, *continuation)));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let help = COMMANDS
+            .iter()
+            .find(|spec| spec.id == RegistryEntryId::Help)
+            .unwrap();
+        assert_eq!(
+            help.aliases,
+            &[
+                BindingAlias::Direct {
+                    key: '?',
+                    contexts: RENDERED
+                },
+                BindingAlias::Space {
+                    continuation: '?',
+                    contexts: RENDERED
+                },
+            ]
+        );
+        assert_eq!(rendered_binding(help), "? / Space h/?");
+        assert_eq!(
+            rendered_binding_for(help, Contexts::SELECT),
+            "? / Space h/?"
+        );
+        assert_eq!(
+            direct_command(Contexts::NORMAL, '?'),
+            Some(AppCommand::Help)
+        );
+        assert_eq!(
+            direct_command(Contexts::SELECT, '?'),
+            Some(AppCommand::Help)
+        );
+        assert_eq!(app_chord(Contexts::NORMAL, '?'), Some(AppCommand::Help));
+        assert_eq!(app_chord(Contexts::SELECT, '?'), Some(AppCommand::Help));
     }
 
     #[test]
@@ -582,6 +751,7 @@ mod tests {
                 "spell-set",
                 BindingRole::CoreEx {
                     display: ":set spell / :set nospell",
+                    prefill: None,
                 },
                 Some("SP-1:set-toggle"),
             ),
@@ -840,6 +1010,7 @@ mod tests {
                 Contexts::COMMAND,
                 BindingRole::CoreEx {
                     display: ":set spell / :set nospell",
+                    prefill: None,
                 },
                 None,
             ),
@@ -884,6 +1055,7 @@ mod tests {
                 RENDERED,
                 BindingRole::CoreEx {
                     display: ":tabnew {path}",
+                    prefill: Some("tabnew "),
                 },
                 None,
             ),
@@ -894,6 +1066,7 @@ mod tests {
                 RENDERED,
                 BindingRole::CoreEx {
                     display: ":tabclose",
+                    prefill: Some("tabclose"),
                 },
                 None,
             ),
@@ -902,7 +1075,10 @@ mod tests {
                 "quit-all",
                 "quit all tabs",
                 Contexts::COMMAND,
-                BindingRole::CoreEx { display: ":qa" },
+                BindingRole::CoreEx {
+                    display: ":qa",
+                    prefill: Some("qa"),
+                },
                 None,
             ),
         ];
@@ -958,13 +1134,32 @@ mod tests {
     }
 
     #[test]
-    fn core_binding_descriptors_are_visibility_only() {
+    fn core_binding_descriptors_never_dispatch_app_commands() {
         for spec in COMMANDS {
             if matches!(
                 spec.binding,
                 BindingRole::CoreKey { .. } | BindingRole::CoreEx { .. }
             ) {
                 assert!(!matches!(spec.binding, BindingRole::AppChord { .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn core_ex_prefills_are_safe_single_command_inputs() {
+        for spec in COMMANDS {
+            if let BindingRole::CoreEx { display, prefill } = spec.binding {
+                assert!(display.starts_with(':'));
+                if let Some(text) = prefill {
+                    assert!(!text.is_empty());
+                    assert!(!text.starts_with(':'));
+                    assert!(!text.chars().any(char::is_control));
+                    assert!(!text.contains('{') && !text.contains('}'));
+                    assert!(
+                        !display.contains(" / :"),
+                        "combined commands need one choice"
+                    );
+                }
             }
         }
     }

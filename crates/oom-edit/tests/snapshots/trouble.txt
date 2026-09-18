@@ -1,24 +1,24 @@
-   1 ┌─ metadata ──────────────────────────────────────────────────────────────┐
-   2 │ title: Kitchen Sink                                                     │
-   3 │ author: Test                                                            │
+  1 ┌─ metadata ───────────────────────────────────────────────────────────────┐
+  2 │ title: Kitchen Sink                                                      │
+  3 │ author: Test                                                             │
   ┌ Trouble (2) ─────────────────────────────────────────────────────────────┐─┘
   │▸ 1:1   warning [spell] Unknown word: teh                                 │
   │  14:27 info    [spell] Review unusual spelling                           │
   │… checking diagnostics                                                    │
   │                                                                          │
   │                                                                          │
+ 1│                                                                          │
   │                                                                          │
   │                                                                          │
+ 1│                                                                          │
+ 1│                                                                          │
+ 1│                                                                          │
   │                                                                          │
   │                                                                          │
+ 1│                                                                          │──
   │                                                                          │
-  │                                                                          │
-  │                                                                          │
-  │                                                                          │
-  │                                                                          │──
-  │                                                                          │
-  │                                                                          │
+ 2│                                                                          │
   └──────────────────────────────────────────────────────────────────────────┘
-  22 More text here.
+ 22 More text here.
 
  NORMAL  j/k navigate · Enter jump · Esc close

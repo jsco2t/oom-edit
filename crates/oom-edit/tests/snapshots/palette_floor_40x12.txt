@@ -1,12 +1,12 @@
 ┌ Command Palette ─────────────────────┐
 │>                                     │
 │                                      │
-│▸ v            character-w… select-ch…│
-│· V            line-wise s… select-li…│
-│· Ctrl-V       block-wise … select-bl…│
-│· Esc / Ctrl-C cancel sele… cancel-se…│
-│· "{register}  select regi… select-re…│
-│· y            yank (Markd… select-ya…│
-│· Y            yank and se… select-ya…│
 │· d / x        delete sele… select-de…│
+│· c            change sele… select-ch…│
+│· >            indent sele… select-in…│
+│· <            outdent sel… select-ou…│
+│· o            swap select… select-sw…│
+│· /            search rend… search    │
+│· :            enter Comma… command   │
+│▸ help         command pal… ? / Space…│
 └──────────────────────────────────────┘

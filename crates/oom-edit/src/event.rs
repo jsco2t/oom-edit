@@ -506,6 +506,7 @@ mod tests {
                 Box::new(RecordingClipboardSink::default()),
                 Box::new(crate::config::DisabledConfigStore),
                 crate::spell_host::SpellHost::testing(words),
+                std::path::PathBuf::from("/"),
             ),
             initial,
         )
@@ -586,7 +587,7 @@ mod tests {
         assert!(outcome.redraw);
         assert_eq!(sample_count, 3);
         assert_eq!(scroll_follows, 1);
-        assert_eq!(viewport_width, 95);
+        assert_eq!(viewport_width, 97);
         assert_eq!(last_input, initial + Duration::from_millis(3));
         scheduler.request(outcome.redraw);
         scheduler

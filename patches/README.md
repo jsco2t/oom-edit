@@ -3,14 +3,15 @@
 This directory contains complete crate sources used through the workspace's
 `[patch.crates-io]` entries. These are maintained source inputs, not generated
 copies under `vendor/`. Cargo therefore excludes the replaced registry packages
-when `make vendor` regenerates `vendor/`; the absence of `vendor/hjkl-buffer`
-and `vendor/tree-sitter-md` is intentional.
+when `make vendor` regenerates `vendor/`; the absence of `vendor/hjkl-buffer`,
+`vendor/hjkl-engine`, and `vendor/tree-sitter-md` is intentional.
 
 ## Provenance and removal criteria
 
 | Crate | Base release | crates.io package checksum | Upstream commit | Reviewed local delta | Remove the patch when |
 | --- | --- | --- | --- | --- | --- |
 | `hjkl-buffer` | `0.39.0` | `8c9f9314b826a7e6c2bb4531442b0e73d279e785f9e74685f806ac4762c7f237` | `fa25c86eb122573784ebc29ff64e911933072f68` | One public, read-only `Buffer::current_undo_seq` accessor returning the current undo node's stable sequence number under the existing mutex. | A compatible `hjkl` family release exposes an equivalent public O(1) history-state identity and the dirty-tracking conformance suite passes without the fork. Version `0.41.2`, checked 2026-08-07, does not yet do so. |
+| `hjkl-engine` | `0.39.0` | `fae8e2de24aacf87fe7449d2ecc58727e98552f205245eb291622285eece3cc8` | `fa25c86eb122573784ebc29ff64e911933072f68` | Strip Ropey line breaks by character boundary in `rope_row_range_str` and `rope_line_to_str`; the upstream one-byte assumption panics on NEL and other multibyte line separators during Insert exit. | A compatible release handles Unicode line separators in both helpers and the NEL Insert-exit regression passes without the fork. |
 | `tree-sitter-md` | `0.5.3` | `2efd398be546456c814598ee56c0f51769a77241511b4a58077815d120afa882` | `f969cd3ae3f9fbd4e43205431d0ae286014c05b5` | Replace two C `isdigit` calls with explicit ASCII digit-range checks so a Unicode `TSLexer::lookahead` cannot index a libc classification table out of bounds. | A compatible release contains the equivalent scanner fix and the deterministic Unicode regression test passes without the fork. No such release existed when checked 2026-08-07. |
 
 The package checksums above authenticate the original immutable crates.io
@@ -22,14 +23,16 @@ upstream source commits and paths.
 
 ## Supply-chain assessment
 
-Both crates were already accepted, exact-pinned runtime dependencies before the
+All three crates were already accepted, exact-pinned runtime dependencies before the
 patches were introduced. The patches add no package or transitive dependency,
-so the original adoption/popularity baseline is unchanged. Both remain MIT
+so the original adoption/popularity baseline is unchanged. All three remain MIT
 licensed. Maintenance is checked against upstream releases and source before
 each update; the complete local delta is small enough to review directly.
 
 The `hjkl-buffer` behavior cannot be safely hand-rolled in oom-edit without
 mirroring the engine's branching, pruning, and history-node identity. The
+`hjkl-engine` correction belongs in the engine-owned Insert session; duplicating
+that state in oom-edit would be less reliable. The
 `tree-sitter-md` correction is hand-written locally because it is two explicit
 ASCII comparisons and adding another dependency would not help.
 

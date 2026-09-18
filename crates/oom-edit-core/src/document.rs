@@ -223,6 +223,17 @@ impl Document {
     /// Per FR-5.2: dominant line ending is detected and recorded; final-newline
     /// presence is recorded; in-memory text is normalized to LF.
     pub(crate) fn open(path: &Path) -> Result<OpenedDocument, OpenError> {
+        Self::open_with_missing_policy(path, true)
+    }
+
+    pub(crate) fn open_existing(path: &Path) -> Result<OpenedDocument, OpenError> {
+        Self::open_with_missing_policy(path, false)
+    }
+
+    fn open_with_missing_policy(
+        path: &Path,
+        allow_missing: bool,
+    ) -> Result<OpenedDocument, OpenError> {
         match fs::read(path) {
             Ok(bytes) => {
                 // UTF-8 validation: find the first invalid byte (FR-5.1)
@@ -256,7 +267,7 @@ impl Document {
                     },
                 })
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            Err(e) if allow_missing && e.kind() == io::ErrorKind::NotFound => {
                 // New-buffer semantics: empty buffer, path retained, not-dirty
                 Ok(OpenedDocument {
                     text: String::new(),

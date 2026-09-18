@@ -64,6 +64,7 @@ fn test_app(text: &str, spell_enabled: bool) -> App {
             Box::new(RecordingClipboardSink::default()),
             Box::new(DisabledConfigStore),
             SpellHost::testing("known\ntext\nword\n"),
+            std::path::PathBuf::from("/"),
         ),
         Instant::now(),
     )

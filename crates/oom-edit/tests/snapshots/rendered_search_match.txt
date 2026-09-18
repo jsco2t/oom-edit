@@ -1,24 +1,24 @@
-   3 │ author: Test                                                            │
-   4 └─────────────────────────────────────────────────────────────────────────┘
+  3 │ author: Test                                                             │
+  4 └──────────────────────────────────────────────────────────────────────────┘
 
-   6 █ Heading One
+  6 █ Heading One
 
-   8 Some bold and italic text with inline code and a link [0].
+  8 Some bold and italic text with inline code and a link [0].
 
-  10 ┃ A blockquote with emphasis inside.
+ 10 ┃ A blockquote with emphasis inside.
 
-     ▏ rust
-  13 ▏ fn main() {
-  14 ▏     println!("Hello!");
-  15 ▏ }
-     ▏
+    ▏ rust
+ 13 ▏ fn main() {
+ 14 ▏     println!("Hello!");
+ 15 ▏ }
+    ▏
 
-  18 ───────────────────────────────────────────────────────────────────────────
+ 18 ────────────────────────────────────────────────────────────────────────────
 
-  20 Another heading.
+ 20 Another heading.
 
-  22 More text here.
+ 22 More text here.
 
-     ─ links ─
-     [0] https://example.com
- NORMAL  v=select  /=search  :=command  Space+h=help               🅂 0 20:1  86%
+    ─ links ─
+    [0] https://example.com
+ NORMAL  v=select  /=search  :=command  ?=commands                🅂 0 20:1  86%
