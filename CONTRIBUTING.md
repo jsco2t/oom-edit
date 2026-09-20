@@ -36,6 +36,7 @@ are:
 | `make lint` | Run Clippy for all workspace targets with warnings denied |
 | `make build` | Build the complete workspace |
 | `make test` | Run the complete test suite with isolated configuration |
+| `make ci` | Build the release binary, then run the full local CI gate |
 | `make check` | Run the full local CI gate |
 | `make test-all` | Run tests and build examples |
 | `make bench-check` | Run debug performance smoke gates |

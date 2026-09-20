@@ -8,3 +8,4 @@
 - 2026-08-26-rendered-selection-yank-fidelity — Rendered Selection Yank Fidelity — completed 2026-08-26T17:26:24Z — 50d6e763698d69d7d5b26e405b37d7a817bfc5eb..21683fc398bcb1efe9f4824e6d064b2cc86e9c4d
 - 2026-09-16-editor-ux-improvements — Editor UX improvements — completed 2026-09-16T22:38:02Z — a9e503b231a9dbdb71949387c98a3dfc7be5fd0c..a9e503b231a9dbdb71949387c98a3dfc7be5fd0c
 - 2026-09-17-editor-interaction-and-code-block-fixes — Editor interaction and code block fixes — completed 2026-09-18T15:15:10Z — b1044df098eaa76b5d288ed7accb0d613d345c29..b1044df098eaa76b5d288ed7accb0d613d345c29
+- 2026-09-19-environment-free-github-release-ci — Environment-Free GitHub Release CI — completed 2026-09-20T00:29:54Z — 7fbfd7784ca1fa7800dcecb0820f7bffdab81999..7fbfd7784ca1fa7800dcecb0820f7bffdab81999

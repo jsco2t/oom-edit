@@ -1,0 +1,12 @@
+{
+  "standard_commands": [
+    "make fmt-check",
+    "make check",
+    "make ci"
+  ],
+  "final_commands": [
+    "make fmt-check",
+    "make check",
+    "make ci"
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "schema_version": 2,
+  "work_id": "2026-09-19-environment-free-github-release-ci",
+  "title": "Environment-Free GitHub Release CI",
+  "phase": "DONE",
+  "created_at": "2026-09-19T23:58:46Z",
+  "updated_at": "2026-09-20T00:32:36Z",
+  "approved_at": "2026-09-20T00:17:39Z",
+  "completed_at": "2026-09-20T00:29:54Z",
+  "archived_at": "2026-09-20T00:32:36Z",
+  "baseline_sha": "7fbfd7784ca1fa7800dcecb0820f7bffdab81999",
+  "final_sha": "7fbfd7784ca1fa7800dcecb0820f7bffdab81999",
+  "plan_revision": 2,
+  "acceptance_round": 1,
+  "completed_rounds": [],
+  "approved_plan_sha256": "98906e91995f333c000e7d078a53098aeee904cb25ba32fbb195fe9e20de9035",
+  "current_task": null,
+  "tasks": [
+    {
+      "id": "001",
+      "path": "tasks/001-add-environment-free-release-ci.md",
+      "round": 1,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/001.md"
+    }
+  ],
+  "task_retry_limit": 3,
+  "final_retry_limit": 2,
+  "final_attempts": 1,
+  "stop_continuations": 0,
+  "max_stop_continuations": 50,
+  "block_reason": null
+}

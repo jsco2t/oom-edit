@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "work_id": "2026-09-19-environment-free-github-release-ci",
+  "title": "Environment-Free GitHub Release CI",
+  "created_at": "2026-09-19T23:58:46Z",
+  "approved_at": "2026-09-20T00:17:39Z",
+  "completed_at": "2026-09-20T00:29:54Z",
+  "archived_at": "2026-09-20T00:32:36Z",
+  "baseline_sha": "7fbfd7784ca1fa7800dcecb0820f7bffdab81999",
+  "final_sha": "7fbfd7784ca1fa7800dcecb0820f7bffdab81999",
+  "approved_plan_sha256": "98906e91995f333c000e7d078a53098aeee904cb25ba32fbb195fe9e20de9035",
+  "acceptance_rounds": 1,
+  "prior_completed_rounds": 0,
+  "task_count": 1,
+  "tasks_completed": 1,
+  "result": "DONE",
+  "final_evidence": "evidence/final.md"
+}

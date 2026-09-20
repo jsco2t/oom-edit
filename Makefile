@@ -41,7 +41,7 @@ build-examples: ## Build all examples with locked offline dependencies
 # Test
 # ---------------------------------------------------------------------------
 .PHONY: test
-test: feature-workflow-test tui-perf-test ## Run the full test suite
+test: feature-workflow-test tui-perf-test ci-workflow-test ## Run the full test suite
 	bash scripts/with-isolated-config.sh cargo test --workspace --offline --locked
 
 .PHONY: feature-workflow-test
@@ -51,6 +51,10 @@ feature-workflow-test: ## Test feature-workflow helper scripts
 .PHONY: tui-perf-test
 tui-perf-test: ## Test TUI performance evidence tooling
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_tui_performance.py'
+
+.PHONY: ci-workflow-test
+ci-workflow-test: ## Test the GitHub Actions workflow contract
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_ci_workflow.py'
 
 .PHONY: test-update-snapshots
 test-update-snapshots: ## Re-run tests with OOM_UPDATE_SNAPSHOTS=1 to (re)write golden files
@@ -85,6 +89,11 @@ lint-fix: ## Apply safe clippy suggestions
 # ---------------------------------------------------------------------------
 # Check — the local CI gate
 # ---------------------------------------------------------------------------
+.PHONY: ci
+ci: ## Build the release binary and run the full local CI gate
+	$(MAKE) build-release
+	$(MAKE) check
+
 .PHONY: check
 check: ## Run fmt-check + lint + build + test + deny + audit + data-license-check (with summary)
 	@PASS=0; FAIL=0; \
@@ -121,6 +130,7 @@ check: ## Run fmt-check + lint + build + test + deny + audit + data-license-chec
 	echo "test"; \
 	if PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .agents/skills/feature-workflow/tests -p 'test_*.py' 2>&1 \
 		&& PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_tui_performance.py' 2>&1 \
+		&& PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_ci_workflow.py' 2>&1 \
 		&& bash scripts/with-isolated-config.sh cargo test --workspace --offline --locked 2>&1; then \
 		echo "[PASS] test"; PASS=$$((PASS + 1)); \
 	else \
