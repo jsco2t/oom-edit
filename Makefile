@@ -1,10 +1,11 @@
 # oom-edit — build system of record.
 #
-# Run `make help` to list every target.  All cargo invocations use
-# --offline --locked except vendor and toolchain.
+# Run `make help` to list every target. Builds and tests use --offline
+# --locked; toolchain, vendor, and supply-chain checks require network access.
 
 SHELL := /bin/bash
 DENY_FLAGS := check -D warnings
+DENY_COMMAND := bash scripts/cargo-deny.sh
 AUDIT_FLAGS := -D warnings
 DATA_LICENSE_ROOT ?= $(CURDIR)
 
@@ -138,7 +139,7 @@ check: ## Run fmt-check + lint + build + test + deny + audit + data-license-chec
 	fi; \
 	echo ""; \
 	echo "deny"; \
-	if cargo deny $(DENY_FLAGS) 2>&1; then \
+	if $(DENY_COMMAND) $(DENY_FLAGS) 2>&1; then \
 		echo "[PASS] deny"; PASS=$$((PASS + 1)); \
 	else \
 		echo "[FAIL] deny"; FAIL=$$((FAIL + 1)); deny_ok=false; \
@@ -182,11 +183,11 @@ check: ## Run fmt-check + lint + build + test + deny + audit + data-license-chec
 # Supply-chain audit
 # ---------------------------------------------------------------------------
 .PHONY: deny
-deny: ## License/ban/advisory checks (CI gate)
-	cargo deny $(DENY_FLAGS)
+deny: ## License/ban/advisory checks (CI gate; requires network)
+	$(DENY_COMMAND) $(DENY_FLAGS)
 
 .PHONY: audit
-audit: ## RustSec advisory checks (CI gate)
+audit: ## RustSec advisory checks (CI gate; requires network)
 	cargo audit $(AUDIT_FLAGS)
 
 .PHONY: dictionaries

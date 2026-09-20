@@ -136,7 +136,7 @@ fn make_deny_and_check_promote_warnings() {
         let stdout = checked_stdout(output, &format!("make --dry-run {target}"));
 
         assert!(
-            stdout.contains("cargo deny check -D warnings"),
+            stdout.contains("bash scripts/cargo-deny.sh check -D warnings"),
             "make --dry-run {target} should expand the shared warning-fatal policy:\n{stdout}"
         );
 
@@ -153,7 +153,7 @@ fn make_deny_and_check_promote_warnings() {
         );
 
         assert!(
-            stdout.contains("cargo deny __DENY_FLAGS_SENTINEL__"),
+            stdout.contains("bash scripts/cargo-deny.sh __DENY_FLAGS_SENTINEL__"),
             "make --dry-run {target} should consume the shared DENY_FLAGS variable:\n{stdout}"
         );
     }

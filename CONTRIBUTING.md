@@ -23,8 +23,8 @@ make toolchain
 
 Dependencies are locked in `Cargo.lock` and vendored under `vendor/`. Normal
 builds, tests, and documentation generation run with Cargo's `--offline` and
-`--locked` options. A fresh checkout therefore should not need the network once
-the toolchain and Cargo tools are installed.
+`--locked` options. Supply-chain checks require network access so they can use
+current registry and RustSec metadata.
 
 Run `make help` to see every supported workflow. The most important targets
 are:
@@ -39,6 +39,8 @@ are:
 | `make ci` | Build the release binary, then run the full local CI gate |
 | `make check` | Run the full local CI gate |
 | `make test-all` | Run tests and build examples |
+| `make deny` | Check licenses, bans, advisories, and yanked crates using current registry metadata |
+| `make audit` | Check the lockfile against current RustSec advisories |
 | `make bench-check` | Run debug performance smoke gates |
 | `make bench` | Run release performance gates |
 | `make doc` | Build API documentation without dependencies |
