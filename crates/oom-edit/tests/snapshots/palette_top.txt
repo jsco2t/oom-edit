@@ -2,23 +2,23 @@
   2 │ title: Kitchen Sink                                                      │
   3 │ au┌ Command Palette ─────────────────────────────────────────────┐       │
   4 └───│>                                                             │───────┘
-        │                                                              │
+  5     │                                                              │
   6 █ He│· v              character-wise selection       select-charac…│
-        │· V              line-wise selection            select-line   │
+  7     │· V              line-wise selection            select-line   │
   8 Some│· Ctrl-V         block-wise selection           select-block  │
-        │· Esc / Ctrl-C   cancel selection               cancel-select │
+  9     │· Esc / Ctrl-C   cancel selection               cancel-select │
  10 ┃ A │· "{register}    select register                select-regist…│
-        │· y              yank (Markdown by default) to… select-yank   │
+ 11     │· y              yank (Markdown by default) to… select-yank   │
     ▏ ru│· Y              yank and send plain text to c… select-yank-p…│
  13 ▏ fn│· d / x          delete selection               select-delete │
  14 ▏   │· c              change selection               select-change │
  15 ▏ } │· >              indent selection               select-indent │
     ▏   │· <              outdent selection              select-outdent│
-        │· o              swap selection endpoint        select-swap-a…│
+ 17     │· o              swap selection endpoint        select-swap-a…│
  18 ────│· /              search rendered text           search        │────────
-        │· :              enter Command mode             command       │
+ 19     │· :              enter Command mode             command       │
  20 Anot│▸ help           command palette                ? / Space h/? │
-        └──────────────────────────────────────────────────────────────┘
+ 21     └──────────────────────────────────────────────────────────────┘
  22 More text here.
 
  NORMAL  ↑↓ navigate · type to filter · Enter run/open ex · Esc close

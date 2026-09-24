@@ -206,6 +206,60 @@ fn ordinary_edit_shifts_unaffected_diagnostics_when_markdown_markers_exist_elsew
 }
 
 #[test]
+fn repeated_local_spell_invalidation_retains_current_source_and_rendered_decorations() {
+    let engine = engine("known\n");
+    let mut session = EditorSession::from_text("wrnga\n\nwrngb\n");
+    drain(&mut session, &engine, 3);
+    let unaffected = session
+        .diagnostics()
+        .iter()
+        .find(|diagnostic| diagnostic.source_text == "wrngb")
+        .expect("second misspelling")
+        .clone();
+
+    session.jump_to_offset(0).unwrap();
+    session.handle_key(key('i'));
+    for (index, character) in ['x', 'y'].into_iter().enumerate() {
+        session.handle_key(key(character));
+        assert!(session.diagnostics_pending());
+        assert_eq!(session.diagnostics().len(), 1);
+        assert_eq!(session.diagnostics()[0].source_text, "wrngb");
+        assert_eq!(
+            session.diagnostics()[0].range,
+            unaffected.range.start + index + 1..unaffected.range.end + index + 1
+        );
+
+        let source = session.render_source(Viewport {
+            top_line: 0,
+            height: 4,
+            width: 40,
+            wrap: true,
+            left_col: 0,
+            skip_rows: 0,
+        });
+        assert_eq!(source.decorations.len(), 1);
+        assert_eq!(source.decorations[0].row, 2);
+        assert_eq!(source.decorations[0].columns, 0..5);
+
+        session.render_layout(40);
+        let rendered = session.diagnostic_decoration_rows(0..usize::MAX);
+        assert_eq!(rendered.len(), 1);
+        assert_eq!(rendered[0].columns, 0..5);
+
+        if index == 0 {
+            assert!(session.spell_tick(&engine, 1));
+            assert!(session.diagnostics_pending());
+        }
+    }
+    session.handle_key(special(KeyCodeKind::Esc));
+
+    drain(&mut session, &engine, 3);
+    let mut fresh = EditorSession::from_text(&session.document());
+    drain(&mut fresh, &engine, 3);
+    assert_eq!(session.diagnostics(), fresh.diagnostics());
+}
+
+#[test]
 fn local_edit_shifts_retained_multiline_exclusion_before_interior_edit() {
     let engine = engine("good\noutside\n");
     let mut session = EditorSession::from_text("good\n`hidden\nwrng`\noutside");
@@ -692,11 +746,9 @@ fn source_frame_decorations_use_display_cells_and_preserve_semantic_spans() {
         .iter()
         .flat_map(|line| &line.spans)
         .any(|span| { matches!(span.style, SemanticStyle::Heading1 | SemanticStyle::Punct) }));
-    assert_eq!(frame.decorations.len(), 2, "wrng crosses the width-8 wrap");
-    assert_eq!(frame.decorations[0].row, 0);
-    assert_eq!(frame.decorations[0].columns, 7..8);
-    assert_eq!(frame.decorations[1].row, 1);
-    assert_eq!(frame.decorations[1].columns, 0..3);
+    assert_eq!(frame.decorations.len(), 1, "wrng stays whole at the wrap");
+    assert_eq!(frame.decorations[0].row, 1);
+    assert_eq!(frame.decorations[0].columns, 0..4);
 
     let mut clipped = EditorSession::from_text("東京 abcdefgh wrng tail\n");
     drain(&mut clipped, &engine, 5);

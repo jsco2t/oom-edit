@@ -51,6 +51,7 @@ points are:
 | `Space h` | Open help and the command palette |
 | `Space w` | Save |
 | `Space q` | Quit |
+| `Space m` | Insert `---\ntitle: ""\n---\n\n` when the document has no front matter |
 
 ## Clipboard
 
@@ -95,6 +96,9 @@ relative_line_numbers = false
 
 [editor]
 wrap = true
+# Limit wrapped source and rendered prose to this many display columns.
+# Tables keep their 80-column minimum and horizontally scroll when needed.
+wrap_width = 100
 # Use a steady block in Normal, a steady bar in Insert and Command, and a
 # steady underscore in Select. Set false for a steady block in every mode.
 cursor_shapes = true
@@ -199,7 +203,8 @@ The highest severity wins when a line has more than one diagnostic; glyphs and
 modifiers preserve the signal without color.
 
 Wrapping can also be changed for the running session with `:set wrap` and
-`:set nowrap`. Spell checking can be toggled with `Space z`, `:set spell`, or
+`:set nowrap`; `wrap_width` is read at startup. Spell checking can be toggled
+with `Space z`, `:set spell`, or
 `:set nospell`; runtime toggles are not written back to configuration.
 
 Additional dictionaries are UTF-8 plain-text word lists with one entry per line.

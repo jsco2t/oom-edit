@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+pub(crate) const DEFAULT_WRAP_WIDTH: u16 = 100;
+
 /// Persistence boundary injected into [`crate::app::App`].
 ///
 /// Ordinary tests use [`DisabledConfigStore`], while production explicitly
@@ -269,6 +271,12 @@ pub struct EditorConfig {
     /// Whether long source lines wrap. Defaults to `true`.
     #[serde(default = "default_wrap")]
     pub wrap: bool,
+    /// Maximum display columns used to lay out wrapped source and prose.
+    #[serde(
+        default = "default_wrap_width",
+        deserialize_with = "deserialize_wrap_width"
+    )]
+    pub wrap_width: u16,
     /// Whether the terminal cursor shape follows the active mode.
     #[serde(default = "default_cursor_shapes")]
     pub cursor_shapes: bool,
@@ -278,6 +286,7 @@ impl Default for EditorConfig {
     fn default() -> Self {
         Self {
             wrap: default_wrap(),
+            wrap_width: default_wrap_width(),
             cursor_shapes: default_cursor_shapes(),
         }
     }
@@ -285,6 +294,21 @@ impl Default for EditorConfig {
 
 fn default_wrap() -> bool {
     true
+}
+
+fn default_wrap_width() -> u16 {
+    DEFAULT_WRAP_WIDTH
+}
+
+fn deserialize_wrap_width<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let width = u16::deserialize(deserializer)?;
+    if width == 0 {
+        return Err(serde::de::Error::custom("wrap_width must be positive"));
+    }
+    Ok(width)
 }
 
 fn default_cursor_shapes() -> bool {
@@ -575,10 +599,29 @@ additional_dictionaries = ["team.txt", "/opt/shared.txt"]
     }
 
     #[test]
+    fn config_editor_wrap_width_defaults_validates_and_roundtrips() {
+        assert_eq!(Config::default().editor.wrap_width, 100);
+
+        let partial: Config = toml::from_str("[editor]\nwrap = false\n").unwrap();
+        assert_eq!(partial.editor.wrap_width, 100);
+
+        let configured: Config = toml::from_str("[editor]\nwrap_width = 72\n").unwrap();
+        assert_eq!(configured.editor.wrap_width, 72);
+        assert_eq!(
+            toml::from_str::<Config>(&toml::to_string(&configured).unwrap()).unwrap(),
+            configured
+        );
+
+        assert!(toml::from_str::<Config>("[editor]\nwrap_width = 0\n").is_err());
+        assert!(toml::from_str::<Config>("[editor]\nwrap_width = 70000\n").is_err());
+    }
+
+    #[test]
     fn config_editor_wrap_roundtrip() {
         let config = Config {
             editor: EditorConfig {
                 wrap: false,
+                wrap_width: 72,
                 cursor_shapes: false,
             },
             ..Config::default()
@@ -586,6 +629,7 @@ additional_dictionaries = ["team.txt", "/opt/shared.txt"]
         let serialized = toml::to_string(&config).unwrap();
         let parsed: Config = toml::from_str(&serialized).unwrap();
         assert!(!parsed.editor.wrap);
+        assert_eq!(parsed.editor.wrap_width, 72);
         assert!(!parsed.editor.cursor_shapes);
     }
 
@@ -633,6 +677,7 @@ additional_dictionaries = ["team.txt", "/opt/shared.txt"]
             },
             editor: EditorConfig {
                 wrap: false,
+                wrap_width: 72,
                 cursor_shapes: false,
             },
             clipboard: ClipboardConfig {

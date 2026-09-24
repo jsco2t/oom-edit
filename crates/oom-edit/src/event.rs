@@ -22,7 +22,7 @@ use crate::app::App;
 /// without requesting unchanged frames.
 pub const FRAME_BUDGET: Duration = Duration::from_millis(50);
 /// Required pause after the most recently observed input before spell work.
-pub const SPELL_IDLE_DELAY: Duration = Duration::from_millis(150);
+pub const SPELL_IDLE_DELAY: Duration = Duration::from_secs(5);
 /// Maximum wall-clock slice reserved for one idle drain.
 pub const SPELL_SLICE_BUDGET: Duration = Duration::from_millis(8);
 /// Deterministic byte unit shared by file loading, engine building, and scans.
@@ -545,6 +545,42 @@ mod tests {
             event_time + SPELL_IDLE_DELAY - Duration::from_nanos(1),
             SPELL_IDLE_DELAY
         ));
+    }
+
+    #[test]
+    fn spell_idle_delay_is_five_seconds_and_resets_after_each_input() {
+        assert_eq!(SPELL_IDLE_DELAY, Duration::from_secs(5));
+
+        let initial = Instant::now();
+        let latest_input = initial + Duration::from_secs(2);
+        let mut app = test_app_with_spell_at("misspelledd\n", "known\n".to_string(), true, initial);
+        app.record_input(latest_input);
+
+        let before_threshold = latest_input + SPELL_IDLE_DELAY - Duration::from_nanos(1);
+        handle_poll_outcome(
+            &mut app,
+            false,
+            None,
+            before_threshold,
+            || panic!("timeout branch must not read an event"),
+            || Ok(false),
+            || before_threshold,
+        )
+        .unwrap();
+        assert_eq!(app.spell_host_phase(), "Unbuilt");
+
+        let threshold = latest_input + SPELL_IDLE_DELAY;
+        handle_poll_outcome(
+            &mut app,
+            false,
+            None,
+            threshold,
+            || panic!("timeout branch must not read an event"),
+            || Ok(true),
+            || threshold,
+        )
+        .unwrap();
+        assert_eq!(app.spell_host_phase(), "Loading");
     }
 
     #[test]

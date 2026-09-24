@@ -1,0 +1,44 @@
+{
+  "schema_version": 2,
+  "work_id": "2026-09-23-rendered-blank-line-navigation",
+  "title": "Rendered Blank-Line and Wrapped Navigation Fixes",
+  "phase": "DONE",
+  "created_at": "2026-09-23T23:22:06Z",
+  "updated_at": "2026-09-24T15:13:03Z",
+  "approved_at": "2026-09-23T23:36:41Z",
+  "completed_at": "2026-09-24T00:25:35Z",
+  "archived_at": "2026-09-24T15:13:03Z",
+  "baseline_sha": "235f63ba74d9ba6eba0e4f1ea2a23779e90547d2",
+  "final_sha": "235f63ba74d9ba6eba0e4f1ea2a23779e90547d2",
+  "plan_revision": 1,
+  "acceptance_round": 1,
+  "completed_rounds": [],
+  "approved_plan_sha256": "12f1fd311a0cc70f2bc3baffc16b53954850aebd67e333c880df8b633a08ce1f",
+  "current_task": null,
+  "tasks": [
+    {
+      "id": "001",
+      "path": "tasks/001-rendered-blank-line-identity.md",
+      "round": 1,
+      "status": "COMPLETE",
+      "attempts": 4,
+      "implementation": "main",
+      "evidence": "evidence/001.md"
+    },
+    {
+      "id": "002",
+      "path": "tasks/002-blank-row-horizontal-navigation.md",
+      "round": 1,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/002.md"
+    }
+  ],
+  "task_retry_limit": 6,
+  "final_retry_limit": 2,
+  "final_attempts": 1,
+  "stop_continuations": 0,
+  "max_stop_continuations": 50,
+  "block_reason": null
+}

@@ -712,12 +712,12 @@ fn select_required_motion_surface() {
         .map(|number| format!("paragraph {number}\n\n"))
         .collect::<String>();
     for (motion, row, source, range_count, last_end) in [
-        (key('j'), 1, (0, 0), 1, 11),
-        (special(KeyCodeKind::Down), 1, (0, 0), 1, 11),
-        (ctrl('d'), 23, (22, 0), 12, 157),
+        (key('j'), 1, (1, 0), 1, 11),
+        (special(KeyCodeKind::Down), 1, (1, 0), 1, 11),
+        (ctrl('d'), 23, (23, 0), 12, 157),
         (ctrl('f'), 46, (46, 0), 24, 314),
         (key('G'), 46, (46, 0), 24, 314),
-        (key('}'), 1, (0, 0), 1, 11),
+        (key('}'), 1, (1, 0), 1, 11),
     ] {
         let mut session = EditorSession::from_text(&document);
         session.render_layout(20);
@@ -744,11 +744,11 @@ fn select_required_motion_surface() {
     }
 
     for (motion, row, source, range_count, first_start) in [
-        (key('k'), 45, (44, 0), 1, 313),
-        (special(KeyCodeKind::Up), 45, (44, 0), 1, 313),
-        (ctrl('u'), 23, (22, 0), 12, 159),
+        (key('k'), 45, (45, 0), 1, 313),
+        (special(KeyCodeKind::Up), 45, (45, 0), 1, 313),
+        (ctrl('u'), 23, (23, 0), 12, 159),
         (ctrl('b'), 0, (0, 0), 24, 0),
-        (key('{'), 45, (44, 0), 1, 313),
+        (key('{'), 45, (45, 0), 1, 313),
     ] {
         let mut session = EditorSession::from_text(&document);
         session.render_layout(20);
@@ -1235,7 +1235,7 @@ fn wide_block_registers_put_without_character_count_padding() {
     session.handle_key(key('P'));
     assert_eq!(session.document(), source);
 
-    let mixed = "- 東\n- a\n\n- xx\n- yy\n";
+    let mixed = "- 東\n- a\n- xx\n- yy\n";
     let mut ragged = EditorSession::from_text(mixed);
     ragged.render_layout(40);
     ragged.handle_key(ctrl('v'));
@@ -1250,9 +1250,9 @@ fn wide_block_registers_put_without_character_count_padding() {
     ragged.handle_key(key('x'));
     ragged.handle_key(special(KeyCodeKind::Enter));
     ragged.handle_key(key('P'));
-    assert_eq!(ragged.document(), "- 東\n- a\n\n- 東xx\n- a yy\n");
+    assert_eq!(ragged.document(), "- 東\n- a\n- 東xx\n- a yy\n");
 
-    let mixed_prefixes = "- z\n- q\n\n- 東X\n- abY\n";
+    let mixed_prefixes = "- z\n- q\n- 東X\n- abY\n";
     let mut aligned = EditorSession::from_text(mixed_prefixes);
     aligned.render_layout(40);
     aligned.handle_key(ctrl('v'));
@@ -1264,9 +1264,9 @@ fn wide_block_registers_put_without_character_count_padding() {
     aligned.handle_key(special(KeyCodeKind::Enter));
     aligned.handle_key(key('l'));
     aligned.handle_key(key('P'));
-    assert_eq!(aligned.document(), "- z\n- q\n\n- 東zX\n- abqY\n");
+    assert_eq!(aligned.document(), "- z\n- q\n- 東zX\n- abqY\n");
 
-    let combining_prefixes = "- z\n- q\n\n- a\u{301}X\n- b\u{301}Y\n";
+    let combining_prefixes = "- z\n- q\n- a\u{301}X\n- b\u{301}Y\n";
     let mut atomic = EditorSession::from_text(combining_prefixes);
     atomic.render_layout(40);
     atomic.handle_key(ctrl('v'));
@@ -1278,10 +1278,7 @@ fn wide_block_registers_put_without_character_count_padding() {
     atomic.handle_key(special(KeyCodeKind::Enter));
     atomic.handle_key(key('l'));
     atomic.handle_key(key('P'));
-    assert_eq!(
-        atomic.document(),
-        "- z\n- q\n\n- a\u{301}zX\n- b\u{301}qY\n"
-    );
+    assert_eq!(atomic.document(), "- z\n- q\n- a\u{301}zX\n- b\u{301}qY\n");
 }
 
 #[test]

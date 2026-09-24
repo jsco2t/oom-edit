@@ -107,15 +107,6 @@ impl SpellState {
     }
 
     pub(crate) fn invalidate(&mut self, plan: InvalidationPlan, new_text: &str) {
-        if !matches!(self.scan, ScanState::Clean) {
-            self.diagnostics.clear();
-            self.exclusions.clear();
-            self.scan = ScanState::Dirty {
-                range: 0..new_text.len(),
-            };
-            return;
-        }
-
         match plan {
             InvalidationPlan::Full => {
                 self.diagnostics.clear();
@@ -130,6 +121,12 @@ impl SpellState {
                 new_text_len,
                 delta,
             } => {
+                let pending_range = match &self.scan {
+                    ScanState::Clean => None,
+                    ScanState::Dirty { range } | ScanState::Scanning { range, .. } => {
+                        Some(range.clone())
+                    }
+                };
                 self.diagnostics.retain_mut(|diagnostic| {
                     if diagnostic.range.end <= old_range.start {
                         return true;
@@ -151,9 +148,13 @@ impl SpellState {
                     false
                 });
                 let new_end = edit_start.saturating_add(new_text_len).min(new_text.len());
-                self.scan = ScanState::Dirty {
-                    range: containing_line(new_text, edit_start.min(new_text.len()), new_end),
-                };
+                let changed_range =
+                    containing_line(new_text, edit_start.min(new_text.len()), new_end);
+                let range = pending_range.map_or(changed_range.clone(), |pending| {
+                    let pending = shift_pending_range(pending, &old_range, delta, new_text.len());
+                    pending.start.min(changed_range.start)..pending.end.max(changed_range.end)
+                });
+                self.scan = ScanState::Dirty { range };
             }
         }
     }
@@ -338,4 +339,23 @@ fn containing_line(text: &str, start: usize, end: usize) -> Range<usize> {
 
 fn shift_range(range: &Range<usize>, delta: isize) -> Range<usize> {
     range.start.saturating_add_signed(delta)..range.end.saturating_add_signed(delta)
+}
+
+fn shift_pending_range(
+    range: Range<usize>,
+    changed_line: &Range<usize>,
+    delta: isize,
+    new_text_len: usize,
+) -> Range<usize> {
+    let start = if range.start >= changed_line.end {
+        range.start.saturating_add_signed(delta)
+    } else {
+        range.start
+    };
+    let end = if range.end <= changed_line.start {
+        range.end
+    } else {
+        range.end.saturating_add_signed(delta)
+    };
+    start.min(new_text_len)..end.min(new_text_len)
 }

@@ -2,23 +2,23 @@
   2 │ title: Kitchen Sink                                                      │
   3 │ au┌ Command Palette ─────────────────────────────────────────────┐       │
   4 └───│>                                                             │───────┘
-        │                                                              │
+  5     │                                                              │
   6 █ He│· j/k, ↑/↓       Move by rendered row.          R-N1          │
-        │· gg / G         Jump to the first / last rend… R-N2          │
+  7     │· gg / G         Jump to the first / last rend… R-N2          │
   8 Some│· Tab / S-Tab    Move between rendered jump ta… R-N3          │
-        │· /pattern⏎      Search rendered text forward.  R-N4          │
+  9     │· /pattern⏎      Search rendered text forward.  R-N4          │
  10 ┃ A │· n / N          Repeat the rendered search.    R-N4          │
-        │· i/a/I/A/o/O    Enter source Insert mode.      R-I1          │
+ 11     │· i/a/I/A/o/O    Enter source Insert mode.      R-I1          │
     ▏ ru│· Esc            Return from Insert to rendere… R-I2          │
  13 ▏ fn│· u / <C-r>      Undo / redo.                   R-E1          │
  14 ▏   │◦ :w             Save (atomic).                 V-X1          │
  15 ▏ } │◦ :w {path}      Save a copy to path without r… V-X1          │
     ▏   │◦ :q             Quit; refuses if dirty.        V-X2          │
-        │◦ :q!            Quit; discards changes.        V-X2          │
+ 17     │◦ :q!            Quit; discards changes.        V-X2          │
  18 ────│◦ :wq            Save then quit.                V-X3          │────────
-        │◦ :x             Save then quit (if changed).   V-X3          │
+ 19     │◦ :x             Save then quit (if changed).   V-X3          │
  20 Anot│↳ :e {path}      Open file; refuses if dirty w… V-X4          │
-        └──────────────────────────────────────────────────────────────┘
+ 21     └──────────────────────────────────────────────────────────────┘
  22 More text here.
 
  NORMAL  ↑↓ navigate · type to filter · Enter run/open ex · Esc close

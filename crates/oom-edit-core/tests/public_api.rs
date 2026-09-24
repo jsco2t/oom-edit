@@ -58,6 +58,7 @@ fn assert_no_exported_macros(path: &Path) {
 fn public_facade_types_are_available_at_crate_root() {
     let mut session = EditorSession::from_text("# root\n");
     let _: Vec<Effect> = session.open_command_prompt("wq");
+    let _: Vec<Effect> = session.insert_default_front_matter();
     session.set_command_history(CommandHistory::new());
     let _: Result<EditorSession, OpenError> = EditorSession::open_existing(Path::new("/missing"));
     let _: Effect = Effect::ReloadCurrentRequested { force: true };

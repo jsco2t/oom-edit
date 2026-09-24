@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "work_id": "2026-09-23-bug-report-batch",
+  "title": "Bug Report Batch — September 23, 2026",
+  "created_at": "2026-09-23T21:46:04Z",
+  "approved_at": "2026-09-23T22:05:18Z",
+  "completed_at": "2026-09-23T23:01:54Z",
+  "archived_at": "2026-09-23T23:07:50Z",
+  "baseline_sha": "235f63ba74d9ba6eba0e4f1ea2a23779e90547d2",
+  "final_sha": "235f63ba74d9ba6eba0e4f1ea2a23779e90547d2",
+  "approved_plan_sha256": "8dad5dd9c82ae92ee2968575f73aea663c3549aa85b8a9285cb6e96a603ae51c",
+  "acceptance_rounds": 1,
+  "prior_completed_rounds": 0,
+  "task_count": 5,
+  "tasks_completed": 5,
+  "result": "DONE",
+  "final_evidence": "evidence/final.md"
+}

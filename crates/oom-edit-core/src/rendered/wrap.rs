@@ -327,13 +327,13 @@ pub fn wrap_lines(input: &StyledLine, width: u16, hanging_indent: u16) -> Vec<St
     result
 }
 
-/// Hard-wrap a source line without dropping or inserting any source character.
+/// Wrap a source line without dropping or inserting any source character.
 ///
-/// Unlike [`wrap_lines`], this function does not prefer word boundaries or
-/// trim continuation whitespace. Source mode must display raw Markdown
-/// exactly, so concatenating the returned line texts always reproduces the
-/// input text. Zero-width suffixes remain attached to the preceding scalar,
-/// and an over-wide scalar is emitted whole so wrapping always makes progress.
+/// Whitespace stays attached to the preceding segment so ordinary prose wraps
+/// between words without adding indentation to the continuation. Indivisible
+/// overlong tokens are hard-wrapped. Concatenating the returned line texts
+/// always reproduces the input text, and zero-width suffixes remain attached
+/// to the preceding scalar.
 pub(crate) fn wrap_source_line(input: &StyledLine, width: u16) -> Vec<StyledLine> {
     if width == 0 {
         return vec![StyledLine {
@@ -357,6 +357,8 @@ pub(crate) fn wrap_source_line(input: &StyledLine, width: u16) -> Vec<StyledLine
     while start < chars.len() {
         let mut end = start;
         let mut display_width = 0;
+        let mut last_word_boundary = None;
+        let mut previous_word_boundary = None;
         while end < chars.len() {
             let character_width = chars[end].width().unwrap_or(0);
             if end > start && character_width > 0 && display_width + character_width > max_width {
@@ -366,11 +368,41 @@ pub(crate) fn wrap_source_line(input: &StyledLine, width: u16) -> Vec<StyledLine
             display_width += character_width;
             end += 1;
 
+            if chars[end - 1].is_whitespace() {
+                if end == 1 || !chars[end - 2].is_whitespace() {
+                    previous_word_boundary = last_word_boundary;
+                }
+                last_word_boundary = Some(end);
+            }
+
             if display_width >= max_width {
                 while end < chars.len() && chars[end].width().unwrap_or(0) == 0 {
                     end += 1;
                 }
                 break;
+            }
+        }
+
+        let repeated_space_boundary =
+            (end < chars.len() && chars[end - 1].is_whitespace() && chars[end].is_whitespace())
+                .then_some(previous_word_boundary)
+                .flatten()
+                .filter(|boundary| *boundary > start);
+        if let Some(boundary) = repeated_space_boundary {
+            end = boundary;
+        } else if end < chars.len() {
+            if let Some(boundary) = last_word_boundary.filter(|boundary| *boundary > start) {
+                let next_boundary = chars[boundary..]
+                    .iter()
+                    .position(|character| character.is_whitespace())
+                    .map_or(chars.len(), |offset| boundary + offset);
+                let word_width = chars[boundary..next_boundary]
+                    .iter()
+                    .map(|character| character.width().unwrap_or(0))
+                    .sum::<usize>();
+                if word_width <= max_width {
+                    end = boundary;
+                }
             }
         }
 
@@ -813,6 +845,56 @@ mod tests {
                 end_col: line.text.chars().count(),
                 style: SemanticStyle::Heading1,
             }]));
+    }
+
+    #[test]
+    fn source_wrap_prefers_word_boundaries_without_losing_source() {
+        let input = StyledLine {
+            text: "one two three four".to_string(),
+            spans: Vec::new(),
+        };
+
+        let result = wrap_source_line(&input, 8);
+
+        assert_eq!(
+            result
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["one two ", "three ", "four"]
+        );
+        assert_eq!(
+            result
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<String>(),
+            input.text
+        );
+    }
+
+    #[test]
+    fn source_wrap_keeps_repeated_boundary_spaces_off_continuations() {
+        let input = StyledLine {
+            text: "one two   three".to_string(),
+            spans: Vec::new(),
+        };
+
+        let result = wrap_source_line(&input, 8);
+
+        assert_eq!(
+            result
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["one ", "two   ", "three"]
+        );
+        assert_eq!(
+            result
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<String>(),
+            input.text
+        );
     }
 
     #[test]
