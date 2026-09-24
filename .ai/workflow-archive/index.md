@@ -11,3 +11,4 @@
 - 2026-09-19-environment-free-github-release-ci — Environment-Free GitHub Release CI — completed 2026-09-20T00:29:54Z — 7fbfd7784ca1fa7800dcecb0820f7bffdab81999..7fbfd7784ca1fa7800dcecb0820f7bffdab81999
 - 2026-09-23-bug-report-batch — Bug Report Batch — September 23, 2026 — completed 2026-09-23T23:01:54Z — 235f63ba74d9ba6eba0e4f1ea2a23779e90547d2..235f63ba74d9ba6eba0e4f1ea2a23779e90547d2
 - 2026-09-23-rendered-blank-line-navigation — Rendered Blank-Line and Wrapped Navigation Fixes — completed 2026-09-24T00:25:35Z — 235f63ba74d9ba6eba0e4f1ea2a23779e90547d2..235f63ba74d9ba6eba0e4f1ea2a23779e90547d2
+- 2026-09-24-rendered-line-numbering-and-soft-break-fidelity — Rendered Line Numbering and Soft-Break Fidelity — completed 2026-09-24T17:40:09Z — 5cf7981417db4bbc68bb13a1bd0e7e94170080fd..5cf7981417db4bbc68bb13a1bd0e7e94170080fd

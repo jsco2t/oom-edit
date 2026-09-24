@@ -16,6 +16,8 @@ category: testing
 status: draft
 ---
 
+> **Expected rendering:** The leading YAML becomes a structured metadata panel, `Space m` reports that front matter is already present, and six heading levels remain individually navigable.
+
 # Heading Level 1
 
 ## Heading Level 2
@@ -32,8 +34,15 @@ status: draft
 
 ## Inline Formatting
 
-This paragraph has **bold text**, _italic text_, _**bold and italic text**_, and ~~strikethrough text~~. It also has `inline code` and an inline code span with backtick escaping: `` `backticks` inside code ``. Here is a hard line break (two trailing spaces):\
-This line should start on a new line without a paragraph gap.
+> **Expected rendering:** Inline emphasis, strong text, strikethrough, code, and escapes keep distinct styles; both hard-break forms start a new physical row without a paragraph gap.
+
+This paragraph has **bold text**, _italic text_, _**bold and italic text**_, and ~~strikethrough text~~. It also has `inline code` and an inline code span with backtick escaping: `` `backticks` inside code ``.
+
+Backslash hard break follows this line:\
+This line should start on a new row without a paragraph gap.
+
+Two-space hard break follows this line:  
+This line should also start on a new row without a paragraph gap.
 
 You can also use _underscores for emphasis_ and **underscores for strong emphasis** and _**both at once**_.
 
@@ -43,11 +52,15 @@ Backslash escapes: \*not italic\*, \`not code\`, \[not a link\], \#not a heading
 
 ## Text wrapping
 
+> **Expected rendering:** The long physical line wraps at word boundaries; its first row has a line number, width continuations show `↳`, and the physical blank row below retains its own number and cursor position.
+
 This is a very long sentence to see how the editor handles text that needs to wrap to multiple lines the content of the sentence doesn't matter and infact it's clearly not even valid english that's ok as this is just a test to see how well wrapping works.
 
 ---
 
 ## Links and Images
+
+> **Expected rendering:** Link labels and image alt text remain styled and source-backed, while generated numeric markers identify their destinations without claiming source bytes.
 
 ### Inline Links
 
@@ -79,6 +92,8 @@ Here is a [reference link][ref1] and a [collapsed reference link][collapsed refe
 
 ## Block Quotes
 
+> **Expected rendering:** Every authored quote line remains a separately numbered rendered row with a `┃` prefix; nesting repeats the prefix and preserves embedded lists and code.
+
 > This is a simple block quote. It can contain **formatted text** and `code`.
 
 > Block quotes can span multiple lines.
@@ -108,6 +123,8 @@ Here is a [reference link][ref1] and a [collapsed reference link][collapsed refe
 
 ## Unordered Lists
 
+> **Expected rendering:** Tight lists remain compact, loose siblings retain one blank rendered row, nested indentation stays aligned, and `-`, `+`, and `*` start distinct list runs.
+
 - Item one
 - Item two
 - Item three with **bold** and `code`
@@ -123,18 +140,32 @@ Nested unordered lists:
 
 Different bullet characters start different lists:
 
-- Asterisk item one
-- Asterisk item two
+* Asterisk item one
+* Asterisk item two
 
-* Plus item one
-* Plus item two
++ Plus item one
++ Plus item two
 
 - Dash item one
 - Dash item two
 
+Loose list with blank-line-separated siblings and multiple blocks:
+
+- First loose item.
+
+- Second loose item with its first paragraph.
+
+  This second paragraph remains inside the second item.
+
+### Heading After a List and Physical Blank
+
+The physical blank line before this heading should retain its own gutter number and cursor identity.
+
 ---
 
 ## Ordered Lists
+
+> **Expected rendering:** Ordered lists retain declared starting values, accept both `.` and `)` source delimiters, and keep nested ordered and unordered children aligned.
 
 1. First item
 2. Second item
@@ -145,6 +176,11 @@ Starting from a different number:
 5. This starts at five
 6. Six
 7. Seven
+
+Parenthesis delimiters start a separate ordered list:
+
+1) Parenthesis item one
+2) Parenthesis item two
 
 Nested ordered lists:
 
@@ -169,6 +205,8 @@ Mixed nesting:
 
 ## Task Lists
 
+> **Expected rendering:** Checked and unchecked task markers remain visible non-color signals, including on nested tasks with inline formatting.
+
 - [ ] Unchecked task
 - [x] Checked task
 - [ ] Another unchecked task with `inline code`
@@ -179,6 +217,8 @@ Mixed nesting:
 ---
 
 ## Tables
+
+> **Expected rendering:** Pipe tables align columns and preserve inline styles; wide cells retain their complete content and use the table's horizontal layout instead of prose reflow.
 
 ### Simple Table
 
@@ -221,17 +261,21 @@ This table has cells with content long enough to force horizontal scrolling or w
 
 ## Thematic Breaks
 
+> **Expected rendering:** Each of the three CommonMark rule syntaxes becomes the same full-width visual separator.
+
 Three different syntaxes:
 
 ---
 
----
+***
 
----
+___
 
 ---
 
 ## Code Blocks
+
+> **Expected rendering:** Fenced blocks keep literal whitespace and language-specific highlighting, unknown or absent languages remain preformatted, and indented code stays literal.
 
 ### Fenced Code Blocks
 
@@ -501,6 +545,11 @@ It should be rendered as plain preformatted text.
 No syntax highlighting is applied.
 ```
 
+~~~text
+This block uses tilde fences instead of backticks.
+Its contents remain plain preformatted text.
+~~~
+
 ### Indented Code Block
 
     This is an indented code block.
@@ -514,6 +563,8 @@ No syntax highlighting is applied.
 
 ## Very Long Lines
 
+> **Expected rendering:** Long prose wraps without losing words or source positions, while indivisible code spans and URLs remain navigable across every displayed row.
+
 This is a very long line that should test horizontal scrolling and line wrapping behavior in the editor. It contains enough text to exceed the typical terminal width of 80 or even 120 columns, and it just keeps going and going and going with more words and clauses and phrases to push it well past any reasonable column limit that a user might have configured in their terminal emulator or window manager. The purpose is to verify that the editor handles extremely wide content gracefully, whether through soft-wrapping, horizontal scrolling, or some other mechanism. Does the cursor track correctly at column 300? Column 400? Let's find out by adding even more text to this single unbroken paragraph line.
 
 Here is a line with a very long inline code span: `fn this_is_a_really_long_function_name_that_goes_on_and_on(parameter_one: &str, parameter_two: &mut Vec<SomeGenericType<AnotherLongTypeName>>, parameter_three: Option<Result<HashMap<String, Vec<u64>>, SomeErrorType>>) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>>`
@@ -523,6 +574,8 @@ A very long URL in a link: [this link has an absurdly long URL](https://example.
 ---
 
 ## Deeply Nested Structures
+
+> **Expected rendering:** Six levels of mixed lists remain visibly nested, and the deepest block quote retains its own prefix, formatting, and source mapping.
 
 1. Level one ordered
    - Level two unordered
@@ -538,17 +591,28 @@ A very long URL in a link: [this link has an absurdly long URL](https://example.
 
 ## Paragraphs and Soft Breaks
 
+> **Expected rendering:** Blank lines separate paragraphs, while every plain source newline inside a paragraph starts a distinct numbered rendered row; nested styles survive those row boundaries.
+
 This is the first paragraph. It has multiple sentences. Each sentence adds to the overall content of the paragraph and tests how the editor handles flowing text within a single block.
 
 This is the second paragraph, separated from the first by a blank line. Paragraphs are the most basic block element in markdown and are used more than any other construct.
 
-This is the third paragraph. It contains a soft line break — in the source this
-paragraph spans two lines but they should be treated as a single paragraph with
-a soft break (rendered as a space or newline depending on the renderer).
+These three authored prose lines belong to one Markdown paragraph.
+Each physical source line should keep its own rendered row and line number.
+No blank lines separate these statements, so their soft breaks remain visible.
+
+This **strong phrase continues
+on the next physical source line** and [this link also crosses
+a physical source line](https://example.com/soft-break).
+
+This multiline code span contains a source newline: `alpha
+beta`; its internal line ending should normalize to a space on one rendered row.
 
 ---
 
 ## HTML (Inline and Block)
+
+> **Expected rendering:** Inline HTML stays within prose, while the block HTML remains a literal multi-line block without Markdown interpretation inside its tags.
 
 Inline HTML: This has a <strong>strong tag</strong> and a <em>em tag</em> and a <code>code tag</code>.
 
@@ -566,6 +630,8 @@ Block HTML:
 
 ## Footnotes
 
+> **Expected rendering:** Footnote references remain link-like in prose, and definitions are collected into one ordered footnote area after the document content.
+
 This sentence has a footnote[^1]. And here is another[^longnote].
 
 [^1]: This is the footnote content.
@@ -578,6 +644,8 @@ This sentence has a footnote[^1]. And here is another[^longnote].
 ---
 
 ## Escapes and Special Characters
+
+> **Expected rendering:** Escapes suppress Markdown punctuation, entities decode to their characters, literal table pipes remain inside code spans, and Unicode stays intact.
 
 Escaped characters: \* \_ \` \# \~ \[ \] \( \) \{ \} \| \\ \! \. \- \+
 
@@ -594,7 +662,19 @@ Unicode: em dash — en dash – ellipsis … bullet • copyright © section §
 
 ---
 
+## Spell-check Diagnostics
+
+> **Expected rendering:** Both invented words receive independent diagnostics; editing the correctly spelled middle line does not make the unaffected diagnostics disappear while rescanning waits for idle time.
+
+The invented word qzorpulated is intentionally misspelled.
+Edit this correctly spelled middle line repeatedly during manual verification.
+The invented word flarnivex is also intentionally misspelled.
+
+---
+
 ## Edge Cases
+
+> **Expected rendering:** Empty and consecutive headings remain safe and navigable, inline formatting survives inside headings, and Setext underlines produce real level-one and level-two headings.
 
 ### Empty Heading
 
@@ -620,13 +700,17 @@ Back to a paragraph.
 
 ### Setext Headings
 
-# This is a setext h1
+This is a setext h1
+===================
 
-## This is a setext h2
+This is a setext h2
+-------------------
 
 ---
 
 ## Long Table Stress Test
+
+> **Expected rendering:** The ten-row table keeps stable borders, aligned columns, inline code, and full-width horizontal navigation on narrow terminals.
 
 | #  | Method | Endpoint                   | Status | Latency | Description                                             |
 | -- | ------ | -------------------------- | ------ | ------- | ------------------------------------------------------- |
@@ -644,6 +728,8 @@ Back to a paragraph.
 ---
 
 ## Everything in a Block Quote
+
+> **Expected rendering:** The outer quote prefix applies to every nested heading, paragraph, list, table, fence, and inner quote without stealing their source identity.
 
 > # Quoted Heading
 >
@@ -669,4 +755,6 @@ Back to a paragraph.
 
 ## Final Paragraph
 
-This document exercises headings (ATX and setext, levels 1-6), inline formatting (bold, italic, bold-italic, strikethrough, code spans), links (inline, reference, collapsed, shortcut, autolinks), images, block quotes (including nested and with embedded content), ordered and unordered lists (including deep nesting and mixed types), task lists, tables (simple, aligned, wide, and long), thematic breaks, fenced code blocks (Rust, Go, Python, JavaScript, TypeScript, Bash, C, YAML, TOML, JSON, SQL, CSS, and unspecified), indented code blocks, very long lines, HTML (inline and block), footnotes, setext headings, escape sequences, special characters, and edge cases. If oom-edit renders all of the above correctly, it handles real-world markdown well.
+> **Expected rendering:** This final summary is an ordinary paragraph following a numbered physical blank row and remains reachable through document-end navigation.
+
+This document exercises headings (ATX and Setext, levels 1-6), inline formatting (bold, italic, bold-italic, strikethrough, hard and soft breaks, and single- or multi-line code spans), links (inline, reference, collapsed, shortcut, autolinks, and links crossing source lines), images, block quotes (including nested and with embedded content), ordered and unordered lists (tight, loose, alternate delimiters, deep nesting, and mixed types), task lists, tables (simple, aligned, wide, and long), all thematic-break syntaxes, backtick and tilde fenced code blocks (Rust, Go, Python, JavaScript, TypeScript, Bash, C, YAML, TOML, JSON, SQL, CSS, text, and unspecified), indented code blocks, very long lines, spelling diagnostics, HTML (inline and block), footnotes, escape sequences, special characters, and edge cases. If oom-edit renders all of the above correctly, it handles real-world Markdown well.

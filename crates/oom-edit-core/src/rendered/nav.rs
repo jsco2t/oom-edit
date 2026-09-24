@@ -176,11 +176,27 @@ pub(crate) fn enter_rendered_at_offset(
         });
     }
 
-    if let Some(idx) = layout.lines.iter().position(|rendered_line| {
-        rendered_line.kind == LineKind::Content
-            && (rendered_line.source.contains(&edit_offset)
-                || rendered_line.source.start == edit_offset)
-    }) {
+    if let Some(idx) = layout
+        .lines
+        .iter()
+        .enumerate()
+        .filter(|(_, rendered_line)| {
+            rendered_line.kind == LineKind::Content
+                && (rendered_line.source.contains(&edit_offset)
+                    || rendered_line.source.start == edit_offset)
+        })
+        .min_by_key(|(idx, rendered_line)| {
+            (
+                rendered_line.source.start != edit_offset,
+                rendered_line
+                    .source
+                    .end
+                    .saturating_sub(rendered_line.source.start),
+                *idx,
+            )
+        })
+        .map(|(idx, _)| idx)
+    {
         return cursor_for_row(idx, 0, layout);
     }
 

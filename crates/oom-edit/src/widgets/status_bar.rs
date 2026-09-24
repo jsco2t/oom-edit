@@ -417,6 +417,11 @@ fn format_gutter_cell(text: &str, width: usize) -> String {
     format!("{text:>number_width$}{}", " ".repeat(GUTTER_CONTENT_GAP))
 }
 
+/// Place a one-cell marker in the gutter number field without changing geometry.
+pub(crate) fn format_gutter_marker(marker: &str, width: usize) -> String {
+    format_gutter_cell(marker, width)
+}
+
 /// Compute the gutter width for the active line-number presentation.
 pub fn gutter_width(line_count: usize, relative_line_numbers: bool) -> usize {
     let digits = if line_count == 0 {

@@ -776,6 +776,135 @@ fn test_paragraphs() {
     }
 }
 
+#[test]
+fn soft_breaks_preserve_physical_rows_and_width_wrap_identity() {
+    let text = "**Suite:** Warewulf Pro\n**Purpose:** Final sweep with enough words to wrap\nLeaves the server on dev\n**Estimated Time:** 5 minutes\n";
+    let wide = rendered_layout_at_width(text, 120);
+    let expected = [
+        ("Suite: Warewulf Pro", 0..24, Some(1)),
+        (
+            "Purpose: Final sweep with enough words to wrap",
+            24..75,
+            Some(2),
+        ),
+        ("Leaves the server on dev", 75..100, Some(3)),
+        ("Estimated Time: 5 minutes", 100..130, Some(4)),
+    ];
+
+    assert_eq!(wide.lines.len(), expected.len());
+    for ((line, number), (visible, source, expected_number)) in
+        wide.lines.iter().zip(&wide.line_numbers).zip(expected)
+    {
+        assert_eq!(line.styled.text, visible);
+        assert_eq!(line.source, source);
+        assert_eq!(*number, expected_number);
+    }
+
+    let narrow = rendered_layout_at_width(text, 22);
+    let purpose_rows = narrow
+        .lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.source == (24..75))
+        .collect::<Vec<_>>();
+    assert!(purpose_rows.len() > 1);
+    assert_eq!(narrow.line_numbers[purpose_rows[0].0], Some(2));
+    for (row, line) in purpose_rows.iter().skip(1) {
+        assert_eq!(narrow.line_numbers[*row], None);
+        assert_eq!(line.source, 24..75);
+    }
+    assert!(narrow
+        .lines
+        .iter()
+        .zip(&narrow.line_numbers)
+        .any(|(line, number)| line.source == (75..100) && *number == Some(3)));
+}
+
+#[test]
+fn hard_breaks_preserve_rows_without_visible_break_atoms() {
+    for text in ["alpha  \nbeta\n", "alpha\\\nbeta\n"] {
+        let layout = rendered_layout_at_width(text, 80);
+        assert_eq!(
+            layout
+                .lines
+                .iter()
+                .map(|line| line.styled.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta"]
+        );
+        assert_eq!(layout.line_numbers, vec![Some(1), Some(2)]);
+        assert!(layout
+            .lines
+            .iter()
+            .flat_map(|line| &line.atoms)
+            .all(|atom| {
+                atom.source.as_ref().is_none_or(|range| {
+                    !text[range.clone()].contains('\n')
+                        && !text[range.clone()].contains("  ")
+                        && &text[range.clone()] != "\\"
+                })
+            }));
+    }
+}
+
+#[test]
+fn nested_soft_breaks_keep_styles_prefixes_unicode_and_crlf_provenance() {
+    let text = "> **東京** [one](dest)\r\n> *second* line\r\n";
+    let layout = rendered_layout_at_width(text, 80);
+    assert_eq!(&layout.line_numbers[..2], &[Some(1), Some(2)]);
+    assert_eq!(layout.lines[0].source, 0..26);
+    assert_eq!(layout.lines[1].source, 26..43);
+    assert!(layout.lines[0]
+        .styled
+        .spans
+        .iter()
+        .any(|span| span.style == SemanticStyle::Strong));
+    assert!(layout.lines[1]
+        .styled
+        .spans
+        .iter()
+        .any(|span| span.style == SemanticStyle::Emphasis));
+    for line in &layout.lines {
+        for atom in &line.atoms {
+            if let Some(source) = &atom.source {
+                assert!(line.source.start <= source.start && source.end <= line.source.end);
+            }
+        }
+    }
+}
+
+#[test]
+fn soft_break_inside_a_list_link_keeps_prefixes_and_places_marker_last() {
+    let text = "- [one\n  two](dest)\n";
+    let layout = rendered_layout_at_width(text, 80);
+    assert_eq!(layout.lines[0].styled.text, "• one");
+    assert_eq!(layout.lines[1].styled.text, "  two [0]");
+    assert_eq!(layout.lines[0].source, 0..7);
+    assert_eq!(layout.lines[1].source, 7..20);
+    assert_eq!(&layout.line_numbers[..2], &[Some(1), Some(2)]);
+    for line in &layout.lines[..2] {
+        assert!(line
+            .styled
+            .spans
+            .iter()
+            .any(|span| span.style == SemanticStyle::Link));
+        assert!(line
+            .atoms
+            .iter()
+            .filter_map(|atom| atom.source.as_ref())
+            .all(|source| line.source.start <= source.start && source.end <= line.source.end));
+    }
+}
+
+#[test]
+fn code_span_line_endings_remain_normalized_inside_one_rendered_row() {
+    let text = "`alpha\nbeta`\n";
+    let layout = rendered_layout_at_width(text, 80);
+    assert_eq!(layout.lines.len(), 1);
+    assert_eq!(layout.lines[0].styled.text, "alpha beta");
+    assert_eq!(layout.line_numbers, vec![Some(1)]);
+}
+
 // ── Code fence tests ───────────────────────────────────────────────────────
 
 #[test]
@@ -1888,6 +2017,181 @@ fn test_span_integrity_code_blocks() {
 }
 
 // ── Kitchen-sink corpus test ───────────────────────────────────────────────
+
+#[test]
+fn example_kitchen_sink_recent_regressions_are_explicit_and_renderable() {
+    let text = include_str!("../../../../../examples/kitchen-sink.md");
+    const CALLOUT: &str = "> **Expected rendering:**";
+    const SECTION_HEADINGS: [&str; 21] = [
+        "## Inline Formatting",
+        "## Text wrapping",
+        "## Links and Images",
+        "## Block Quotes",
+        "## Unordered Lists",
+        "## Ordered Lists",
+        "## Task Lists",
+        "## Tables",
+        "## Thematic Breaks",
+        "## Code Blocks",
+        "## Very Long Lines",
+        "## Deeply Nested Structures",
+        "## Paragraphs and Soft Breaks",
+        "## HTML (Inline and Block)",
+        "## Footnotes",
+        "## Escapes and Special Characters",
+        "## Spell-check Diagnostics",
+        "## Edge Cases",
+        "## Long Table Stress Test",
+        "## Everything in a Block Quote",
+        "## Final Paragraph",
+    ];
+
+    assert_eq!(text.matches(CALLOUT).count(), SECTION_HEADINGS.len() + 1);
+    assert!(text.contains(&format!("status: draft\n---\n\n{CALLOUT} The leading YAML")));
+    for heading in SECTION_HEADINGS {
+        assert!(
+            text.contains(&format!("{heading}\n\n{CALLOUT}")),
+            "missing expected-rendering callout after {heading}"
+        );
+    }
+
+    for source_form in [
+        "Two-space hard break follows this line:  \n",
+        "* Asterisk item one\n",
+        "+ Plus item one\n",
+        "- Dash item one\n",
+        "1) Parenthesis item one\n",
+        "Three different syntaxes:\n\n---\n\n***\n\n___\n\n---\n\n## Code Blocks",
+        "~~~text\nThis block uses tilde fences instead of backticks.\n",
+        "This is a setext h1\n===================\n",
+        "This is a setext h2\n-------------------\n",
+        "This multiline code span contains a source newline: `alpha\nbeta`",
+        "\tvar wg sync.WaitGroup\n",
+        "\t\tdefer wg.Done()\n",
+    ] {
+        assert!(
+            text.contains(source_form),
+            "kitchen-sink is missing source form {source_form:?}"
+        );
+    }
+
+    let source_line = |needle: &str| {
+        let position = text
+            .find(needle)
+            .unwrap_or_else(|| panic!("missing kitchen-sink scenario {needle:?}"));
+        let start = text[..position].rfind('\n').map_or(0, |index| index + 1);
+        let end = text[start..]
+            .find('\n')
+            .map_or(text.len(), |index| start + index + 1);
+        start..end
+    };
+    let source_number =
+        |start: usize| text[..start].bytes().filter(|byte| *byte == b'\n').count() + 1;
+
+    let wide = rendered_layout_at_width(text, 512);
+    assert_eq!(
+        wide.lines
+            .iter()
+            .filter(|line| line.styled.text.starts_with("┃ Expected rendering:"))
+            .count(),
+        SECTION_HEADINGS.len() + 1
+    );
+
+    for needle in [
+        "Backslash hard break follows this line:",
+        "This line should start on a new row",
+        "Two-space hard break follows this line:",
+        "This line should also start on a new row",
+        "These three authored prose lines belong",
+        "Each physical source line should keep",
+        "No blank lines separate these statements",
+        "> Block quotes can span multiple lines.",
+        "> Each line is prefixed with a `>` character.",
+    ] {
+        let source = source_line(needle);
+        assert!(wide
+            .lines
+            .iter()
+            .zip(&wide.line_numbers)
+            .any(|(line, number)| line.source == source
+                && *number == Some(source_number(source.start))));
+    }
+
+    let wrapped_source = source_line("This is a very long sentence to see how the editor");
+    let physical_blank = wrapped_source.end..wrapped_source.end + 1;
+    assert_eq!(&text[physical_blank.clone()], "\n");
+    assert!(wide
+        .lines
+        .iter()
+        .zip(&wide.line_numbers)
+        .any(|(line, number)| {
+            line.kind == LineKind::Content
+                && line.source == physical_blank
+                && line.styled.text.is_empty()
+                && line.atoms.is_empty()
+                && *number == Some(source_number(physical_blank.start))
+        }));
+
+    let heading_source = source_line("### Heading After a List and Physical Blank");
+    let list_heading_blank = heading_source.start - 1..heading_source.start;
+    assert_eq!(&text[list_heading_blank.clone()], "\n");
+    assert!(wide
+        .lines
+        .iter()
+        .zip(&wide.line_numbers)
+        .any(|(line, number)| {
+            line.kind == LineKind::Content
+                && line.source == list_heading_blank
+                && line.styled.text.is_empty()
+                && line.atoms.is_empty()
+                && *number == Some(source_number(list_heading_blank.start))
+        }));
+
+    let first_loose = wide
+        .lines
+        .iter()
+        .position(|line| line.styled.text == "• First loose item.")
+        .expect("first loose-list item should render");
+    let second_loose = wide
+        .lines
+        .iter()
+        .position(|line| line.styled.text == "• Second loose item with its first paragraph.")
+        .expect("second loose-list item should render");
+    assert!(wide.lines[first_loose + 1..second_loose]
+        .iter()
+        .enumerate()
+        .any(|(offset, line)| {
+            line.kind == LineKind::Content
+                && line.styled.text.is_empty()
+                && line.atoms.is_empty()
+                && wide.line_numbers[first_loose + 1 + offset].is_some()
+        }));
+
+    let code_rows = wide
+        .lines
+        .iter()
+        .filter(|line| line.styled.text.contains("alpha beta"))
+        .collect::<Vec<_>>();
+    assert_eq!(code_rows.len(), 1);
+    assert!(text[code_rows[0].source.clone()].contains("`alpha\nbeta`"));
+
+    let narrow = rendered_layout_at_width(text, 40);
+    let wrapped_rows = narrow
+        .lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.source == wrapped_source)
+        .collect::<Vec<_>>();
+    assert!(wrapped_rows.len() > 1);
+    assert_eq!(
+        narrow.line_numbers[wrapped_rows[0].0],
+        Some(source_number(wrapped_source.start))
+    );
+    assert!(wrapped_rows
+        .iter()
+        .skip(1)
+        .all(|(row, _)| narrow.line_numbers[*row].is_none()));
+}
 
 #[test]
 fn test_kitchen_sink_no_panic() {

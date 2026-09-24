@@ -161,9 +161,9 @@ pub enum Inline {
     Text(InlineLeaf),
     /// Inline code span (content without backticks).
     Code(InlineLeaf),
-    /// Soft line break (two+ spaces at end of line in source).
+    /// Soft line break (a plain line ending within a paragraph).
     SoftBreak(InlineLeaf),
-    /// Hard line break (backslash at end of line or two+ newlines).
+    /// Hard line break (two+ spaces or a backslash before the line ending).
     HardBreak(InlineLeaf),
     /// Emphasized text.
     Emph(Vec<Inline>),

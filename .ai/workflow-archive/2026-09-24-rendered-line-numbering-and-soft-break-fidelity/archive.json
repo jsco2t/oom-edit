@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "work_id": "2026-09-24-rendered-line-numbering-and-soft-break-fidelity",
+  "title": "Rendered Line Numbering and Soft-Break Fidelity",
+  "created_at": "2026-09-24T15:52:59Z",
+  "approved_at": "2026-09-24T17:33:26Z",
+  "completed_at": "2026-09-24T17:40:09Z",
+  "archived_at": "2026-09-24T18:59:30Z",
+  "baseline_sha": "5cf7981417db4bbc68bb13a1bd0e7e94170080fd",
+  "final_sha": "5cf7981417db4bbc68bb13a1bd0e7e94170080fd",
+  "approved_plan_sha256": "3e715888ed185252a2eb3415bf8bd99fa2ee189cb01e4bbb0fcc10ddeeb6f454",
+  "acceptance_rounds": 3,
+  "prior_completed_rounds": 2,
+  "task_count": 5,
+  "tasks_completed": 5,
+  "result": "DONE",
+  "final_evidence": "evidence/final.md"
+}

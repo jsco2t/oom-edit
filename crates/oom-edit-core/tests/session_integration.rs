@@ -804,6 +804,75 @@ fn rendered_navigation_updates_canonical_source_cursor() {
 }
 
 #[test]
+fn rendered_navigation_tracks_soft_break_source_lines_across_resize_and_search() {
+    let text = "alpha one\nbeta two with words that wrap\ngamma three\n";
+    let mut session = EditorSession::from_text(text);
+    let layout = session.render_layout(80);
+    assert_eq!(&layout.line_numbers[..3], &[Some(1), Some(2), Some(3)]);
+
+    session.handle_key(key('j'));
+    assert_eq!(session.cursor(), (1, 0));
+    session.render_layout(10);
+    assert_eq!(session.cursor().0, 1);
+    assert!(
+        session
+            .render_layout(10)
+            .lines
+            .iter()
+            .filter(|line| line.source == (10..40))
+            .count()
+            > 1
+    );
+
+    session.handle_key(key('/'));
+    for ch in "gamma".chars() {
+        session.handle_key(key(ch));
+    }
+    session.handle_key(special(KeyCodeKind::Enter));
+    assert_eq!(session.cursor(), (2, 0));
+
+    let mut horizontal = EditorSession::from_text(text);
+    horizontal.render_layout(80);
+    horizontal.handle_key(key('$'));
+    horizontal.handle_key(key('l'));
+    assert_eq!(horizontal.cursor(), (1, 0));
+}
+
+#[test]
+fn rendered_select_and_operators_preserve_soft_break_source_ranges() {
+    let text = "alpha one\nbeta two\ngamma three\n";
+    let mut line = EditorSession::from_text(text);
+    line.render_layout(80);
+    line.handle_key(key('V'));
+    line.handle_key(key('j'));
+    let selection = line.rendered_selection().unwrap();
+    assert_eq!(selection.source_ranges, vec![0..19]);
+    assert_eq!(clipboard_writes(&line.handle_key(key('y'))), [&text[..19]]);
+
+    let mut character = EditorSession::from_text(text);
+    character.render_layout(80);
+    character.handle_key(key('$'));
+    character.handle_key(key('v'));
+    character.handle_key(key('l'));
+    assert_eq!(
+        character.rendered_selection().unwrap().source_ranges,
+        vec![8..9, 10..11]
+    );
+    assert_eq!(clipboard_writes(&character.handle_key(key('y'))), ["e\nb"]);
+
+    let mut block = EditorSession::from_text(text);
+    block.render_layout(80);
+    block.handle_key(ctrl('v'));
+    block.handle_key(key('j'));
+    block.handle_key(key('l'));
+    assert_eq!(
+        block.rendered_selection().unwrap().source_ranges,
+        vec![0..2, 10..12]
+    );
+    assert_eq!(clipboard_writes(&block.handle_key(key('y'))), ["al\nbe"]);
+}
+
+#[test]
 fn first_actual_width_preserves_source_anchor() {
     let text = "# One\n\nA long paragraph whose words wrap differently at narrow widths.\n";
     let mut session = EditorSession::from_text(text);
@@ -1318,6 +1387,45 @@ fn rendered_blank_line_preserves_physical_identity_and_canonical_cursor() {
     assert_eq!(layout.lines[separator].kind, LineKind::Synthetic);
     assert!(layout.lines[separator].atoms.is_empty());
     assert_eq!(layout.line_numbers[separator], None);
+}
+
+#[test]
+fn rendered_blank_after_list_preserves_physical_identity() {
+    let text = "- result\n\n## Pass\n";
+    let mut session = EditorSession::from_text(text);
+    let layout = session.render_layout(40).clone();
+    let blank_row = layout
+        .line_numbers
+        .iter()
+        .position(|line_number| *line_number == Some(2))
+        .expect("the physical blank after a list must retain line two");
+    let blank = &layout.lines[blank_row];
+
+    assert_eq!(blank.kind, LineKind::Content);
+    assert_eq!(blank.source, 9..10);
+    assert!(blank.styled.text.is_empty());
+    assert!(blank.atoms.is_empty());
+
+    for _ in 0..blank_row {
+        session.handle_key(key('j'));
+    }
+    assert_eq!(session.rendered_cursor_line(), blank_row);
+    assert_eq!(session.cursor(), (1, 0));
+
+    session.remap_rendered_cursor(1, 0);
+    assert_eq!(session.rendered_cursor_line(), blank_row);
+    assert_eq!(session.cursor(), (1, 0));
+
+    let mut multiple = EditorSession::from_text("- result\n\n\n## Pass\n");
+    let multiple_layout = multiple.render_layout(40);
+    let empty_rows = multiple_layout
+        .lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.styled.text.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(empty_rows.len(), 1);
+    assert_eq!(multiple_layout.line_numbers[empty_rows[0].0], Some(3));
 }
 
 #[test]

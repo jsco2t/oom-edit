@@ -98,6 +98,17 @@ paragraphs, table cells). Ordered roughly by precedence:
 **Nesting constraint worth remembering:** links can't nest in links; code spans and
 autolinks are opaque (no inline children).
 
+### oom-edit rendered-line policy
+
+CommonMark and GFM permit a soft line break to render as either a space or a line
+ending. Rendered Normal and Select modes use the line-ending form so every authored
+prose line retains its physical source-line identity. Hard line breaks use the same
+row boundary. Width wrapping is then applied independently within each physical
+line; only those width-generated continuation rows omit a source line number.
+
+Line endings inside code spans remain normalized to spaces as required by code-span
+parsing and do not create rendered row boundaries.
+
 ---
 
 ## 5. GFM extensions

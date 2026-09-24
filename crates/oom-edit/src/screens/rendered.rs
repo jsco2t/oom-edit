@@ -6,7 +6,7 @@
 //!
 //! See plan §6.3, VN-1, VN-3.
 
-use oom_edit_core::{EditorSession, RenderedLineRole};
+use oom_edit_core::{EditorSession, RenderedLine, RenderedLineRole};
 use ratatui::buffer::CellWidth;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -16,7 +16,7 @@ use ratatui::Frame;
 
 #[cfg(test)]
 use crate::gutter::GutterTroubleSnapshot;
-use crate::screens::editor::DocumentPresentation;
+use crate::screens::editor::{DocumentPresentation, GutterRows};
 use crate::theme::{Theme, Tier, UiSlot};
 use crate::widgets::spans;
 use crate::widgets::status_bar;
@@ -27,6 +27,33 @@ fn line_surface(theme: &Theme, tier: Tier, role: RenderedLineRole) -> Option<Sty
         RenderedLineRole::Metadata => Some(theme.ui_style(tier, UiSlot::MetadataPanel)),
         RenderedLineRole::CodeFence => Some(theme.ui_style(tier, UiSlot::CodeFence)),
     }
+}
+
+fn gutter_continuation_sources(
+    lines: &[RenderedLine],
+    line_numbers: &[Option<usize>],
+) -> Vec<Option<usize>> {
+    let mut source_line = None;
+    lines
+        .iter()
+        .enumerate()
+        .map(
+            |(row, line)| match line_numbers.get(row).copied().flatten() {
+                Some(number) => {
+                    source_line = Some(number.saturating_sub(1));
+                    None
+                }
+                None if row > 0
+                    && line_numbers.get(row).is_some_and(Option::is_none)
+                    && line.kind == oom_edit_core::LineKind::Content
+                    && line.source == lines[row - 1].source =>
+                {
+                    source_line
+                }
+                None => None,
+            },
+        )
+        .collect()
 }
 
 /// App-owned viewport coordinates for a rendered surface.
@@ -142,6 +169,7 @@ pub(crate) fn render_rendered_with_settings(
     let layout = session
         .rendered_layout()
         .expect("rendered layout was built for this frame");
+    let gutter_continuations = gutter_continuation_sources(&layout.lines, &layout.line_numbers);
 
     if gutter_width > 0 {
         let gutter_area = Rect::new(area.x, area.y, gutter_width, area.height);
@@ -149,7 +177,10 @@ pub(crate) fn render_rendered_with_settings(
             frame,
             mode,
             source_cursor_line,
-            &layout.line_numbers[rendered_top..rendered_bottom],
+            GutterRows::new(
+                &layout.line_numbers[rendered_top..rendered_bottom],
+                &gutter_continuations[rendered_top..rendered_bottom],
+            ),
             settings.relative_line_numbers,
             gutter_area,
             presentation,
@@ -1673,28 +1704,98 @@ mod tests {
     }
 
     #[test]
-    fn rendered_gutter_shows_source_number_and_blanks_wrapped_rows() {
-        let mut session = EditorSession::from_text(
-            "A paragraph with enough words to wrap across several narrow rows.\n",
-        );
-        let mut terminal = Terminal::new(TestBackend::new(24, 5)).unwrap();
-        terminal
-            .draw(|frame| {
-                render_rendered(
-                    frame,
-                    &mut session,
-                    RenderedViewport::new(0, 0),
-                    false,
-                    frame.area(),
-                    &DEFAULT_DARK,
-                    Tier::TrueColor,
+    fn rendered_gutter_continuation_marks_only_width_wrapped_rows() {
+        for relative in [false, true] {
+            let mut session = EditorSession::from_text(
+                "# Head\nA paragraph with enough words to wrap across several narrow rows.\n\n# Next\n",
+            );
+            let mut terminal = Terminal::new(TestBackend::new(24, 10)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_rendered(
+                        frame,
+                        &mut session,
+                        RenderedViewport::new(0, 4),
+                        relative,
+                        frame.area(),
+                        &DEFAULT_DARK,
+                        Tier::TrueColor,
+                    );
+                })
+                .unwrap();
+            let layout = session.rendered_layout().unwrap();
+            let buffer = terminal.backend().buffer();
+            let marker_column = status_bar::gutter_width(session.line_count(), relative) - 2;
+            let continuations = gutter_continuation_sources(&layout.lines, &layout.line_numbers);
+            assert!(layout
+                .lines
+                .iter()
+                .any(|line| line.kind == oom_edit_core::LineKind::Synthetic));
+            assert!(layout
+                .lines
+                .iter()
+                .zip(&layout.line_numbers)
+                .any(
+                    |(line, number)| line.kind == oom_edit_core::LineKind::Content
+                        && line.styled.text.is_empty()
+                        && number.is_some()
+                ));
+            for (row, (_line, number)) in layout.lines.iter().zip(&layout.line_numbers).enumerate()
+            {
+                let expected = if continuations[row].is_some() {
+                    "↳"
+                } else if number.is_some() {
+                    continue;
+                } else {
+                    " "
+                };
+                assert_eq!(
+                    buffer
+                        .cell((marker_column as u16, row as u16))
+                        .unwrap()
+                        .symbol(),
+                    expected
                 );
-            })
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        assert_eq!(buffer.cell((0, 0)).unwrap().symbol(), " ");
-        assert_eq!(buffer.cell((1, 0)).unwrap().symbol(), "1");
-        assert_eq!(buffer.cell((1, 1)).unwrap().symbol(), " ");
+            }
+            for row in layout.lines.len()..10 {
+                assert_eq!(
+                    buffer
+                        .cell((marker_column as u16, row as u16))
+                        .unwrap()
+                        .symbol(),
+                    " "
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gutter_continuation_classification_covers_rendered_surfaces() {
+        let long = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda";
+        let cases = [
+            long.to_string(),
+            format!("- {long}\n"),
+            format!("> {long}\n"),
+            format!("---\ntitle: {long}\n---\n"),
+            format!("| value |\n| --- |\n| {long} {long} |\n"),
+        ];
+
+        for source in cases {
+            let mut session = EditorSession::from_text(&source);
+            let layout = session.render_layout(18);
+            let continuations = gutter_continuation_sources(&layout.lines, &layout.line_numbers);
+            assert!(
+                continuations.iter().any(Option::is_some),
+                "expected a width continuation for {source:?}"
+            );
+            for (row, continuation) in continuations.iter().copied().enumerate() {
+                if continuation.is_some() {
+                    assert_eq!(layout.lines[row].kind, oom_edit_core::LineKind::Content);
+                    assert_eq!(layout.lines[row].source, layout.lines[row - 1].source);
+                    assert_eq!(layout.line_numbers[row], None);
+                }
+            }
+        }
     }
 
     #[test]
@@ -1747,6 +1848,56 @@ mod tests {
                 .collect::<String>();
             assert!(gutter.contains('2'), "blank-line gutter was {gutter:?}");
 
+            let status = (0..40)
+                .map(|column| buffer.cell((column, 7)).unwrap().symbol())
+                .collect::<String>();
+            assert!(status.contains("2:1"), "blank-line status was {status:?}");
+        }
+    }
+
+    #[test]
+    fn rendered_blank_after_list_gutter_and_status_report_its_physical_position() {
+        let mut session = EditorSession::from_text("- result\n\n## Pass\n");
+        let layout = session.render_layout(40).clone();
+        let blank_row = layout
+            .line_numbers
+            .iter()
+            .position(|line_number| *line_number == Some(2))
+            .expect("the physical blank after a list must retain line two");
+        for _ in 0..blank_row {
+            session.handle_key(key('j'));
+        }
+
+        for relative in [false, true] {
+            let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_rendered(
+                        frame,
+                        &mut session,
+                        RenderedViewport::new(0, 0),
+                        relative,
+                        Rect::new(0, 0, 40, 7),
+                        &DEFAULT_DARK,
+                        Tier::TrueColor,
+                    );
+                    crate::screens::editor::render_status_row(
+                        frame,
+                        &session,
+                        None,
+                        "",
+                        Rect::new(0, 7, 40, 1),
+                        &DEFAULT_DARK,
+                        Tier::TrueColor,
+                    );
+                })
+                .unwrap();
+
+            let buffer = terminal.backend().buffer();
+            let gutter = (0..status_bar::gutter_width(session.line_count(), relative) as u16)
+                .map(|column| buffer.cell((column, blank_row as u16)).unwrap().symbol())
+                .collect::<String>();
+            assert!(gutter.contains('2'), "blank-line gutter was {gutter:?}");
             let status = (0..40)
                 .map(|column| buffer.cell((column, 7)).unwrap().symbol())
                 .collect::<String>();
