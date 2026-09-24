@@ -1,8 +1,8 @@
 //! Integration coverage for the four-mode rendered-first session contract.
 
 use oom_edit_core::{
-    ClipboardContent, EditorSession, Effect, KeyCode, KeyCodeKind, KeyInput, Mode, Modifiers,
-    RenderedLineRole, RenderedPoint, SelectionShape, SemanticStyle, Viewport,
+    ClipboardContent, EditorSession, Effect, KeyCode, KeyCodeKind, KeyInput, LineKind, Mode,
+    Modifiers, RenderedLineRole, RenderedPoint, SelectionShape, SemanticStyle, Viewport,
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -1004,6 +1004,323 @@ fn rendered_character_selection_maps_inline_source() {
 }
 
 #[test]
+fn default_front_matter_is_exact_idempotent_and_undoable() {
+    const TEMPLATE: &str = "---\ntitle: \"\"\n---\n\n";
+    let body = "Body α without a final newline";
+    let mut session = EditorSession::from_text(body);
+    render_and_move_to(&mut session, "α", 40);
+    let cursor = session.cursor();
+
+    let effects = session.insert_default_front_matter();
+    assert!(effects.contains(&Effect::Edited));
+    assert_eq!(session.document(), format!("{TEMPLATE}{body}"));
+    assert!(session.front_matter().is_some());
+    assert_eq!(session.cursor(), (cursor.0 + 4, cursor.1));
+
+    let unchanged = session.document();
+    let repeated_cursor = session.cursor();
+    assert!(session.insert_default_front_matter().is_empty());
+    assert_eq!(session.document(), unchanged);
+    assert_eq!(session.cursor(), repeated_cursor);
+
+    session.handle_key(key('u'));
+    assert_eq!(session.document(), body);
+    assert!(!session.front_matter().is_some());
+    assert_eq!(session.cursor(), cursor);
+    session.handle_key(ctrl('r'));
+    assert_eq!(session.document(), format!("{TEMPLATE}{body}"));
+    assert!(session.front_matter().is_some());
+
+    let mut empty = EditorSession::from_text("");
+    assert!(!empty.insert_default_front_matter().is_empty());
+    assert_eq!(empty.document(), TEMPLATE);
+    assert_eq!(empty.cursor(), (4, 0));
+
+    for existing in [
+        "---\ntitle: existing\n---\n\nBody",
+        "+++\ntitle = \"existing\"\n+++\n\nBody",
+        "---\nunterminated: [\nBody",
+        "+++\nunterminated = [\nBody",
+    ] {
+        let mut session = EditorSession::from_text(existing);
+        assert!(session.front_matter().is_some());
+        assert!(session.insert_default_front_matter().is_empty());
+        assert_eq!(session.document(), existing);
+        assert!(!session.is_dirty());
+    }
+}
+
+#[test]
+fn rendered_horizontal_navigation_crosses_rendered_rows() {
+    let text = "alpha beta gamma delta epsilon zeta eta theta\n\nomega psi\n";
+    let mut session = EditorSession::from_text(text);
+    let layout = session.render_layout(12).clone();
+    let points = layout
+        .lines
+        .iter()
+        .enumerate()
+        .flat_map(|(row, line)| {
+            line.atoms.iter().filter_map(move |atom| {
+                atom.source.as_ref().map(|_| RenderedPoint {
+                    row,
+                    column: atom.columns.start,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    let next_row = points
+        .iter()
+        .position(|point| point.row > points[0].row)
+        .unwrap();
+    assert!(layout.lines[points[0].row + 1..points.last().unwrap().row]
+        .iter()
+        .any(|line| line.atoms.iter().all(|atom| atom.source.is_none())));
+
+    session.move_to_rendered_point(points[next_row]);
+    session.handle_key(special(KeyCodeKind::Left));
+    assert_eq!(session.rendered_cursor(), points[next_row - 1]);
+    session.handle_key(key('l'));
+    assert_eq!(session.rendered_cursor(), points[next_row]);
+
+    session.move_to_rendered_point(points[0]);
+    for digit in (points.len() - 1).to_string().chars() {
+        session.handle_key(key(digit));
+    }
+    session.handle_key(special(KeyCodeKind::Right));
+    assert_eq!(session.rendered_cursor(), *points.last().unwrap());
+    for digit in (points.len() - 1).to_string().chars() {
+        session.handle_key(key(digit));
+    }
+    session.handle_key(key('h'));
+    assert_eq!(session.rendered_cursor(), points[0]);
+
+    session.move_to_rendered_point(points[next_row]);
+    session.handle_key(key('v'));
+    session.handle_key(key('h'));
+    let selection = session.rendered_selection().unwrap();
+    assert_eq!(selection.active, points[next_row - 1]);
+    let expected_source = layout.lines[points[next_row - 1].row]
+        .atoms
+        .iter()
+        .find(|atom| atom.columns.start == points[next_row - 1].column)
+        .unwrap()
+        .source
+        .as_ref()
+        .unwrap()
+        .start;
+    assert_eq!(session.cursor(), (0, expected_source));
+}
+
+#[test]
+fn horizontal_navigation_from_blank_line_uses_directional_edges() {
+    let text = "alpha beta gamma delta epsilon zeta eta theta 東京\n\n# next\n";
+    let mut probe = EditorSession::from_text(text);
+    let layout = probe.render_layout(12).clone();
+    let blank_row = layout
+        .line_numbers
+        .iter()
+        .position(|line_number| *line_number == Some(2))
+        .expect("physical blank line must retain its rendered row");
+    let before = layout.lines[..blank_row]
+        .iter()
+        .enumerate()
+        .flat_map(|(row, line)| {
+            line.atoms.iter().filter_map(move |atom| {
+                atom.source.as_ref().map(|source| {
+                    (
+                        RenderedPoint {
+                            row,
+                            column: atom.columns.start,
+                        },
+                        source.clone(),
+                    )
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    let after = layout.lines[blank_row + 1..]
+        .iter()
+        .enumerate()
+        .find_map(|(offset, line)| {
+            line.atoms.iter().find_map(|atom| {
+                atom.source.as_ref().map(|source| {
+                    (
+                        RenderedPoint {
+                            row: blank_row + offset + 1,
+                            column: atom.columns.start,
+                        },
+                        source.clone(),
+                    )
+                })
+            })
+        })
+        .expect("following block must have a source-backed atom");
+    let (last, last_source) = before.last().unwrap();
+    let (penultimate, penultimate_source) = &before[before.len() - 2];
+    assert!(last.row + 1 == blank_row);
+    assert!(last.row >= 2, "the preceding paragraph must wrap deeply");
+
+    let move_to_blank = |session: &mut EditorSession| {
+        session.render_layout(12);
+        for _ in 0..blank_row {
+            session.handle_key(key('j'));
+        }
+        assert_eq!(session.rendered_cursor_line(), blank_row);
+        assert_eq!(session.cursor(), (1, 0));
+    };
+
+    for motion in [key('h'), special(KeyCodeKind::Left)] {
+        let mut session = EditorSession::from_text(text);
+        move_to_blank(&mut session);
+        session.handle_key(motion);
+        assert_eq!(session.rendered_cursor(), *last, "{motion:?}");
+        let expected = session.position_for_offset(last_source.start).unwrap();
+        assert_eq!(
+            session.cursor(),
+            (expected.line, expected.column),
+            "{motion:?}"
+        );
+    }
+
+    let mut counted = EditorSession::from_text(text);
+    move_to_blank(&mut counted);
+    counted.handle_key(key('2'));
+    counted.handle_key(key('h'));
+    assert_eq!(counted.rendered_cursor(), *penultimate);
+    let expected = counted
+        .position_for_offset(penultimate_source.start)
+        .unwrap();
+    assert_eq!(counted.cursor(), (expected.line, expected.column));
+
+    for motion in [key('l'), special(KeyCodeKind::Right)] {
+        let mut forward = EditorSession::from_text(text);
+        move_to_blank(&mut forward);
+        forward.handle_key(motion);
+        assert_eq!(forward.rendered_cursor(), after.0, "{motion:?}");
+        let expected = forward.position_for_offset(after.1.start).unwrap();
+        assert_eq!(
+            forward.cursor(),
+            (expected.line, expected.column),
+            "{motion:?}"
+        );
+    }
+
+    let mut selected = EditorSession::from_text(text);
+    move_to_blank(&mut selected);
+    selected.handle_key(key('v'));
+    selected.handle_key(key('h'));
+    let selection = selected.rendered_selection().unwrap();
+    assert_eq!(selection.active, *last);
+    assert_eq!(selection.source_ranges, vec![last_source.clone()]);
+
+    let mut synthetic = EditorSession::from_text("# heading\nparagraph\n");
+    let synthetic_layout = synthetic.render_layout(40).clone();
+    let separator = synthetic_layout
+        .lines
+        .iter()
+        .position(|line| line.kind == LineKind::Synthetic && line.styled.text.is_empty())
+        .expect("adjacent blocks must retain a generated separator");
+    let previous = synthetic_layout.lines[..separator]
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(row, line)| {
+            line.atoms
+                .iter()
+                .rev()
+                .find(|atom| atom.source.is_some())
+                .map(|atom| RenderedPoint {
+                    row,
+                    column: atom.columns.start,
+                })
+        })
+        .unwrap();
+    let next = synthetic_layout.lines[separator + 1..]
+        .iter()
+        .enumerate()
+        .find_map(|(offset, line)| {
+            line.atoms
+                .iter()
+                .find(|atom| atom.source.is_some())
+                .map(|atom| RenderedPoint {
+                    row: separator + offset + 1,
+                    column: atom.columns.start,
+                })
+        })
+        .unwrap();
+    synthetic.handle_key(key('j'));
+    assert_eq!(synthetic.rendered_cursor_line(), separator);
+    synthetic.handle_key(key('h'));
+    assert_eq!(synthetic.rendered_cursor(), previous);
+    synthetic.handle_key(key('j'));
+    assert_eq!(synthetic.rendered_cursor_line(), separator);
+    synthetic.handle_key(key('l'));
+    assert_eq!(synthetic.rendered_cursor(), next);
+
+    let mut bounded = EditorSession::from_text(text);
+    let points = layout
+        .lines
+        .iter()
+        .enumerate()
+        .flat_map(|(row, line)| {
+            line.atoms.iter().filter_map(move |atom| {
+                atom.source.as_ref().map(|_| RenderedPoint {
+                    row,
+                    column: atom.columns.start,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    bounded.render_layout(12);
+    bounded.move_to_rendered_point(points[0]);
+    bounded.handle_key(key('h'));
+    assert_eq!(bounded.rendered_cursor(), points[0]);
+    bounded.move_to_rendered_point(*points.last().unwrap());
+    bounded.handle_key(key('l'));
+    assert_eq!(bounded.rendered_cursor(), *points.last().unwrap());
+}
+
+#[test]
+fn rendered_blank_line_preserves_physical_identity_and_canonical_cursor() {
+    let text = "alpha beta gamma delta epsilon zeta eta theta 東京\n\n# next\n";
+    let mut session = EditorSession::from_text(text);
+    let layout = session.render_layout(12).clone();
+    let blank_row = layout
+        .lines
+        .iter()
+        .position(|line| line.styled.text.is_empty())
+        .expect("physical blank line must have a rendered row");
+    let blank = &layout.lines[blank_row];
+
+    assert_eq!(blank.kind, LineKind::Content);
+    assert_eq!(blank.source, 53..54);
+    assert!(blank.atoms.is_empty());
+    assert_eq!(layout.line_numbers[blank_row], Some(2));
+    assert!(blank_row >= 3, "the preceding paragraph must wrap deeply");
+
+    for _ in 0..blank_row {
+        session.handle_key(key('j'));
+    }
+    assert_eq!(session.rendered_cursor_line(), blank_row);
+    assert_eq!(session.cursor(), (1, 0));
+
+    session.remap_rendered_cursor(1, 0);
+    assert_eq!(session.rendered_cursor_line(), blank_row);
+    assert_eq!(session.cursor(), (1, 0));
+
+    let mut adjacent = EditorSession::from_text("# heading\nparagraph\n");
+    let layout = adjacent.render_layout(40);
+    let separator = layout
+        .lines
+        .iter()
+        .position(|line| line.styled.text.is_empty())
+        .expect("adjacent blocks retain their presentation separator");
+    assert_eq!(layout.lines[separator].kind, LineKind::Synthetic);
+    assert!(layout.lines[separator].atoms.is_empty());
+    assert_eq!(layout.line_numbers[separator], None);
+}
+
+#[test]
 fn wrapped_table_character_selection_is_source_driven_and_operator_exact() {
     let text = "| Description | Neighbor |\n| --- | --- |\n| alpha beta gamma delta epsilon zeta eta theta iota kappa lambda | NEIGHBOR CONTENT THAT FILLS ITS COLUMN |\n| OTHER | ROW |\n";
     let cell_start = text.find("alpha").unwrap();
@@ -1722,18 +2039,18 @@ fn front_matter_panel_is_structured_and_collapsible() {
 
     session.handle_key(key('j'));
     assert_eq!(session.rendered_cursor().row, 1);
-    assert_eq!(session.cursor(), (0, 0));
+    assert_eq!(session.cursor(), (5, 0));
     session.handle_key(key('j'));
     assert!(session.cursor().0 >= 6);
     session.handle_key(key('k'));
-    assert_eq!(session.cursor().0, 0);
+    assert_eq!(session.cursor().0, 5);
     session.handle_key(key('z'));
     let reexpanded = session.render_layout(50);
     assert!(reexpanded
         .lines
         .iter()
         .any(|line| line.styled.text.contains("title: Example")));
-    assert_eq!(session.cursor().0, 0);
+    assert_eq!(session.cursor().0, 5);
 }
 
 #[test]

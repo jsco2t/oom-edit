@@ -285,31 +285,106 @@ fn horizontal_point(
     forward: bool,
     count: usize,
 ) -> Option<RenderedPoint> {
-    let atoms: Vec<_> = layout
-        .lines
-        .get(cursor.line)?
+    let row = cursor.line.min(layout.lines.len().checked_sub(1)?);
+    let row_has_source = layout.lines[row]
         .atoms
         .iter()
-        .filter(|atom| atom.source.is_some())
-        .collect();
-    if atoms.is_empty() {
-        return None;
-    }
-    let current = atoms
-        .iter()
-        .position(|atom| {
-            atom.columns.contains(&cursor.column) || atom.columns.start == cursor.column
-        })
-        .unwrap_or(0);
-    let target = if forward {
-        current.saturating_add(count).min(atoms.len() - 1)
+        .any(|atom| atom.source.is_some());
+    let (mut point, remaining) = if row_has_source {
+        (source_backed_point(cursor.point(), layout)?, count)
     } else {
-        current.saturating_sub(count)
+        let point = if forward {
+            layout.lines[row + 1..]
+                .iter()
+                .enumerate()
+                .find_map(|(offset, line)| {
+                    line.atoms
+                        .iter()
+                        .find(|atom| atom.source.is_some())
+                        .map(|atom| RenderedPoint {
+                            row: row + offset + 1,
+                            column: atom.columns.start,
+                        })
+                })
+        } else {
+            layout.lines[..row]
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(row, line)| {
+                    line.atoms
+                        .iter()
+                        .rev()
+                        .find(|atom| atom.source.is_some())
+                        .map(|atom| RenderedPoint {
+                            row,
+                            column: atom.columns.start,
+                        })
+                })
+        }?;
+        (point, count.saturating_sub(1))
     };
-    Some(RenderedPoint {
-        row: cursor.line,
-        column: atoms[target].columns.start,
-    })
+
+    for _ in 0..remaining {
+        let line = &layout.lines[point.row];
+        let current = line.atoms.iter().position(|atom| {
+            atom.source.is_some()
+                && (atom.columns.contains(&point.column) || atom.columns.start == point.column)
+        })?;
+        let adjacent =
+            if forward {
+                line.atoms
+                    .iter()
+                    .skip(current + 1)
+                    .find(|atom| atom.source.is_some())
+                    .map(|atom| RenderedPoint {
+                        row: point.row,
+                        column: atom.columns.start,
+                    })
+                    .or_else(|| {
+                        layout.lines[point.row + 1..].iter().enumerate().find_map(
+                            |(offset, line)| {
+                                line.atoms
+                                    .iter()
+                                    .find(|atom| atom.source.is_some())
+                                    .map(|atom| RenderedPoint {
+                                        row: point.row + offset + 1,
+                                        column: atom.columns.start,
+                                    })
+                            },
+                        )
+                    })
+            } else {
+                line.atoms[..current]
+                    .iter()
+                    .rev()
+                    .find(|atom| atom.source.is_some())
+                    .map(|atom| RenderedPoint {
+                        row: point.row,
+                        column: atom.columns.start,
+                    })
+                    .or_else(|| {
+                        layout.lines[..point.row].iter().enumerate().rev().find_map(
+                            |(row, line)| {
+                                line.atoms
+                                    .iter()
+                                    .rev()
+                                    .find(|atom| atom.source.is_some())
+                                    .map(|atom| RenderedPoint {
+                                        row,
+                                        column: atom.columns.start,
+                                    })
+                            },
+                        )
+                    })
+            };
+        let Some(adjacent) = adjacent else {
+            break;
+        };
+        point = adjacent;
+    }
+
+    Some(point)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1485,18 +1560,23 @@ pub fn find_next_match(
 
 // ── Block boundary jumping ({/}) ──────────────────────────────────────────
 
-/// Find the previous synthetic boundary line before the cursor.
+fn is_block_boundary(line: &crate::style::RenderedLine) -> bool {
+    line.kind == LineKind::Synthetic
+        || (line.kind == LineKind::Content && line.styled.text.is_empty() && line.atoms.is_empty())
+}
+
+/// Find the previous rendered boundary line before the cursor.
 fn find_prev_boundary(cursor: &RenderedCursor, layout: &RenderedLayout) -> Option<usize> {
     let cursor_line = cursor.line;
     (0..cursor_line)
         .rev()
-        .find(|&i| layout.lines[i].kind == LineKind::Synthetic)
+        .find(|&i| is_block_boundary(&layout.lines[i]))
 }
 
-/// Find the next synthetic boundary line after the cursor.
+/// Find the next rendered boundary line after the cursor.
 fn find_next_boundary(cursor: &RenderedCursor, layout: &RenderedLayout) -> Option<usize> {
     let cursor_line = cursor.line;
-    (cursor_line + 1..layout.lines.len()).find(|&i| layout.lines[i].kind == LineKind::Synthetic)
+    (cursor_line + 1..layout.lines.len()).find(|&i| is_block_boundary(&layout.lines[i]))
 }
 
 // ── Heading jumping ([[ / ]]) ─────────────────────────────────────────────

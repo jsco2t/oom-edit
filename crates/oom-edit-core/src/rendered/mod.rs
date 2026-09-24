@@ -110,8 +110,7 @@ impl<'a> RenderedLayoutBuilder<'a> {
         // Process top-level blocks
         for (i, block) in self.model.blocks.iter().enumerate() {
             if i > 0 && !self.lines.is_empty() {
-                // Blank line between blocks
-                self.add_synthetic_blank(block.span.clone());
+                self.add_separator_before(block.span.clone());
             }
             self.render_block(block);
         }
@@ -149,6 +148,30 @@ impl<'a> RenderedLayoutBuilder<'a> {
             role: RenderedLineRole::Document,
             atoms: Vec::new(),
         });
+    }
+
+    fn add_separator_before(&mut self, next_source: Range<usize>) {
+        let source_blank = self.last_content_source.as_ref().and_then(|previous| {
+            source_blank_line_between(
+                self.highlighter.text(),
+                previous.end.min(next_source.start)..next_source.start,
+            )
+        });
+        if let Some(source) = source_blank {
+            self.lines.push(RenderedLine {
+                styled: StyledLine {
+                    text: String::new(),
+                    spans: Vec::new(),
+                },
+                source: source.clone(),
+                kind: LineKind::Content,
+                role: RenderedLineRole::Document,
+                atoms: Vec::new(),
+            });
+            self.set_last_content_source(source);
+        } else {
+            self.add_synthetic_blank(next_source);
+        }
     }
 
     fn set_last_content_source(&mut self, source: Range<usize>) {
@@ -219,9 +242,9 @@ impl<'a> RenderedLayoutBuilder<'a> {
             } => self.render_code_fence(lang, content_span, *indented, &block.span),
             BlockKind::List {
                 ordered,
-                tight: _tight,
+                tight,
                 items,
-            } => self.render_list(*ordered, items),
+            } => self.render_list(*ordered, *tight, items),
             BlockKind::BlockQuote { children } => self.render_blockquote(children, &block.span),
             BlockKind::Table {
                 alignments,
@@ -538,17 +561,26 @@ impl<'a> RenderedLayoutBuilder<'a> {
 
     // ── VW-6: Bulleted lists ─────────────────────────────────────────
 
-    fn render_list(&mut self, ordered: Option<u64>, items: &[crate::rendered::blocks::ListItem]) {
-        self.render_list_at_depth(ordered, items, 0);
+    fn render_list(
+        &mut self,
+        ordered: Option<u64>,
+        tight: bool,
+        items: &[crate::rendered::blocks::ListItem],
+    ) {
+        self.render_list_at_depth(ordered, tight, items, 0);
     }
 
     fn render_list_at_depth(
         &mut self,
         ordered: Option<u64>,
+        tight: bool,
         items: &[crate::rendered::blocks::ListItem],
         depth: usize,
     ) {
         for (index, item) in items.iter().enumerate() {
+            if index > 0 && !tight {
+                self.add_separator_before(item.span.clone());
+            }
             let marker = match item.task {
                 Some(true) => "☑".to_string(),
                 Some(false) => "☐".to_string(),
@@ -581,7 +613,12 @@ impl<'a> RenderedLayoutBuilder<'a> {
 
         // Render children into this builder so document-level metadata is shared.
         for child in &item.children {
-            if let BlockKind::List { ordered, items, .. } = &child.kind {
+            if let BlockKind::List {
+                ordered,
+                tight,
+                items,
+            } = &child.kind
+            {
                 if marker_pending {
                     let marker_start = indent.chars().count();
                     self.make_generated_content_line(
@@ -597,7 +634,7 @@ impl<'a> RenderedLayoutBuilder<'a> {
                     );
                     marker_pending = false;
                 }
-                self.render_list_at_depth(*ordered, items, depth + 1);
+                self.render_list_at_depth(*ordered, *tight, items, depth + 1);
                 continue;
             }
 
@@ -1045,6 +1082,34 @@ fn rendered_line_numbers(lines: &[RenderedLine], text: &str) -> Vec<Option<usize
         .collect()
 }
 
+fn source_blank_line_between(text: &str, gap: Range<usize>) -> Option<Range<usize>> {
+    let gap = gap.start.min(text.len())..gap.end.min(text.len());
+    let mut start = gap.start;
+    while start < gap.end {
+        let end = text[start..gap.end]
+            .find('\n')
+            .map_or(gap.end, |relative| start + relative + 1);
+        let at_line_start = start == 0 || text.as_bytes().get(start - 1) == Some(&b'\n');
+        let content_end = end
+            .checked_sub(1)
+            .filter(|index| text.as_bytes().get(*index) == Some(&b'\n'))
+            .unwrap_or(end);
+        let content_end = content_end
+            .checked_sub(1)
+            .filter(|index| text.as_bytes().get(*index) == Some(&b'\r'))
+            .unwrap_or(content_end);
+        if at_line_start
+            && text[start..content_end]
+                .bytes()
+                .all(|byte| matches!(byte, b' ' | b'\t'))
+        {
+            return Some(start..end);
+        }
+        start = end;
+    }
+    None
+}
+
 // ── Footnote storage ────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -1193,6 +1258,34 @@ pub(crate) use wrap::{text_width, wrap_source_line};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rendered_blank_line_ranges_are_exact_for_lf_crlf_and_unicode() {
+        for (text, expected) in [
+            (
+                "alpha beta gamma delta epsilon zeta eta theta 東京\n\n# next\n",
+                53..54,
+            ),
+            (
+                "alpha beta gamma delta epsilon zeta eta theta 東京\r\n\r\n# next\r\n",
+                54..56,
+            ),
+        ] {
+            let model = BlockModel::build(text, None);
+            let highlighter = syntax::Highlighter::new(text);
+            let layout = RenderedLayout::build(&model, 12, &highlighter);
+            let blank_row = layout
+                .line_numbers
+                .iter()
+                .position(|line_number| *line_number == Some(2))
+                .expect("physical blank row must retain line two");
+            let blank = &layout.lines[blank_row];
+            assert_eq!(blank.kind, LineKind::Content);
+            assert_eq!(blank.source, expected);
+            assert!(blank.styled.text.is_empty());
+            assert!(blank.atoms.is_empty());
+        }
+    }
 
     #[test]
     fn rendered_line_number_index_preserves_content_and_synthetic_semantics() {

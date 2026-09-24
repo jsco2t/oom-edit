@@ -44,6 +44,7 @@ pub struct EditorViewport {
     pub wrap: bool,
     pub left_col: usize,
     pub skip_rows: usize,
+    wrap_width: u16,
     cursor_visible: bool,
 }
 
@@ -54,8 +55,14 @@ impl EditorViewport {
             wrap,
             left_col,
             skip_rows,
+            wrap_width: u16::MAX,
             cursor_visible: true,
         }
+    }
+
+    pub(crate) const fn with_wrap_width(mut self, wrap_width: u16) -> Self {
+        self.wrap_width = wrap_width;
+        self
     }
 
     /// Control whether this screen owns the frame cursor.
@@ -140,10 +147,15 @@ fn render_body(
     let gutter_w = status_bar::gutter_width(line_count, false) as u16;
     let gutter_area_width = gutter_w.min(area.width);
 
+    let text_width = area.width.saturating_sub(gutter_area_width);
     let vp = oom_edit_core::Viewport {
         top_line: viewport.top_line,
         height: area.height,
-        width: area.width.saturating_sub(gutter_area_width),
+        width: if viewport.wrap {
+            text_width.min(viewport.wrap_width)
+        } else {
+            text_width
+        },
         wrap: viewport.wrap,
         left_col: viewport.left_col,
         skip_rows: viewport.skip_rows,

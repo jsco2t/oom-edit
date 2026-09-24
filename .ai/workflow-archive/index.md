@@ -9,3 +9,5 @@
 - 2026-09-16-editor-ux-improvements — Editor UX improvements — completed 2026-09-16T22:38:02Z — a9e503b231a9dbdb71949387c98a3dfc7be5fd0c..a9e503b231a9dbdb71949387c98a3dfc7be5fd0c
 - 2026-09-17-editor-interaction-and-code-block-fixes — Editor interaction and code block fixes — completed 2026-09-18T15:15:10Z — b1044df098eaa76b5d288ed7accb0d613d345c29..b1044df098eaa76b5d288ed7accb0d613d345c29
 - 2026-09-19-environment-free-github-release-ci — Environment-Free GitHub Release CI — completed 2026-09-20T00:29:54Z — 7fbfd7784ca1fa7800dcecb0820f7bffdab81999..7fbfd7784ca1fa7800dcecb0820f7bffdab81999
+- 2026-09-23-bug-report-batch — Bug Report Batch — September 23, 2026 — completed 2026-09-23T23:01:54Z — 235f63ba74d9ba6eba0e4f1ea2a23779e90547d2..235f63ba74d9ba6eba0e4f1ea2a23779e90547d2
+- 2026-09-23-rendered-blank-line-navigation — Rendered Blank-Line and Wrapped Navigation Fixes — completed 2026-09-24T00:25:35Z — 235f63ba74d9ba6eba0e4f1ea2a23779e90547d2..235f63ba74d9ba6eba0e4f1ea2a23779e90547d2

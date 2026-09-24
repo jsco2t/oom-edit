@@ -1,0 +1,71 @@
+{
+  "schema_version": 2,
+  "work_id": "2026-09-23-bug-report-batch",
+  "title": "Bug Report Batch — September 23, 2026",
+  "phase": "DONE",
+  "created_at": "2026-09-23T21:46:04Z",
+  "updated_at": "2026-09-23T23:01:54Z",
+  "approved_at": "2026-09-23T22:05:18Z",
+  "completed_at": "2026-09-23T23:01:54Z",
+  "archived_at": "2026-09-23T23:07:50Z",
+  "baseline_sha": "235f63ba74d9ba6eba0e4f1ea2a23779e90547d2",
+  "final_sha": "235f63ba74d9ba6eba0e4f1ea2a23779e90547d2",
+  "plan_revision": 1,
+  "acceptance_round": 1,
+  "completed_rounds": [],
+  "approved_plan_sha256": "8dad5dd9c82ae92ee2968575f73aea663c3549aa85b8a9285cb6e96a603ae51c",
+  "current_task": null,
+  "tasks": [
+    {
+      "id": "001",
+      "path": "tasks/001-source-cursor-and-wrapping.md",
+      "round": 1,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/001.md"
+    },
+    {
+      "id": "002",
+      "path": "tasks/002-rendered-horizontal-navigation.md",
+      "round": 1,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/002.md"
+    },
+    {
+      "id": "003",
+      "path": "tasks/003-loose-list-spacing.md",
+      "round": 1,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/003.md"
+    },
+    {
+      "id": "004",
+      "path": "tasks/004-default-front-matter-command.md",
+      "round": 1,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/004.md"
+    },
+    {
+      "id": "005",
+      "path": "tasks/005-spell-idle-and-stable-diagnostics.md",
+      "round": 1,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/005.md"
+    }
+  ],
+  "task_retry_limit": 3,
+  "final_retry_limit": 2,
+  "final_attempts": 1,
+  "stop_continuations": 0,
+  "max_stop_continuations": 50,
+  "block_reason": null
+}

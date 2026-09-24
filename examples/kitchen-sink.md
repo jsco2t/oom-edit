@@ -41,6 +41,12 @@ Backslash escapes: \*not italic\*, \`not code\`, \[not a link\], \#not a heading
 
 ---
 
+## Text wrapping
+
+This is a very long sentence to see how the editor handles text that needs to wrap to multiple lines the content of the sentence doesn't matter and infact it's clearly not even valid english that's ok as this is just a test to see how well wrapping works.
+
+---
+
 ## Links and Images
 
 ### Inline Links

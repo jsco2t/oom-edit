@@ -878,7 +878,7 @@ fn fenced_layout_marks_complete_surface_role() {
         LineKind::Synthetic,
         LineKind::Content,
         LineKind::Synthetic,
-        LineKind::Synthetic,
+        LineKind::Content,
         LineKind::Content,
     ];
     assert_eq!(
@@ -1153,6 +1153,54 @@ fn test_ordered_list() {
     }
 }
 
+#[test]
+fn loose_list_preserves_blank_item_separation() {
+    for (source, first, second) in [
+        ("- one\n\n- two", "• one", "• two"),
+        ("1. one\n\n2. two", "1. one", "2. two"),
+        ("- [ ] todo\n\n- [x] done", "☐ todo", "☑ done"),
+    ] {
+        let layout = rendered_layout(source);
+        assert_eq!(
+            layout
+                .lines
+                .iter()
+                .map(|line| line.styled.text.as_str())
+                .collect::<Vec<_>>(),
+            [first, "", second]
+        );
+        let blank = &layout.lines[1];
+        assert_eq!(blank.kind, LineKind::Content);
+        assert!(blank.atoms.is_empty());
+        assert_eq!(layout.line_numbers[1], Some(2));
+    }
+
+    let tight = rendered_layout("- one\n- two");
+    assert_eq!(
+        tight
+            .lines
+            .iter()
+            .map(|line| line.styled.text.as_str())
+            .collect::<Vec<_>>(),
+        ["• one", "• two"]
+    );
+
+    let nested = rendered_layout("- parent\n  - child one\n\n  - child two");
+    let child_one = nested
+        .lines
+        .iter()
+        .position(|line| line.styled.text == "  ◦ child one")
+        .unwrap();
+    let child_two = nested
+        .lines
+        .iter()
+        .position(|line| line.styled.text == "  ◦ child two")
+        .unwrap();
+    assert_eq!(child_two, child_one + 2);
+    assert_eq!(nested.lines[child_one + 1].styled.text, "");
+    assert!(nested.lines[child_one + 1].atoms.is_empty());
+}
+
 /// Recursively count the maximum list nesting depth.
 fn max_list_depth(blocks: &[Block]) -> usize {
     let mut max_depth = 0;
@@ -1318,6 +1366,7 @@ fn ordered_lists_render_declared_start_and_nested_restart() {
         lines,
         [
             "10. Tenth item",
+            "",
             "11. Eleventh item",
             "  3. Nested third",
             "  4. Nested fourth",

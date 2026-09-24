@@ -143,7 +143,8 @@ pub struct SourceFrame {
 /// The kind of a rendered Markdown line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineKind {
-    /// A line derived from actual document content.
+    /// A line derived from actual document content. A physical blank source
+    /// line has no display atoms but still uses this kind for line identity.
     Content,
     /// A synthetic line (blank separator, border, links index, footnote
     /// separator). Per VP-1: synthetic lines carry the source span of the
@@ -219,9 +220,9 @@ pub struct JumpTarget {
 pub struct RenderedLayout {
     /// Rendered lines, in display order.
     pub lines: Vec<RenderedLine>,
-    /// Optional 1-based source line number for each rendered row. Only the
-    /// first content row for a distinct source line is numbered; wrapped,
-    /// repeated, and synthetic rows are `None`.
+    /// Optional 1-based source line number for each rendered row. Physical
+    /// blank lines and the first content row for a distinct source line are
+    /// numbered; wrapped, repeated, and synthetic rows are `None`.
     pub line_numbers: Vec<Option<usize>>,
     /// Jump targets sorted by line number.
     pub jump_targets: Vec<JumpTarget>,

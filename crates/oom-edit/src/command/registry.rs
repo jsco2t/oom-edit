@@ -21,6 +21,7 @@ pub enum RegistryEntryId {
     Save,
     Quit,
     CycleTheme,
+    DefaultFrontMatter,
     SpellSuggest,
     SpellAdd,
     SpellToggle,
@@ -44,6 +45,7 @@ pub enum AppCommand {
     Save,
     Quit,
     CycleTheme,
+    DefaultFrontMatter,
     SpellSuggest,
     SpellAdd,
     SpellToggle,
@@ -349,6 +351,17 @@ pub static COMMANDS: &[CommandSpec] = &[
         None
     ),
     row!(
+        DefaultFrontMatter,
+        "default-front-matter",
+        "insert default front matter",
+        Contexts::NORMAL,
+        BindingRole::AppChord {
+            continuation: 'm',
+            command: AppCommand::DefaultFrontMatter
+        },
+        None
+    ),
+    row!(
         SpellSuggest,
         "spell-suggest",
         "spelling suggestions",
@@ -615,7 +628,7 @@ mod tests {
             assert!(!spec.contexts.is_empty());
             assert!(!rendered_binding(spec).is_empty());
         }
-        assert_eq!(COMMANDS.len(), 32);
+        assert_eq!(COMMANDS.len(), 33);
     }
 
     #[test]
@@ -940,6 +953,17 @@ mod tests {
                 BindingRole::AppChord {
                     continuation: 't',
                     command: AppCommand::CycleTheme,
+                },
+                None,
+            ),
+            (
+                RegistryEntryId::DefaultFrontMatter,
+                "default-front-matter",
+                "insert default front matter",
+                Contexts::NORMAL,
+                BindingRole::AppChord {
+                    continuation: 'm',
+                    command: AppCommand::DefaultFrontMatter,
                 },
                 None,
             ),

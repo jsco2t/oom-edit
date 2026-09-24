@@ -199,6 +199,7 @@ impl AppServices {
 #[derive(Clone, Copy)]
 pub(crate) struct AppStartupOptions {
     wrap_enabled: bool,
+    wrap_width: u16,
     relative_line_numbers: bool,
     clipboard_copy_format: ClipboardCopyFormat,
     spell_enabled: bool,
@@ -213,10 +214,16 @@ impl AppStartupOptions {
     ) -> Self {
         Self {
             wrap_enabled,
+            wrap_width: crate::config::DEFAULT_WRAP_WIDTH,
             relative_line_numbers,
             clipboard_copy_format,
             spell_enabled,
         }
+    }
+
+    pub(crate) const fn with_wrap_width(mut self, wrap_width: u16) -> Self {
+        self.wrap_width = wrap_width;
+        self
     }
 }
 
@@ -336,6 +343,8 @@ pub struct App {
     last_follow_geometry: Option<(usize, usize)>,
     /// Runtime source-wrap option, initialized from config.
     wrap_enabled: bool,
+    /// Configured prose layout limit; physical viewport width remains separate.
+    wrap_width: u16,
     /// Whether rendered Normal, Select, and Command use hybrid-relative numbers.
     relative_line_numbers: bool,
     /// Current time (injected by tick for testability of which-key delay gate).
@@ -423,6 +432,7 @@ impl App {
     ) -> Self {
         let AppStartupOptions {
             wrap_enabled,
+            wrap_width,
             relative_line_numbers,
             clipboard_copy_format,
             spell_enabled: spell_enabled_default,
@@ -449,6 +459,7 @@ impl App {
             pending_scroll_follow: true,
             last_follow_geometry: None,
             wrap_enabled,
+            wrap_width,
             relative_line_numbers,
             now: initial_time,
             transient: None,
@@ -824,6 +835,7 @@ impl App {
                     &mut entry.session,
                     RenderedViewport::new(entry.rendered_top, entry.rendered_left_col),
                     RenderedSettings::new(self.relative_line_numbers)
+                        .with_wrap_width(self.wrap_width)
                         .with_cursor_visible(document_cursor_visible),
                     body_area,
                     DocumentPresentation::new(active_theme, self.tier, &entry.gutter_trouble),
@@ -838,6 +850,7 @@ impl App {
                         entry.left_col,
                         entry.skip_rows,
                     )
+                    .with_wrap_width(self.wrap_width)
                     .with_cursor_visible(document_cursor_visible),
                     self.relative_line_numbers,
                     body_area,
@@ -1036,7 +1049,7 @@ impl App {
                         entry.session.line_count(),
                         self.relative_line_numbers,
                     );
-                    entry.session.render_layout(text_width);
+                    entry.session.render_layout(text_width.min(self.wrap_width));
                 }
             }
             self.scroll_follow();
@@ -1369,6 +1382,36 @@ impl App {
                         format!("theme: {next}")
                     },
                     oom_edit_core::Severity::Info,
+                );
+            }
+            AppCommand::DefaultFrontMatter => {
+                let effects = if let Some(entry) = self.tabs.get_mut(self.active_tab) {
+                    let effects = entry.session.insert_default_front_matter();
+                    if entry.session.diagnostics_pending() {
+                        entry.invalidate_gutter_trouble_if_present();
+                    }
+                    effects
+                } else {
+                    Vec::new()
+                };
+                let inserted = effects.contains(&Effect::Edited);
+                for effect in effects {
+                    self.handle_effect(effect);
+                }
+                if inserted {
+                    self.pending_scroll_follow = true;
+                }
+                self.set_transient(
+                    if inserted {
+                        "default front matter inserted".to_string()
+                    } else {
+                        "front matter already exists".to_string()
+                    },
+                    if inserted {
+                        oom_edit_core::Severity::Info
+                    } else {
+                        oom_edit_core::Severity::Warning
+                    },
                 );
             }
             AppCommand::SpellSuggest => self.open_spell_suggestions(),
@@ -2002,11 +2045,12 @@ impl App {
 
         if is_rendered {
             let viewport_width = self.viewport_width.min(usize::from(u16::MAX)) as u16;
+            let layout_width = viewport_width.min(self.wrap_width);
             if let Some(entry) = self.tabs.get_mut(self.active_tab) {
                 // Insert edits invalidate the rendered cache. Rebuild before
                 // reading the rendered cursor so Escape can follow a cursor
                 // that moved beyond the current rendered viewport.
-                entry.session.render_layout(viewport_width);
+                entry.session.render_layout(layout_width);
                 let cursor = entry.session.rendered_cursor();
                 let cursor_line = cursor.row;
                 let layout = entry.session.rendered_layout();
@@ -2061,7 +2105,11 @@ impl App {
                     entry,
                     self.wrap_enabled,
                     self.viewport_height,
-                    self.viewport_width,
+                    if self.wrap_enabled {
+                        self.viewport_width.min(usize::from(self.wrap_width))
+                    } else {
+                        self.viewport_width
+                    },
                 );
                 self.set_top_line(top_line);
                 self.set_skip_rows(skip_rows);
@@ -2237,7 +2285,11 @@ impl App {
         Viewport {
             top_line: entry.top_line,
             height: self.body_area.height,
-            width: self.viewport_width.min(usize::from(u16::MAX)) as u16,
+            width: self.viewport_width.min(if self.wrap_enabled {
+                usize::from(self.wrap_width)
+            } else {
+                usize::from(u16::MAX)
+            }) as u16,
             wrap: self.wrap_enabled,
             left_col: entry.left_col,
             skip_rows: entry.skip_rows,
@@ -2432,10 +2484,15 @@ impl App {
         {
             return;
         }
-        let width = self.viewport_width.min(usize::from(u16::MAX)) as u16;
+        let physical_width = self.viewport_width.min(usize::from(u16::MAX)) as u16;
         let height = self.viewport_height;
         let Some(entry) = self.tabs.get_mut(self.active_tab) else {
             return;
+        };
+        let width = if entry.session.mode() != oom_edit_core::Mode::Insert || self.wrap_enabled {
+            physical_width.min(self.wrap_width)
+        } else {
+            physical_width
         };
         if height == 0 || width == 0 || delta == 0 {
             return;
@@ -3045,6 +3102,63 @@ mod tests {
             assert_eq!(app.tabs[0].rendered_top, top);
             assert_eq!(app.pointer_gesture, PointerGesture::Idle);
         }
+    }
+
+    #[test]
+    fn wrap_width_caps_source_and_rendered_layout_without_shrinking_viewport() {
+        let mut app = test_app(EditorSession::from_text(
+            "ordinary prose has enough words to wrap across several configured rows\n",
+        ));
+        app.wrap_width = 12;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 8)).unwrap();
+
+        terminal.draw(|frame| app.render(frame)).unwrap();
+
+        assert!(app.viewport_width > usize::from(app.wrap_width));
+        assert!(
+            app.session()
+                .unwrap()
+                .rendered_layout()
+                .unwrap()
+                .lines
+                .len()
+                > 1
+        );
+
+        app.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('i'),
+            KeyModifiers::NONE,
+        )));
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let viewport = app.source_viewport(&app.tabs[0]);
+        assert_eq!(viewport.width, 12);
+        assert!(app.viewport_width > usize::from(viewport.width));
+    }
+
+    #[test]
+    fn rendered_table_keeps_eighty_column_floor_with_narrow_wrap_width() {
+        let mut app = test_app(EditorSession::from_text(
+            "| First column with deliberately lengthy content | Second column with deliberately lengthy content |\n| --- | --- |\n| alpha alpha alpha alpha alpha alpha alpha | beta beta beta beta beta beta beta beta |\n",
+        ));
+        app.wrap_width = 20;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 8)).unwrap();
+
+        terminal.draw(|frame| app.render(frame)).unwrap();
+
+        let widest = app
+            .session()
+            .unwrap()
+            .rendered_layout()
+            .unwrap()
+            .lines
+            .iter()
+            .map(|line| line.styled.text.chars().count())
+            .max()
+            .unwrap_or(0);
+        assert!(widest >= 80);
+        assert!(app.viewport_width < widest);
     }
 
     fn test_app_at(mut session: EditorSession, initial_time: Instant) -> App {
@@ -5702,6 +5816,49 @@ mod tests {
         open_palette_with_space_h(&mut app);
 
         assert!(app.overlay.is_palette());
+    }
+
+    #[test]
+    fn front_matter_command_dispatches_only_in_normal_and_reports_results() {
+        let mut app = test_app(EditorSession::from_text("Body"));
+        for ch in [' ', 'm'] {
+            app.handle_event(&Event::Key(KeyEvent::new(
+                CrosstermKeyCode::Char(ch),
+                KeyModifiers::NONE,
+            )));
+        }
+        assert_eq!(
+            app.session().unwrap().document(),
+            "---\ntitle: \"\"\n---\n\nBody"
+        );
+        assert_eq!(
+            app.transient.as_ref().unwrap().text,
+            "default front matter inserted"
+        );
+
+        for ch in [' ', 'm'] {
+            app.handle_event(&Event::Key(KeyEvent::new(
+                CrosstermKeyCode::Char(ch),
+                KeyModifiers::NONE,
+            )));
+        }
+        assert_eq!(
+            app.transient.as_ref().unwrap().text,
+            "front matter already exists"
+        );
+
+        let mut select = test_app(EditorSession::from_text("Body"));
+        select.handle_event(&Event::Key(KeyEvent::new(
+            CrosstermKeyCode::Char('v'),
+            KeyModifiers::NONE,
+        )));
+        for ch in [' ', 'm'] {
+            select.handle_event(&Event::Key(KeyEvent::new(
+                CrosstermKeyCode::Char(ch),
+                KeyModifiers::NONE,
+            )));
+        }
+        assert_eq!(select.session().unwrap().document(), "Body");
     }
 
     #[test]

@@ -80,11 +80,37 @@ mod tests {
     }
 
     #[test]
+    fn source_frame_tracks_cursor_on_trailing_empty_lines() {
+        let mut session = EditorSession::from_text("");
+        session.handle_key(key('i'));
+        for character in "# foo".chars() {
+            session.handle_key(key(character));
+        }
+
+        for expected_line in 1..=2 {
+            session.handle_key(special(KeyCodeKind::Enter));
+            let frame = session.render_source(Viewport {
+                top_line: 0,
+                height: 5,
+                width: 80,
+                wrap: true,
+                left_col: 0,
+                skip_rows: 0,
+            });
+
+            assert_eq!(session.cursor(), (expected_line, 0));
+            assert_eq!(frame.cursor, (expected_line as u16, 0));
+            assert_eq!(frame.line_numbers[expected_line], Some(expected_line + 1));
+            assert_eq!(frame.lines[expected_line].text, "");
+        }
+    }
+
+    #[test]
     fn rendered_navigation_updates_canonical_source_cursor() {
         let mut session = EditorSession::from_text("# Heading\n\nBody\n");
         session.render_layout(40);
         session.handle_key(key('j'));
-        assert_eq!(session.cursor(), (0, 0));
+        assert_eq!(session.cursor(), (1, 0));
         session.handle_key(key('j'));
         assert_eq!(session.cursor().0, 2);
     }
@@ -200,8 +226,8 @@ mod tests {
         session.handle_key(key('V'));
         session.handle_key(key('j'));
         let selection = session.rendered_selection().unwrap();
-        assert_eq!(selection.source_ranges, vec![0..10]);
-        assert_eq!(&text[selection.source_ranges[0].clone()], "# Heading\n");
+        assert_eq!(selection.source_ranges, vec![0..11]);
+        assert_eq!(&text[selection.source_ranges[0].clone()], "# Heading\n\n");
         session.handle_key(key('y'));
         assert_eq!(session.mode(), Mode::Normal);
         assert_eq!(session.document(), text);
@@ -1891,6 +1917,28 @@ impl EditorSession {
         self.live.front_matter()
     }
 
+    /// Prepend the built-in YAML front-matter template when none is present.
+    ///
+    /// The insertion is one undoable mutation. Existing YAML or TOML front
+    /// matter, including malformed leading blocks, leaves the session
+    /// unchanged and returns no effects.
+    pub fn insert_default_front_matter(&mut self) -> Vec<Effect> {
+        const TEMPLATE: &str = "---\ntitle: \"\"\n---\n\n";
+        if self.mode() != Mode::Normal || self.live.front_matter().is_some() {
+            return Vec::new();
+        }
+
+        let cursor_offset = self.live.cursor_byte_offset();
+        let Some(outcome) = self.live.replace_range(0..0, TEMPLATE) else {
+            return Vec::new();
+        };
+        let shifted = self
+            .live
+            .position_for_byte_offset(cursor_offset.saturating_add(TEMPLATE.len()));
+        self.live.jump_to(shifted.0, shifted.1);
+        self.translate_vim_effects(outcome)
+    }
+
     /// Return cursor position as `(line, col)` — 0-based.
     pub fn cursor(&self) -> (usize, usize) {
         self.live.cursor()
@@ -2185,6 +2233,12 @@ impl EditorSession {
             .live
             .highlighter()
             .highlight_lines(start_line..end_line);
+        highlighted.resize_with(end_line.saturating_sub(start_line), || {
+            crate::style::StyledLine {
+                text: String::new(),
+                spans: Vec::new(),
+            }
+        });
         let rendered_search = self.rendered_state.search.current().cloned();
         for (offset, styled_line) in highlighted.iter_mut().enumerate() {
             for search_match in self.live.search_matches_for_line(start_line + offset) {

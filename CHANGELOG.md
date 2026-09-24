@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added configurable `[editor] wrap_width` for source and rendered prose, with
+  a 100-column default and the existing 80-column table floor preserved.
+- Added the Normal-mode `Space m` command for an exact, undoable default YAML
+  front-matter template, with safe refusal when front matter already exists.
 - Added uppercase `Y` in rendered Select for one-shot syntax-free clipboard
   output while retaining exact Markdown in internal registers.
 - Added copyable rendered link-index rows in Normal and Select and configurable
@@ -18,6 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Delayed spell work until five seconds after the latest input and kept
+  unaffected misspelling decorations stable across repeated local edits.
+- Fixed source Insert cursor projection on trailing empty lines and made source
+  prose wrap at exact, Unicode-aware word boundaries without changing bytes.
+- Preserved visible blank-row separation between sibling items in loose
+  unordered, ordered, nested, and task lists.
 - Made plain `y` in rendered Select preserve multiline whitespace and the actual
   Markdown source, including hidden delimiters, in both internal registers and
   canonical, padded OSC 52 output.

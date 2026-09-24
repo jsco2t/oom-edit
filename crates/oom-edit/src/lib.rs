@@ -136,7 +136,8 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             config.relative_line_numbers,
             config.clipboard.copy_format,
             config.spell.enabled,
-        ),
+        )
+        .with_wrap_width(config.editor.wrap_width),
         AppServices::new(
             Box::new(crate::clipboard::Osc52Clipboard::stdout()),
             Box::new(crate::config::FileConfigStore::production()),

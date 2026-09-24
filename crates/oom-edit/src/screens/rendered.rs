@@ -49,6 +49,7 @@ impl RenderedViewport {
 pub(crate) struct RenderedSettings {
     relative_line_numbers: bool,
     cursor_visible: bool,
+    wrap_width: u16,
 }
 
 impl RenderedSettings {
@@ -56,7 +57,13 @@ impl RenderedSettings {
         Self {
             relative_line_numbers,
             cursor_visible: true,
+            wrap_width: u16::MAX,
         }
+    }
+
+    pub(crate) const fn with_wrap_width(mut self, wrap_width: u16) -> Self {
+        self.wrap_width = wrap_width;
+        self
     }
 
     /// Control whether this screen owns the frame cursor.
@@ -114,7 +121,7 @@ pub(crate) fn render_rendered_with_settings(
         .left
         .saturating_add(usize::from(text_width))
         .min(usize::from(u16::MAX)) as u16;
-    session.render_layout(text_width);
+    session.render_layout(text_width.min(settings.wrap_width));
     let cursor = session.rendered_cursor();
     let cursor_line = cursor.row;
     let selection = session.rendered_selection();
@@ -1688,6 +1695,63 @@ mod tests {
         assert_eq!(buffer.cell((0, 0)).unwrap().symbol(), " ");
         assert_eq!(buffer.cell((1, 0)).unwrap().symbol(), "1");
         assert_eq!(buffer.cell((1, 1)).unwrap().symbol(), " ");
+    }
+
+    #[test]
+    fn rendered_blank_line_gutter_and_status_report_its_physical_position() {
+        let text = "alpha beta gamma delta epsilon zeta eta theta 東京\n\n# next\n";
+        let mut session = EditorSession::from_text(text);
+        let layout = session.render_layout(12).clone();
+        let blank_row = layout
+            .lines
+            .iter()
+            .position(|line| line.styled.text.is_empty())
+            .expect("physical blank line must have a rendered row");
+        for _ in 0..blank_row {
+            session.handle_key(key('j'));
+        }
+
+        for relative in [false, true] {
+            let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_rendered(
+                        frame,
+                        &mut session,
+                        RenderedViewport::new(0, 0),
+                        relative,
+                        Rect::new(0, 0, 40, 7),
+                        &DEFAULT_DARK,
+                        Tier::TrueColor,
+                    );
+                    crate::screens::editor::render_status_row(
+                        frame,
+                        &session,
+                        None,
+                        "",
+                        Rect::new(0, 7, 40, 1),
+                        &DEFAULT_DARK,
+                        Tier::TrueColor,
+                    );
+                })
+                .unwrap();
+
+            let buffer = terminal.backend().buffer();
+            let blank_row = session.rendered_cursor_line();
+            assert_eq!(
+                session.rendered_layout().unwrap().line_numbers[blank_row],
+                Some(2)
+            );
+            let gutter = (0..status_bar::gutter_width(session.line_count(), relative) as u16)
+                .map(|column| buffer.cell((column, blank_row as u16)).unwrap().symbol())
+                .collect::<String>();
+            assert!(gutter.contains('2'), "blank-line gutter was {gutter:?}");
+
+            let status = (0..40)
+                .map(|column| buffer.cell((column, 7)).unwrap().symbol())
+                .collect::<String>();
+            assert!(status.contains("2:1"), "blank-line status was {status:?}");
+        }
     }
 
     #[test]
