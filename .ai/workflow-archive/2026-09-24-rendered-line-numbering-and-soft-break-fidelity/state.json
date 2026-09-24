@@ -1,0 +1,98 @@
+{
+  "schema_version": 2,
+  "work_id": "2026-09-24-rendered-line-numbering-and-soft-break-fidelity",
+  "title": "Rendered Line Numbering and Soft-Break Fidelity",
+  "phase": "DONE",
+  "created_at": "2026-09-24T15:52:59Z",
+  "updated_at": "2026-09-24T18:59:30Z",
+  "approved_at": "2026-09-24T17:33:26Z",
+  "completed_at": "2026-09-24T17:40:09Z",
+  "archived_at": "2026-09-24T18:59:30Z",
+  "baseline_sha": "5cf7981417db4bbc68bb13a1bd0e7e94170080fd",
+  "final_sha": "5cf7981417db4bbc68bb13a1bd0e7e94170080fd",
+  "plan_revision": 4,
+  "acceptance_round": 3,
+  "completed_rounds": [
+    {
+      "round": 1,
+      "plan_revision": 1,
+      "approved_at": "2026-09-24T16:04:47Z",
+      "completed_at": "2026-09-24T16:53:39Z",
+      "approved_plan_sha256": "f5fc74eeaf1a2088c3ca19c31c039e1fd545375b0fae4902acc1e98d3106e049",
+      "final_sha": "5cf7981417db4bbc68bb13a1bd0e7e94170080fd",
+      "task_ids": [
+        "001",
+        "002",
+        "003"
+      ],
+      "final_evidence": "evidence/final-round-001.md"
+    },
+    {
+      "round": 2,
+      "plan_revision": 3,
+      "approved_at": "2026-09-24T17:12:47Z",
+      "completed_at": "2026-09-24T17:23:53Z",
+      "approved_plan_sha256": "f9a34a977e0785ca611a7dbdd96a7c21934eac94db0ebcdee186e33abe91b456",
+      "final_sha": "5cf7981417db4bbc68bb13a1bd0e7e94170080fd",
+      "task_ids": [
+        "004"
+      ],
+      "final_evidence": "evidence/final-round-002.md"
+    }
+  ],
+  "approved_plan_sha256": "3e715888ed185252a2eb3415bf8bd99fa2ee189cb01e4bbb0fcc10ddeeb6f454",
+  "current_task": null,
+  "tasks": [
+    {
+      "id": "001",
+      "path": "tasks/001-complete-physical-blank-line-identity.md",
+      "round": 1,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/001.md"
+    },
+    {
+      "id": "002",
+      "path": "tasks/002-preserve-rendered-soft-and-hard-breaks.md",
+      "round": 1,
+      "status": "COMPLETE",
+      "attempts": 2,
+      "implementation": "main",
+      "evidence": "evidence/002.md"
+    },
+    {
+      "id": "003",
+      "path": "tasks/003-mark-width-continuations-in-the-gutter.md",
+      "round": 1,
+      "status": "COMPLETE",
+      "attempts": 2,
+      "implementation": "main",
+      "evidence": "evidence/003.md"
+    },
+    {
+      "id": "004",
+      "path": "tasks/004-expand-kitchen-sink-regression-scenarios.md",
+      "round": 2,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/004.md"
+    },
+    {
+      "id": "005",
+      "path": "tasks/005-make-continuation-markers-visible.md",
+      "round": 3,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/005.md"
+    }
+  ],
+  "task_retry_limit": 3,
+  "final_retry_limit": 2,
+  "final_attempts": 1,
+  "stop_continuations": 0,
+  "max_stop_continuations": 50,
+  "block_reason": null
+}

@@ -66,6 +66,8 @@ pub enum UiSlot {
     GutterBackground,
     /// Gutter background.
     Gutter,
+    /// Width-wrapped rendered-row continuation marker.
+    GutterContinuation,
     /// Gutter current-line highlight.
     GutterCurrent,
     /// Full-width cursor-line chrome in the source editor.
@@ -1275,6 +1277,18 @@ fn add_surface_slots(
     ] {
         match palette {
             Palette::TrueColor { ui, .. } | Palette::Color16 { ui, .. } => {
+                let ordinary_gutter = ui
+                    .iter()
+                    .find(|(slot, _, _, _)| *slot == UiSlot::Gutter)
+                    .map_or(Color::Reset, |(_, foreground, _, _)| *foreground);
+                // Legacy palettes may reuse the ordinary gutter color as the surface.
+                let continuation = if Some(ordinary_gutter) == gutter {
+                    ui.iter()
+                        .find(|(slot, _, _, _)| *slot == UiSlot::GutterCurrent)
+                        .map_or(Color::Reset, |(_, foreground, _, _)| *foreground)
+                } else {
+                    ordinary_gutter
+                };
                 ui.push((UiSlot::DocumentBody, Color::Reset, None, Modifier::empty()));
                 ui.push((
                     UiSlot::GutterBackground,
@@ -1282,10 +1296,17 @@ fn add_surface_slots(
                     gutter,
                     Modifier::empty(),
                 ));
+                ui.push((
+                    UiSlot::GutterContinuation,
+                    continuation,
+                    None,
+                    Modifier::DIM | Modifier::ITALIC,
+                ));
             }
             Palette::Monochrome { ui, .. } => {
                 ui.push((UiSlot::DocumentBody, Modifier::empty()));
                 ui.push((UiSlot::GutterBackground, Modifier::empty()));
+                ui.push((UiSlot::GutterContinuation, Modifier::DIM | Modifier::ITALIC));
             }
         }
     }
@@ -1293,6 +1314,7 @@ fn add_surface_slots(
         Palette::Monochrome { ui, .. } => {
             ui.push((UiSlot::DocumentBody, Modifier::empty()));
             ui.push((UiSlot::GutterBackground, Modifier::empty()));
+            ui.push((UiSlot::GutterContinuation, Modifier::DIM | Modifier::ITALIC));
         }
         Palette::TrueColor { .. } | Palette::Color16 { .. } => {
             unreachable!("legacy monochrome declarations stay color-free")
@@ -1438,7 +1460,13 @@ fn ui_rows(roles: PaletteRoles) -> Vec<(UiSlot, Color, Option<Color>, Modifier)>
             Some(roles.gutter_background),
             Modifier::empty(),
         ),
-        (UiSlot::Gutter, roles.gutter_text, None, Modifier::DIM),
+        (UiSlot::Gutter, roles.gutter_text, None, Modifier::empty()),
+        (
+            UiSlot::GutterContinuation,
+            roles.gutter_text,
+            None,
+            Modifier::DIM | Modifier::ITALIC,
+        ),
         (
             UiSlot::GutterCurrent,
             roles.gutter_text_active,
@@ -1962,7 +1990,12 @@ static DEFAULT_DARK_SPEC: StaticTheme = StaticTheme {
                 None,
                 Modifier::empty(),
             ),
-            (UiSlot::Gutter, Color::Rgb(93, 99, 111), None, Modifier::DIM),
+            (
+                UiSlot::Gutter,
+                Color::Rgb(93, 99, 111),
+                None,
+                Modifier::empty(),
+            ),
             (
                 UiSlot::GutterCurrent,
                 Color::Rgb(200, 204, 212),
@@ -2121,7 +2154,7 @@ static DEFAULT_DARK_SPEC: StaticTheme = StaticTheme {
                 Modifier::empty(),
             ),
             (UiSlot::StatusError, Color::Red, None, Modifier::empty()),
-            (UiSlot::Gutter, Color::DarkGray, None, Modifier::DIM),
+            (UiSlot::Gutter, Color::DarkGray, None, Modifier::empty()),
             (UiSlot::GutterCurrent, Color::Yellow, None, Modifier::BOLD),
             (
                 UiSlot::CursorLine,
@@ -2211,7 +2244,7 @@ static DEFAULT_DARK_SPEC: StaticTheme = StaticTheme {
             (UiSlot::StatusInfo, Modifier::empty()),
             (UiSlot::StatusWarning, Modifier::empty()),
             (UiSlot::StatusError, Modifier::empty()),
-            (UiSlot::Gutter, Modifier::DIM),
+            (UiSlot::Gutter, Modifier::empty()),
             (UiSlot::GutterCurrent, Modifier::BOLD),
             (UiSlot::CursorLine, Modifier::UNDERLINED),
             (UiSlot::NormalCursor, Modifier::BOLD),
@@ -2312,7 +2345,7 @@ static DEFAULT_LIGHT_SPEC: StaticTheme = StaticTheme {
                 Modifier::empty(),
             ),
             (UiSlot::StatusError, Color::Red, None, Modifier::empty()),
-            (UiSlot::Gutter, Color::Gray, None, Modifier::DIM),
+            (UiSlot::Gutter, Color::Gray, None, Modifier::empty()),
             (UiSlot::GutterCurrent, Color::Yellow, None, Modifier::BOLD),
             (
                 UiSlot::CursorLine,
@@ -2437,7 +2470,7 @@ static DEFAULT_LIGHT_SPEC: StaticTheme = StaticTheme {
                 Modifier::empty(),
             ),
             (UiSlot::StatusError, Color::Red, None, Modifier::empty()),
-            (UiSlot::Gutter, Color::Gray, None, Modifier::DIM),
+            (UiSlot::Gutter, Color::Gray, None, Modifier::empty()),
             (UiSlot::GutterCurrent, Color::Yellow, None, Modifier::BOLD),
             (
                 UiSlot::CursorLine,
@@ -2532,7 +2565,7 @@ static DEFAULT_LIGHT_SPEC: StaticTheme = StaticTheme {
             (UiSlot::StatusInfo, Modifier::empty()),
             (UiSlot::StatusWarning, Modifier::empty()),
             (UiSlot::StatusError, Modifier::empty()),
-            (UiSlot::Gutter, Modifier::DIM),
+            (UiSlot::Gutter, Modifier::empty()),
             (UiSlot::GutterCurrent, Modifier::BOLD),
             (UiSlot::CursorLine, Modifier::UNDERLINED),
             (UiSlot::NormalCursor, Modifier::BOLD),
@@ -2603,7 +2636,7 @@ static ACCESSIBLE_SPEC: StaticTheme = StaticTheme {
             (UiSlot::StatusInfo, Modifier::empty()),
             (UiSlot::StatusWarning, Modifier::empty()),
             (UiSlot::StatusError, Modifier::empty()),
-            (UiSlot::Gutter, Modifier::DIM),
+            (UiSlot::Gutter, Modifier::empty()),
             (UiSlot::GutterCurrent, Modifier::BOLD),
             (UiSlot::CursorLine, Modifier::UNDERLINED),
             (UiSlot::NormalCursor, Modifier::BOLD),
@@ -2668,7 +2701,7 @@ static ACCESSIBLE_SPEC: StaticTheme = StaticTheme {
             (UiSlot::StatusInfo, Modifier::empty()),
             (UiSlot::StatusWarning, Modifier::empty()),
             (UiSlot::StatusError, Modifier::empty()),
-            (UiSlot::Gutter, Modifier::DIM),
+            (UiSlot::Gutter, Modifier::empty()),
             (UiSlot::GutterCurrent, Modifier::BOLD),
             (UiSlot::CursorLine, Modifier::UNDERLINED),
             (UiSlot::NormalCursor, Modifier::BOLD),
@@ -2733,7 +2766,7 @@ static ACCESSIBLE_SPEC: StaticTheme = StaticTheme {
             (UiSlot::StatusInfo, Modifier::empty()),
             (UiSlot::StatusWarning, Modifier::empty()),
             (UiSlot::StatusError, Modifier::empty()),
-            (UiSlot::Gutter, Modifier::DIM),
+            (UiSlot::Gutter, Modifier::empty()),
             (UiSlot::GutterCurrent, Modifier::BOLD),
             (UiSlot::CursorLine, Modifier::UNDERLINED),
             (UiSlot::NormalCursor, Modifier::BOLD),
@@ -3038,6 +3071,7 @@ mod tests {
             UiSlot::DocumentBody,
             UiSlot::GutterBackground,
             UiSlot::Gutter,
+            UiSlot::GutterContinuation,
             UiSlot::GutterCurrent,
             UiSlot::CursorLine,
             UiSlot::NormalCursor,
@@ -3680,6 +3714,19 @@ mod tests {
             .ui_style(Tier::Monochrome, UiSlot::NormalCursor)
             .add_modifier
             .contains(Modifier::UNDERLINED));
+        for tier in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
+            let continuation = custom.ui_style(tier, UiSlot::GutterContinuation);
+            assert!(continuation.add_modifier.contains(Modifier::DIM));
+            assert!(continuation.add_modifier.contains(Modifier::ITALIC));
+            if tier == Tier::Monochrome {
+                assert_eq!(continuation.fg, Some(Color::Reset));
+            } else {
+                assert_ne!(
+                    continuation.fg,
+                    custom.ui_style(tier, UiSlot::GutterBackground).bg
+                );
+            }
+        }
         for severity in [
             DiagnosticSeverity::Error,
             DiagnosticSeverity::Warning,
@@ -4476,7 +4523,7 @@ mod tests {
                 UiSlot::Gutter,
                 Some(Color::Rgb(93, 99, 111)),
                 None,
-                Modifier::DIM,
+                Modifier::empty(),
             ),
             (
                 UiSlot::GutterCurrent,
@@ -4695,6 +4742,7 @@ mod tests {
             UiSlot::DocumentBody,
             UiSlot::GutterBackground,
             UiSlot::Gutter,
+            UiSlot::GutterContinuation,
             UiSlot::GutterCurrent,
             UiSlot::CursorLine,
             UiSlot::NormalCursor,
@@ -4984,6 +5032,33 @@ mod tests {
                     assert!(
                         !theme.ui_style(tier, slot).add_modifier.is_empty(),
                         "{slot:?} must retain a modifier for {} at {tier:?}",
+                        theme.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gutter_continuation_is_quieter_and_accessible_at_every_tier() {
+        for theme in TEST_THEME_CATALOG
+            .entries()
+            .iter()
+            .map(|entry| &entry.theme)
+        {
+            for tier in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
+                let ordinary = theme.ui_style(tier, UiSlot::Gutter);
+                let continuation = theme.ui_style(tier, UiSlot::GutterContinuation);
+                let gutter_background = theme.ui_style(tier, UiSlot::GutterBackground);
+                assert!(continuation.add_modifier.contains(Modifier::DIM));
+                assert!(continuation.add_modifier.contains(Modifier::ITALIC));
+                assert_ne!(continuation, ordinary);
+                if tier == Tier::Monochrome || theme.name == "accessible" {
+                    assert_eq!(continuation.fg, Some(Color::Reset));
+                } else {
+                    assert_ne!(
+                        continuation.fg, gutter_background.bg,
+                        "{} {tier:?} continuation must contrast with its gutter surface",
                         theme.name
                     );
                 }

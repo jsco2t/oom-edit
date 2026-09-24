@@ -84,6 +84,55 @@ struct RenderedLayoutBuilder<'a> {
     code_fence_regions: Vec<RenderedCodeFenceRegion>,
 }
 
+#[derive(Debug, Default)]
+struct MappedInlineLines {
+    lines: Vec<MappedLine>,
+    breaks: Vec<Range<usize>>,
+}
+
+impl MappedInlineLines {
+    fn one(line: MappedLine) -> Self {
+        Self {
+            lines: vec![line],
+            breaks: Vec::new(),
+        }
+    }
+
+    fn line_break(source: Range<usize>) -> Self {
+        Self {
+            lines: vec![MappedLine::default(), MappedLine::default()],
+            breaks: vec![source],
+        }
+    }
+
+    fn append(&mut self, mut other: Self) {
+        if self.lines.is_empty() {
+            *self = other;
+            return;
+        }
+        if let Some(first) = other.lines.first_mut() {
+            self.lines
+                .last_mut()
+                .expect("non-empty inline composition")
+                .append(std::mem::take(first));
+        }
+        self.lines.extend(other.lines.into_iter().skip(1));
+        self.breaks.append(&mut other.breaks);
+    }
+
+    fn push_generated_at_start(&mut self, text: &str, style: SemanticStyle) {
+        if let Some(first) = self.lines.first_mut() {
+            first.prepend_generated(text, style);
+        }
+    }
+
+    fn push_generated_at_end(&mut self, text: &str, style: SemanticStyle) {
+        if let Some(last) = self.lines.last_mut() {
+            last.push_generated(text, style);
+        }
+    }
+}
+
 impl<'a> RenderedLayoutBuilder<'a> {
     fn new(
         model: &'a BlockModel,
@@ -151,12 +200,7 @@ impl<'a> RenderedLayoutBuilder<'a> {
     }
 
     fn add_separator_before(&mut self, next_source: Range<usize>) {
-        let source_blank = self.last_content_source.as_ref().and_then(|previous| {
-            source_blank_line_between(
-                self.highlighter.text(),
-                previous.end.min(next_source.start)..next_source.start,
-            )
-        });
+        let source_blank = source_blank_line_before(self.highlighter.text(), next_source.start);
         if let Some(source) = source_blank {
             self.lines.push(RenderedLine {
                 styled: StyledLine {
@@ -341,18 +385,16 @@ impl<'a> RenderedLayoutBuilder<'a> {
             _ => "# ".to_string(),
         };
 
-        // Render inline content
-        let styled = self.render_inlines(inlines, heading_style);
+        let mut mapped = self.render_inlines_preserving_breaks(inlines, heading_style);
+        mapped.push_generated_at_start(&prefix, heading_style);
+        let source_lines = paragraph_source_lines(self.highlighter.text(), source, &mapped.breaks);
+        debug_assert_eq!(mapped.lines.len(), source_lines.len());
 
-        let mut combined = MappedLine::default();
-        combined.push_generated(&prefix, heading_style);
-        combined.append(styled);
-
-        // Wrap the heading
         let jump_line = self.lines.len();
-        let wrapped = wrap_mapped_line(&combined, self.width, 0);
-        for line in wrapped {
-            self.make_content_line(line, source.clone());
+        for (physical_line, source_line) in mapped.lines.into_iter().zip(source_lines) {
+            for line in wrap_mapped_line(&physical_line, self.width, 0) {
+                self.make_content_line(line, source_line.clone());
+            }
         }
 
         // Register heading as jump target
@@ -367,10 +409,13 @@ impl<'a> RenderedLayoutBuilder<'a> {
     fn render_paragraph(&mut self, inlines: &[Inline], source: &Range<usize>) {
         let first_line = self.lines.len();
         let first_link = self.link_index.len();
-        let styled = self.render_inlines(inlines, SemanticStyle::Text);
-        let wrapped = wrap_mapped_line(&styled, self.width, 0);
-        for line in wrapped {
-            self.make_content_line(line, source.clone());
+        let mapped = self.render_inlines_preserving_breaks(inlines, SemanticStyle::Text);
+        let source_lines = paragraph_source_lines(self.highlighter.text(), source, &mapped.breaks);
+        debug_assert_eq!(mapped.lines.len(), source_lines.len());
+        for (physical_line, source_line) in mapped.lines.into_iter().zip(source_lines) {
+            for line in wrap_mapped_line(&physical_line, self.width, 0) {
+                self.make_content_line(line, source_line.clone());
+            }
         }
         for link_index in first_link..self.link_index.len() {
             self.jump_targets.push(JumpTarget {
@@ -382,49 +427,60 @@ impl<'a> RenderedLayoutBuilder<'a> {
 
     // ── VW-3: Emphasis / VW-4: Inline code ───────────────────────────
 
-    fn render_inlines(&mut self, inlines: &[Inline], default_style: SemanticStyle) -> MappedLine {
-        let mut line = MappedLine::default();
+    fn render_inlines_preserving_breaks(
+        &mut self,
+        inlines: &[Inline],
+        default_style: SemanticStyle,
+    ) -> MappedInlineLines {
+        let mut mapped = MappedInlineLines::one(MappedLine::default());
         for inline in inlines {
-            line.append(self.render_inline(inline, default_style));
+            mapped.append(self.render_inline_preserving_breaks(inline, default_style));
         }
-        line
+        mapped
     }
 
-    /// Convert an inline node to (text, SemanticStyle).
-    ///
-    /// Per the inline styling rule: nested emphasis resolves to the
-    /// innermost semantic. `Strong(Emph(..))` → `Strong`, etc.
-    fn render_inline(&mut self, inline: &Inline, default_style: SemanticStyle) -> MappedLine {
+    fn render_inline_preserving_breaks(
+        &mut self,
+        inline: &Inline,
+        default_style: SemanticStyle,
+    ) -> MappedInlineLines {
         let mut line = MappedLine::default();
         match inline {
             Inline::Text(leaf) => append_leaf(&mut line, leaf, default_style),
             Inline::Code(leaf) => append_leaf(&mut line, leaf, SemanticStyle::CodeSpan),
             Inline::SoftBreak(leaf) | Inline::HardBreak(leaf) => {
-                append_leaf(&mut line, leaf, default_style)
+                return MappedInlineLines::line_break(inline_leaf_source(leaf));
             }
-            Inline::Emph(inner) => line.append(self.render_inlines(inner, SemanticStyle::Emphasis)),
-            Inline::Strong(inner) => line.append(self.render_inlines(inner, SemanticStyle::Strong)),
+            Inline::Emph(inner) => {
+                return self.render_inlines_preserving_breaks(inner, SemanticStyle::Emphasis);
+            }
+            Inline::Strong(inner) => {
+                return self.render_inlines_preserving_breaks(inner, SemanticStyle::Strong);
+            }
             Inline::Strike(inner) => {
-                line.append(self.render_inlines(inner, SemanticStyle::Strikethrough))
+                return self.render_inlines_preserving_breaks(inner, SemanticStyle::Strikethrough);
             }
             Inline::Link {
                 text: link_text,
                 dest,
             } => {
                 let marker = self.register_link(dest.clone());
-                line.append(self.render_inlines(link_text, SemanticStyle::Link));
-                line.push_generated(&format!(" [{}]", marker), SemanticStyle::Link);
+                let mut mapped =
+                    self.render_inlines_preserving_breaks(link_text, SemanticStyle::Link);
+                mapped.push_generated_at_end(&format!(" [{}]", marker), SemanticStyle::Link);
+                return mapped;
             }
             Inline::Image { alt, dest } => {
                 let marker = self.register_link(dest.clone());
-                line.push_generated("⧉ ", SemanticStyle::Link);
-                line.append(self.render_inlines(alt, SemanticStyle::Link));
-                line.push_generated(&format!(" [{}]", marker), SemanticStyle::Link);
+                let mut mapped = self.render_inlines_preserving_breaks(alt, SemanticStyle::Link);
+                mapped.push_generated_at_start("⧉ ", SemanticStyle::Link);
+                mapped.push_generated_at_end(&format!(" [{}]", marker), SemanticStyle::Link);
+                return mapped;
             }
             Inline::FootnoteRef(leaf) => append_leaf(&mut line, leaf, SemanticStyle::Link),
             Inline::Html(leaf) => append_leaf(&mut line, leaf, SemanticStyle::HtmlRaw),
         }
-        line
+        MappedInlineLines::one(line)
     }
 
     // ── VW-5: Fenced code blocks ─────────────────────────────────────
@@ -1082,32 +1138,24 @@ fn rendered_line_numbers(lines: &[RenderedLine], text: &str) -> Vec<Option<usize
         .collect()
 }
 
-fn source_blank_line_between(text: &str, gap: Range<usize>) -> Option<Range<usize>> {
-    let gap = gap.start.min(text.len())..gap.end.min(text.len());
-    let mut start = gap.start;
-    while start < gap.end {
-        let end = text[start..gap.end]
-            .find('\n')
-            .map_or(gap.end, |relative| start + relative + 1);
-        let at_line_start = start == 0 || text.as_bytes().get(start - 1) == Some(&b'\n');
-        let content_end = end
-            .checked_sub(1)
-            .filter(|index| text.as_bytes().get(*index) == Some(&b'\n'))
-            .unwrap_or(end);
-        let content_end = content_end
-            .checked_sub(1)
-            .filter(|index| text.as_bytes().get(*index) == Some(&b'\r'))
-            .unwrap_or(content_end);
-        if at_line_start
-            && text[start..content_end]
-                .bytes()
-                .all(|byte| matches!(byte, b' ' | b'\t'))
-        {
-            return Some(start..end);
-        }
-        start = end;
+fn source_blank_line_before(text: &str, next_source_start: usize) -> Option<Range<usize>> {
+    let next_source_start = next_source_start.min(text.len());
+    let current_line_start = text[..next_source_start]
+        .rfind('\n')
+        .map_or(0, |index| index + 1);
+    let previous_end = current_line_start;
+    let before_terminator = previous_end.checked_sub(1)?;
+    let previous_start = text[..before_terminator]
+        .rfind('\n')
+        .map_or(0, |index| index + 1);
+    let mut content_end = before_terminator;
+    if content_end > previous_start && text.as_bytes().get(content_end - 1) == Some(&b'\r') {
+        content_end -= 1;
     }
-    None
+    text[previous_start..content_end]
+        .bytes()
+        .all(|byte| matches!(byte, b' ' | b'\t'))
+        .then_some(previous_start..previous_end)
 }
 
 // ── Footnote storage ────────────────────────────────────────────────────────
@@ -1163,6 +1211,36 @@ fn source_line_spans(text: &str, source: &Range<usize>) -> Vec<Range<usize>> {
         spans.push(start..source.end);
     }
     spans
+}
+
+fn paragraph_source_lines(
+    text: &str,
+    source: &Range<usize>,
+    breaks: &[Range<usize>],
+) -> Vec<Range<usize>> {
+    if breaks.is_empty() {
+        return vec![source.clone()];
+    }
+
+    let first_start = text[..source.start.min(text.len())]
+        .rfind('\n')
+        .map_or(0, |index| index + 1);
+    let mut lines = Vec::with_capacity(breaks.len() + 1);
+    let mut start = first_start;
+    for line_break in breaks {
+        let end = line_break.end.min(text.len()).max(start);
+        lines.push(start..end);
+        start = end;
+    }
+    lines.push(start..source.end.min(text.len()).max(start));
+    lines
+}
+
+fn inline_leaf_source(leaf: &InlineLeaf) -> Range<usize> {
+    leaf.atoms
+        .first()
+        .map(|atom| atom.source.clone())
+        .expect("break leaves always carry their parser span")
 }
 
 fn append_leaf(line: &mut MappedLine, leaf: &InlineLeaf, style: SemanticStyle) {
@@ -1258,6 +1336,24 @@ pub(crate) use wrap::{text_width, wrap_source_line};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blank_line_before_block_is_exact_for_lf_crlf_and_container_spans() {
+        for text in ["- result\n\n## Pass\n", "- 東京\r\n\r\n## Pass\r\n"] {
+            let next = text.find("## Pass").unwrap();
+            let expected_start = text[..next - 1].rfind('\n').map_or(0, |index| index + 1);
+            assert_eq!(
+                source_blank_line_before(text, next),
+                Some(expected_start..next)
+            );
+        }
+
+        let adjacent = "- result\n## Pass\n";
+        assert_eq!(
+            source_blank_line_before(adjacent, adjacent.find("## Pass").unwrap()),
+            None
+        );
+    }
 
     #[test]
     fn rendered_blank_line_ranges_are_exact_for_lf_crlf_and_unicode() {

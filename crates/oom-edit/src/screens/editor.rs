@@ -35,6 +35,23 @@ impl<'a> DocumentPresentation<'a> {
     }
 }
 
+pub(crate) struct GutterRows<'a> {
+    line_numbers: &'a [Option<usize>],
+    continuation_sources: &'a [Option<usize>],
+}
+
+impl<'a> GutterRows<'a> {
+    pub(crate) const fn new(
+        line_numbers: &'a [Option<usize>],
+        continuation_sources: &'a [Option<usize>],
+    ) -> Self {
+        Self {
+            line_numbers,
+            continuation_sources,
+        }
+    }
+}
+
 /// Render the editor screen into the given frame area.
 ///
 /// The `area` is the editor body rect; the application owns surrounding UI.
@@ -175,7 +192,7 @@ fn render_body(
             frame,
             mode,
             cursor.0,
-            &frame_data.line_numbers,
+            GutterRows::new(&frame_data.line_numbers, &[]),
             relative_line_numbers,
             gutter_area,
             presentation,
@@ -241,7 +258,7 @@ pub(crate) fn render_gutter(
     frame: &mut Frame<'_>,
     mode: oom_edit_core::Mode,
     cursor_line: usize,
-    line_numbers: &[Option<usize>],
+    rows: GutterRows<'_>,
     relative_line_numbers: bool,
     area: Rect,
     presentation: DocumentPresentation<'_>,
@@ -252,9 +269,54 @@ pub(crate) fn render_gutter(
     let background = theme.ui_style(tier, UiSlot::GutterBackground);
     frame.render_widget(Block::default().style(background), area);
     let mut text_lines = Vec::with_capacity(area.height as usize);
-    for line_number in line_numbers.iter().take(area.height as usize) {
+    for (row, line_number) in rows
+        .line_numbers
+        .iter()
+        .take(area.height as usize)
+        .enumerate()
+    {
         let Some(line_number) = line_number else {
-            text_lines.push(Line::styled(" ".repeat(area.width as usize), background));
+            if let Some(source_line) = rows.continuation_sources.get(row).copied().flatten() {
+                let label = status_bar::format_gutter_marker("↳", area.width as usize);
+                let mut cells = label.chars().collect::<Vec<_>>();
+                cells.resize(area.width as usize, ' ');
+                let number_end = label
+                    .chars()
+                    .count()
+                    .saturating_sub(status_bar::GUTTER_CONTENT_GAP)
+                    .min(cells.len());
+                let continuation_style =
+                    background.patch(theme.ui_style(tier, UiSlot::GutterContinuation));
+                let mut spans = Vec::new();
+                if let Some(first_cell) = cells.first() {
+                    if let Some(severity) = gutter_trouble.severity(source_line) {
+                        let marker = marker_style(severity);
+                        let role_style = marker.role.style(theme, tier);
+                        spans.push(ratatui::text::Span::styled(
+                            marker.glyph.to_string(),
+                            background.patch(role_style).add_modifier(marker.modifier),
+                        ));
+                    } else {
+                        spans.push(ratatui::text::Span::styled(
+                            first_cell.to_string(),
+                            background,
+                        ));
+                    }
+                    if number_end > 1 {
+                        spans.push(ratatui::text::Span::styled(
+                            cells[1..number_end].iter().collect::<String>(),
+                            continuation_style,
+                        ));
+                    }
+                    spans.push(ratatui::text::Span::styled(
+                        cells[number_end.max(1)..].iter().collect::<String>(),
+                        background,
+                    ));
+                }
+                text_lines.push(Line::from(spans));
+            } else {
+                text_lines.push(Line::styled(" ".repeat(area.width as usize), background));
+            }
             continue;
         };
         let source_line = line_number.saturating_sub(1);
@@ -433,7 +495,7 @@ fn mode_to_context(mode: oom_edit_core::Mode) -> Contexts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::theme::{get_theme, Tier, DEFAULT_DARK};
+    use crate::theme::{built_in_themes, get_theme, Tier, DEFAULT_DARK};
     use oom_edit_core::{KeyCode, KeyCodeKind, KeyInput, Modifiers};
     use oom_spell::{BuildProgress, SpellEngineBuilder};
     use ratatui::backend::TestBackend;
@@ -528,7 +590,7 @@ mod tests {
                         frame,
                         oom_edit_core::Mode::Normal,
                         1,
-                        &[Some(1), Some(2), Some(3), Some(4), None],
+                        GutterRows::new(&[Some(1), Some(2), Some(3), Some(4), None], &[]),
                         false,
                         frame.area(),
                         DocumentPresentation::new(theme, tier, &snapshot),
@@ -585,6 +647,51 @@ mod tests {
     }
 
     #[test]
+    fn gutter_continuation_uses_number_field_style_without_moving_diagnostics() {
+        let snapshot =
+            GutterTroubleSnapshot::testing(&[(72, oom_edit_core::DiagnosticSeverity::Warning)]);
+        for name in built_in_themes() {
+            for tier in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
+                let theme = get_theme(name);
+                let mut terminal = Terminal::new(TestBackend::new(5, 2)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        render_gutter(
+                            frame,
+                            oom_edit_core::Mode::Normal,
+                            72,
+                            GutterRows::new(&[Some(73), None], &[None, Some(72)]),
+                            false,
+                            frame.area(),
+                            DocumentPresentation::new(theme, tier, &snapshot),
+                        );
+                    })
+                    .unwrap();
+
+                assert_eq!(buffer_row(&terminal, 0, 5), "• 73 ");
+                assert_eq!(buffer_row(&terminal, 1, 5), "•  ↳ ");
+                let buffer = terminal.backend().buffer();
+                let continuation = buffer.cell((3, 1)).unwrap();
+                let expected = theme
+                    .ui_style(tier, UiSlot::GutterBackground)
+                    .patch(theme.ui_style(tier, UiSlot::GutterContinuation));
+                assert_eq!(continuation.fg, expected_cell_color(expected.fg));
+                assert_eq!(continuation.modifier, expected.add_modifier);
+                assert!(continuation.modifier.contains(Modifier::DIM));
+                assert!(continuation.modifier.contains(Modifier::ITALIC));
+                if tier != Tier::Monochrome && theme.name != "accessible" {
+                    assert_ne!(
+                        continuation.fg, continuation.bg,
+                        "{name} {tier:?} continuation must contrast with its gutter surface"
+                    );
+                }
+                assert_eq!(buffer.cell((0, 1)).unwrap().symbol(), "•");
+                assert_eq!(buffer.cell((4, 1)).unwrap().symbol(), " ");
+            }
+        }
+    }
+
+    #[test]
     fn gutter_marker_replaces_leading_alignment_cell_without_moving_number() {
         let marked =
             GutterTroubleSnapshot::testing(&[(72, oom_edit_core::DiagnosticSeverity::Warning)]);
@@ -600,7 +707,7 @@ mod tests {
                         frame,
                         oom_edit_core::Mode::Insert,
                         72,
-                        &[Some(73)],
+                        GutterRows::new(&[Some(73)], &[]),
                         false,
                         frame.area(),
                         DocumentPresentation::new(&DEFAULT_DARK, Tier::TrueColor, snapshot),
@@ -625,7 +732,7 @@ mod tests {
                         frame,
                         oom_edit_core::Mode::Insert,
                         147,
-                        &[Some(148)],
+                        GutterRows::new(&[Some(148)], &[]),
                         false,
                         frame.area(),
                         DocumentPresentation::new(&DEFAULT_DARK, Tier::TrueColor, snapshot),
@@ -652,7 +759,7 @@ mod tests {
                     frame,
                     oom_edit_core::Mode::Normal,
                     9,
-                    &[Some(9), Some(10), Some(999), Some(1000)],
+                    GutterRows::new(&[Some(9), Some(10), Some(999), Some(1000)], &[]),
                     true,
                     frame.area(),
                     DocumentPresentation::new(&DEFAULT_DARK, Tier::TrueColor, &snapshot),
@@ -671,7 +778,7 @@ mod tests {
                     frame,
                     oom_edit_core::Mode::Insert,
                     0,
-                    &[Some(1)],
+                    GutterRows::new(&[Some(1)], &[]),
                     false,
                     Rect::new(0, 0, 0, 1),
                     DocumentPresentation::new(&DEFAULT_DARK, Tier::TrueColor, &snapshot),
@@ -688,7 +795,7 @@ mod tests {
                         frame,
                         oom_edit_core::Mode::Insert,
                         0,
-                        &[Some(1)],
+                        GutterRows::new(&[Some(1)], &[]),
                         false,
                         frame.area(),
                         DocumentPresentation::new(&DEFAULT_DARK, Tier::TrueColor, &snapshot),
