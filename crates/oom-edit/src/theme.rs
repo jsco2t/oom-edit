@@ -20,6 +20,143 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
+use crate::config::ThemeConfig;
+use crate::owned_style::{ColorValue, OwnedStyle};
+
+impl ColorValue {
+    pub(crate) fn from_ratatui(color: Color) -> Self {
+        match color {
+            Color::Reset => Self::Default,
+            Color::Black => Self::Indexed(0),
+            Color::Red => Self::Indexed(1),
+            Color::Green => Self::Indexed(2),
+            Color::Yellow => Self::Indexed(3),
+            Color::Blue => Self::Indexed(4),
+            Color::Magenta => Self::Indexed(5),
+            Color::Cyan => Self::Indexed(6),
+            Color::Gray => Self::Indexed(7),
+            Color::DarkGray => Self::Indexed(8),
+            Color::LightRed => Self::Indexed(9),
+            Color::LightGreen => Self::Indexed(10),
+            Color::LightYellow => Self::Indexed(11),
+            Color::LightBlue => Self::Indexed(12),
+            Color::LightMagenta => Self::Indexed(13),
+            Color::LightCyan => Self::Indexed(14),
+            Color::White => Self::Indexed(15),
+            Color::Rgb(red, green, blue) => Self::Rgb { red, green, blue },
+            Color::Indexed(index) => Self::Indexed(index),
+        }
+    }
+}
+
+impl ColorValue {
+    pub(crate) fn to_ratatui(self) -> Color {
+        match self {
+            Self::Default => Color::Reset,
+            Self::Indexed(index) => Color::Indexed(index),
+            Self::Rgb { red, green, blue } => Color::Rgb(red, green, blue),
+        }
+    }
+}
+
+#[cfg(test)]
+mod owned_style_boundary_tests {
+    use super::{Color, ColorValue, OwnedStyle, Style};
+    use crate::pane_frame::PaneFrame;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::style::Modifier;
+
+    #[test]
+    fn owned_colors_and_all_modifiers_roundtrip_into_the_host_renderer() {
+        assert_eq!(ColorValue::Default.to_ratatui(), Color::Reset);
+        for index in 0..=u8::MAX {
+            assert_eq!(
+                ColorValue::Indexed(index).to_ratatui(),
+                Color::Indexed(index)
+            );
+        }
+        for (red, green, blue) in [(0, 0, 0), (2, 4, 8), (255, 127, 1)] {
+            assert_eq!(
+                ColorValue::Rgb { red, green, blue }.to_ratatui(),
+                Color::Rgb(red, green, blue)
+            );
+        }
+        let modifiers = Modifier::all();
+        let source = Style::default()
+            .fg(Color::Indexed(12))
+            .bg(Color::Rgb(2, 4, 8))
+            .underline_color(Color::Reset)
+            .add_modifier(modifiers);
+        assert_eq!(OwnedStyle::from_ratatui(source).to_ratatui(), source);
+        let removed = Style::default().remove_modifier(modifiers);
+        assert_eq!(OwnedStyle::from_ratatui(removed).to_ratatui(), removed);
+    }
+
+    #[test]
+    fn underline_color_survives_the_owned_style_boundary() {
+        let source = Style::default().underline_color(Color::Rgb(12, 34, 56));
+        let owned = OwnedStyle::from_ratatui(source);
+        assert_eq!(
+            owned.underline_color,
+            Some(ColorValue::Rgb {
+                red: 12,
+                green: 34,
+                blue: 56,
+            })
+        );
+    }
+
+    #[test]
+    fn frame_conversion_retains_rgb_indexed_default_and_every_modifier() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 1));
+        let every_modifier = Modifier::BOLD
+            | Modifier::DIM
+            | Modifier::ITALIC
+            | Modifier::UNDERLINED
+            | Modifier::SLOW_BLINK
+            | Modifier::RAPID_BLINK
+            | Modifier::REVERSED
+            | Modifier::HIDDEN
+            | Modifier::CROSSED_OUT;
+        buffer.set_string(
+            0,
+            0,
+            "a",
+            Style::default()
+                .fg(Color::Rgb(1, 2, 3))
+                .bg(Color::Indexed(42))
+                .underline_color(Color::Reset)
+                .add_modifier(every_modifier),
+        );
+        let frame = PaneFrame::from_buffer(&buffer, None);
+        let style = frame.cell(0, 0).unwrap().style;
+        assert_eq!(
+            style.foreground,
+            Some(ColorValue::Rgb {
+                red: 1,
+                green: 2,
+                blue: 3
+            })
+        );
+        assert_eq!(style.background, Some(ColorValue::Indexed(42)));
+        assert_eq!(style.underline_color, Some(ColorValue::Default));
+        assert!(style.modifiers.bold);
+        assert!(style.modifiers.dim);
+        assert!(style.modifiers.italic);
+        assert!(style.modifiers.underlined);
+        assert!(style.modifiers.slow_blink);
+        assert!(style.modifiers.rapid_blink);
+        assert!(style.modifiers.reversed);
+        assert!(style.modifiers.hidden);
+        assert!(style.modifiers.crossed_out);
+        assert_eq!(
+            frame.cell(1, 0).unwrap().style.foreground,
+            Some(ColorValue::Default)
+        );
+    }
+}
+
 #[cfg(test)]
 pub(crate) const ZED_UI_TEXT: Color = Color::Rgb(200, 204, 212);
 #[cfg(test)]
@@ -92,6 +229,47 @@ pub enum UiSlot {
     PaletteSecondary,
     /// Active command-palette row.
     PaletteSelected,
+}
+
+/// Shared palette roles for host-owned views outside the editor pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ThemeRole {
+    /// Overall host/editor background.
+    Background,
+    /// Alternate host/editor background.
+    BackgroundAlt,
+    /// Line-number gutter background.
+    GutterBackground,
+    /// Normal line-number text.
+    GutterText,
+    /// Active source-line number.
+    GutterTextActive,
+    /// Raised surface background.
+    Surface,
+    /// Active or selected raised surface.
+    SurfaceActive,
+    /// Pane and overlay borders.
+    Border,
+    /// Primary body/chrome text.
+    Text,
+    /// Secondary de-emphasized text.
+    TextMuted,
+    /// Emphasized text.
+    TextEmphasis,
+    /// Primary accent.
+    Primary,
+    /// Secondary accent.
+    Secondary,
+    /// Informational state.
+    Info,
+    /// Successful state.
+    Success,
+    /// Warning state.
+    Warning,
+    /// Error state.
+    Error,
+    /// Attention state.
+    Attention,
 }
 
 // ── Palette tiers ───────────────────────────────────────────────────────────
@@ -357,6 +535,8 @@ impl fmt::Display for PaletteKind {
 /// Winning source for active-theme selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThemeSource {
+    /// A host-supplied theme override.
+    Host,
     /// Explicit `--theme` CLI flag.
     Cli,
     /// `OOM_EDIT_THEME` environment override.
@@ -372,6 +552,7 @@ pub enum ThemeSource {
 impl fmt::Display for ThemeSource {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::Host => "host",
             Self::Cli => "--theme",
             Self::Environment => "environment",
             Self::ConfigDark => "config.dark",
@@ -394,6 +575,45 @@ pub struct ResolvedTheme {
     pub palette_kind: PaletteKind,
     /// Winning selection source.
     pub source: ThemeSource,
+}
+
+/// Explicit, environment-independent inputs for choosing a theme.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThemeSelection {
+    /// Optional name with priority over the active configuration slot.
+    override_name: Option<String>,
+    /// Host-chosen light or dark appearance.
+    display_mode: DisplayMode,
+    /// Host-chosen terminal color capability.
+    capability: Tier,
+    source: ThemeSource,
+}
+
+impl ThemeSelection {
+    /// Create an explicit host selection without reading process state.
+    pub fn new(override_name: Option<String>, display_mode: DisplayMode, capability: Tier) -> Self {
+        Self {
+            override_name,
+            display_mode,
+            capability,
+            source: ThemeSource::Host,
+        }
+    }
+
+    /// The selected name override, if one was supplied.
+    pub fn override_name(&self) -> Option<&str> {
+        self.override_name.as_deref()
+    }
+
+    /// The selected light or dark appearance.
+    pub fn display_mode(&self) -> DisplayMode {
+        self.display_mode
+    }
+
+    /// The selected color capability.
+    pub fn capability(&self) -> Tier {
+        self.capability
+    }
 }
 
 impl ResolvedTheme {
@@ -441,23 +661,24 @@ impl fmt::Display for ResolvedTheme {
 
 // ── Selection ladder ────────────────────────────────────────────────────────
 
-/// Environment parts for testing the selection ladder without touching real env vars.
+/// Captured environment inputs for reproducing standalone theme selection.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct EnvParts {
+pub struct EnvParts {
     /// Value of `OOM_EDIT_THEME`.
-    pub(crate) oom_edit_theme: Option<String>,
+    pub oom_edit_theme: Option<String>,
     /// Value of `NO_COLOR`.
-    pub(crate) no_color: bool,
+    pub no_color: bool,
     /// Value of `TERM`.
-    pub(crate) term: Option<String>,
+    pub term: Option<String>,
     /// Value of `COLORTERM`.
-    pub(crate) colorterm: Option<String>,
+    pub colorterm: Option<String>,
     /// Value of `COLORFGBG` (e.g. "0;7" for light, "7;0" for dark).
-    pub(crate) colorfgbg: Option<String>,
+    pub colorfgbg: Option<String>,
 }
 
 impl EnvParts {
-    pub(crate) fn from_current_process() -> Self {
+    /// Capture the current process environment into owned values; pane construction never calls this helper.
+    pub fn from_current_process() -> Self {
         Self::from_lookup(|name| std::env::var(name).ok())
     }
 
@@ -468,6 +689,29 @@ impl EnvParts {
             term: lookup("TERM"),
             colorterm: lookup("COLORTERM"),
             colorfgbg: lookup("COLORFGBG"),
+        }
+    }
+
+    /// Derive standalone selection inputs from captured environment values.
+    /// `cli_theme` has priority over `OOM_EDIT_THEME`; `config_mode` has
+    /// priority over the `COLORFGBG` appearance hint.
+    pub fn selection(&self, config_mode: Option<&str>, cli_theme: Option<&str>) -> ThemeSelection {
+        let (override_name, source) = if let Some(name) = cli_theme {
+            (Some(name.to_string()), ThemeSource::Cli)
+        } else if let Some(name) = &self.oom_edit_theme {
+            (Some(name.clone()), ThemeSource::Environment)
+        } else {
+            (None, ThemeSource::Fallback)
+        };
+        ThemeSelection {
+            override_name,
+            display_mode: if self.is_light(config_mode) {
+                DisplayMode::Light
+            } else {
+                DisplayMode::Dark
+            },
+            capability: self.capability(),
+            source,
         }
     }
 
@@ -544,13 +788,21 @@ enum ThemeOrigin {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ThemeLoadWarningKind {
+/// Typed cause of a nonfatal theme loading warning.
+pub enum ThemeLoadWarningKind {
+    /// The file exceeds the supported theme size limit.
     TooLarge,
+    /// The theme file could not be decoded as UTF-8.
     InvalidUtf8,
+    /// The theme file is not valid TOML.
     InvalidToml,
+    /// The theme filename is not a valid identifier.
     InvalidName,
+    /// The theme attempts to replace a reserved built-in identifier.
     ReservedName,
+    /// Another accepted file already defines this theme name.
     DuplicateName,
+    /// The theme file could not be read.
     ReadFailed,
 }
 
@@ -569,9 +821,12 @@ impl fmt::Display for ThemeLoadWarningKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ThemeLoadWarning {
-    pub(crate) path: PathBuf,
-    pub(crate) kind: ThemeLoadWarningKind,
+/// Owned warning for one rejected or unreadable theme file.
+pub struct ThemeLoadWarning {
+    /// Theme file or directory that failed validation or loading.
+    pub path: PathBuf,
+    /// Stable failure category.
+    pub kind: ThemeLoadWarningKind,
     detail: String,
 }
 
@@ -588,21 +843,25 @@ impl fmt::Display for ThemeLoadWarning {
 }
 
 #[derive(Debug)]
-pub(crate) struct ThemeLoadReport {
-    pub(crate) catalog: ThemeCatalog,
-    pub(crate) warnings: Vec<ThemeLoadWarning>,
+/// Accepted theme catalog and every path-specific loading warning.
+pub struct ThemeLoadReport {
+    /// All built-in and successfully loaded user themes.
+    pub catalog: ThemeCatalog,
+    /// Per-file warnings in path order.
+    pub warnings: Vec<ThemeLoadWarning>,
 }
 
 const MAX_USER_THEME_BYTES: usize = 65_536;
 
 /// The one runtime owner for theme lookup, compatibility, fallback, and cycle order.
 #[derive(Debug, Clone)]
-pub(crate) struct ThemeCatalog {
+pub struct ThemeCatalog {
     themes: Vec<ThemeEntry>,
 }
 
 impl ThemeCatalog {
-    pub(crate) fn builtins() -> Self {
+    /// Build the ordered built-in catalog without reading files or environment.
+    pub fn builtins() -> Self {
         Self {
             themes: BUILTIN_THEMES
                 .iter()
@@ -630,6 +889,90 @@ impl ThemeCatalog {
             .filter(|path| !path.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         Self::load_from_directory(&config_dir.join("themes"))
+    }
+
+    /// Load built-ins plus direct `.toml` children of `<base>/themes`.
+    pub fn load_from_base(base_directory: &Path) -> ThemeLoadReport {
+        Self::load_from_directory(&base_directory.join("themes"))
+    }
+
+    /// Names in catalog order, including successful user themes after built-ins.
+    pub fn names(&self) -> Vec<String> {
+        self.themes
+            .iter()
+            .map(|entry| entry.theme.name.clone())
+            .collect()
+    }
+
+    /// Resolve a semantic editor slot into an owned host style.
+    pub fn semantic_style(
+        &self,
+        name: &str,
+        tier: Tier,
+        slot: SemanticStyle,
+    ) -> Option<OwnedStyle> {
+        self.get(name)
+            .map(|theme| OwnedStyle::from_ratatui(theme.style(tier, slot)))
+    }
+
+    /// Resolve a UI chrome slot into an owned host style.
+    pub fn ui_style(&self, name: &str, tier: Tier, slot: UiSlot) -> Option<OwnedStyle> {
+        self.get(name)
+            .map(|theme| OwnedStyle::from_ratatui(theme.ui_style(tier, slot)))
+    }
+
+    /// Resolve a palette role through the same slots the editor renders.
+    /// Background roles carry their color in `background`; text roles use
+    /// `foreground`. Monochrome roles carry no indexed or RGB color.
+    pub fn role_style(&self, name: &str, tier: Tier, role: ThemeRole) -> Option<OwnedStyle> {
+        let theme = self.get(name)?;
+        let style = match role {
+            ThemeRole::Background => theme.ui_style(tier, UiSlot::DocumentBody),
+            ThemeRole::BackgroundAlt => theme.ui_style(tier, UiSlot::StatusBar),
+            ThemeRole::GutterBackground => theme.ui_style(tier, UiSlot::GutterBackground),
+            ThemeRole::GutterText => theme.ui_style(tier, UiSlot::Gutter),
+            ThemeRole::GutterTextActive => theme.ui_style(tier, UiSlot::GutterCurrent),
+            ThemeRole::Surface => theme.ui_style(tier, UiSlot::PaletteSurface),
+            ThemeRole::SurfaceActive => theme.ui_style(tier, UiSlot::PaletteSelected),
+            ThemeRole::Border => theme.ui_style(tier, UiSlot::Border),
+            ThemeRole::Text => theme.ui_style(tier, UiSlot::HintDesc),
+            ThemeRole::TextMuted => theme.ui_style(tier, UiSlot::TabInactive),
+            ThemeRole::TextEmphasis => theme.ui_style(tier, UiSlot::TabActive),
+            ThemeRole::Primary => theme.ui_style(tier, UiSlot::HintKey),
+            ThemeRole::Secondary => theme.style(tier, SemanticStyle::Heading6),
+            ThemeRole::Info => theme.ui_style(tier, UiSlot::StatusInfo),
+            ThemeRole::Success => theme.ui_style(tier, UiSlot::StatusSuccess),
+            ThemeRole::Warning => theme.ui_style(tier, UiSlot::StatusWarning),
+            ThemeRole::Error => theme.ui_style(tier, UiSlot::StatusError),
+            ThemeRole::Attention => theme.style(tier, SemanticStyle::ListMarker),
+        };
+        Some(OwnedStyle::from_ratatui(style))
+    }
+
+    /// Return the next compatible theme name in the existing catalog order.
+    pub fn cycle(&self, current: &str, appearance: DisplayMode) -> String {
+        self.cycle_theme(current, appearance == DisplayMode::Light)
+            .to_string()
+    }
+
+    /// Resolve a named theme only when it supports the requested appearance.
+    pub fn resolve_name(
+        &self,
+        name: &str,
+        mode: DisplayMode,
+        capability: Tier,
+    ) -> Option<ResolvedTheme> {
+        if !self.supports_mode(name, mode) {
+            return None;
+        }
+        let theme = self.get(name)?;
+        Some(ResolvedTheme {
+            name: name.to_string(),
+            display_mode: mode,
+            capability,
+            palette_kind: palette_kind(theme, capability),
+            source: ThemeSource::Host,
+        })
     }
 
     fn load_from_directory(directory: &Path) -> ThemeLoadReport {
@@ -771,44 +1114,60 @@ impl ThemeCatalog {
         config_light: Option<&str>,
         env: &EnvParts,
     ) -> ResolvedTheme {
-        let is_light = env.is_light(config_mode);
-        let mode = if is_light {
-            DisplayMode::Light
-        } else {
-            DisplayMode::Dark
-        };
-        let fallback = self.fallback(mode).theme.name.as_str();
-        let configured = if is_light { config_light } else { config_dark };
-        let (name, source): (&str, ThemeSource) = match cli_theme {
-            Some(cli) if self.supports_mode(cli, mode) => (cli, ThemeSource::Cli),
-            Some(cli) => {
+        let selection = env.selection(config_mode, cli_theme);
+        if let Some(cli) = cli_theme {
+            if !self.supports_mode(cli, selection.display_mode) {
+                let fallback = self.fallback(selection.display_mode).theme.name.as_str();
                 eprintln!("oom-edit: unavailable theme '{cli}', using {fallback}");
-                (fallback, ThemeSource::Fallback)
             }
-            None => match env.oom_edit_theme.as_deref() {
-                Some(name) if self.supports_mode(name, mode) => (name, ThemeSource::Environment),
-                Some(_) => (fallback, ThemeSource::Fallback),
-                None => match configured {
-                    Some(name) if self.supports_mode(name, mode) => (
-                        name,
-                        if is_light {
-                            ThemeSource::ConfigLight
-                        } else {
-                            ThemeSource::ConfigDark
-                        },
-                    ),
-                    Some(_) | None => (fallback, ThemeSource::Fallback),
-                },
+        }
+        let mut config = ThemeConfig::default();
+        if let Some(name) = config_dark {
+            config.set_dark(name.to_string());
+        }
+        if let Some(name) = config_light {
+            config.set_light(name.to_string());
+        }
+        self.resolve_explicit(&config, &selection)
+    }
+
+    /// Resolve a theme from supplied configuration and host selection only.
+    /// An unknown or appearance-incompatible name uses the built-in fallback.
+    pub fn resolve_explicit(
+        &self,
+        config: &ThemeConfig,
+        selection: &ThemeSelection,
+    ) -> ResolvedTheme {
+        let mode = selection.display_mode;
+        let fallback = self.fallback(mode).theme.name.as_str();
+        let configured = match mode {
+            DisplayMode::Dark if config.dark_is_explicit() => Some(config.dark.as_str()),
+            DisplayMode::Light if config.light_is_explicit() => Some(config.light.as_str()),
+            _ => None,
+        };
+        let (name, source) = match selection.override_name.as_deref() {
+            Some(name) if self.supports_mode(name, mode) => (name, selection.source),
+            Some(_) => (fallback, ThemeSource::Fallback),
+            None => match configured {
+                Some(name) if self.supports_mode(name, mode) => (
+                    name,
+                    if mode == DisplayMode::Light {
+                        ThemeSource::ConfigLight
+                    } else {
+                        ThemeSource::ConfigDark
+                    },
+                ),
+                _ => (fallback, ThemeSource::Fallback),
             },
         };
-
-        let capability = env.capability();
-        let palette_kind = palette_kind(self.get(name).expect("resolved theme exists"), capability);
         ResolvedTheme {
             name: name.to_string(),
             display_mode: mode,
-            capability,
-            palette_kind,
+            capability: selection.capability,
+            palette_kind: palette_kind(
+                self.get(name).expect("resolved theme exists"),
+                selection.capability,
+            ),
             source,
         }
     }
@@ -4716,6 +5075,70 @@ mod tests {
     // ── Legacy compatibility ────────────────────────────────────────────
 
     // ── Slot completeness ───────────────────────────────────────────────
+
+    /// Every semantic slot is defined once in every tier of every built-in theme.
+    #[test]
+    fn all_semantic_slots_covered() {
+        let slots = [
+            SemanticStyle::Text,
+            SemanticStyle::Heading1,
+            SemanticStyle::Heading2,
+            SemanticStyle::Heading3,
+            SemanticStyle::Heading4,
+            SemanticStyle::Heading5,
+            SemanticStyle::Heading6,
+            SemanticStyle::Emphasis,
+            SemanticStyle::Strong,
+            SemanticStyle::Strikethrough,
+            SemanticStyle::CodeSpan,
+            SemanticStyle::CodeBlock,
+            SemanticStyle::Quote,
+            SemanticStyle::ListMarker,
+            SemanticStyle::Link,
+            SemanticStyle::LinkUrl,
+            SemanticStyle::Rule,
+            SemanticStyle::HtmlRaw,
+            SemanticStyle::FmDelimiter,
+            SemanticStyle::FmKey,
+            SemanticStyle::FmValue,
+            SemanticStyle::Keyword,
+            SemanticStyle::Function,
+            SemanticStyle::TypeName,
+            SemanticStyle::StringLit,
+            SemanticStyle::NumberLit,
+            SemanticStyle::Comment,
+            SemanticStyle::Operator,
+            SemanticStyle::Variable,
+            SemanticStyle::Punct,
+            SemanticStyle::Selection,
+            SemanticStyle::Match,
+            SemanticStyle::CursorLine,
+            SemanticStyle::Muted,
+        ];
+        for entry in ThemeCatalog::builtins().entries() {
+            for tier in [Tier::TrueColor, Tier::Color16, Tier::Monochrome] {
+                let styles: Vec<_> = match entry.theme.palette_for(tier) {
+                    Palette::TrueColor { semantic, .. } | Palette::Color16 { semantic, .. } => {
+                        semantic.iter().map(|(slot, ..)| *slot).collect()
+                    }
+                    Palette::Monochrome { semantic, .. } => {
+                        semantic.iter().map(|(slot, ..)| *slot).collect()
+                    }
+                };
+                for slot in slots {
+                    assert_eq!(
+                        styles
+                            .iter()
+                            .filter(|candidate| **candidate == slot)
+                            .count(),
+                        1,
+                        "theme {} tier {tier:?} must define {slot:?} exactly once",
+                        entry.theme.name
+                    );
+                }
+            }
+        }
+    }
 
     /// Every UiSlot variant is covered in every tier of every built-in theme.
     #[test]

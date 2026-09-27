@@ -47,6 +47,19 @@ impl LiveDocument {
         }
     }
 
+    /// Atomically replace authoritative text and every derived cache.
+    pub(super) fn reload(&mut self, text: &str, cursor: (usize, usize)) -> MutationOutcome {
+        let spell_enabled = self.spell.enabled();
+        let mut replacement = Self::new(text);
+        replacement.spell.set_enabled(spell_enabled);
+        let row = cursor.0.min(replacement.line_count().saturating_sub(1));
+        replacement.jump_to(row, cursor.1);
+        *self = replacement;
+        MutationOutcome {
+            effects: Vec::new(),
+        }
+    }
+
     pub(super) fn text(&self) -> String {
         self.vim.text()
     }
@@ -148,6 +161,14 @@ impl LiveDocument {
 
     pub(super) fn has_pending_input(&self) -> bool {
         self.vim.has_pending_input()
+    }
+
+    pub(super) fn clear_pending_input(&mut self) {
+        self.vim.clear_pending_input();
+    }
+
+    pub(super) fn set_host_time(&mut self, now: Option<std::time::Duration>) {
+        self.vim.set_host_time(now);
     }
 
     pub(super) fn insert_text(&mut self, text: &str) -> MutationOutcome {

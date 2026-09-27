@@ -7,7 +7,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::command::registry::Contexts;
-use crate::gutter::{marker_style, severity_priority, GutterTroubleSnapshot};
+use crate::gutter::{marker_style, GutterTroubleSnapshot};
 use crate::theme::{Theme, Tier, UiSlot};
 use crate::widgets::hint_bar;
 use crate::widgets::spans;
@@ -386,6 +386,7 @@ pub(crate) fn render_gutter(
 }
 
 /// Render the full status row using one fixed-badge geometry.
+#[cfg(test)]
 pub fn render_status_row(
     frame: &mut Frame<'_>,
     session: &EditorSession,
@@ -395,38 +396,71 @@ pub fn render_status_row(
     theme: &Theme,
     tier: Tier,
 ) {
-    let mode = session.mode();
+    render_status_row_with_options(
+        frame,
+        session,
+        transient,
+        StatusRowOptions {
+            text: overlay_hints,
+            inline: true,
+            disk_marker: None,
+        },
+        area,
+        theme,
+        tier,
+    );
+}
+
+/// Presentation inputs for the editor line, without additional editor state.
+pub struct StatusRowOptions<'a> {
+    pub text: &'a str,
+    pub inline: bool,
+    pub disk_marker: Option<&'a str>,
+}
+
+/// Render the editor line, optionally reserving its flexible region for
+/// standalone hints instead of leaving hints to a host status bar.
+pub fn render_status_row_with_options(
+    frame: &mut Frame<'_>,
+    session: &EditorSession,
+    transient: Option<&status_bar::Transient>,
+    hints: StatusRowOptions<'_>,
+    area: Rect,
+    theme: &Theme,
+    tier: Tier,
+) {
+    let overlay_hints = hints.text;
+    let inline_hints = hints.inline;
+    let editor_status = crate::pane_metadata::editor_status(session, hints.disk_marker);
+    let mode = editor_status.mode;
     let ctx = mode_to_context(mode);
 
     // Build status bar state.
-    let path = session
-        .path()
+    let mut path = editor_status
+        .path
+        .as_ref()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| "(new)".to_string());
-    let dirty = session.is_dirty();
-    let cursor = session.cursor();
+    if let Some(marker) = hints.disk_marker {
+        path.push(' ');
+        path.push_str(marker);
+    }
+    let dirty = editor_status.dirty;
 
     // Check if command line is active.
-    let command_line = session
-        .command_line()
-        .map(|text| format!(":{text}"))
-        .or_else(|| session.rendered_search_prompt());
+    let command_line = editor_status.prompt;
 
     let status = status_bar::StatusBar {
         mode,
         path,
         dirty,
-        is_new: session.is_new(),
-        cursor_line: cursor.0 + 1, // 1-based for display
-        cursor_col: cursor.1 + 1,
-        line_count: session.line_count(),
-        spell_issues: session.spell_enabled().then(|| status_bar::SpellIssues {
-            count: session.diagnostics().len(),
-            highest_severity: session
-                .diagnostics()
-                .iter()
-                .map(|diagnostic| diagnostic.severity)
-                .max_by_key(|severity| severity_priority(*severity)),
+        is_new: editor_status.is_new,
+        cursor_line: editor_status.ruler.line,
+        cursor_col: editor_status.ruler.column,
+        line_count: editor_status.ruler.line_count,
+        spell_issues: editor_status.spell.map(|spell| status_bar::SpellIssues {
+            count: spell.count,
+            highest_severity: spell.highest_severity,
         }),
         command_line: command_line.clone(),
     };
@@ -439,6 +473,9 @@ pub fn render_status_row(
         String::new()
     } else {
         let mut indicators = Vec::new();
+        if let Some(marker) = hints.disk_marker {
+            indicators.push(marker);
+        }
         if dirty {
             indicators.push("[+]");
         }
@@ -446,7 +483,9 @@ pub fn render_status_row(
             indicators.push("[spell off]");
         }
         let indicators = indicators.join(" ");
-        let base = if !overlay_hints.is_empty() {
+        let base = if !inline_hints {
+            String::new()
+        } else if !overlay_hints.is_empty() {
             overlay_hints.to_string()
         } else {
             let mut flexible_width = area
@@ -459,7 +498,7 @@ pub fn render_status_row(
                     .saturating_sub(indicators.len() as u16)
                     .saturating_sub(2);
             }
-            let cells = hint_bar::build_hints(ctx);
+            let cells = hint_bar::context_hints(ctx, overlay_hints);
             hint_bar::format_hints(&cells, flexible_width)
         };
         match (indicators.is_empty(), base.is_empty()) {
@@ -474,7 +513,7 @@ pub fn render_status_row(
         area,
         &status_text,
         &middle,
-        overlay_hints.is_empty(),
+        !inline_hints || overlay_hints.is_empty(),
         theme,
         tier,
     );

@@ -430,6 +430,41 @@ mod tests {
             .join("\n")
     }
 
+    #[test]
+    fn compact_trouble_keeps_selected_entry_visible_and_actionable() {
+        let mut state = TroubleState::new(
+            (0..9)
+                .map(|index| entry(index, DiagnosticSeverity::Warning))
+                .collect(),
+            TroubleProgress::Complete,
+        );
+        for _ in 0..8 {
+            state.handle_key(&key(KeyCodeKind::Down));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(20, 5)).unwrap();
+        terminal
+            .draw(|frame| {
+                state.render(
+                    frame,
+                    crate::theme::get_theme("default-dark"),
+                    Tier::Color16,
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!((1..4).any(|row| {
+            (1..19).any(|column| {
+                buffer[(column, row)]
+                    .modifier
+                    .contains(ratatui::style::Modifier::REVERSED)
+            })
+        }));
+        assert_eq!(
+            state.handle_key(&key(KeyCodeKind::Enter)),
+            TroubleAction::Jump(diagnostic(8, DiagnosticSeverity::Warning))
+        );
+    }
+
     fn line_text(line: Line<'_>) -> String {
         line.spans
             .iter()

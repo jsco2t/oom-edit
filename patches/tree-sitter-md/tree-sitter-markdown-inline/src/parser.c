@@ -6,12 +6,14 @@
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
 #endif
 
+#ifndef TREE_SITTER_MD_OPTIMIZED_BUILD
 #ifdef _MSC_VER
 #pragma optimize("", off)
 #elif defined(__clang__)
 #pragma clang optimize off
 #elif defined(__GNUC__)
 #pragma GCC optimize ("O0")
+#endif
 #endif
 
 #define LANGUAGE_VERSION 15

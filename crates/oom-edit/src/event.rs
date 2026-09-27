@@ -16,7 +16,8 @@ use oom_edit_core::Mode;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use crate::app::App;
+use crate::pane_frame::PaneCursorShape;
+use crate::standalone::StandaloneHost;
 
 /// Maximum idle poll interval, preserving timer and background-work cadence
 /// without requesting unchanged frames.
@@ -37,8 +38,8 @@ fn poll_duration(now: Instant, deadline: Option<Instant>) -> Duration {
 }
 
 #[cfg(test)]
-fn tick_and_poll_duration(app: &mut App, now: Instant) -> Duration {
-    poll_duration(now, app.tick(now).deadline)
+fn tick_and_poll_duration(app: &mut StandaloneHost, now: Instant) -> Duration {
+    poll_duration(now, app.tick(now).next_deadline)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -76,14 +77,9 @@ struct PollOutcome {
     redraw: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ModeCursorShape {
-    Block,
-    Bar,
-    Underscore,
-}
+type ModeCursorShape = PaneCursorShape;
 
-fn cursor_shape(mode: Mode, cursor_shapes: bool) -> ModeCursorShape {
+pub(crate) fn cursor_shape(mode: Mode, cursor_shapes: bool) -> PaneCursorShape {
     if !cursor_shapes {
         return ModeCursorShape::Block;
     }
@@ -94,7 +90,7 @@ fn cursor_shape(mode: Mode, cursor_shapes: bool) -> ModeCursorShape {
     }
 }
 
-impl ModeCursorShape {
+impl PaneCursorShape {
     const fn command(self) -> SetCursorStyle {
         match self {
             Self::Block => SetCursorStyle::SteadyBlock,
@@ -104,6 +100,7 @@ impl ModeCursorShape {
     }
 }
 
+#[cfg(test)]
 fn apply_cursor_shape(
     out: &mut impl Write,
     mode: Mode,
@@ -111,6 +108,14 @@ fn apply_cursor_shape(
     last_shape: &mut Option<ModeCursorShape>,
 ) -> std::io::Result<bool> {
     let shape = cursor_shape(mode, cursor_shapes);
+    apply_cursor_shape_value(out, shape, last_shape)
+}
+
+fn apply_cursor_shape_value(
+    out: &mut impl Write,
+    shape: PaneCursorShape,
+    last_shape: &mut Option<PaneCursorShape>,
+) -> std::io::Result<bool> {
     if *last_shape == Some(shape) {
         return Ok(false);
     }
@@ -129,14 +134,13 @@ fn synchronized_update<W: Write>(
     operation_result.and(end_result)
 }
 
-/// Run the main event loop until [`App::should_quit`] is set.
+/// Run the main event loop until a pane lifecycle event requests host exit.
 ///
 /// The loop paints one initial frame, then only paints after an explicit
 /// input, timer, resize, or idle-work invalidation.
 pub fn run_event_loop(
-    mut app: App,
+    mut app: StandaloneHost,
     mut terminal: Terminal<CrosstermBackend<Stdout>>,
-    cursor_shapes: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut stdout = std::io::stdout();
     let mut last_cursor_shape = None;
@@ -144,13 +148,24 @@ pub fn run_event_loop(
     loop {
         let now = Instant::now();
         let tick = app.tick(now);
-        let deadline = tick.deadline;
+        let deadline = tick.next_deadline;
         redraw.request(tick.redraw);
         let poll_duration = poll_duration(now, deadline);
         redraw.draw_if_requested(|| {
             synchronized_update(&mut stdout, |out| {
-                apply_cursor_shape(out, app.mode(), cursor_shapes, &mut last_cursor_shape)?;
-                terminal.draw(|frame| app.render(frame)).map(|_| ())
+                terminal
+                    .try_draw(|frame| {
+                        let area = frame.area();
+                        let owned = app.render_owned(area.width, area.height, now);
+                        let shape = owned.cursor.map_or_else(
+                            || cursor_shape(app.mode(), app.cursor_shapes()),
+                            |cursor| cursor.shape,
+                        );
+                        apply_cursor_shape_value(out, shape, &mut last_cursor_shape)?;
+                        app.copy_frame(frame, area, &owned);
+                        Ok::<_, std::io::Error>(())
+                    })
+                    .map(|_| ())
             })
         })?;
 
@@ -182,7 +197,7 @@ fn deadline_has_slice_slack(deadline: Option<Instant>, now: Instant) -> bool {
 /// Handle the two post-poll branches without allowing an input event to run
 /// spell work on the same loop iteration.
 fn handle_poll_outcome<ReadEvent, PendingInput, Sample>(
-    app: &mut App,
+    app: &mut StandaloneHost,
     event_ready: bool,
     prior_deadline: Option<Instant>,
     wake_now: Instant,
@@ -249,10 +264,10 @@ where
 }
 
 /// Dispatch one terminal event through the same path used by the event loop.
-fn dispatch_event_at(app: &mut App, ev: Event, now: Instant) -> bool {
+pub(crate) fn dispatch_event_at(app: &mut StandaloneHost, ev: Event, now: Instant) -> bool {
     match &ev {
         // Key press events only (ignore release/repeat).
-        Event::Key(key) if key.kind == KeyEventKind::Press => {
+        Event::Key(key) if accepts_key_event(key.kind) => {
             app.handle_event_at(&ev, now);
             true
         }
@@ -275,6 +290,12 @@ fn dispatch_event_at(app: &mut App, ev: Event, now: Instant) -> bool {
     }
 }
 
+/// Only a press performs an editor action. Enhanced repeat/release reports
+/// remain observable to a host but never become duplicate editor commands.
+pub(crate) const fn accepts_key_event(kind: KeyEventKind) -> bool {
+    matches!(kind, KeyEventKind::Press)
+}
+
 #[cfg(test)]
 fn read_then_sample<T, E>(
     read: impl FnOnce() -> Result<T, E>,
@@ -287,7 +308,7 @@ fn read_then_sample<T, E>(
 
 #[cfg(test)]
 fn read_sample_and_dispatch<E>(
-    app: &mut App,
+    app: &mut StandaloneHost,
     read: impl FnOnce() -> Result<Event, E>,
     sample: impl FnOnce() -> Instant,
 ) -> Result<(), E> {
@@ -297,7 +318,7 @@ fn read_sample_and_dispatch<E>(
 }
 
 #[cfg(test)]
-fn dispatch_event(app: &mut App, ev: Event) {
+fn dispatch_event(app: &mut StandaloneHost, ev: Event) {
     dispatch_event_at(app, ev, Instant::now());
 }
 
@@ -310,6 +331,7 @@ mod tests {
     use oom_edit_core::RecordingClipboardSink;
     use oom_edit_core::{EditorSession, Mode};
 
+    use crate::app::App;
     use crate::command::keymap::PendingAppInput;
     use crate::theme::Tier;
 
@@ -369,7 +391,7 @@ mod tests {
             let outcome = handle_poll_outcome(
                 &mut app,
                 false,
-                tick.deadline,
+                tick.next_deadline,
                 now,
                 || panic!("idle poll must not read an event"),
                 || Ok(false),
@@ -474,15 +496,19 @@ mod tests {
         );
     }
 
-    fn test_app() -> App {
-        App::new(
-            EditorSession::from_text(RESIZE_DOCUMENT),
-            crate::theme::ResolvedTheme::injected("default-dark", false, Tier::TrueColor),
-            true,
-            false,
-            Box::new(RecordingClipboardSink::default()),
-            Box::new(crate::config::DisabledConfigStore),
-            std::time::Instant::now(),
+    fn test_app() -> StandaloneHost {
+        let now = Instant::now();
+        StandaloneHost::from_app_for_test(
+            App::new(
+                EditorSession::from_text(RESIZE_DOCUMENT),
+                crate::theme::ResolvedTheme::injected("default-dark", false, Tier::TrueColor),
+                true,
+                false,
+                Box::new(RecordingClipboardSink::default()),
+                Box::new(crate::config::DisabledConfigStore),
+                now,
+            ),
+            now,
         )
     }
 
@@ -491,22 +517,25 @@ mod tests {
         words: String,
         enabled: bool,
         initial: Instant,
-    ) -> App {
-        App::new_with_spell(
-            EditorSession::from_text(document),
-            crate::theme::ThemeCatalog::builtins(),
-            crate::theme::ResolvedTheme::injected("default-dark", false, Tier::TrueColor),
-            crate::app::AppStartupOptions::new(
-                true,
-                false,
-                crate::config::ClipboardCopyFormat::Markdown,
-                enabled,
-            ),
-            crate::app::AppServices::new(
-                Box::new(RecordingClipboardSink::default()),
-                Box::new(crate::config::DisabledConfigStore),
-                crate::spell_host::SpellHost::testing(words),
-                std::path::PathBuf::from("/"),
+    ) -> StandaloneHost {
+        StandaloneHost::from_app_for_test(
+            App::new_with_spell(
+                EditorSession::from_text(document),
+                crate::theme::ThemeCatalog::builtins(),
+                crate::theme::ResolvedTheme::injected("default-dark", false, Tier::TrueColor),
+                crate::app::AppStartupOptions::new(
+                    true,
+                    false,
+                    crate::config::ClipboardCopyFormat::Markdown,
+                    enabled,
+                ),
+                crate::app::AppServices::new(
+                    Box::new(RecordingClipboardSink::default()),
+                    Box::new(crate::config::DisabledConfigStore),
+                    crate::spell_host::SpellHost::testing(words),
+                    std::path::PathBuf::from("/"),
+                ),
+                initial,
             ),
             initial,
         )
@@ -870,6 +899,36 @@ mod tests {
     }
 
     #[test]
+    fn sampled_elapsed_time_stops_idle_work_at_the_eight_millisecond_boundary() {
+        let initial = Instant::now();
+        let wake = initial + SPELL_IDLE_DELAY;
+        let mut app = test_app_with_spell_at("misspelledd\n", "known\n".to_string(), true, initial);
+        let mut probes = 0;
+        let mut samples = 0;
+        let outcome = handle_poll_outcome(
+            &mut app,
+            false,
+            None,
+            wake,
+            || panic!("timeout branch must not read an event"),
+            || {
+                probes += 1;
+                Ok(false)
+            },
+            || {
+                samples += 1;
+                wake + SPELL_SLICE_BUDGET
+            },
+        )
+        .unwrap();
+        assert_eq!(SPELL_SLICE_BUDGET, Duration::from_millis(8));
+        assert_eq!(probes, 1);
+        assert_eq!(samples, 1);
+        assert_eq!(app.spell_host_phase(), "Loading");
+        assert!(outcome.redraw);
+    }
+
+    #[test]
     fn sampled_deadline_stops_between_units_at_equality() {
         let initial = Instant::now();
         let wake = initial + SPELL_IDLE_DELAY;
@@ -1018,12 +1077,12 @@ mod tests {
         assert_eq!(session.diagnostics()[0].source_text, "misspelledd");
     }
 
-    fn build_initial_rendered_layout(app: &mut App) {
+    fn build_initial_rendered_layout(app: &mut StandaloneHost) {
         dispatch_event(app, Event::Resize(80, 24));
         assert_eq!(app.active_mut().unwrap().session_mut().mode(), Mode::Normal);
     }
 
-    fn current_content_line(app: &mut App) -> usize {
+    fn current_content_line(app: &mut StandaloneHost) -> usize {
         let session = app.active_mut().unwrap().session_mut();
         let cursor = session.rendered_cursor_line();
         let text = session.document();

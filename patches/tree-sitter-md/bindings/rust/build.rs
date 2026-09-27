@@ -5,6 +5,11 @@ fn main() {
     let mut c_config = cc::Build::new();
     c_config.std("c11").include(&block_dir);
 
+    // Generated parsers disable optimization unless the host profile opts in.
+    if std::env::var("OPT_LEVEL").unwrap() != "0" {
+        c_config.define("TREE_SITTER_MD_OPTIMIZED_BUILD", None);
+    }
+
     #[cfg(target_env = "msvc")]
     c_config.flag("-utf-8");
 

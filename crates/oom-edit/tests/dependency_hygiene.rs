@@ -14,6 +14,76 @@ fn workspace_root() -> PathBuf {
         .expect("workspace root should resolve")
 }
 
+#[test]
+fn standalone_startup_and_loop_use_only_the_public_pane() {
+    let lib = include_str!("../src/lib.rs");
+    let startup = lib
+        .split("pub fn run(")
+        .nth(1)
+        .unwrap()
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap();
+    for bypass in ["App::", "EditorSession::", "AppServices", "SpellHost::"] {
+        assert!(
+            !startup.contains(bypass),
+            "standalone startup bypasses the pane: {bypass}"
+        );
+    }
+    assert!(startup.contains("EditorPane::construct("));
+    let event = include_str!("../src/event.rs");
+    let driver = event.split("#[cfg(test)]\nmod tests").next().unwrap();
+    assert!(!driver.contains("use crate::app::App;"));
+    assert!(!driver.contains("app: App"));
+    assert!(!driver.contains("app: &mut App"));
+    assert!(driver.contains("StandaloneHost"));
+}
+
+#[test]
+fn pane_lifecycle_has_one_private_executor_and_no_session_io_escape() {
+    let app = include_str!("../src/app.rs");
+    let pane = include_str!("../src/pane.rs");
+    let protocol = include_str!("../src/app/lifecycle_protocol.rs");
+    assert_eq!(app.matches("fn execute_lifecycle(").count(), 1);
+    assert!(!pane.contains("fn execute_lifecycle("));
+    assert!(!protocol.contains("fn execute_lifecycle("));
+    for bypass in [
+        "EditorSession::open(",
+        "EditorSession::open_existing(",
+        ".session.save(",
+        ".session.retarget(",
+        "pub fn session_mut(",
+    ] {
+        assert!(
+            !pane.contains(bypass),
+            "public facade bypasses the canonical lifecycle gateway: {bypass}"
+        );
+    }
+    let dispatcher = app
+        .split("pub(crate) fn execute_lifecycle(")
+        .nth(1)
+        .unwrap()
+        .split("fn execute_open(")
+        .next()
+        .unwrap();
+    for action in [
+        "PrepareClose",
+        "CommitClose",
+        "PrepareRetarget",
+        "CommitRetarget",
+        "BeginExternalChange",
+        "CommitExternalChange",
+        "Save",
+        "ReloadTabs",
+        "QuitAll",
+    ] {
+        assert!(
+            dispatcher.contains(&format!("LifecycleAction::{action}")),
+            "the one executor no longer owns {action}"
+        );
+    }
+}
+
 fn checked_stdout(output: Output, command: &str) -> String {
     assert!(
         output.status.success(),
@@ -225,25 +295,26 @@ fn spell_release_versions_and_exact_path_edges_are_reconciled() {
     let changelog =
         std::fs::read_to_string(root.join("CHANGELOG.md")).expect("changelog should be readable");
 
-    assert_eq!(env!("CARGO_PKG_VERSION"), "0.5.0");
-    assert!(tui_manifest.contains("version = \"0.5.0\""));
-    assert!(core_manifest.contains("version = \"0.5.0\""));
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.6.0");
+    assert!(tui_manifest.contains("version = \"0.6.0\""));
+    assert!(core_manifest.contains("version = \"0.6.0\""));
     assert!(spell_manifest.contains("version = \"0.1.0\""));
     assert!(tui_manifest
-        .contains("oom-edit-core = { path = \"../oom-edit-core\", version = \"=0.5.0\" }"));
+        .contains("oom-edit-core = { path = \"../oom-edit-core\", version = \"=0.6.0\" }"));
     assert_eq!(
         lockfile
-            .matches("name = \"oom-edit\"\nversion = \"0.5.0\"")
+            .matches("name = \"oom-edit\"\nversion = \"0.6.0\"")
             .count(),
         1
     );
     assert_eq!(
         lockfile
-            .matches("name = \"oom-edit-core\"\nversion = \"0.5.0\"")
+            .matches("name = \"oom-edit-core\"\nversion = \"0.6.0\"")
             .count(),
         1
     );
     assert!(changelog.contains("## [0.5.0] - 2026-08-15"));
+    assert!(changelog.contains("0.6.0 release candidate"));
     assert!(changelog.contains("`oom-spell` 0.1.0"));
 }
 

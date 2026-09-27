@@ -1,0 +1,12 @@
+{
+  "standard_commands": [
+    "make check"
+  ],
+  "final_commands": [
+    "make ci",
+    "make build-examples",
+    "make doc",
+    "make bench-check",
+    "make bench"
+  ]
+}

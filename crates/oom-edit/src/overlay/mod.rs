@@ -11,6 +11,7 @@ pub mod palette;
 pub mod spell_suggest;
 pub mod trouble;
 
+pub(crate) use confirm::{ConfirmDiskChange, DiskChangeChoice};
 pub use confirm::{
     ConfirmOverwrite, ConfirmQuit, ConfirmationResolution, DirtyCloseChoice, ExternalSaveChoice,
 };
@@ -43,6 +44,7 @@ pub enum Overlay {
     ConfirmQuit(ConfirmQuit),
     /// Confirm overwrite overlay (T16).
     ConfirmOverwrite(ConfirmOverwrite),
+    DiskChange(ConfirmDiskChange),
 }
 
 impl Overlay {
@@ -86,9 +88,25 @@ impl Overlay {
         Overlay::ConfirmQuit(ConfirmQuit::for_action(action))
     }
 
+    pub(crate) fn open_save_path_wait(action: CloseTabRequest) -> Self {
+        Overlay::ConfirmQuit(ConfirmQuit::for_save_path(action))
+    }
+
     /// Open the confirm-overwrite overlay.
-    pub fn open_confirm_overwrite(request: SaveRequest, disk_path: std::path::PathBuf) -> Self {
-        Overlay::ConfirmOverwrite(ConfirmOverwrite::for_request(request, disk_path))
+    pub fn open_confirm_overwrite(
+        request: SaveRequest,
+        disk_path: std::path::PathBuf,
+        version: oom_edit_core::DiskVersion,
+    ) -> Self {
+        Overlay::ConfirmOverwrite(ConfirmOverwrite::for_request(request, disk_path, version))
+    }
+
+    pub(crate) fn open_disk_change(
+        target: usize,
+        path: std::path::PathBuf,
+        version: oom_edit_core::DiskVersion,
+    ) -> Self {
+        Self::DiskChange(ConfirmDiskChange::new(target, path, version))
     }
 
     /// Close the current overlay, returning the old value.
@@ -102,7 +120,7 @@ impl Overlay {
             Overlay::Palette(p) => p.handle_key(key),
             Overlay::SpellSuggest(_) => true,
             Overlay::Trouble(_) => true,
-            Overlay::ConfirmQuit(_) | Overlay::ConfirmOverwrite(_) => true,
+            Overlay::ConfirmQuit(_) | Overlay::ConfirmOverwrite(_) | Overlay::DiskChange(_) => true,
             Overlay::None => false,
         }
     }
@@ -115,6 +133,7 @@ impl Overlay {
             Overlay::Trouble(t) => t.render(frame, theme, tier),
             Overlay::ConfirmQuit(q) => q.render(frame),
             Overlay::ConfirmOverwrite(o) => o.render(frame),
+            Overlay::DiskChange(change) => change.render(frame),
             Overlay::None => {}
         }
     }
@@ -128,6 +147,7 @@ impl Overlay {
             Overlay::Trouble(t) => t.geometry(),
             Overlay::ConfirmQuit(q) => q.geometry(),
             Overlay::ConfirmOverwrite(o) => o.geometry(),
+            Overlay::DiskChange(_) => (44, 7),
             Overlay::None => (0, 0),
         }
     }
@@ -138,8 +158,9 @@ impl Overlay {
             Overlay::Palette(p) => p.hints(),
             Overlay::SpellSuggest(s) => s.hints(),
             Overlay::Trouble(t) => t.hints(),
-            Overlay::ConfirmQuit(_) => "y/w save+quit · n quit · Esc cancel",
+            Overlay::ConfirmQuit(q) => q.hints(),
             Overlay::ConfirmOverwrite(_) => "o overwrite · r reload · Esc cancel",
+            Overlay::DiskChange(_) => "k keep mine · r reload · Esc cancel",
             Overlay::None => "",
         }
     }
@@ -211,7 +232,10 @@ impl Overlay {
     }
 
     pub fn is_confirmation(&self) -> bool {
-        matches!(self, Overlay::ConfirmQuit(_) | Overlay::ConfirmOverwrite(_))
+        matches!(
+            self,
+            Overlay::ConfirmQuit(_) | Overlay::ConfirmOverwrite(_) | Overlay::DiskChange(_)
+        )
     }
 
     /// Handle confirmation input exclusively and return a semantic resolution.
@@ -222,6 +246,7 @@ impl Overlay {
         match self {
             Overlay::ConfirmQuit(q) => q.resolve_key(key),
             Overlay::ConfirmOverwrite(o) => o.resolve_key(key),
+            Overlay::DiskChange(change) => change.resolve_key(key),
             _ => None,
         }
     }

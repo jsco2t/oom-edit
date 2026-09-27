@@ -45,7 +45,7 @@ impl MappedLine {
 
     pub(super) fn push_generated(&mut self, text: &str, style: SemanticStyle) {
         for group in display_groups(text) {
-            self.push(group, style, None);
+            self.push(group.to_owned(), style, None);
         }
     }
 
@@ -73,6 +73,34 @@ impl MappedLine {
             .iter()
             .map(|fragment| fragment.text.width())
             .sum()
+    }
+
+    fn styled_line(&self) -> StyledLine {
+        let mut text = String::with_capacity(
+            self.fragments
+                .iter()
+                .map(|fragment| fragment.text.len())
+                .sum(),
+        );
+        let mut spans: Vec<Span> = Vec::new();
+        let mut char_column = 0;
+        for fragment in &self.fragments {
+            let char_len = fragment.text.chars().count();
+            text.push_str(&fragment.text);
+            if let Some(previous) = spans.last_mut().filter(|previous| {
+                previous.style == fragment.style && previous.end_col == char_column
+            }) {
+                previous.end_col += char_len;
+            } else if char_len > 0 {
+                spans.push(Span {
+                    start_col: char_column,
+                    end_col: char_column + char_len,
+                    style: fragment.style,
+                });
+            }
+            char_column += char_len;
+        }
+        StyledLine { text, spans }
     }
 
     pub(super) fn into_parts(self) -> (StyledLine, Vec<RenderedSourceAtom>) {
@@ -117,12 +145,12 @@ impl MappedLine {
 
 /// Wrap mapped display groups without separating their source ownership.
 pub(super) fn wrap_mapped_line(
-    input: &MappedLine,
+    input: MappedLine,
     width: u16,
     hanging_indent: u16,
 ) -> Vec<MappedLine> {
-    let visual = wrap_lines(&input.clone().into_parts().0, width, hanging_indent);
-    let mut source_index = 0;
+    let visual = wrap_lines(&input.styled_line(), width, hanging_indent);
+    let mut fragments = input.fragments.into_iter();
     visual
         .into_iter()
         .enumerate()
@@ -137,18 +165,12 @@ pub(super) fn wrap_mapped_line(
                 line.push_generated(&" ".repeat(indent), SemanticStyle::Text);
             }
 
-            let visible = visual_line.text.chars().skip(indent).collect::<String>();
-            for group in display_groups(&visible) {
-                while source_index < input.fragments.len()
-                    && input.fragments[source_index].text != group
-                {
-                    source_index += 1;
-                }
-                if let Some(fragment) = input.fragments.get(source_index).cloned() {
+            let visible = &visual_line.text[indent..];
+            for group in display_groups(visible) {
+                if let Some(fragment) = fragments.find(|fragment| fragment.text == group) {
                     line.fragments.push(fragment);
-                    source_index += 1;
                 } else {
-                    line.push_generated(&group, SemanticStyle::Text);
+                    line.push_generated(group, SemanticStyle::Text);
                 }
             }
             line
@@ -156,20 +178,19 @@ pub(super) fn wrap_mapped_line(
         .collect()
 }
 
-fn display_groups(text: &str) -> Vec<String> {
-    let mut groups: Vec<String> = Vec::new();
-    for character in text.chars() {
-        if character.width().unwrap_or(0) == 0 {
-            if let Some(previous) = groups.last_mut() {
-                previous.push(character);
-            } else {
-                groups.push(character.to_string());
-            }
-        } else {
-            groups.push(character.to_string());
+fn display_groups(text: &str) -> impl Iterator<Item = &str> {
+    let mut characters = text.char_indices().peekable();
+    std::iter::from_fn(move || {
+        let (start, _) = characters.next()?;
+        while characters
+            .peek()
+            .is_some_and(|(_, character)| character.width().unwrap_or(0) == 0)
+        {
+            characters.next();
         }
-    }
-    groups
+        let end = characters.peek().map_or(text.len(), |(offset, _)| *offset);
+        Some(&text[start..end])
+    })
 }
 
 /// Wrap a styled line into multiple lines that fit within `width` columns.
@@ -514,6 +535,65 @@ pub fn text_width(s: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mapped_borrowed_styles_match_owned_projection() {
+        let mut input = MappedLine::default();
+        input.push("e\u{301}".into(), SemanticStyle::Emphasis, Some(0..3));
+        input.push(" ".into(), SemanticStyle::Text, None);
+        input.push("界".into(), SemanticStyle::CodeSpan, Some(4..7));
+        input.push("👩\u{200d}".into(), SemanticStyle::Strong, Some(7..14));
+        input.push("💻".into(), SemanticStyle::Strong, Some(14..18));
+        input.push(String::new(), SemanticStyle::HtmlRaw, None);
+        assert_eq!(input.styled_line(), input.clone().into_parts().0);
+        assert_eq!(
+            MappedLine::default().styled_line(),
+            StyledLine {
+                text: String::new(),
+                spans: Vec::new()
+            }
+        );
+    }
+
+    #[test]
+    fn mapped_wrapping_keeps_repeated_unicode_source_and_generated_padding() {
+        use sha2::{Digest, Sha256};
+        let mut projection = String::new();
+        for text in [
+            "",
+            "same same same",
+            " e\u{301} 界👩\u{200d}💻 same ",
+            "\u{301}a\t a",
+        ] {
+            let mut mapped = MappedLine::default();
+            let mut offset = 7;
+            for (index, group) in display_groups(text).enumerate() {
+                let end = offset + group.len();
+                mapped.push(
+                    group.to_owned(),
+                    if index % 2 == 0 {
+                        SemanticStyle::Strong
+                    } else {
+                        SemanticStyle::Text
+                    },
+                    (index % 3 != 0).then_some(offset..end),
+                );
+                offset = end;
+            }
+            for width in 0..18 {
+                for indent in 0..6 {
+                    projection.push_str(&format!(
+                        "{:?}\n",
+                        wrap_mapped_line(mapped.clone(), width, indent)
+                    ));
+                }
+            }
+        }
+        assert_eq!(
+            format!("{:x}", Sha256::digest(projection.as_bytes())),
+            "ec2db6eb07d22467612350f9fb4f247c507b5dfa43603de25ab7cefb0b2235f8"
+        );
+    }
     use crate::style::SemanticStyle;
 
     #[test]

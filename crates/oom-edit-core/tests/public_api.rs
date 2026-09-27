@@ -1,13 +1,16 @@
 //! Downstream-style guards for the curated root facade.
 
 use oom_edit_core::{
-    ClipboardContent, ClipboardError, ClipboardSink, CommandHistory, DecorationKind, Diagnostic,
-    DiagnosticDecorationRow, DiagnosticProvider, DiagnosticSeverity, EditorSession, Effect,
-    FmError, FrontMatter, JumpTarget, KeyCode, KeyCodeKind, KeyInput, LineEnding, LineKind, Mode,
-    Modifiers, Num, OpenError, PositionError, RecordingClipboardSink, RenderedLayout, RenderedLine,
-    RenderedLineRole, RenderedPoint, RenderedSearch, RenderedSelection, RenderedSelectionRow,
-    RenderedSourceAtom, SaveError, SearchDirection, SelectionShape, SemanticStyle, Severity,
-    SourceDecoration, SourceFrame, Span, StyledLine, TargetKind, TextPosition, Value, Viewport,
+    analyze_markdown, AnalysisDiagnostic, AnalysisHeading, ClipboardContent, ClipboardError,
+    ClipboardSink, CommandHistory, DecorationKind, Diagnostic, DiagnosticDecorationRow,
+    DiagnosticProvider, DiagnosticSeverity, DiskDecisionError, DiskHint, DiskIoError,
+    DiskIoErrorKind, DiskState, DiskVersion, EditorSession, Effect, FmError, FrontMatter,
+    JumpTarget, KeyCode, KeyCodeKind, KeyInput, LineEnding, LineKind, MarkdownAnalysis, Mode,
+    Modifiers, Num, OpenError, PositionError, RecordingClipboardSink, ReloadError, RenderedLayout,
+    RenderedLine, RenderedLineRole, RenderedPoint, RenderedSearch, RenderedSelection,
+    RenderedSelectionRow, RenderedSourceAtom, RetargetError, SaveError, SearchDirection,
+    SelectionShape, SemanticStyle, Severity, SourceDecoration, SourceFrame, Span, StyledLine,
+    TargetKind, TextPosition, Value, Viewport,
 };
 use std::path::Path;
 
@@ -64,8 +67,31 @@ fn public_facade_types_are_available_at_crate_root() {
     let _: Effect = Effect::ReloadCurrentRequested { force: true };
     let _: Effect = Effect::ReloadAllRequested;
     let _: Mode = session.mode();
+    let _: fn(&EditorSession) -> bool = EditorSession::has_pending_input;
+    let _: fn(&mut EditorSession) = EditorSession::clear_pending_input;
+    let _: fn(&mut EditorSession, KeyInput, std::time::Duration) -> Vec<Effect> =
+        EditorSession::handle_key_at;
     let _: &FrontMatter = session.front_matter();
     let _: LineEnding = session.line_ending();
+    let _: DiskState = session.disk_state();
+    let _: DiskHint = session.disk_hint();
+    let _: fn(
+        &EditorSession,
+        &std::path::Path,
+        &DiskVersion,
+    ) -> Result<oom_edit_core::RetargetPreparation, RetargetError> =
+        EditorSession::prepare_retarget;
+    let _: fn(
+        &EditorSession,
+        &oom_edit_core::RetargetPreparation,
+    ) -> Result<oom_edit_core::RetargetBinding, RetargetError> = EditorSession::validate_retarget;
+    let _: fn(&mut EditorSession, oom_edit_core::RetargetBinding) -> Result<(), RetargetError> =
+        EditorSession::commit_retarget;
+    let _: fn(&mut EditorSession, Option<&std::path::Path>, &DiskVersion) -> Result<(), SaveError> =
+        EditorSession::save_if_version;
+    let _ =
+        std::any::TypeId::of::<(oom_edit_core::SaveBoundary, dyn oom_edit_core::SaveObserver)>();
+    let _: MarkdownAnalysis<'_> = analyze_markdown("# facade\n");
     let _: RenderedPoint = session.rendered_cursor();
     let _: &RenderedLayout = session.render_layout(20);
     let _: Option<RenderedSelection> = session.rendered_selection();
@@ -113,6 +139,8 @@ fn public_facade_types_are_available_at_crate_root() {
     assert_eq!(content.plain_text(), "root");
 
     let _nameable = std::any::TypeId::of::<(
+        AnalysisDiagnostic,
+        AnalysisHeading,
         ClipboardContent,
         ClipboardError,
         CommandHistory,
@@ -121,6 +149,10 @@ fn public_facade_types_are_available_at_crate_root() {
         DiagnosticDecorationRow,
         DiagnosticProvider,
         DiagnosticSeverity,
+        DiskDecisionError,
+        DiskIoError,
+        DiskIoErrorKind,
+        DiskVersion,
         Effect,
         FmError,
         JumpTarget,
@@ -128,10 +160,13 @@ fn public_facade_types_are_available_at_crate_root() {
         KeyCodeKind,
         KeyInput,
         LineKind,
+        MarkdownAnalysis<'static>,
         Modifiers,
         Num,
         OpenError,
         PositionError,
+        ReloadError,
+        RetargetError,
         RenderedLine,
         RenderedLineRole,
         RenderedSearch,
@@ -158,9 +193,11 @@ fn public_facade_remains_curated_without_partial_spell_reexports() {
     assert_eq!(
         declarations,
         [
+            "pub use analysis::{analyze_markdown, AnalysisDiagnostic, AnalysisHeading, MarkdownAnalysis};",
             "pub use clipboard::{ClipboardContent, ClipboardError, ClipboardSink, RecordingClipboardSink};",
-            "pub use document::LineEnding;",
-            "pub use error::{FmError, OpenError, SaveError};",
+            "pub use document::{ DiskHint, DiskIoError, DiskIoErrorKind, DiskState, DiskVersion, LineEnding, RetargetBinding, RetargetPreparation, };",
+            "pub use document::{SaveBoundary, SaveObserver};",
+            "pub use error::{DiskDecisionError, FmError, OpenError, ReloadError, RetargetError, SaveError};",
             "pub use frontmatter::{FrontMatter, Num, Value};",
             "pub use input::{KeyCode, KeyCodeKind, KeyInput, Modifiers};",
             "pub use session::{CommandHistory, EditorSession};",

@@ -14,6 +14,10 @@ jobs:
     name: Release build and checks
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      DOWNSTREAM_DIR: ${{ runner.temp }}/oom-edit-consumer
+      DOWNSTREAM_REV: ${{ github.sha }}
+      DOWNSTREAM_SOURCE: ${{ github.workspace }}
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -28,3 +32,12 @@ jobs:
 
       - name: Build release and run checks
         run: make ci
+
+      - name: Prepare independent committed-revision consumer
+        run: make downstream-prepare
+
+      - name: Verify independent consumer offline and locked
+        run: make downstream-candidate-check
+
+      - name: Reject incorrect sources and corrupted vendored bytes
+        run: make downstream-negative-check

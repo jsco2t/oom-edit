@@ -32,6 +32,54 @@ pub enum Mode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document::{AtomicSaveOperations, FileSystemAtomicSave};
+    use std::fs;
+    use std::io;
+    use std::path::Path;
+
+    struct FaultSave {
+        delegate: FileSystemAtomicSave,
+        fail_parent_sync: bool,
+    }
+
+    impl AtomicSaveOperations for FaultSave {
+        type TempFile = tempfile::NamedTempFile;
+        type ParentDirectory = fs::File;
+
+        fn create_temp(&mut self, parent: &Path) -> io::Result<Self::TempFile> {
+            self.delegate.create_temp(parent)
+        }
+        fn write_all(&mut self, temp: &mut Self::TempFile, contents: &[u8]) -> io::Result<()> {
+            self.delegate.write_all(temp, contents)
+        }
+        fn set_permissions(
+            &mut self,
+            temp: &Self::TempFile,
+            permissions: fs::Permissions,
+        ) -> io::Result<()> {
+            self.delegate.set_permissions(temp, permissions)
+        }
+        fn sync_file(&mut self, temp: &Self::TempFile) -> io::Result<()> {
+            if self.fail_parent_sync {
+                self.delegate.sync_file(temp)
+            } else {
+                Err(io::Error::other("injected pre-commit failure"))
+            }
+        }
+        fn persist(&mut self, temp: Self::TempFile, target: &Path) -> io::Result<()> {
+            self.delegate.persist(temp, target)
+        }
+        fn open_parent_read_only(&mut self, parent: &Path) -> io::Result<Self::ParentDirectory> {
+            self.delegate.open_parent_read_only(parent)
+        }
+        fn sync_parent(&mut self, parent: &Self::ParentDirectory) -> io::Result<()> {
+            if self.fail_parent_sync {
+                Err(io::Error::other("injected post-commit failure"))
+            } else {
+                self.delegate.sync_parent(parent)
+            }
+        }
+    }
 
     fn key(c: char) -> KeyInput {
         KeyInput {
@@ -67,6 +115,40 @@ mod tests {
                 ctrl: true,
                 ..Modifiers::default()
             },
+        }
+    }
+
+    #[test]
+    fn save_faults_preserve_live_text_and_undo_and_distinguish_commit() {
+        for (after_commit, expected_bytes) in [(false, "original\n"), (true, "Xoriginal\n")] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("file.md");
+            fs::write(&path, "original\n").unwrap();
+            let mut session = EditorSession::open(&path).unwrap();
+            session.handle_key(key('i'));
+            session.handle_key(key('X'));
+            session.handle_key(esc());
+            let cursor = session.cursor();
+            let mut operations = FaultSave {
+                delegate: FileSystemAtomicSave,
+                fail_parent_sync: after_commit,
+            };
+            let error = session
+                .save_with_operations(None, false, &mut operations)
+                .unwrap_err();
+            assert_eq!(
+                matches!(error, SaveError::CommittedUncertain(_)),
+                after_commit
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), expected_bytes);
+            assert_eq!(session.document(), "Xoriginal\n");
+            assert_eq!(session.cursor(), cursor);
+            assert!(session.is_dirty());
+            session.handle_key(key('u'));
+            assert_eq!(session.document(), "original\n");
+            if after_commit {
+                assert!(session.is_dirty(), "durability uncertainty survives undo");
+            }
         }
     }
 
@@ -1492,13 +1574,18 @@ pub struct EditorSession {
     /// Session-owned modes; Normal and Insert are always derived from Vim.
     session_mode: SessionMode,
     /// Dirty generation at last save.
-    save_point: UndoMark,
+    save_point: SaveBaseline,
     /// History shared with other sessions in this editor process.
     command_history: CommandHistory,
     /// The document model — text, path, front matter, I/O state.
     document: Document,
     /// Persistent rendered navigation and Select state.
     rendered_state: RenderedState,
+}
+
+enum SaveBaseline {
+    Confirmed(UndoMark),
+    CommittedUncertain(UndoMark),
 }
 
 impl EditorSession {
@@ -1520,7 +1607,7 @@ impl EditorSession {
         Self {
             live,
             session_mode: SessionMode::CoreDriven,
-            save_point,
+            save_point: SaveBaseline::Confirmed(save_point),
             command_history: CommandHistory::new(),
             document,
             rendered_state: RenderedState::new(),
@@ -1551,7 +1638,7 @@ impl EditorSession {
         Self {
             live,
             session_mode: SessionMode::CoreDriven,
-            save_point,
+            save_point: SaveBaseline::Confirmed(save_point),
             command_history: CommandHistory::new(),
             document,
             rendered_state: RenderedState::new(),
@@ -1565,14 +1652,81 @@ impl EditorSession {
     /// Returns `SaveError::ExternallyModified` if the file was externally
     /// modified and `force` is `false` (FR-5.7).
     pub fn save(&mut self, path: Option<&std::path::Path>, force: bool) -> Result<(), SaveError> {
+        self.save_with_operations(path, force, &mut crate::document::FileSystemAtomicSave)
+    }
+
+    /// Save through the normal atomic protocol with an injected boundary observer.
+    pub fn save_with_observer(
+        &mut self,
+        path: Option<&std::path::Path>,
+        force: bool,
+        observer: &mut dyn crate::SaveObserver,
+    ) -> Result<(), SaveError> {
+        let target = path
+            .or_else(|| self.path())
+            .ok_or_else(|| SaveError::Io(std::io::Error::other("document has no path")))?
+            .to_path_buf();
+        self.save_with_operations(
+            path,
+            force,
+            &mut crate::document::ObservedAtomicSave { observer, target },
+        )
+    }
+
+    /// Overwrite or recreate only the exact version presented to the user.
+    /// The version is checked again immediately before atomic replacement.
+    pub fn save_if_version(
+        &mut self,
+        path: Option<&std::path::Path>,
+        expected: &crate::DiskVersion,
+    ) -> Result<(), SaveError> {
+        let text = self.live.text();
+        let result = self.document.save_with_text_expected_using(
+            &text,
+            path,
+            true,
+            Some(expected),
+            &mut crate::document::FileSystemAtomicSave,
+        );
+        if let Err(error) = result {
+            if matches!(error, SaveError::CommittedUncertain(_)) {
+                let mark = match self.save_point {
+                    SaveBaseline::Confirmed(mark) | SaveBaseline::CommittedUncertain(mark) => mark,
+                };
+                self.save_point = SaveBaseline::CommittedUncertain(mark);
+            }
+            return Err(error);
+        }
+        self.save_point = SaveBaseline::Confirmed(self.live.save_point());
+        self.rendered_state.invalidate();
+        Ok(())
+    }
+
+    fn save_with_operations<O: crate::document::AtomicSaveOperations>(
+        &mut self,
+        path: Option<&std::path::Path>,
+        force: bool,
+        operations: &mut O,
+    ) -> Result<(), SaveError> {
         // Get the current text from the vim buffer
         let text = self.live.text();
         // Save using the document's I/O logic, passing the vim buffer text
-        self.document.save_with_text(&text, path, force)?;
+        if let Err(error) = self
+            .document
+            .save_with_text_using(&text, path, force, operations)
+        {
+            if matches!(error, SaveError::CommittedUncertain(_)) {
+                let mark = match self.save_point {
+                    SaveBaseline::Confirmed(mark) | SaveBaseline::CommittedUncertain(mark) => mark,
+                };
+                self.save_point = SaveBaseline::CommittedUncertain(mark);
+            }
+            return Err(error);
+        }
         // The vim engine owns the authoritative dirty generation. Capture it
         // once after the save succeeds.
         let mark = self.live.save_point();
-        self.save_point = mark;
+        self.save_point = SaveBaseline::Confirmed(mark);
         self.rendered_state.invalidate();
         Ok(())
     }
@@ -1581,6 +1735,105 @@ impl EditorSession {
     /// dirty state (`:w {path}`).
     pub fn save_copy(&self, path: &std::path::Path) -> Result<(), SaveError> {
         self.document.save_copy_with_text(&self.live.text(), path)
+    }
+
+    /// Save a copy through the atomic protocol with an injected boundary observer.
+    pub fn save_copy_with_observer(
+        &self,
+        path: &std::path::Path,
+        observer: &mut dyn crate::SaveObserver,
+    ) -> Result<(), SaveError> {
+        self.document.save_copy_with_text_using(
+            &self.live.text(),
+            path,
+            &mut crate::document::ObservedAtomicSave {
+                observer,
+                target: path.to_path_buf(),
+            },
+        )
+    }
+
+    /// Content-validate the backing path and return its versioned state.
+    pub fn disk_state(&self) -> crate::document::DiskState {
+        self.document.disk_state()
+    }
+
+    /// Probe only metadata for routine polling; Unchanged is not a content guarantee.
+    pub fn disk_hint(&self) -> crate::document::DiskHint {
+        self.document.disk_hint()
+    }
+
+    /// Accept the displayed modified version for a later non-forced save.
+    pub fn acknowledge_keep_mine(
+        &mut self,
+        expected: &crate::document::DiskVersion,
+    ) -> Result<(), crate::error::DiskDecisionError> {
+        self.document.acknowledge_keep_mine(expected)
+    }
+
+    /// Authorize recreation of this exact missing-path version.
+    pub fn authorize_recreation(
+        &mut self,
+        expected: &crate::document::DiskVersion,
+    ) -> Result<(), crate::error::DiskDecisionError> {
+        self.document.authorize_recreation(expected)
+    }
+
+    /// Reload a candidate only if its content-validated version is still current.
+    pub fn reload_from_disk(
+        &mut self,
+        expected: &crate::document::DiskVersion,
+    ) -> Result<(), crate::error::ReloadError> {
+        let candidate = self.document.prepare_reload(expected)?;
+        if candidate.text != self.live.text_ref() {
+            let cursor = self.live.cursor();
+            let _outcome = self.live.reload(&candidate.text, cursor);
+            self.session_mode = SessionMode::CoreDriven;
+            self.rendered_state = RenderedState::new();
+        }
+        self.document.commit_reload(&candidate);
+        self.save_point = SaveBaseline::Confirmed(self.live.save_point());
+        self.rendered_state.invalidate();
+        Ok(())
+    }
+
+    /// Follow a validated rename without writing or changing editor state.
+    pub fn retarget(
+        &mut self,
+        destination: &std::path::Path,
+        expected: &crate::document::DiskVersion,
+    ) -> Result<(), crate::error::RetargetError> {
+        self.document.retarget(destination, expected)
+    }
+
+    /// Capture source and destination versions before a host-managed move.
+    pub fn prepare_retarget(
+        &self,
+        destination: &std::path::Path,
+        expected_source: &crate::DiskVersion,
+    ) -> Result<crate::RetargetPreparation, crate::RetargetError> {
+        self.document.prepare_retarget(destination, expected_source)
+    }
+
+    /// Validate moved identity without changing the session's binding.
+    pub fn validate_retarget(
+        &self,
+        preparation: &crate::RetargetPreparation,
+    ) -> Result<crate::RetargetBinding, crate::RetargetError> {
+        self.document.validate_retarget(preparation)
+    }
+
+    /// Check that an IO-free binding still addresses this document generation.
+    pub fn can_commit_retarget(&self, binding: &crate::RetargetBinding) -> bool {
+        self.document.can_commit_retarget(binding)
+    }
+
+    /// Apply a validated binding without file IO or changes to editor state.
+    pub fn commit_retarget(
+        &mut self,
+        binding: crate::RetargetBinding,
+    ) -> Result<(), crate::RetargetError> {
+        self.document.commit_retarget(binding)
     }
 
     /// Handle a key input. Returns zero or more effects.
@@ -1628,6 +1881,38 @@ impl EditorSession {
             SessionMode::Select(_) => Mode::Select,
             SessionMode::Command(_) => Mode::Command,
         }
+    }
+
+    /// Clear an in-flight engine prefix when its tab loses active ownership.
+    /// Mode, prompt, selection, text and undo remain unchanged.
+    pub fn clear_pending_input(&mut self) {
+        self.live.clear_pending_input();
+        self.rendered_state.register_input = RegisterInput::Default;
+        self.rendered_state.count = 0;
+        self.rendered_state.pending_g = false;
+        self.rendered_state.pending_heading_bracket = None;
+    }
+
+    /// Whether a buffer-local prefix is waiting for another key.
+    pub fn has_pending_input(&self) -> bool {
+        self.live.has_pending_input()
+            || self.rendered_state.register_input != RegisterInput::Default
+            || self.rendered_state.count != 0
+            || self.rendered_state.pending_g
+            || self.rendered_state.pending_heading_bracket.is_some()
+    }
+
+    /// Handle a key using the host's monotonic elapsed time for engine chords.
+    /// The timeout clock is restored after this dispatch.
+    pub fn handle_key_at(
+        &mut self,
+        key: KeyInput,
+        host_elapsed: std::time::Duration,
+    ) -> Vec<Effect> {
+        self.live.set_host_time(Some(host_elapsed));
+        let effects = self.handle_key(key);
+        self.live.set_host_time(None);
+        effects
     }
 
     /// Return the full document text.
@@ -2037,12 +2322,15 @@ impl EditorSession {
 
     /// Check if the buffer is dirty (modified since last save).
     pub fn is_dirty(&self) -> bool {
-        self.live.is_modified_since(self.save_point)
+        match self.save_point {
+            SaveBaseline::Confirmed(mark) => self.live.is_modified_since(mark),
+            SaveBaseline::CommittedUncertain(_) => true,
+        }
     }
 
     /// Take a save point (marks current state as clean).
     pub fn save_point(&mut self) {
-        self.save_point = self.live.save_point();
+        self.save_point = SaveBaseline::Confirmed(self.live.save_point());
     }
 
     /// Insert pasted text in the active input mode.

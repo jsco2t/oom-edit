@@ -28,8 +28,64 @@ pub enum SaveError {
     #[error("file externally modified: {0}")]
     ExternallyModified(PathBuf),
 
+    /// A previously backed path disappeared; an explicit version-bound choice is required.
+    #[error("file is missing on disk: {0}")]
+    Missing(PathBuf),
+
+    /// Replacement occurred, but durability or the final disk state could not be confirmed.
+    #[error("file replacement committed but final state is uncertain: {0}")]
+    CommittedUncertain(std::io::Error),
+
     /// Atomic write failed (temp file write, fsync, or rename).
     #[error("failed to save file: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Rejection of a version-bound external-change decision.
+#[derive(Debug, Error)]
+pub enum DiskDecisionError {
+    /// The observed version is no longer current or belongs to another path.
+    #[error("disk version is stale")]
+    StaleVersion,
+    /// The decision does not apply to the current disk state.
+    #[error("disk decision does not apply to the current state")]
+    WrongState,
+    /// Disk observation failed.
+    #[error("failed to inspect disk state: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Error from atomic reload preparation.
+#[derive(Debug, Error)]
+pub enum ReloadError {
+    /// No file is attached to this session.
+    #[error("session has no disk path")]
+    Unbacked,
+    /// The expected disk version no longer matches.
+    #[error("disk version is stale")]
+    StaleVersion,
+    /// The candidate contains invalid UTF-8 at this byte.
+    #[error("file contains invalid UTF-8 at byte offset {0}")]
+    NotUtf8(usize),
+    /// The candidate could not be read.
+    #[error("failed to read reload candidate: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Error from a guarded path retarget.
+#[derive(Debug, Error)]
+pub enum RetargetError {
+    /// No file is attached to this session.
+    #[error("session has no disk path")]
+    Unbacked,
+    /// The destination version changed since validation.
+    #[error("destination disk version is stale")]
+    StaleVersion,
+    /// Destination bytes or identity conflict with the source baseline.
+    #[error("destination does not match the moved file")]
+    ConflictingDestination,
+    /// The destination could not be read.
+    #[error("failed to inspect destination: {0}")]
     Io(#[from] std::io::Error),
 }
 

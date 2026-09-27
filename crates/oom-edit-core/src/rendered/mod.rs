@@ -392,7 +392,7 @@ impl<'a> RenderedLayoutBuilder<'a> {
 
         let jump_line = self.lines.len();
         for (physical_line, source_line) in mapped.lines.into_iter().zip(source_lines) {
-            for line in wrap_mapped_line(&physical_line, self.width, 0) {
+            for line in wrap_mapped_line(physical_line, self.width, 0) {
                 self.make_content_line(line, source_line.clone());
             }
         }
@@ -413,7 +413,7 @@ impl<'a> RenderedLayoutBuilder<'a> {
         let source_lines = paragraph_source_lines(self.highlighter.text(), source, &mapped.breaks);
         debug_assert_eq!(mapped.lines.len(), source_lines.len());
         for (physical_line, source_line) in mapped.lines.into_iter().zip(source_lines) {
-            for line in wrap_mapped_line(&physical_line, self.width, 0) {
+            for line in wrap_mapped_line(physical_line, self.width, 0) {
                 self.make_content_line(line, source_line.clone());
             }
         }
@@ -1089,7 +1089,7 @@ impl<'a> RenderedLayoutBuilder<'a> {
         let width = self.width as usize;
         let mapped = mapped_from_styled(styled, Some(source.start));
         if width < 4 {
-            for mut line in wrap_mapped_line(&mapped, self.width, 0) {
+            for mut line in wrap_mapped_line(mapped, self.width, 0) {
                 while line.width() > width {
                     line.fragments.pop();
                 }
@@ -1099,7 +1099,7 @@ impl<'a> RenderedLayoutBuilder<'a> {
         }
 
         let content_width = self.width.saturating_sub(4).max(1);
-        for mut line in wrap_mapped_line(&mapped, content_width, 0) {
+        for mut line in wrap_mapped_line(mapped, content_width, 0) {
             let body_width = line.width();
             let padding = content_width as usize - body_width.min(content_width as usize);
             line.prepend_generated("│ ", SemanticStyle::FmDelimiter);

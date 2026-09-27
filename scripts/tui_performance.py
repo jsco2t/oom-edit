@@ -252,12 +252,17 @@ def _parse_time(stderr: str) -> tuple[int, int]:
     return cpu_ns, int(rss.group(1)) * 1024
 
 
-def _timed_case_process(executable: Path, case: str) -> dict[str, object]:
+def _timing_command(executable: Path) -> list[str]:
+    system_time = Path("/usr/bin/time")
+    if not system_time.is_file():
+        return [str(executable)]
     time_args = ["-l"] if sys.platform == "darwin" else ["-v"]
+    return [str(system_time), *time_args, str(executable)]
+
+
+def _timed_case_process(executable: Path, case: str) -> dict[str, object]:
     command = [
-        "/usr/bin/time",
-        *time_args,
-        str(executable),
+        *_timing_command(executable),
         "--exact",
         "perf_tests::tui_release_performance_case",
         "--ignored",
@@ -413,7 +418,11 @@ def validate_evidence(rows: list[dict[str, str]], role: str) -> None:
         seen.add(key)
         counts[row["case"]] = counts.get(row["case"], 0) + 1
         trials_by_case.setdefault(row["case"], set()).add(trial)
-        if row["status"] != "pass":
+        baseline_limit_failure = role == "baseline" and row["status"] in {
+            "fail-absolute-limit",
+            "fail-peak-rss-limit",
+        }
+        if row["status"] != "pass" and not baseline_limit_failure:
             raise EvidenceError(f"{role} {row['case']} trial {trial} did not pass")
     for case, count in counts.items():
         if count < 5:
@@ -559,6 +568,12 @@ def compare_records(
     return rows
 
 
+def record_failure_count(role: str, rows: list[dict[str, str]]) -> int:
+    if role not in {"baseline", "candidate"}:
+        raise EvidenceError("branch role must be baseline or candidate")
+    return sum(row["status"] != "pass" for row in rows)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
@@ -582,11 +597,12 @@ def main() -> int:
         elif args.command == "record":
             rows = record(args.root, args.role, args.trials)
             write_tsv(args.output, FIELDS, rows)
-            failures = [row for row in rows if row["status"] != "pass"]
+            failures = record_failure_count(args.role, rows)
             if failures:
-                raise EvidenceError(
-                    f"recorded {len(failures)} failing trial rows; evidence was retained"
-                )
+                message = f"recorded {failures} failing trial rows; evidence was retained"
+                if args.role == "candidate":
+                    raise EvidenceError(message)
+                print(f"tui-performance: baseline {message}", file=sys.stderr)
         elif args.command == "gate":
             rows = record(args.root, "candidate", 1)
             if any(row["status"] != "pass" for row in rows):

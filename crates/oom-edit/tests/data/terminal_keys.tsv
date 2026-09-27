@@ -1,0 +1,16 @@
+# input_code modifiers event_kind expected_code expected_modifiers dispatch
+Esc none Press Esc none yes
+Char:[ ctrl Press Esc none yes
+Tab none Press Tab none yes
+Char:i ctrl Press Tab none yes
+Enter none Press Enter none yes
+Char:m ctrl Press Enter none yes
+Backspace none Press Backspace none yes
+Char:h ctrl Press Backspace none yes
+BackTab none Press BackTab none yes
+Tab shift Press BackTab none yes
+Char:I shift Press Char:I shift yes
+Char:c ctrl Press Char:c ctrl yes
+Char:c ctrl_alt Press Char:c ctrl_alt yes
+Tab none Repeat Tab none no
+Tab none Release Tab none no

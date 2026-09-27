@@ -128,7 +128,12 @@ impl SpellSuggestState {
                 })
                 .collect()
         };
-        frame.render_widget(Paragraph::new(lines), inner);
+        let scroll = self.selected.map_or(0, |selected| {
+            selected
+                .saturating_add(1)
+                .saturating_sub(usize::from(inner.height)) as u16
+        });
+        frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
     }
 
     /// Preferred centered geometry (width, height).
@@ -166,6 +171,8 @@ fn centered(parent: Rect, preferred_width: u16, preferred_height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use oom_edit_core::{DiagnosticProvider, DiagnosticSeverity, KeyCode, Modifiers};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
     use super::*;
 
@@ -291,5 +298,31 @@ mod tests {
             SpellSuggestAction::Close
         );
         assert_eq!(state.handle_key(&ctrl('c')), SpellSuggestAction::Close);
+    }
+
+    #[test]
+    fn compact_suggestions_keep_the_selected_row_visible() {
+        let mut state = SpellSuggestState::new(
+            diagnostic(),
+            (1..=9).map(|index| format!("word{index}")).collect(),
+        );
+        for _ in 0..7 {
+            state.handle_key(&key(KeyCodeKind::Down));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(20, 5)).unwrap();
+        terminal
+            .draw(|frame| {
+                state.render(
+                    frame,
+                    crate::theme::get_theme("default-dark"),
+                    Tier::Color16,
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let visible = (0..5)
+            .flat_map(|row| (0..20).map(move |column| buffer[(column, row)].symbol()))
+            .collect::<String>();
+        assert!(visible.contains("8. word8"));
     }
 }

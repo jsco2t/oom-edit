@@ -5,11 +5,16 @@ use std::time::{Duration, Instant};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use oom_edit_core::{EditorSession, RecordingClipboardSink};
 use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::Style;
 use ratatui::Terminal;
 
 use crate::app::{App, AppServices, AppStartupOptions};
 use crate::config::{ClipboardCopyFormat, DisabledConfigStore};
+use crate::pane_frame::PaneFrame;
 use crate::spell_host::SpellHost;
+use crate::standalone::StandaloneHost;
 use crate::theme::{ResolvedTheme, ThemeCatalog, Tier};
 
 #[path = "../../oom-edit-core/perf/fixtures.rs"]
@@ -54,19 +59,23 @@ struct Measurement {
     snapshot_heap_bytes: usize,
 }
 
-fn test_app(text: &str, spell_enabled: bool) -> App {
-    App::new_with_spell(
-        EditorSession::from_text(text),
-        ThemeCatalog::builtins(),
-        ResolvedTheme::injected("default-dark", false, Tier::TrueColor),
-        AppStartupOptions::new(true, false, ClipboardCopyFormat::Markdown, spell_enabled),
-        AppServices::new(
-            Box::new(RecordingClipboardSink::default()),
-            Box::new(DisabledConfigStore),
-            SpellHost::testing("known\ntext\nword\n"),
-            std::path::PathBuf::from("/"),
+fn test_app(text: &str, spell_enabled: bool) -> StandaloneHost {
+    let now = Instant::now();
+    StandaloneHost::from_app_for_test(
+        App::new_with_spell(
+            EditorSession::from_text(text),
+            ThemeCatalog::builtins(),
+            ResolvedTheme::injected("default-dark", false, Tier::TrueColor),
+            AppStartupOptions::new(true, false, ClipboardCopyFormat::Markdown, spell_enabled),
+            AppServices::new(
+                Box::new(RecordingClipboardSink::default()),
+                Box::new(DisabledConfigStore),
+                SpellHost::testing("known\ntext\nword\n"),
+                std::path::PathBuf::from("/"),
+            ),
+            now,
         ),
-        Instant::now(),
+        now,
     )
 }
 
@@ -78,8 +87,9 @@ fn special(code: KeyCode) -> Event {
     Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
 }
 
-fn draw(app: &mut App, terminal: &mut Terminal<TestBackend>) {
-    terminal.draw(|frame| app.render(frame)).unwrap();
+fn draw(app: &mut StandaloneHost, terminal: &mut Terminal<TestBackend>) {
+    let now = Instant::now();
+    terminal.draw(|frame| app.render(frame, now)).unwrap();
 }
 
 fn measure(mut operation: impl FnMut()) -> Measurement {
@@ -160,7 +170,7 @@ fn gutter_dense(rendered: bool, marked_lines: usize) -> Measurement {
     gutter_render(rendered, &source_lines)
 }
 
-fn drain_background_work(app: &mut App) {
+fn drain_background_work(app: &mut StandaloneHost) {
     for _ in 0..100_000 {
         let worked = app.on_idle_unit(crate::event::SPELL_WORK_UNIT_BYTES);
         if app.spell_host_phase() == "Ready"
@@ -369,6 +379,33 @@ fn tui_gutter_debug_performance_smoke() {
     assert_eq!(app.performance_state_shape(), app_shape);
     assert_eq!(terminal.backend().buffer().content().len(), buffer_cells);
     assert!(!app.on_idle_unit(crate::event::SPELL_WORK_UNIT_BYTES));
+}
+
+#[test]
+#[ignore = "run by make bench-pane-frame"]
+fn pane_frame_conversion_release_limit() {
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 200, 60));
+    let row_text = "# Heading 界 e\u{301} 🙂 compact status · ".repeat(8);
+    for row in 0..60 {
+        buffer.set_stringn(0, row, &row_text, 200, Style::default());
+    }
+    for _ in 0..20 {
+        std::hint::black_box(PaneFrame::from_buffer(&buffer, None));
+    }
+    let mut samples = Vec::with_capacity(101);
+    for _ in 0..101 {
+        let start = Instant::now();
+        let frame = PaneFrame::from_buffer(&buffer, None);
+        std::hint::black_box(&frame);
+        samples.push(start.elapsed());
+    }
+    samples.sort_unstable();
+    let p95 = samples[95];
+    eprintln!("200x60 owned frame conversion p95 {p95:?}");
+    assert!(
+        p95 <= Duration::from_millis(1),
+        "conversion p95 {p95:?} exceeded 1 ms"
+    );
 }
 
 #[test]

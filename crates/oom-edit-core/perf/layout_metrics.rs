@@ -2,7 +2,44 @@
 
 use std::mem::size_of;
 
-use oom_edit_core::{JumpTarget, RenderedLayout, RenderedLine, RenderedSourceAtom, Span};
+use oom_edit_core::{
+    AnalysisDiagnostic, FrontMatter, JumpTarget, MarkdownAnalysis, RenderedLayout, RenderedLine,
+    RenderedSourceAtom, Span, Value,
+};
+
+/// Lower bound for heap capacity retained by one read-only analysis result.
+/// Parser scratch allocations are excluded; the body remains borrowed.
+pub(crate) fn analysis_retained_bytes(analysis: &MarkdownAnalysis<'_>) -> usize {
+    let mut bytes = analysis
+        .first_h1
+        .as_ref()
+        .map_or(0, |heading| heading.text.capacity());
+    bytes += analysis.diagnostics.capacity() * size_of::<AnalysisDiagnostic>();
+    bytes += analysis
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.capacity())
+        .sum::<usize>();
+    if let FrontMatter::Yaml(Ok(value)) | FrontMatter::Toml(Ok(value)) = &analysis.front_matter {
+        bytes += value_retained_bytes(value);
+    }
+    bytes
+}
+
+fn value_retained_bytes(value: &Value) -> usize {
+    match value {
+        Value::Str(text) => text.capacity(),
+        Value::Seq(items) => {
+            items.capacity() * size_of::<Value>()
+                + items.iter().map(value_retained_bytes).sum::<usize>()
+        }
+        Value::Map(entries) => entries
+            .iter()
+            .map(|(key, value)| key.capacity() + value_retained_bytes(value))
+            .sum(),
+        Value::Num(_) | Value::Bool(_) => 0,
+    }
+}
 
 /// Count heap capacity owned directly or transitively by a rendered layout.
 pub(crate) fn rendered_layout_heap_bytes(layout: &RenderedLayout) -> usize {

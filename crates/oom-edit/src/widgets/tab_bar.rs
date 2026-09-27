@@ -36,6 +36,8 @@ pub struct TabEntry {
     pub path: String,
     /// Whether the tab is dirty.
     pub dirty: bool,
+    /// Non-color signal retained even in the narrow ordinal-only layout.
+    pub disk_changed: bool,
 }
 
 /// Tab bar state.
@@ -112,7 +114,8 @@ impl TabBar {
                 // Format: `n:filename`
                 let filename = tab.path.split('/').next_back().unwrap_or(&tab.path);
                 let ordinal = index + 1;
-                let mut label = format!("{ordinal}:{filename}");
+                let marker = if tab.disk_changed { "!" } else { "" };
+                let mut label = format!("{ordinal}{marker}:{filename}");
                 if tab.dirty {
                     label.push_str(" [+]");
                 }
@@ -120,8 +123,18 @@ impl TabBar {
                 let width_usize = width as usize;
                 if label.len() > width_usize {
                     let truncate_at = (width as usize).saturating_sub(3);
-                    if truncate_at > 0 {
-                        label.truncate(truncate_at);
+                    if tab.disk_changed && truncate_at < ordinal.to_string().len() + 1 {
+                        label = if width_usize > ordinal.to_string().len() {
+                            format!("{ordinal}!")
+                        } else {
+                            "!".into()
+                        };
+                    } else if truncate_at > 0 {
+                        let mut boundary = truncate_at;
+                        while !label.is_char_boundary(boundary) {
+                            boundary -= 1;
+                        }
+                        label.truncate(boundary);
                         label.push('…');
                     }
                 }
@@ -131,7 +144,8 @@ impl TabBar {
                 // Format: `[n:filename]`
                 let filename = tab.path.split('/').next_back().unwrap_or(&tab.path);
                 let ordinal = index + 1;
-                let mut label = format!("[{ordinal}:{filename}]");
+                let marker = if tab.disk_changed { "!" } else { "" };
+                let mut label = format!("[{ordinal}{marker}:{filename}]");
                 if tab.dirty {
                     label.push('+');
                 }
@@ -139,8 +153,18 @@ impl TabBar {
                 let width_usize = width as usize;
                 if label.len() > width_usize {
                     let truncate_at = (width as usize).saturating_sub(3);
-                    if truncate_at > 0 {
-                        label.truncate(truncate_at);
+                    if tab.disk_changed && truncate_at < ordinal.to_string().len() + 2 {
+                        label = if width_usize > ordinal.to_string().len() {
+                            format!("{ordinal}!")
+                        } else {
+                            "!".into()
+                        };
+                    } else if truncate_at > 0 {
+                        let mut boundary = truncate_at;
+                        while !label.is_char_boundary(boundary) {
+                            boundary -= 1;
+                        }
+                        label.truncate(boundary);
                         label.push('…');
                     }
                 }
@@ -149,7 +173,8 @@ impl TabBar {
             TabBarLevel::Minimal => {
                 // Format: `n` (bare ordinal)
                 let ordinal = index + 1;
-                format!("{ordinal}")
+                let marker = if tab.disk_changed { "!" } else { "" };
+                format!("{ordinal}{marker}")
             }
         }
     }
@@ -183,6 +208,23 @@ pub fn render(frame: &mut Frame<'_>, area: ratatui::layout::Rect, text: &TabBarT
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disk_signal_survives_narrow_labels_and_unicode_boundaries() {
+        for width in 0..40 {
+            let bar = TabBar {
+                tabs: vec![TabEntry {
+                    path: "界e\u{301}👩\u{200d}💻.md".into(),
+                    dirty: false,
+                    disk_changed: true,
+                }],
+                active_index: 0,
+                width,
+            };
+            let text = bar.build(&crate::theme::ACCESSIBLE, Tier::Monochrome);
+            assert!(text.spans[0].content.contains('!'));
+        }
+    }
     use crate::theme::{DEFAULT_DARK, DEFAULT_LIGHT};
 
     #[test]
@@ -203,10 +245,12 @@ mod tests {
                 TabEntry {
                     path: "/home/user/file1.md".to_string(),
                     dirty: false,
+                    disk_changed: false,
                 },
                 TabEntry {
                     path: "/home/user/file2.md".to_string(),
                     dirty: true,
+                    disk_changed: false,
                 },
             ],
             active_index: 0,
@@ -226,10 +270,12 @@ mod tests {
                 TabEntry {
                     path: "/home/user/file1.md".to_string(),
                     dirty: false,
+                    disk_changed: false,
                 },
                 TabEntry {
                     path: "/home/user/file2.md".to_string(),
                     dirty: false,
+                    disk_changed: false,
                 },
             ],
             active_index: 0,
@@ -249,10 +295,12 @@ mod tests {
                 TabEntry {
                     path: "/home/user/file1.md".to_string(),
                     dirty: false,
+                    disk_changed: false,
                 },
                 TabEntry {
                     path: "/home/user/file2.md".to_string(),
                     dirty: false,
+                    disk_changed: false,
                 },
             ],
             active_index: 0,
@@ -272,10 +320,12 @@ mod tests {
                 TabEntry {
                     path: "/home/user/file1.md".to_string(),
                     dirty: false,
+                    disk_changed: false,
                 },
                 TabEntry {
                     path: "/home/user/file2.md".to_string(),
                     dirty: false,
+                    disk_changed: false,
                 },
             ],
             active_index: 1,
@@ -297,10 +347,12 @@ mod tests {
                 TabEntry {
                     path: "active.md".to_string(),
                     dirty: false,
+                    disk_changed: false,
                 },
                 TabEntry {
                     path: "inactive.md".to_string(),
                     dirty: false,
+                    disk_changed: false,
                 },
             ],
             active_index: 0,

@@ -5,7 +5,7 @@ members = ["crates/oom-spell", "crates/oom-edit-core", "crates/oom-edit"]
 [workspace.package]
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/earendil-works/oom-edit"
+repository = "https://github.com/jsco2t/oom-edit"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

@@ -1,4 +1,4 @@
-//! Performance-smoke assertions for NFR-1..NFR-4.
+//! Debug performance-smoke assertions.
 //!
 //! These relaxed debug-build ceilings are paired with deterministic unit
 //! invariants. Exact release-profile budgets are asserted by `make bench`.
@@ -7,12 +7,16 @@
 mod fixtures;
 #[path = "../perf/layout_metrics.rs"]
 mod layout_metrics;
+#[path = "../perf/timing.rs"]
+mod timing;
 
 mod perf_assertions {
     use std::sync::{Mutex, MutexGuard};
     use std::time::{Duration, Instant};
 
-    use oom_edit_core::{EditorSession, KeyCode, KeyCodeKind, KeyInput, Mode, Modifiers, Viewport};
+    use oom_edit_core::{
+        analyze_markdown, EditorSession, KeyCode, KeyCodeKind, KeyInput, Mode, Modifiers, Viewport,
+    };
     use oom_spell::{BuildProgress, SpellEngine, SpellEngineBuilder};
 
     const ONE_MIB: usize = 1024 * 1024;
@@ -27,6 +31,65 @@ mod perf_assertions {
 
     fn source_fixture_1mb() -> String {
         super::fixtures::seeded_markdown_fixture(ONE_MIB, FIXTURE_SEED)
+    }
+
+    #[test]
+    fn zero_incremental_overhead_requires_two_real_timings_and_keeps_the_exact_limit() {
+        use super::timing::{checked_additional_duration, duration_gate_passes};
+        let base = Duration::from_micros(200);
+        assert_eq!(
+            checked_additional_duration(base, base),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            checked_additional_duration(base, base / 2),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(checked_additional_duration(Duration::ZERO, base), None);
+        assert_eq!(checked_additional_duration(base, Duration::ZERO), None);
+        assert_eq!(
+            checked_additional_duration(Duration::ZERO, Duration::ZERO),
+            None
+        );
+        let limit = Duration::from_micros(100);
+        assert!(duration_gate_passes(Duration::ZERO, limit));
+        assert!(!duration_gate_passes(Duration::ZERO, Duration::ZERO));
+        for additional in [
+            limit - Duration::from_nanos(1),
+            limit,
+            limit + Duration::from_nanos(1),
+        ] {
+            let actual = checked_additional_duration(base, base + additional).unwrap();
+            assert_eq!(actual, additional);
+            assert_eq!(duration_gate_passes(actual, limit), additional < limit);
+        }
+    }
+
+    #[test]
+    fn perf_smoke_read_only_analysis_batch_and_retained_capacity() {
+        let _serial = serial();
+        let documents: Vec<String> = (0..64)
+            .map(|index| {
+                format!(
+                    "---\ntitle: Note {index}\n---\n# Note {index} &amp; More\n{}",
+                    "Body words and links [example](https://example.invalid).\n".repeat(24)
+                )
+            })
+            .collect();
+        let start = Instant::now();
+        let retained = documents
+            .iter()
+            .map(|document| {
+                let analysis = analyze_markdown(document);
+                assert!(analysis.first_h1.is_some());
+                super::layout_metrics::analysis_retained_bytes(&analysis)
+            })
+            .sum::<usize>();
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(
+            retained < 16 * 1024,
+            "analysis retained too much owned data: {retained}"
+        );
     }
 
     fn rendered_5000_line_fixture() -> String {

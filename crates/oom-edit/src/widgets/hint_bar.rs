@@ -14,7 +14,7 @@ use crate::command::{
 };
 
 /// A single hint cell for the hint bar.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HintCell {
     /// The hint text (for example, `v=character-wise selection`).
     pub text: String,
@@ -22,6 +22,19 @@ pub struct HintCell {
     pub compact_text: Option<String>,
     /// Whether this command is disabled in the current context.
     pub disabled: bool,
+}
+
+/// Shared projection for inline and host-owned hint zones.
+pub(crate) fn context_hints(ctx: Contexts, overlay: &str) -> Vec<HintCell> {
+    if overlay.is_empty() {
+        build_hints(ctx)
+    } else {
+        vec![HintCell {
+            text: overlay.to_owned(),
+            compact_text: None,
+            disabled: false,
+        }]
+    }
 }
 
 /// Build the hint bar text from the command registry.

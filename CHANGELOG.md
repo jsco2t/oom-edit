@@ -7,7 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+The changes below form the 0.6.0 release candidate. Native platform verification
+and separate publication authorization are still required; this is not a
+published release.
+
 ### Added
+
+- Public `EditorPane` with explicit services, owned input and immutable cell
+  frames, focus/timing/idle control, tab metadata, hints and binding ownership.
+  The standalone binary uses the same pane implementation.
+- Prepared close/retarget and external-change tokens, stable tab/request IDs,
+  typed ordered events, and policy-checked document I/O, including bang actions.
+- Public configuration, theme/style catalog, clipboard services, configurable
+  terminal guard and complete third-party notices; lightweight read-only core
+  Markdown analysis does not construct an editing engine.
+- Tested embedding guide and split-pane example, independent immutable-Git
+  consumer checks, strict executable requirement coverage and API/privacy guards.
+
+- Added shared two-second disk polling and explicit path notifications, with
+  focused Normal safe-point reloads, version-bound dirty-buffer decisions and
+  non-color pending/missing/error markers.
 
 - Added configurable `[editor] wrap_width` for source and rendered prose, with
   a 100-column default and the existing 80-column table floor preserved.
@@ -21,6 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   supports syntax-free `plain-text` clipboard output.
 
 ### Changed
+
+- Theme persistence updates the latest valid TOML semantically and atomically,
+  retaining unrelated values and refusing malformed or concurrently changed data.
+
+- Retained open buffers and undo after external disappearance; saving requires
+  explicit version-checked recreation rather than silently recreating a file.
 
 - Delayed spell work until five seconds after the latest input and kept
   unaffected misspelling decorations stable across repeated local edits.

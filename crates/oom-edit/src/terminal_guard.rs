@@ -1,120 +1,287 @@
-//! `TerminalGuard` — RAII terminal setup/teardown + a panic hook + a
-//! best-effort fatal-signal handler, so the terminal is always restored.
-//!
-//! Order matters: the panic hook **and** the signal handler are installed
-//! *first*, before any terminal state is touched, so (a) a panic during
-//! construction still restores the terminal and (b) the hook is installable
-//! /testable without a TTY. Restore is factored into [`restore_terminal`]
-//! so the wiring test can inject a buffer, and the alternate-screen error
-//! path explicitly undoes raw mode (a bare `?` would leak it).
+//! Exclusive RAII terminal setup, with acquisition-aware panic and signal restore.
 //!
 //! See the "Signals" block at the bottom for why this module carries exactly
 //! one audited `#[allow(unsafe_code)]` block.
 
 use std::io::{stdout, Write};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Once;
 
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EndSynchronizedUpdate, EnterAlternateScreen,
-    LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EndSynchronizedUpdate,
+    EnterAlternateScreen, LeaveAlternateScreen,
 };
 
-/// Owns the raw-mode + alternate-screen state for the lifetime of the TUI.
-///
-/// Constructed only via [`TerminalGuard::new`] (`_private` blocks struct-literal
-/// construction), which guarantees the panic hook + signal handler are armed.
+const RAW: u8 = 1 << 0;
+const ALTERNATE: u8 = 1 << 1;
+const MOUSE: u8 = 1 << 2;
+const PASTE: u8 = 1 << 3;
+const KEYBOARD: u8 = 1 << 4;
+
+static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Bits are published before each terminal command, so a signal during setup
+/// can conservatively undo an operation that may have partially reached the TTY.
+static ACQUIRED: AtomicU8 = AtomicU8::new(0);
+
+/// Terminal features owned by this guard. Standalone retains its legacy mouse
+/// and bracketed-paste defaults; keyboard disambiguation is opt-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalGuardOptions {
+    /// Acquire mouse capture on guard creation.
+    pub mouse_capture: bool,
+    /// Acquire bracketed-paste reporting on guard creation.
+    pub bracketed_paste: bool,
+    /// Acquire supported keyboard disambiguation; standalone defaults to false.
+    pub keyboard_enhancement: bool,
+}
+
+impl Default for TerminalGuardOptions {
+    fn default() -> Self {
+        Self {
+            mouse_capture: true,
+            bracketed_paste: true,
+            keyboard_enhancement: false,
+        }
+    }
+}
+
+/// Owns one process-wide raw-mode and alternate-screen session.
 pub struct TerminalGuard {
-    /// Private field: only constructible via `TerminalGuard::new`.
     _private: (),
 }
 
 /// Errors that can occur during terminal setup.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalError {
+    /// Another live guard owns the process terminal.
+    Busy,
     /// Crossterm failed to enable raw mode.
     RawMode(std::io::ErrorKind),
     /// Crossterm failed to enter the alternate screen.
     AlternateScreen(std::io::ErrorKind),
+    /// Mouse capture could not be toggled.
+    MouseCapture(std::io::ErrorKind),
+    /// Bracketed paste could not be enabled.
+    BracketedPaste(std::io::ErrorKind),
+    /// Supported keyboard enhancement could not be pushed.
+    KeyboardEnhancement(std::io::ErrorKind),
+    /// A panic already restored the terminal owned by this guard.
+    Inactive,
 }
 
 impl std::fmt::Display for TerminalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            TerminalError::Busy => f.write_str("a terminal guard is already active"),
             TerminalError::RawMode(kind) => write!(f, "failed to enable raw mode: {kind}"),
             TerminalError::AlternateScreen(kind) => {
                 write!(f, "failed to enter alternate screen: {kind}")
             }
+            TerminalError::MouseCapture(kind) => {
+                write!(f, "failed to enable mouse capture: {kind}")
+            }
+            TerminalError::BracketedPaste(kind) => {
+                write!(f, "failed to enable bracketed paste: {kind}")
+            }
+            TerminalError::KeyboardEnhancement(kind) => {
+                write!(f, "failed to enable keyboard enhancement: {kind}")
+            }
+            TerminalError::Inactive => f.write_str("terminal guard is no longer active"),
         }
     }
 }
 
 impl std::error::Error for TerminalError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupStep {
+    Raw,
+    Alternate,
+    Mouse,
+    Paste,
+    Keyboard,
+}
+
+impl SetupStep {
+    const fn bit(self) -> u8 {
+        match self {
+            Self::Raw => RAW,
+            Self::Alternate => ALTERNATE,
+            Self::Mouse => MOUSE,
+            Self::Paste => PASTE,
+            Self::Keyboard => KEYBOARD,
+        }
+    }
+
+    const fn error(self, kind: std::io::ErrorKind) -> TerminalError {
+        match self {
+            Self::Raw => TerminalError::RawMode(kind),
+            Self::Alternate => TerminalError::AlternateScreen(kind),
+            Self::Mouse => TerminalError::MouseCapture(kind),
+            Self::Paste => TerminalError::BracketedPaste(kind),
+            Self::Keyboard => TerminalError::KeyboardEnhancement(kind),
+        }
+    }
+}
+
+/// The same acquisition order drives the real terminal and fault-injection
+/// tests. A bit is published before each operation for signal-time rollback.
+fn setup_steps(
+    options: TerminalGuardOptions,
+    mut keyboard_supported: impl FnMut() -> bool,
+    mut perform: impl FnMut(SetupStep) -> std::io::Result<()>,
+    mut update: impl FnMut(u8, bool),
+) -> Result<(), TerminalError> {
+    for step in [
+        SetupStep::Raw,
+        SetupStep::Alternate,
+        SetupStep::Mouse,
+        SetupStep::Paste,
+        SetupStep::Keyboard,
+    ] {
+        let requested = match step {
+            SetupStep::Raw | SetupStep::Alternate => true,
+            SetupStep::Mouse => options.mouse_capture,
+            SetupStep::Paste => options.bracketed_paste,
+            SetupStep::Keyboard => options.keyboard_enhancement && keyboard_supported(),
+        };
+        if !requested {
+            continue;
+        }
+        update(step.bit(), true);
+        if let Err(error) = perform(step) {
+            update(step.bit(), false);
+            return Err(step.error(error.kind()));
+        }
+    }
+    Ok(())
+}
+
 impl TerminalGuard {
-    /// Enter raw mode + alternate screen.
-    ///
-    /// Hooks (panic + signal) are installed *before* any terminal mutation,
-    /// so a panic during this call still restores the terminal.
+    /// Enter raw mode and alternate screen with standalone-compatible defaults.
     ///
     /// # Errors
-    ///
-    /// Returns `TerminalError` if raw mode or alternate screen cannot be
-    /// entered. Raw mode is undone on error (no guard is constructed).
+    /// Returns a typed setup error, restoring acquired features first.
     pub fn new() -> Result<Self, TerminalError> {
-        // Hooks FIRST: a panic or fatal signal during construction must still
-        // restore the terminal.
+        Self::with_options(TerminalGuardOptions::default())
+    }
+
+    /// Acquire the requested terminal features, exclusively for this process.
+    ///
+    /// # Errors
+    /// Returns `Busy` if another guard is active or a typed setup failure.
+    pub fn with_options(options: TerminalGuardOptions) -> Result<Self, TerminalError> {
+        if ACTIVE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(TerminalError::Busy);
+        }
         install_panic_hook();
         signals::install();
-
-        if enable_raw_mode().is_err() {
-            return Err(TerminalError::RawMode(std::io::ErrorKind::Other));
+        let result = setup_steps(
+            options,
+            || supports_keyboard_enhancement().unwrap_or(false),
+            |step| match step {
+                SetupStep::Raw => enable_raw_mode(),
+                SetupStep::Alternate => execute!(stdout(), EnterAlternateScreen),
+                SetupStep::Mouse => execute!(stdout(), EnableMouseCapture),
+                SetupStep::Paste => execute!(stdout(), EnableBracketedPaste),
+                SetupStep::Keyboard => execute!(
+                    stdout(),
+                    PushKeyboardEnhancementFlags(
+                        KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                            | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                    )
+                ),
+            },
+            |bit, acquired| {
+                if acquired {
+                    ACQUIRED.fetch_or(bit, Ordering::AcqRel);
+                } else {
+                    ACQUIRED.fetch_and(!bit, Ordering::AcqRel);
+                }
+            },
+        );
+        if let Err(error) = result {
+            return setup_failed(error);
         }
-
-        if let Err(e) = execute!(stdout(), EnterAlternateScreen) {
-            // Raw mode already succeeded but no guard is constructed on this
-            // path, so Drop will never run to undo it — undo it here.
-            let _ = disable_raw_mode();
-            return Err(TerminalError::AlternateScreen(e.kind()));
-        }
-
-        // Best-effort mouse capture (FR-6.11 is Should-have; proceed keyboard-only).
-        let _ = execute!(stdout(), EnableMouseCapture);
-        // Best-effort bracketed paste; unsupported terminals remain usable.
-        let _ = execute!(stdout(), EnableBracketedPaste);
 
         Ok(Self { _private: () })
+    }
+
+    /// Toggle mouse capture without recreating the guard.
+    ///
+    /// # Errors
+    /// Returns a typed error if the active terminal cannot accept the command.
+    pub fn set_mouse_capture(&mut self, enabled: bool) -> Result<(), TerminalError> {
+        if !ACTIVE.load(Ordering::Acquire) || ACQUIRED.load(Ordering::Acquire) == 0 {
+            return Err(TerminalError::Inactive);
+        }
+        let currently_enabled = ACQUIRED.load(Ordering::Acquire) & MOUSE != 0;
+        if currently_enabled == enabled {
+            return Ok(());
+        }
+        if enabled {
+            ACQUIRED.fetch_or(MOUSE, Ordering::AcqRel);
+            if let Err(error) = execute!(stdout(), EnableMouseCapture) {
+                ACQUIRED.fetch_and(!MOUSE, Ordering::AcqRel);
+                return Err(TerminalError::MouseCapture(error.kind()));
+            }
+        } else {
+            ACQUIRED.fetch_and(!MOUSE, Ordering::AcqRel);
+            if let Err(error) = execute!(stdout(), DisableMouseCapture) {
+                ACQUIRED.fetch_or(MOUSE, Ordering::AcqRel);
+                return Err(TerminalError::MouseCapture(error.kind()));
+            }
+        }
+        Ok(())
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        restore_terminal(&mut stdout());
+        restore_active();
+        ACTIVE.store(false, Ordering::Release);
     }
 }
 
-/// Best-effort terminal restore, shared by `Drop` and the panic hook so there
-/// is exactly one restore path.
-///
-/// `disable_raw_mode()` is a `tcsetattr` termios syscall and writes no bytes
-/// through `out`, so a `Vec<u8>` sink observes the alt-screen escape but NOT
-/// the raw-mode restoration. The termios half is covered by manual
-/// verification, not the in-process test.
-pub fn restore_terminal(out: &mut impl Write) {
-    // End any frame that was interrupted between synchronized-update commands.
-    let _ = execute!(out, EndSynchronizedUpdate);
-    // Restore the user's configured cursor before returning to their shell.
-    let _ = execute!(out, SetCursorStyle::DefaultUserShape);
-    let _ = execute!(out, DisableBracketedPaste);
-    // Disable mouse capture unconditionally (harmless if it was never enabled)
-    // so a panic mid-session never leaves the terminal emitting mouse escapes.
-    let _ = execute!(out, DisableMouseCapture);
-    let _ = execute!(out, LeaveAlternateScreen);
-    let _ = disable_raw_mode();
+fn setup_failed<T>(error: TerminalError) -> Result<T, TerminalError> {
+    restore_active();
+    ACTIVE.store(false, Ordering::Release);
+    Err(error)
+}
+
+fn restore_active() {
+    let acquired = ACQUIRED.swap(0, Ordering::AcqRel);
+    restore_terminal(&mut stdout(), acquired);
+}
+
+/// Restore only features this guard acquired, in reverse setup order.
+fn restore_terminal(out: &mut impl Write, acquired: u8) {
+    if acquired & KEYBOARD != 0 {
+        let _ = execute!(out, PopKeyboardEnhancementFlags);
+    }
+    if acquired & PASTE != 0 {
+        let _ = execute!(out, DisableBracketedPaste);
+    }
+    if acquired & MOUSE != 0 {
+        let _ = execute!(out, DisableMouseCapture);
+    }
+    if acquired & ALTERNATE != 0 {
+        let _ = execute!(out, EndSynchronizedUpdate);
+        let _ = execute!(out, SetCursorStyle::DefaultUserShape);
+        let _ = execute!(out, LeaveAlternateScreen);
+    }
+    if acquired & RAW != 0 {
+        let _ = disable_raw_mode();
+    }
 }
 
 /// Global panic hook that restores the terminal before the default hook prints.
@@ -126,7 +293,7 @@ pub fn install_panic_hook() {
     install_hook_once(&ONCE, || {
         let default = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            restore_then_default(|| restore_terminal(&mut stdout()), || default(info));
+            restore_then_default(restore_active, || default(info));
         }));
     });
 }
@@ -158,6 +325,7 @@ fn restore_then_default(restore: impl FnOnce(), default: impl FnOnce()) {
 #[cfg(unix)]
 #[allow(unsafe_code)]
 mod signals {
+    use super::{ACQUIRED, ALTERNATE, KEYBOARD, MOUSE, PASTE, RAW};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Cooked-mode termios captured before raw mode, restored by the handler.
@@ -165,40 +333,41 @@ mod signals {
     static TERMIOS_SAVED: AtomicBool = AtomicBool::new(false);
     static INSTALLED: AtomicBool = AtomicBool::new(false);
 
-    /// End synchronized updates, restore input/cursor modes, and leave the alternate screen.
-    /// Written directly because `execute!`/`Stdout` are not async-signal-safe.
-    pub(super) const RESTORE_TERMINAL: &[u8] =
-        b"\x1b[?2026l\x1b[0 q\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1015l\x1b[?1006l\x1b[?1049l";
+    pub(super) const POP_KEYBOARD: &[u8] = b"\x1b[<1u";
+    pub(super) const DISABLE_PASTE: &[u8] = b"\x1b[?2004l";
+    pub(super) const DISABLE_MOUSE: &[u8] =
+        b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+    pub(super) const LEAVE_ALTERNATE: &[u8] = b"\x1b[?2026l\x1b[0 q\x1b[?1049l";
 
-    /// Capture the current (cooked) termios and install the handlers.
-    /// Idempotent and called before `enable_raw_mode`.
+    /// Refresh cooked termios for this guard and install handlers once.
+    /// An inactive handler emits no terminal bytes.
     pub fn install() {
-        if INSTALLED.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        // SAFETY: single-threaded construction path; we capture the terminal's
-        // current termios into a process-global before any signal handler is
-        // armed, and only read it (never write) from the handler thereafter.
+        // SAFETY: the exclusive guard slot is held and ACQUIRED is zero, so
+        // the handler cannot read this snapshot until publication of RAW.
         unsafe {
+            TERMIOS_SAVED.store(false, Ordering::SeqCst);
             let mut termios = std::mem::zeroed::<libc::termios>();
             if libc::tcgetattr(libc::STDIN_FILENO, std::ptr::addr_of_mut!(termios)) == 0 {
                 SAVED_TERMIOS = Some(termios);
                 TERMIOS_SAVED.store(true, Ordering::SeqCst);
             }
-            let handler_ptr = handler as *const () as libc::sighandler_t;
-            libc::signal(libc::SIGHUP, handler_ptr);
-            libc::signal(libc::SIGTERM, handler_ptr);
+            if !INSTALLED.swap(true, Ordering::SeqCst) {
+                let handler_ptr = handler as *const () as libc::sighandler_t;
+                libc::signal(libc::SIGHUP, handler_ptr);
+                libc::signal(libc::SIGTERM, handler_ptr);
+            }
         }
     }
 
-    /// Async-signal-safe handler: restore termios, leave the alternate screen,
-    /// then re-raise the signal's default disposition.
+    /// Async-signal-safe handler: claim the acquired bits once, restore only
+    /// those features, then re-raise the signal's default disposition.
     extern "C" fn handler(sig: libc::c_int) {
         // SAFETY: only async-signal-safe syscalls (`tcsetattr`, `write`,
         // `signal`, `raise`) and reads of statics written before the handler
         // could fire. No allocation, no locks, no Rust runtime services.
         unsafe {
-            if TERMIOS_SAVED.load(Ordering::SeqCst) {
+            let acquired = ACQUIRED.swap(0, Ordering::AcqRel);
+            if acquired & RAW != 0 && TERMIOS_SAVED.load(Ordering::SeqCst) {
                 if let Some(termios) = std::ptr::addr_of!(SAVED_TERMIOS).read() {
                     libc::tcsetattr(
                         libc::STDIN_FILENO,
@@ -207,11 +376,34 @@ mod signals {
                     );
                 }
             }
-            libc::write(
-                libc::STDOUT_FILENO,
-                RESTORE_TERMINAL.as_ptr().cast::<libc::c_void>(),
-                RESTORE_TERMINAL.len(),
-            );
+            if acquired & KEYBOARD != 0 {
+                libc::write(
+                    libc::STDOUT_FILENO,
+                    POP_KEYBOARD.as_ptr().cast(),
+                    POP_KEYBOARD.len(),
+                );
+            }
+            if acquired & PASTE != 0 {
+                libc::write(
+                    libc::STDOUT_FILENO,
+                    DISABLE_PASTE.as_ptr().cast(),
+                    DISABLE_PASTE.len(),
+                );
+            }
+            if acquired & MOUSE != 0 {
+                libc::write(
+                    libc::STDOUT_FILENO,
+                    DISABLE_MOUSE.as_ptr().cast(),
+                    DISABLE_MOUSE.len(),
+                );
+            }
+            if acquired & ALTERNATE != 0 {
+                libc::write(
+                    libc::STDOUT_FILENO,
+                    LEAVE_ALTERNATE.as_ptr().cast(),
+                    LEAVE_ALTERNATE.len(),
+                );
+            }
             libc::signal(sig, libc::SIG_DFL);
             libc::raise(sig);
         }
@@ -226,7 +418,7 @@ mod signals {
 
 #[cfg(test)]
 mod tests {
-    //! Terminal guard wiring tests (NFR-5 / FR-6.8).
+    //! Terminal guard wiring tests.
     //!
     //! `enable_raw_mode()` errors with no TTY, so `TerminalGuard::new` cannot
     //! be constructed in CI. These are deterministic in-process tests of the
@@ -238,8 +430,8 @@ mod tests {
 
     /// The leave-alternate-screen escape emitted by `restore_terminal`.
     const LEAVE_ALT_SCREEN: &[u8] = b"\x1b[?1049l";
-    /// The disable-mouse-capture escape emitted by `restore_terminal`.
-    const DISABLE_MOUSE: &[u8] = b"\x1b[?1000l";
+    /// The complete disable-mouse-capture sequence emitted by crossterm.
+    const DISABLE_MOUSE: &[u8] = b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
     /// The user-default cursor-shape escape emitted by every restore path.
     const DEFAULT_CURSOR_SHAPE: &[u8] = b"\x1b[0 q";
     /// The end-synchronized-update escape emitted defensively during cleanup.
@@ -247,30 +439,139 @@ mod tests {
     /// The bracketed-paste disable escape emitted by every restore path.
     const DISABLE_BRACKETED_PASTE: &[u8] = b"\x1b[?2004l";
 
-    fn contains(bytes: &[u8], needle: &[u8]) -> bool {
-        bytes.windows(needle.len()).any(|w| w == needle)
+    /// Every optional feature is restored exactly when it was acquired.
+    #[test]
+    fn restore_terminal_writes_only_acquired_feature_escapes() {
+        for bits in 0..=(RAW | ALTERNATE | MOUSE | PASTE | KEYBOARD) {
+            let mut sink = Vec::new();
+            restore_terminal(&mut sink, bits);
+            let mut expected = Vec::new();
+            if bits & KEYBOARD != 0 {
+                expected.extend_from_slice(b"\x1b[<1u");
+            }
+            if bits & PASTE != 0 {
+                expected.extend_from_slice(DISABLE_BRACKETED_PASTE);
+            }
+            if bits & MOUSE != 0 {
+                expected.extend_from_slice(DISABLE_MOUSE);
+            }
+            if bits & ALTERNATE != 0 {
+                expected.extend_from_slice(END_SYNCHRONIZED_UPDATE);
+                expected.extend_from_slice(DEFAULT_CURSOR_SHAPE);
+                expected.extend_from_slice(LEAVE_ALT_SCREEN);
+            }
+            assert_eq!(sink, expected, "acquired bits {bits:#07b}");
+        }
     }
 
-    /// The restore body writes the leave-alt-screen escape AND disables mouse
-    /// capture into an injected sink (the observable half of the cleanup).
     #[test]
-    fn restore_terminal_writes_escapes() {
-        let mut sink: Vec<u8> = Vec::new();
-        restore_terminal(&mut sink);
-        assert!(
-            contains(&sink, LEAVE_ALT_SCREEN),
-            "restore_terminal must emit the leave-alt-screen escape; got {sink:?}"
-        );
-        assert!(
-            contains(&sink, DISABLE_MOUSE),
-            "restore_terminal must disable mouse capture; got {sink:?}"
-        );
-        assert!(
-            contains(&sink, DEFAULT_CURSOR_SHAPE),
-            "restore_terminal must restore the user's cursor shape; got {sink:?}"
-        );
-        assert!(contains(&sink, END_SYNCHRONIZED_UPDATE));
-        assert!(contains(&sink, DISABLE_BRACKETED_PASTE));
+    fn setup_failure_rolls_back_every_published_feature() {
+        let options = TerminalGuardOptions {
+            mouse_capture: true,
+            bracketed_paste: true,
+            keyboard_enhancement: true,
+        };
+        for failed in [
+            SetupStep::Raw,
+            SetupStep::Alternate,
+            SetupStep::Mouse,
+            SetupStep::Paste,
+            SetupStep::Keyboard,
+        ] {
+            let published = Cell::new(0_u8);
+            let reached = RefCell::new(Vec::new());
+            let result = setup_steps(
+                options,
+                || true,
+                |step| {
+                    reached.borrow_mut().push(step);
+                    if step == failed {
+                        Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+                    } else {
+                        Ok(())
+                    }
+                },
+                |bit, acquired| {
+                    published.set(if acquired {
+                        published.get() | bit
+                    } else {
+                        published.get() & !bit
+                    });
+                },
+            );
+            assert_eq!(result, Err(failed.error(std::io::ErrorKind::BrokenPipe)));
+            assert_eq!(reached.borrow().last(), Some(&failed));
+            assert_eq!(published.get() & failed.bit(), 0);
+            let mut rollback = Vec::new();
+            restore_terminal(&mut rollback, published.get());
+            assert_eq!(
+                rollback
+                    .windows(b"\x1b[<1u".len())
+                    .filter(|window| *window == b"\x1b[<1u")
+                    .count(),
+                usize::from(published.get() & KEYBOARD != 0)
+            );
+            assert_eq!(
+                rollback
+                    .windows(LEAVE_ALT_SCREEN.len())
+                    .filter(|window| *window == LEAVE_ALT_SCREEN)
+                    .count(),
+                usize::from(published.get() & ALTERNATE != 0)
+            );
+            assert_eq!(
+                rollback
+                    .windows(DISABLE_MOUSE.len())
+                    .filter(|window| *window == DISABLE_MOUSE)
+                    .count(),
+                usize::from(published.get() & MOUSE != 0)
+            );
+            assert_eq!(
+                rollback
+                    .windows(DISABLE_BRACKETED_PASTE.len())
+                    .filter(|window| *window == DISABLE_BRACKETED_PASTE)
+                    .count(),
+                usize::from(published.get() & PASTE != 0)
+            );
+        }
+    }
+
+    #[test]
+    fn optional_setup_skips_unrequested_and_unsupported_features() {
+        for options in [
+            TerminalGuardOptions {
+                mouse_capture: false,
+                bracketed_paste: false,
+                keyboard_enhancement: false,
+            },
+            TerminalGuardOptions {
+                mouse_capture: true,
+                bracketed_paste: false,
+                keyboard_enhancement: true,
+            },
+            TerminalGuardOptions {
+                mouse_capture: false,
+                bracketed_paste: true,
+                keyboard_enhancement: true,
+            },
+        ] {
+            let published = Cell::new(0_u8);
+            setup_steps(
+                options,
+                || false,
+                |_| Ok(()),
+                |bit, acquired| {
+                    published.set(if acquired {
+                        published.get() | bit
+                    } else {
+                        published.get() & !bit
+                    });
+                },
+            )
+            .unwrap();
+            assert_eq!(published.get() & MOUSE != 0, options.mouse_capture);
+            assert_eq!(published.get() & PASTE != 0, options.bracketed_paste);
+            assert_eq!(published.get() & KEYBOARD, 0);
+        }
     }
 
     /// The production panic-hook composition runs the restore body *before*
@@ -300,12 +601,20 @@ mod tests {
         assert_eq!(calls.get(), 1);
     }
 
-    /// The signal handler's escape sequence disables mouse before leaving
-    /// the alternate screen (NFR-5 panic-safety extension).
+    /// The signal handler uses the same escape bytes and restoration order.
     #[cfg(unix)]
     #[test]
-    fn signal_restore_resets_cursor_and_disables_mouse_before_leaving_alt_screen() {
-        let bytes = signals::RESTORE_TERMINAL;
+    fn signal_restore_uses_the_exact_acquired_feature_bytes() {
+        let bytes = [
+            signals::POP_KEYBOARD,
+            signals::DISABLE_PASTE,
+            signals::DISABLE_MOUSE,
+            signals::LEAVE_ALTERNATE,
+        ]
+        .concat();
+        assert_eq!(signals::POP_KEYBOARD, b"\x1b[<1u");
+        assert_eq!(signals::DISABLE_PASTE, DISABLE_BRACKETED_PASTE);
+        assert_eq!(signals::DISABLE_MOUSE, DISABLE_MOUSE);
         let cursor = bytes
             .windows(DEFAULT_CURSOR_SHAPE.len())
             .position(|w| w == DEFAULT_CURSOR_SHAPE)
@@ -327,8 +636,8 @@ mod tests {
             .position(|w| w == LEAVE_ALT_SCREEN)
             .expect("signal restore leaves alternate screen");
         assert!(
-            synchronized < cursor && cursor < paste && paste < mouse && mouse < alt,
-            "synchronized update, cursor, paste, and mouse cleanup must precede alt-screen leave"
+            paste < mouse && mouse < synchronized && synchronized < cursor && cursor < alt,
+            "optional features must be restored before alternate-screen cleanup"
         );
     }
 }

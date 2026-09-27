@@ -6,6 +6,19 @@
 
 use std::path::PathBuf;
 
+use crate::overlay::DirtyCloseChoice;
+use crate::pane::{ExternalChangeToken, OpenOptions, OpenOutcome, PaneError, RequestId, TabId};
+
+/// Synchronous output from the one App lifecycle executor.
+pub(crate) enum LifecycleOutcome {
+    Applied,
+    Open(OpenOutcome),
+    Failed(PaneError),
+    Request(RequestId),
+    External(ExternalChangeToken),
+    Retarget(crate::pane::PreparedRetarget),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SaveContinuation {
     StayOpen,
@@ -36,6 +49,68 @@ pub(crate) struct CloseTabRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LifecycleAction {
+    PrepareClose {
+        targets: Vec<TabId>,
+        auto_commit: bool,
+        all: bool,
+    },
+    PrepareRetarget {
+        targets: Vec<crate::pane::Retarget>,
+    },
+    CommitRetarget {
+        request: RequestId,
+    },
+    ResolveClose {
+        choice: DirtyCloseChoice,
+    },
+    CancelConfirmation,
+    CancelRequest {
+        request: RequestId,
+    },
+    ResolveSave {
+        request: SaveRequest,
+        disk_path: PathBuf,
+        version: oom_edit_core::DiskVersion,
+        choice: crate::overlay::ExternalSaveChoice,
+    },
+    ReloadVersion {
+        target: usize,
+        path: PathBuf,
+        version: oom_edit_core::DiskVersion,
+    },
+    ReconcileDiskChange {
+        target: usize,
+        version: oom_edit_core::DiskVersion,
+    },
+    ResolveDiskChange {
+        target: usize,
+        path: PathBuf,
+        version: oom_edit_core::DiskVersion,
+        choice: crate::overlay::DiskChangeChoice,
+    },
+    ProvideSavePath {
+        request: RequestId,
+        path: Option<PathBuf>,
+    },
+    CommitClose {
+        request: RequestId,
+    },
+    BeginExternalChange,
+    CommitExternalChange {
+        request: RequestId,
+        paths: Vec<PathBuf>,
+    },
+    AbortToken {
+        request: RequestId,
+    },
+    HostOpen {
+        path: PathBuf,
+        options: OpenOptions,
+        existing_only: bool,
+    },
+    NewBuffer {
+        options: OpenOptions,
+    },
     Save(SaveRequest),
     CloseTab(CloseTabRequest),
     ReplaceTab {

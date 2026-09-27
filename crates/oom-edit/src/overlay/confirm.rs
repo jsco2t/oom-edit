@@ -48,8 +48,21 @@ pub enum ExternalSaveChoice {
     Cancel,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DiskChangeChoice {
+    KeepMine,
+    Reload,
+    Cancel,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfirmationResolution {
+    DiskChange {
+        target: usize,
+        path: PathBuf,
+        version: oom_edit_core::DiskVersion,
+        choice: DiskChangeChoice,
+    },
     DirtyClose {
         action: CloseTabRequest,
         choice: DirtyCloseChoice,
@@ -57,8 +70,84 @@ pub enum ConfirmationResolution {
     ExternalSave {
         request: SaveRequest,
         disk_path: PathBuf,
+        version: oom_edit_core::DiskVersion,
         choice: ExternalSaveChoice,
     },
+}
+
+/// A dirty-buffer decision captures the tab and the exact version displayed.
+#[derive(Debug)]
+pub(crate) struct ConfirmDiskChange {
+    target: usize,
+    path: PathBuf,
+    version: oom_edit_core::DiskVersion,
+    selected: usize,
+}
+
+impl ConfirmDiskChange {
+    pub(crate) fn new(target: usize, path: PathBuf, version: oom_edit_core::DiskVersion) -> Self {
+        Self {
+            target,
+            path,
+            version,
+            selected: 0,
+        }
+    }
+
+    pub(crate) fn resolve_key(&mut self, key: &KeyInput) -> Option<ConfirmationResolution> {
+        use oom_edit_core::KeyCodeKind;
+        let choice = match key.code.kind {
+            KeyCodeKind::Char('k') if !key.mods.ctrl && !key.mods.alt && !key.mods.shift => {
+                Some(DiskChangeChoice::KeepMine)
+            }
+            KeyCodeKind::Char('r') if !key.mods.ctrl && !key.mods.alt && !key.mods.shift => {
+                Some(DiskChangeChoice::Reload)
+            }
+            KeyCodeKind::Esc => Some(DiskChangeChoice::Cancel),
+            KeyCodeKind::Char('c') if key.mods.ctrl && !key.mods.alt => {
+                Some(DiskChangeChoice::Cancel)
+            }
+            KeyCodeKind::Up => {
+                self.selected = self.selected.saturating_sub(1);
+                None
+            }
+            KeyCodeKind::Down => {
+                self.selected = (self.selected + 1).min(2);
+                None
+            }
+            KeyCodeKind::Enter => Some(match self.selected {
+                0 => DiskChangeChoice::KeepMine,
+                1 => DiskChangeChoice::Reload,
+                _ => DiskChangeChoice::Cancel,
+            }),
+            _ => None,
+        };
+        choice.map(|choice| ConfirmationResolution::DiskChange {
+            target: self.target,
+            path: self.path.clone(),
+            version: self.version.clone(),
+            choice,
+        })
+    }
+
+    pub(crate) fn render(&self, frame: &mut Frame<'_>) {
+        let area = centered_area(44, 7, frame.area());
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Disk changed ");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let choices = ["Keep mine [k]", "Reload disk [r]", "Cancel [Esc]"];
+        let lines = choices
+            .iter()
+            .enumerate()
+            .map(|(index, label)| {
+                let prefix = if index == self.selected { "> " } else { "  " };
+                Line::raw(format!("{prefix}{label}"))
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
 }
 
 /// Confirm quit overlay (dirty buffer).
@@ -67,8 +156,13 @@ pub enum ConfirmationResolution {
 #[derive(Debug)]
 pub struct ConfirmQuit {
     action: CloseTabRequest,
-    /// Which option is currently highlighted (0=save+quit, 1=quit, 2=cancel).
-    selected: usize,
+    choices: QuitChoices,
+}
+
+#[derive(Debug)]
+enum QuitChoices {
+    Decision(usize),
+    AwaitingSavePath,
 }
 
 impl ConfirmQuit {
@@ -76,7 +170,14 @@ impl ConfirmQuit {
     pub fn for_action(action: CloseTabRequest) -> Self {
         Self {
             action,
-            selected: 0,
+            choices: QuitChoices::Decision(0),
+        }
+    }
+
+    pub(crate) fn for_save_path(action: CloseTabRequest) -> Self {
+        Self {
+            action,
+            choices: QuitChoices::AwaitingSavePath,
         }
     }
 
@@ -93,38 +194,61 @@ impl ConfirmQuit {
     pub fn resolve_key(&mut self, key: &KeyInput) -> Option<ConfirmationResolution> {
         use oom_edit_core::KeyCodeKind;
 
+        let mut selected = match self.choices {
+            QuitChoices::Decision(selected) => selected,
+            QuitChoices::AwaitingSavePath => {
+                let choice = match key.code.kind {
+                    KeyCodeKind::Esc => DirtyCloseChoice::Cancel,
+                    KeyCodeKind::Char('c') if key.mods.ctrl && !key.mods.alt => {
+                        DirtyCloseChoice::Cancel
+                    }
+                    KeyCodeKind::Char('n')
+                        if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
+                    {
+                        DirtyCloseChoice::Discard
+                    }
+                    _ => return None,
+                };
+                return Some(ConfirmationResolution::DirtyClose {
+                    action: self.action,
+                    choice,
+                });
+            }
+        };
+
         let choice = match key.code.kind {
             KeyCodeKind::Char('y') if !key.mods.ctrl && !key.mods.alt && !key.mods.shift => {
-                self.selected = 0;
+                selected = 0;
                 Some(DirtyCloseChoice::SaveAndClose)
             }
             KeyCodeKind::Char('w') if !key.mods.ctrl && !key.mods.alt && !key.mods.shift => {
-                self.selected = 0;
+                selected = 0;
                 Some(DirtyCloseChoice::SaveAndClose)
             }
             KeyCodeKind::Char('n') if !key.mods.ctrl && !key.mods.alt && !key.mods.shift => {
-                self.selected = 1;
+                selected = 1;
                 Some(DirtyCloseChoice::Discard)
             }
             KeyCodeKind::Esc => {
-                self.selected = 2;
+                selected = 2;
                 Some(DirtyCloseChoice::Cancel)
             }
             KeyCodeKind::Char('c') if key.mods.ctrl && !key.mods.alt => {
-                self.selected = 2;
+                selected = 2;
                 Some(DirtyCloseChoice::Cancel)
             }
             KeyCodeKind::Up => {
-                self.selected = self.selected.saturating_sub(1);
+                selected = selected.saturating_sub(1);
                 None
             }
             KeyCodeKind::Down => {
-                self.selected = (self.selected + 1).min(2);
+                selected = (selected + 1).min(2);
                 None
             }
             KeyCodeKind::Enter => Some(self.selected_choice()),
             _ => None,
         };
+        self.choices = QuitChoices::Decision(selected);
         choice.map(|choice| ConfirmationResolution::DirtyClose {
             action: self.action,
             choice,
@@ -153,9 +277,9 @@ impl ConfirmQuit {
     }
 
     fn selected_choice(&self) -> DirtyCloseChoice {
-        match self.selected {
-            0 => DirtyCloseChoice::SaveAndClose,
-            1 => DirtyCloseChoice::Discard,
+        match self.choices {
+            QuitChoices::Decision(0) => DirtyCloseChoice::SaveAndClose,
+            QuitChoices::Decision(1) => DirtyCloseChoice::Discard,
             _ => DirtyCloseChoice::Cancel,
         }
     }
@@ -167,18 +291,39 @@ impl ConfirmQuit {
 
         frame.render_widget(block.clone(), area);
 
-        let lines = [
-            Line::raw(""),
-            Line::raw("  Save and quit?    [y/w]"),
-            Line::raw("  Quit without save [n]"),
-            Line::raw("  Cancel            [Esc]"),
-            Line::raw(""),
-        ];
+        let QuitChoices::Decision(selected) = self.choices else {
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::raw("Host save path pending"),
+                    Line::raw("Discard [n]"),
+                    Line::raw("Cancel [Esc]"),
+                ]),
+                block.inner(area),
+            );
+            return;
+        };
 
-        // Highlight the selected option (lines[1] = selected==0, lines[2] = selected==1, lines[3] = selected==2)
+        let compact = area.width < 40 || area.height < 7;
+        let lines = if compact {
+            vec![
+                Line::raw("Save [y/w]"),
+                Line::raw("Discard [n]"),
+                Line::raw("Cancel [Esc]"),
+            ]
+        } else {
+            vec![
+                Line::raw(""),
+                Line::raw("  Save and quit?    [y/w]"),
+                Line::raw("  Quit without save [n]"),
+                Line::raw("  Cancel            [Esc]"),
+                Line::raw(""),
+            ]
+        };
+
+        // Highlight the selected option in both full and compact layouts.
         let mut rendered_lines: Vec<Line<'_>> = Vec::new();
         for (i, line) in lines.iter().enumerate() {
-            if i == self.selected + 1 {
+            if i == selected + usize::from(!compact) {
                 rendered_lines.push(Line::styled(
                     line.to_string(),
                     Style::default().add_modifier(ratatui::style::Modifier::REVERSED),
@@ -202,7 +347,10 @@ impl ConfirmQuit {
     /// Hint string.
     #[allow(dead_code)]
     pub fn hints(&self) -> &'static str {
-        "y/w save+quit · n quit · Esc cancel"
+        match self.choices {
+            QuitChoices::Decision(_) => "y/w save+quit · n quit · Esc cancel",
+            QuitChoices::AwaitingSavePath => "host save path pending · n discard · Esc cancel",
+        }
     }
 }
 
@@ -213,22 +361,32 @@ impl ConfirmQuit {
 pub struct ConfirmOverwrite {
     request: SaveRequest,
     disk_path: PathBuf,
+    version: oom_edit_core::DiskVersion,
     /// Which option is currently highlighted (0=overwrite, 1=reload, 2=cancel).
     selected: usize,
 }
 
 impl ConfirmOverwrite {
     /// Open a new confirm-overwrite overlay.
-    pub fn for_request(request: SaveRequest, disk_path: PathBuf) -> Self {
+    pub fn for_request(
+        request: SaveRequest,
+        disk_path: PathBuf,
+        version: oom_edit_core::DiskVersion,
+    ) -> Self {
         Self {
             request,
             disk_path,
+            version,
             selected: 0,
         }
     }
 
     #[cfg(test)]
     pub fn new() -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fixture.md");
+        std::fs::write(&path, "fixture\n").unwrap();
+        let version = oom_edit_core::DiskVersion::observe(&path).unwrap();
         Self::for_request(
             SaveRequest {
                 target: 0,
@@ -238,6 +396,7 @@ impl ConfirmOverwrite {
                 continuation: crate::lifecycle::SaveContinuation::StayOpen,
             },
             PathBuf::from("fixture.md"),
+            version,
         )
     }
 
@@ -276,6 +435,7 @@ impl ConfirmOverwrite {
         choice.map(|choice| ConfirmationResolution::ExternalSave {
             request: self.request.clone(),
             disk_path: self.disk_path.clone(),
+            version: self.version.clone(),
             choice,
         })
     }
@@ -312,24 +472,44 @@ impl ConfirmOverwrite {
     /// Render the overlay.
     pub fn render(&self, frame: &mut Frame<'_>) {
         let area = centered_area(40, 7, frame.area());
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" File Modified ");
+        let missing = self.version.is_missing();
+        let block = Block::default().borders(Borders::ALL).title(if missing {
+            " File Missing "
+        } else {
+            " File Modified "
+        });
 
         frame.render_widget(block.clone(), area);
 
-        let lines = [
-            Line::raw(""),
-            Line::raw("  Overwrite (:w!)   [o]"),
-            Line::raw("  Reload (:e!)      [r]"),
-            Line::raw("  Cancel            [Esc]"),
-            Line::raw(""),
-        ];
+        let compact = area.width < 40 || area.height < 7;
+        let lines = if compact {
+            vec![
+                Line::raw(if missing {
+                    "Recreate [o]"
+                } else {
+                    "Overwrite [o]"
+                }),
+                Line::raw("Reload [r]"),
+                Line::raw("Cancel [Esc]"),
+            ]
+        } else {
+            vec![
+                Line::raw(""),
+                Line::raw(if missing {
+                    "  Recreate file    [o]"
+                } else {
+                    "  Overwrite (:w!)   [o]"
+                }),
+                Line::raw("  Reload (:e!)      [r]"),
+                Line::raw("  Cancel            [Esc]"),
+                Line::raw(""),
+            ]
+        };
 
-        // Highlight the selected option (lines[1] = selected==0, lines[2] = selected==1, lines[3] = selected==2)
+        // Highlight the selected option in both full and compact layouts.
         let mut rendered_lines: Vec<Line<'_>> = Vec::new();
         for (i, line) in lines.iter().enumerate() {
-            if i == self.selected + 1 {
+            if i == self.selected + usize::from(!compact) {
                 rendered_lines.push(Line::styled(
                     line.to_string(),
                     Style::default().add_modifier(ratatui::style::Modifier::REVERSED),
@@ -365,13 +545,17 @@ pub fn centered_area(
     height: u16,
     parent: ratatui::layout::Rect,
 ) -> ratatui::layout::Rect {
-    let x = parent.width.saturating_sub(width).saturating_sub(1) / 2;
-    let y = parent.height.saturating_sub(height).saturating_sub(1) / 2;
+    let x = parent
+        .x
+        .saturating_add(parent.width.saturating_sub(width).saturating_sub(1) / 2);
+    let y = parent
+        .y
+        .saturating_add(parent.height.saturating_sub(height).saturating_sub(1) / 2);
     ratatui::layout::Rect::new(
         x,
         y,
-        width.min(parent.width.saturating_sub(x)),
-        height.min(parent.height.saturating_sub(y)),
+        width.min(parent.right().saturating_sub(x)),
+        height.min(parent.bottom().saturating_sub(y)),
     )
 }
 
@@ -380,6 +564,9 @@ pub fn centered_area(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+    use ratatui::Terminal;
 
     fn char_key(c: char) -> KeyInput {
         KeyInput {
@@ -579,5 +766,48 @@ mod tests {
     fn confirm_overwrite_geometry() {
         let overlay = ConfirmOverwrite::new();
         assert_eq!(overlay.geometry(), (40, 7));
+    }
+
+    fn compact_rows(render: impl FnOnce(&mut Frame<'_>)) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(20, 5)).unwrap();
+        terminal.draw(render).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..5)
+            .map(|row| {
+                (0..20)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn all_confirmation_actions_remain_visible_and_selectable_at_twenty_by_five() {
+        let mut quit = ConfirmQuit::new();
+        let lines = compact_rows(|frame| quit.render(frame));
+        assert!(lines.iter().any(|line| line.contains("Save [y/w]")));
+        assert!(lines.iter().any(|line| line.contains("Discard [n]")));
+        assert!(lines.iter().any(|line| line.contains("Cancel [Esc]")));
+        quit.resolve_key(&down_key());
+        quit.resolve_key(&down_key());
+        assert_eq!(quit.result(), ConfirmResult::Cancel);
+        assert!(compact_rows(|frame| quit.render(frame))[3].contains("Cancel [Esc]"));
+
+        let mut overwrite = ConfirmOverwrite::new();
+        let lines = compact_rows(|frame| overwrite.render(frame));
+        assert!(lines.iter().any(|line| line.contains("Overwrite [o]")));
+        assert!(lines.iter().any(|line| line.contains("Reload [r]")));
+        assert!(lines.iter().any(|line| line.contains("Cancel [Esc]")));
+        overwrite.resolve_key(&down_key());
+        overwrite.resolve_key(&down_key());
+        assert_eq!(overwrite.result(), ConfirmResult::Cancel);
+    }
+
+    #[test]
+    fn confirmation_geometry_offsets_the_host_origin_once() {
+        assert_eq!(
+            centered_area(40, 7, Rect::new(10, 20, 80, 24)),
+            Rect::new(29, 28, 40, 7)
+        );
     }
 }
