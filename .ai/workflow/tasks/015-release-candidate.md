@@ -71,3 +71,12 @@ Revision 4 input amendment explicitly approved on 2026-09-27: only the compariso
 baseline path above changes to Task 010's preserved current-host measurement of
 the unchanged original baseline commit. Original Task 001 evidence and all
 performance thresholds remain unchanged.
+
+Revision 5 Shift+V amendment explicitly approved on 2026-09-27: fix only the
+pre-existing terminal-reported Shift+V line-Select routing in rendered Normal
+and Select. Add behavioral red/green regressions for entry, switching,
+cancellation and modifier boundaries through core and translated public-host
+input. Preserve modifier translation, grammar ownership and completed evidence.
+Review and commit a new candidate, then rerun all unchanged exact-SHA local
+gates, performance comparison and independent consumption. No native platform
+requirement, performance threshold, golden or publication authority is waived.

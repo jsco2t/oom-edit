@@ -227,6 +227,27 @@ mod tests {
     }
 
     #[test]
+    fn shift_v_standalone_terminal_events_select_and_cancel() {
+        for cursor_shapes in [false, true] {
+            for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+                let now = Instant::now();
+                let mut host = StandaloneHost::from_app_for_test(reference(now), now);
+                host.cursor_shapes = cursor_shapes;
+                host.render_owned(80, 24, now);
+                let line = key(KeyCode::Char('V'), modifiers);
+                host.handle_event_at(&line, now);
+                assert_eq!(host.mode(), oom_edit_core::Mode::Select);
+                host.handle_event_at(&line, now);
+                assert_eq!(host.mode(), oom_edit_core::Mode::Normal);
+                host.handle_event_at(&key(KeyCode::Char('v'), KeyModifiers::NONE), now);
+                host.handle_event_at(&line, now);
+                host.handle_event_at(&line, now);
+                assert_eq!(host.mode(), oom_edit_core::Mode::Normal);
+            }
+        }
+    }
+
+    #[test]
     fn fr_110_baseline_trace_replay() {
         let initial = Instant::now();
         let mut baseline = reference(initial);

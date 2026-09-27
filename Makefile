@@ -105,6 +105,13 @@ test-paste-work: ## Verify bounded paste indexing and atomic borrowed front-matt
 	cargo test --package oom-edit-core --test dependency_hygiene --offline --locked paste_byte_offsets_use_the_rope_index -- --exact
 	cargo test --package oom-edit-core --lib --offline --locked navigation_and_frames_reuse_materialization_layout_and_line_index_work
 
+.PHONY: test-shift-v
+test-shift-v: ## Verify terminal Shift+V line Select and modifier boundaries in core and both hosts
+	cargo test --package oom-edit-core --test session_integration --offline --locked shift_v
+	cargo test --package oom-edit --offline --locked --lib shift_v
+	cargo test --package oom-edit --test embedding_example --offline --locked shift_v
+	$(MAKE) test-embedding-example
+
 .PHONY: test-public-api
 test-public-api: ## Compile the curated editor APIs and all privacy/boundary compile-fail cases
 	cargo test --package oom-edit --test public_api --offline --locked

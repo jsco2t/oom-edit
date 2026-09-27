@@ -35,3 +35,14 @@ Tasks 014/015 comparison baseline paths change to
 `evidence/010-baseline-current-host.tsv`. That artifact measures the same unchanged
 baseline commit. All completed task documents/evidence, comparator logic,
 thresholds, requirements and separate publication authority remain unchanged.
+
+## Shift+V parity amendment — 2026-09-27
+
+Native Linux README smoke exposed a pre-existing line-Select routing defect:
+terminals report uppercase V with Shift, which the rendered Normal/Select
+handlers reject. Asked for the narrow strict-parity amendment, the user explicitly
+approved: "you are approved to fix the Shift+V bug you found". Task 015 may fix
+that routing and add terminal-realistic regression tests, then commit and rerun
+the exact candidate gates. This is the only additional intentional standalone
+behavior change. Completed tasks/evidence, all performance limits, native macOS
+verification, and separate publication authorization remain unchanged.

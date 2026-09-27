@@ -41,6 +41,9 @@ published release.
 
 ### Changed
 
+- Terminal-reported Shift+V now enters line Select and switches or cancels it
+  like unmodified V; Ctrl+V remains block Select.
+
 - Paste uses the rope's byte index instead of copying preceding lines, and
   atomic front-matter refresh borrows the synchronously updated text cache.
 

@@ -168,7 +168,48 @@ fn fr_094_example_shared_translation_vectors() {
             }
             count += 1;
         }
-        assert_eq!(count, 15);
+        assert_eq!(count, 17);
+    }
+}
+
+#[test]
+fn shift_v_public_hosts_select_switch_cancel_and_delete_exact_line() {
+    use oom_edit::{CommandPolicy, Mode, PaneOptions};
+
+    let text = "# alpha λ\n\nsecond\n";
+    for policy in [CommandPolicy::Standalone, CommandPolicy::Embedded] {
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("note.md");
+            std::fs::write(&path, text).unwrap();
+            let now = Instant::now();
+            let mut host = EmbeddedHost::with_options(
+                directory.path(),
+                vec![path.clone()],
+                PaneOptions {
+                    command_policy: policy,
+                    ..PaneOptions::default()
+                },
+                now,
+            );
+            let id = host.pane.active_tab().unwrap();
+            let area = Rect::new(24, 0, 56, 23);
+            host.pane.render(area.width, area.height, now);
+            let line = key(KeyCode::Char('V'), modifiers);
+            host.handle_event(line.clone(), area, now);
+            assert_eq!(host.pane.status().unwrap().mode, Mode::Select);
+            host.handle_event(line.clone(), area, now);
+            assert_eq!(host.pane.status().unwrap().mode, Mode::Normal);
+            host.handle_event(key(KeyCode::Char('v'), KeyModifiers::NONE), area, now);
+            host.handle_event(line, area, now);
+            assert_eq!(host.pane.status().unwrap().mode, Mode::Select);
+            host.handle_event(key(KeyCode::Char('d'), KeyModifiers::NONE), area, now);
+            assert_eq!(host.pane.status().unwrap().mode, Mode::Normal);
+            assert_eq!(host.pane.text(&id).unwrap(), "\nsecond\n");
+            host.handle_event(key(KeyCode::Char('u'), KeyModifiers::NONE), area, now);
+            assert_eq!(host.pane.text(&id).unwrap(), text);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        }
     }
 }
 

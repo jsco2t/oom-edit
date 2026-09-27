@@ -6145,6 +6145,7 @@ mod tests {
             "Char:m" => CrosstermKeyCode::Char('m'),
             "Char:h" => CrosstermKeyCode::Char('h'),
             "Char:I" => CrosstermKeyCode::Char('I'),
+            "Char:V" => CrosstermKeyCode::Char('V'),
             "Char:c" => CrosstermKeyCode::Char('c'),
             _ => panic!("unknown vector code: {value}"),
         };
@@ -6162,6 +6163,7 @@ mod tests {
             "Backspace" => KeyCodeKind::Backspace,
             "BackTab" => KeyCodeKind::BackTab,
             "Char:I" => KeyCodeKind::Char('I'),
+            "Char:V" => KeyCodeKind::Char('V'),
             "Char:c" => KeyCodeKind::Char('c'),
             _ => panic!("unknown expected code: {value}"),
         };
@@ -6202,7 +6204,7 @@ mod tests {
                 );
                 count += 1;
             }
-            assert_eq!(count, 15, "the shared keyboard vector inventory changed");
+            assert_eq!(count, 17, "the shared keyboard vector inventory changed");
         }
     }
 

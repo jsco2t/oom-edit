@@ -31,6 +31,17 @@ including its original absolute first-frame failures. Task 001 evidence and all
 completed tasks remain immutable. No comparator logic, performance limit,
 requirement, gate or publication authority changes.
 
+Revision 5 Shift+V amendment, explicitly authorized on 2026-09-27 by the user's
+answer "you are approved to fix the Shift+V bug you found": Task 015 fixes the
+pre-existing terminal-reported Shift+V line-Select routing in rendered Normal
+and Select. Add test-forward core and real terminal-translation/public-host
+regressions covering entry, shape switching, cancellation and modifier
+boundaries. Preserve input modifiers and core grammar ownership. Commit a new
+candidate and rerun unchanged exact-SHA gates and same-host performance checks.
+Only this bug is an additional exception to strict standalone parity; completed
+tasks/evidence, source goldens, thresholds, native macOS verification and
+separate release publication authority remain unchanged.
+
 ## Architectural decisions
 
 - Keep `EditorSession` the only editing facade, `LiveDocument` the only mutable text/cache owner, `Document` the file/version owner, `App` the only UI state owner and `App::execute_lifecycle` the only lifecycle executor. Do not expose App, a mutable session escape, third-party public types, or a second dispatcher.
@@ -102,7 +113,7 @@ There is no separate type checker in this Rust repository: `make check` already 
 
 ## Out of scope
 
-Implementing oom itself; wiki links/backlinks; OS file watchers; host commands inside oom-edit's palette/which-key; runtime standalone config reload; guaranteed multi-pane-process support; cross-program portable compare-and-swap; crates.io publication. Nice FR-066 comment/format preservation is the DRD's explicit exclusion, while unknown/unrelated TOML values must survive. No existing command, rendering semantic, theme design or Markdown parsing behavior changes beyond the DRD's explicit exceptions.
+Implementing oom itself; wiki links/backlinks; OS file watchers; host commands inside oom-edit's palette/which-key; runtime standalone config reload; guaranteed multi-pane-process support; cross-program portable compare-and-swap; crates.io publication. Nice FR-066 comment/format preservation is the DRD's explicit exclusion, while unknown/unrelated TOML values must survive. No existing command, rendering semantic, theme design or Markdown parsing behavior changes beyond the DRD's explicit exceptions and the approved revision 5 Shift+V repair.
 
 ## Final acceptance criteria
 

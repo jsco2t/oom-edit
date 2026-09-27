@@ -3304,13 +3304,13 @@ impl EditorSession {
         if key.mods.ctrl && matches!(key.code.kind, KeyCodeKind::Char('v' | 'V')) {
             return self.enter_select(SelectionShape::Block);
         }
+        if !key.mods.ctrl && !key.mods.alt && key.code.kind == KeyCodeKind::Char('V') {
+            return self.enter_select(SelectionShape::Line);
+        }
         if key.mods == Modifiers::default() {
             match key.code.kind {
                 KeyCodeKind::Char('v') => {
                     return self.enter_select(SelectionShape::Character);
-                }
-                KeyCodeKind::Char('V') => {
-                    return self.enter_select(SelectionShape::Line);
                 }
                 KeyCodeKind::Char('"') => {
                     self.rendered_state.register_input = RegisterInput::AwaitingName;
@@ -3436,6 +3436,9 @@ impl EditorSession {
         if key.mods.ctrl && matches!(key.code.kind, KeyCodeKind::Char('v' | 'V')) {
             return self.switch_or_cancel_selection_shape(SelectionShape::Block);
         }
+        if !key.mods.ctrl && !key.mods.alt && key.code.kind == KeyCodeKind::Char('V') {
+            return self.switch_or_cancel_selection_shape(SelectionShape::Line);
+        }
         if plain_text_yank {
             return self.apply_select_operator(RangeOperator::Yank, YankPublication::PlainText);
         }
@@ -3444,9 +3447,6 @@ impl EditorSession {
                 KeyCodeKind::Esc => return self.finish_select(Mode::Normal, Vec::new()),
                 KeyCodeKind::Char('v') => {
                     return self.switch_or_cancel_selection_shape(SelectionShape::Character)
-                }
-                KeyCodeKind::Char('V') => {
-                    return self.switch_or_cancel_selection_shape(SelectionShape::Line)
                 }
                 KeyCodeKind::Char('o') => {
                     let SessionMode::Select(selection) = &mut self.session_mode else {

@@ -10,6 +10,8 @@ Char:h ctrl Press Backspace none yes
 BackTab none Press BackTab none yes
 Tab shift Press BackTab none yes
 Char:I shift Press Char:I shift yes
+Char:V none Press Char:V none yes
+Char:V shift Press Char:V shift yes
 Char:c ctrl Press Char:c ctrl yes
 Char:c ctrl_alt Press Char:c ctrl_alt yes
 Tab none Repeat Tab none no
