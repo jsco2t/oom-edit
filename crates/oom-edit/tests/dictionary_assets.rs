@@ -661,6 +661,8 @@ fn data_license_check_fails_closed_for_contract_mutations() {
     let fixture = tempfile::tempdir().expect("fixture tempdir");
     let files = [
         "THIRD-PARTY-NOTICES.md",
+        "crates/oom-edit/assets/THIRD-PARTY-NOTICES.md",
+        "crates/oom-edit/src/lib.rs",
         "docs/dependencies.md",
         "crates/oom-edit/src/args.rs",
         "crates/oom-edit/src/theme.rs",
@@ -756,7 +758,7 @@ fn data_license_check_fails_closed_for_contract_mutations() {
         ("crates/oom-edit/src/args.rs", "\"--licenses\""),
         (
             "crates/oom-edit/src/args.rs",
-            "include_str!(\"../../../THIRD-PARTY-NOTICES.md\")",
+            "include_str!(\"../assets/THIRD-PARTY-NOTICES.md\")",
         ),
         (
             "THIRD-PARTY-NOTICES.md",

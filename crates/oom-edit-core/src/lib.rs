@@ -18,6 +18,7 @@
 //! - [`RenderedLayout`] and [`RenderedSelection`] — rendered Normal/Select output
 //! - [`SemanticStyle`] — renderer-agnostic style slots
 //! - [`Diagnostic`] and [`TextPosition`] — provider-neutral diagnostics and source positions
+//! - [`analyze_markdown`] — read-only borrowed-source metadata and first-H1 analysis
 //!
 //! # Example
 //!
@@ -51,6 +52,7 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+mod analysis;
 mod clipboard;
 mod document;
 mod error;
@@ -68,11 +70,16 @@ mod vim;
 // Complete public API surface.
 //
 // These re-exports form the public API of `oom-edit-core`. Nothing more
-// is exported publicly; this `pub use` list *is* the API contract (FR-8.3).
+// is exported publicly; this `pub use` list is the supported API contract.
 
+pub use analysis::{analyze_markdown, AnalysisDiagnostic, AnalysisHeading, MarkdownAnalysis};
 pub use clipboard::{ClipboardContent, ClipboardError, ClipboardSink, RecordingClipboardSink};
-pub use document::LineEnding;
-pub use error::{FmError, OpenError, SaveError};
+pub use document::{
+    DiskHint, DiskIoError, DiskIoErrorKind, DiskState, DiskVersion, LineEnding, RetargetBinding,
+    RetargetPreparation,
+};
+pub use document::{SaveBoundary, SaveObserver};
+pub use error::{DiskDecisionError, FmError, OpenError, ReloadError, RetargetError, SaveError};
 pub use frontmatter::{FrontMatter, Num, Value};
 pub use input::{KeyCode, KeyCodeKind, KeyInput, Modifiers};
 pub use session::{CommandHistory, EditorSession};

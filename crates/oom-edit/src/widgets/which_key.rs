@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use ratatui::{style::Style, text::Line, widgets::Paragraph, Frame};
 
 use crate::command::{keymap::continuations_for, registry::Contexts};
+use crate::pane_metadata::{WhichKey, WhichKeyEntry};
 
 /// Which-key delay: 150ms after Space before the hint bar appears.
 const WHICH_KEY_DELAY: Duration = Duration::from_millis(150);
@@ -28,19 +29,28 @@ pub fn should_show(since: Option<Instant>, now: Instant) -> bool {
 /// Pure build: returns the continuations of Space for the given context,
 /// formatted as a hint string. Returns `None` if there are fewer than 2
 /// continuations (the ≥2 rows rule).
+#[cfg(test)]
 pub fn build_hint(ctx: Contexts) -> Option<String> {
+    build_content(ctx).map(|content| content.display_text())
+}
+
+/// Owned content used by both hosts and the standalone renderer.
+pub(crate) fn build_content(ctx: Contexts) -> Option<WhichKey> {
     let conts = continuations_for(ctx);
     if conts.len() < 2 {
         return None;
     }
 
-    // Format: "Space: h=help  w=save  q=quit  t=cycle-theme"
-    let parts: Vec<String> = conts
-        .iter()
-        .map(|(key, spec)| format!("{}={}", key, spec.desc))
-        .collect();
-
-    Some(format!("Space: {}", parts.join("  ")))
+    Some(WhichKey {
+        prefix: "Space".to_owned(),
+        entries: conts
+            .iter()
+            .map(|(key, spec)| WhichKeyEntry {
+                key: crate::command::registry::character_key(*key),
+                label: spec.desc.to_owned(),
+            })
+            .collect(),
+    })
 }
 
 /// Render the which-key hint bar at the bottom-right of the given area.

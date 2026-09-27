@@ -36,7 +36,7 @@ are:
 | `make lint` | Run Clippy for all workspace targets with warnings denied |
 | `make build` | Build the complete workspace |
 | `make test` | Run the complete test suite with isolated configuration |
-| `make ci` | Build the release binary, then run the full local CI gate |
+| `make ci` | Release, full check, strict coverage, examples, docs and performance |
 | `make check` | Run the full local CI gate |
 | `make test-all` | Run tests and build examples |
 | `make deny` | Check licenses, bans, advisories, and yanked crates using current registry metadata |
@@ -46,6 +46,18 @@ are:
 | `make doc` | Build API documentation without dependencies |
 | `make run ARGS=file.md` | Run the editor against a file |
 | `make run-isolated ARGS=file.md` | Run without reading or writing user configuration |
+| `make build-examples` | Build the public-API split-pane reference offline/locked |
+| `make run-embedded ARGS=file.md` | Run the split host (`F1` host help, `Alt-q` safe close-all) |
+| `make test-embedding-example` | Drive the same host headlessly, including shared key vectors |
+| `make test-package-guards` | Check integration snippets, facade docs and CI ownership |
+| `make coverage-check` | Reject unimplemented or nonexistent requirement cases |
+| `make downstream-tool-test` | Check provenance-negative and isolation guards |
+| `make downstream-snapshot` | Create a preliminary immutable source snapshot outside the workspace |
+| `make downstream-prepare` | Seed the separately locked/vendored candidate consumer |
+| `make downstream-candidate-check` | Check the independent consumer offline with a fresh Cargo home |
+| `make downstream-tag-check` | Verify the exact published tag resolves to the separately gated commit |
+| `make downstream-negative-check` | Reject incorrect sources and corrupted source bytes in an isolated copy |
+| `make sync-notices` | Refresh the crate-local mirror of canonical root notices |
 
 `make check` is the definition-of-done gate. It runs formatting, linting,
 building, all tests, dependency policy checks, RustSec auditing, and bundled
@@ -55,6 +67,13 @@ or while any step emits an unresolved warning.
 If a new developer or CI workflow is introduced, add a discoverable Make
 target in the same change. CI and local development should invoke the same
 target rather than maintaining separate command sequences.
+
+CI also prepares and checks an independent consumer at its actual committed
+checkout revision. These are separate make steps so `make ci` remains usable
+while implementation is uncommitted. See [the consumer procedure](docs/downstream-consumer.md)
+for required variables and the four mandatory downstream patches. The complete
+third-party notices are included inside the crate for vendored consumers;
+`make data-license-check` requires byte identity with the canonical root file.
 
 ## Workspace architecture
 
@@ -102,8 +121,10 @@ Its major components are:
   may escape this module or appear in a public signature. Rendered selections
   are projected into operation-specific types before reaching this boundary.
 - `document.rs`: file identity, line-ending and final-newline preservation,
-  external-modification detection, and atomic saving. The live text is passed
-  into document saves explicitly.
+  content-validated disk versions, external-modification detection, atomic
+  reload/retarget, and atomic saving. Live text is passed into saves explicitly.
+- `analysis.rs`: borrowed-source front-matter/body/first-heading analysis using
+  the same Markdown interpretation without constructing an editing engine.
 - `syntax/`: tree-sitter Markdown parsing, injected fenced-language
   highlighting, incremental reparsing, source spans, and the static language
   registry. Grammars are statically linked; there is no runtime loading.
@@ -128,19 +149,29 @@ styles and byte-accurate source provenance without terminal types.
 
 ### `oom-edit`
 
-`crates/oom-edit` is the thin ratatui/crossterm application shell. Its crate
-root intentionally exports only `Args`, `ParseOutcome`, and `run`.
+`crates/oom-edit` provides the embeddable `EditorPane` and a thin standalone
+ratatui/crossterm host. Its curated crate-root API includes owned frames,
+input, status/binding metadata, explicit services and lifecycle tokens, plus
+configuration, themes, clipboard output, notices and terminal ownership.
+Implementation modules stay private and both editor crates deny missing
+public documentation. See [DEVELOPER.md](DEVELOPER.md) for a tested consumer.
 
 Its major components are:
 
 - `args.rs` and `lib.rs`: hand-written CLI parsing and startup ordering. CLI
   messages and file-open failures occur before raw terminal mode is entered.
+- `pane.rs`, `pane_frame.rs` and `pane_metadata.rs`: the curated public host
+  facade over private App, immutable owned cells/cursors, typed lifecycle and
+  disk events, stable identities, input ownership, hints and status projections.
+- `standalone.rs` and `terminal_input.rs`: the standalone public-pane host and
+  one terminal-to-core input translation shared with the embedding example.
 - `app.rs`: the single owner of live TUI state, including tabs, per-tab scroll
   positions, overlays, pending application chords, transient messages, theme,
   and injected host services. It forwards core input and consumes core
   effects.
 - `event.rs`: the draw/poll/dispatch loop. Event timestamps are sampled after
-  input is read, and bounded spell work runs only during proven idle time.
+  input is read; the public standalone host ticks even without input, and
+  bounded spell work runs only during proven idle time.
 - `command/`: the static `COMMANDS` registry and the application-owned
   Space-prefix grammar. Dispatch, which-key text, hint bars, and palette rows
   are projections of this one registry.
@@ -153,9 +184,10 @@ Its major components are:
 - `overlay/`: exclusive modal UI for confirmations, help/palette, spelling
   suggestions, and diagnostics. When an overlay owns input, background command
   routing must not also process it.
-- `config.rs`: TOML loading, defaults, and atomic persistence under the XDG
-  configuration directory. Configuration failures warn and fall back to
-  defaults instead of preventing startup.
+- `config.rs`: owned serde configuration, typed validation and guarded atomic
+  semantic theme persistence. Only standalone startup discovers the XDG path;
+  embedded hosts supply their own roots and services. Startup failures warn and
+  fall back to defaults instead of preventing startup.
 - `theme.rs`: built-in theme registry, light/dark resolution, capability
   detection, and mapping from core `SemanticStyle` slots to terminal colors
   and modifiers. Accessibility signals must never rely on color alone.
@@ -205,24 +237,28 @@ Understanding the following paths prevents most architectural drift.
 ### Startup
 
 1. `main` parses CLI arguments before terminal setup.
-2. `run` loads configuration, resolves the theme and dictionaries, and opens
-   an `EditorSession`.
-3. `App` is constructed with explicit clipboard, configuration, and spelling
-   services.
-4. `TerminalGuard` enters raw mode and the alternate screen.
-5. The event loop draws, polls, timestamps, and dispatches events until the
-   lifecycle state requests exit.
+2. `run` captures configuration/environment and resolves explicit pane
+   options, theme selection and services.
+3. The standalone host constructs the public `EditorPane`; it retains one
+   private `App`, which owns sessions and editor presentation.
+4. The host acquires `TerminalGuard`, not the pane. An embedded application
+   acquires one guard for its entire terminal, never one per pane.
+5. The event loop reads, timestamps, translates and forwards press events;
+   draws owned frames; drains ordered events; and enforces bounded idle work.
+   Host exit is a policy over events, not pane drop or closing its last tab.
 
 ### Input and effects
 
-1. Crossterm events are translated once at the TUI boundary.
+1. Crossterm events are translated once at the host boundary. Host-global
+   commands may intercept them before forwarding unchanged owned input.
 2. An active overlay receives input exclusively.
 3. In rendered modes, the application checks its Space-prefix state machine.
 4. Unconsumed input is passed unchanged to `EditorSession`.
 5. The session returns typed effects such as save, quit, clipboard, message,
    wrap, help, and tab requests.
-6. `App` consumes those effects, invokes host services, follows scrolling, and
-   renders the resulting state.
+6. `App` consumes those effects, invokes injected services and follows
+   scrolling. `EditorPane` returns typed feedback and owned pane-local cells;
+   the host copies those cells and projects hints into surrounding chrome.
 
 Unknown or incomplete application chords must fall through to the core
 without consuming or rewriting their first key.
@@ -247,6 +283,14 @@ executes lifecycle policy and confirmations. Saves use a temporary file,
 behavior is available only through explicit bang/force actions. Confirmations
 retain the complete target and continuation so switching tabs cannot redirect
 an in-progress operation.
+
+Host transactions use generation-scoped tab IDs and correlated request IDs.
+Prepared close and retarget validate captured targets, wait for prerequisite
+saves, and commit only after the host's filesystem operation succeeds. Abort
+or drop retains buffers and undo. External-change leases suspend document I/O
+and polling while allowing edits. Disk acknowledgements bind to a validated
+version; missing and unreadable paths never become empty replacement buffers.
+The two-second metadata poll only reloads at a focused, safe Normal-mode point.
 
 ## Making changes safely
 

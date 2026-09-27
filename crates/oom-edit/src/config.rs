@@ -5,21 +5,12 @@
 //! Load-with-defaults on missing/partial config. Atomic write on change.
 //! Never fail startup on malformed config (warn to stderr, use defaults).
 
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 
 pub(crate) const DEFAULT_WRAP_WIDTH: u16 = 100;
-
-/// Persistence boundary injected into [`crate::app::App`].
-///
-/// Ordinary tests use [`DisabledConfigStore`], while production explicitly
-/// constructs [`FileConfigStore`] from the real configuration path.
-pub(crate) trait ConfigStore {
-    fn load(&self) -> Config;
-    fn save(&mut self, config: &Config) -> Result<(), String>;
-}
 
 /// A configuration store that performs no I/O.
 #[cfg(test)]
@@ -27,43 +18,13 @@ pub(crate) trait ConfigStore {
 pub(crate) struct DisabledConfigStore;
 
 #[cfg(test)]
-impl ConfigStore for DisabledConfigStore {
-    fn load(&self) -> Config {
-        Config::default()
-    }
-
-    fn save(&mut self, _config: &Config) -> Result<(), String> {
+impl ThemePersistenceSink for DisabledConfigStore {
+    fn persist_theme(&mut self, _slot: ThemeSlot, _name: &str) -> Result<(), ConfigPersistError> {
         Ok(())
     }
 }
 
-/// File-backed configuration persistence used by production and dedicated
-/// temporary-path tests.
-#[derive(Debug, Clone)]
-pub(crate) struct FileConfigStore {
-    path: PathBuf,
-}
-
-impl FileConfigStore {
-    pub(crate) fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-
-    pub(crate) fn production() -> Self {
-        Self::new(config_path())
-    }
-}
-
-impl ConfigStore for FileConfigStore {
-    fn load(&self) -> Config {
-        Config::load_from_path(&self.path)
-    }
-
-    fn save(&mut self, config: &Config) -> Result<(), String> {
-        config.save_to_path(&self.path)
-    }
-}
-
+#[cfg(test)]
 trait ConfigSaveOperations {
     type ParentDirectory;
 
@@ -75,8 +36,10 @@ trait ConfigSaveOperations {
     fn sync_parent(&mut self, parent: &Self::ParentDirectory) -> io::Result<()>;
 }
 
+#[cfg(test)]
 struct FileSystemConfigSave;
 
+#[cfg(test)]
 impl ConfigSaveOperations for FileSystemConfigSave {
     type ParentDirectory = std::fs::File;
 
@@ -111,6 +74,7 @@ fn parent_directory(path: &Path) -> &Path {
         .unwrap_or(Path::new("."))
 }
 
+#[cfg(test)]
 fn containing_directory(path: &Path) -> Option<&Path> {
     path.parent().map(|parent| {
         if parent.as_os_str().is_empty() {
@@ -121,6 +85,7 @@ fn containing_directory(path: &Path) -> Option<&Path> {
     })
 }
 
+#[cfg(test)]
 fn ensure_parent_directory<O: ConfigSaveOperations>(
     operations: &mut O,
     parent: &Path,
@@ -154,6 +119,7 @@ fn ensure_parent_directory<O: ConfigSaveOperations>(
     Ok(())
 }
 
+#[cfg(test)]
 fn atomic_save_config<O: ConfigSaveOperations>(
     operations: &mut O,
     path: &Path,
@@ -205,12 +171,16 @@ pub struct Config {
     #[serde(default)]
     pub relative_line_numbers: bool,
     #[serde(default)]
+    /// Theme appearance and name configuration.
     pub theme: ThemeConfig,
     #[serde(default)]
+    /// Editing presentation configuration.
     pub editor: EditorConfig,
     #[serde(default)]
+    /// Clipboard representation configuration.
     pub clipboard: ClipboardConfig,
     #[serde(default)]
+    /// Spelling resource and runtime configuration.
     pub spell: SpellConfig,
 }
 
@@ -272,10 +242,7 @@ pub struct EditorConfig {
     #[serde(default = "default_wrap")]
     pub wrap: bool,
     /// Maximum display columns used to lay out wrapped source and prose.
-    #[serde(
-        default = "default_wrap_width",
-        deserialize_with = "deserialize_wrap_width"
-    )]
+    #[serde(default = "default_wrap_width")]
     pub wrap_width: u16,
     /// Whether the terminal cursor shape follows the active mode.
     #[serde(default = "default_cursor_shapes")]
@@ -300,34 +267,24 @@ fn default_wrap_width() -> u16 {
     DEFAULT_WRAP_WIDTH
 }
 
-fn deserialize_wrap_width<'de, D>(deserializer: D) -> Result<u16, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let width = u16::deserialize(deserializer)?;
-    if width == 0 {
-        return Err(serde::de::Error::custom("wrap_width must be positive"));
-    }
-    Ok(width)
-}
-
 fn default_cursor_shapes() -> bool {
     true
 }
 
 /// The `[theme]` section of the config.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ThemeConfig {
     /// Display mode override: `"light"` or `"dark"`. If `None`, the editor
     /// uses the `COLORFGBG` heuristic (or defaults to dark).
-    #[serde(default)]
     pub mode: Option<String>,
     /// Theme name for dark mode. Defaults to `"default-dark"`.
-    #[serde(default = "default_dark")]
+    /// Use [`Self::set_dark`] to mark an explicit selection of that default.
     pub dark: String,
     /// Theme name for light mode. Defaults to `"default-light"`.
-    #[serde(default = "default_light")]
+    /// Use [`Self::set_light`] to mark an explicit selection of that default.
     pub light: String,
+    explicit_dark: bool,
+    explicit_light: bool,
 }
 
 impl Default for ThemeConfig {
@@ -336,7 +293,86 @@ impl Default for ThemeConfig {
             mode: None,
             dark: default_dark(),
             light: default_light(),
+            explicit_dark: false,
+            explicit_light: false,
         }
+    }
+}
+
+impl ThemeConfig {
+    /// Set an explicitly authored dark-mode theme slot.
+    pub fn set_dark(&mut self, name: String) {
+        self.dark = name;
+        self.explicit_dark = true;
+    }
+
+    /// Set an explicitly authored light-mode theme slot.
+    pub fn set_light(&mut self, name: String) {
+        self.light = name;
+        self.explicit_light = true;
+    }
+
+    /// Whether the dark slot has been explicitly selected by a host or file.
+    pub fn dark_is_explicit(&self) -> bool {
+        self.explicit_dark || self.dark != default_dark()
+    }
+
+    /// Whether the light slot has been explicitly selected by a host or file.
+    pub fn light_is_explicit(&self) -> bool {
+        self.explicit_light || self.light != default_light()
+    }
+}
+
+impl PartialEq for ThemeConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.mode == other.mode
+            && self.dark == other.dark
+            && self.light == other.light
+            && self.dark_is_explicit() == other.dark_is_explicit()
+            && self.light_is_explicit() == other.light_is_explicit()
+    }
+}
+
+impl Eq for ThemeConfig {}
+
+#[derive(Deserialize)]
+struct ThemeConfigWire {
+    #[serde(default)]
+    mode: Option<String>,
+    dark: Option<String>,
+    light: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for ThemeConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = ThemeConfigWire::deserialize(deserializer)?;
+        Ok(Self {
+            mode: wire.mode,
+            explicit_dark: wire.dark.is_some(),
+            explicit_light: wire.light.is_some(),
+            dark: wire.dark.unwrap_or_else(default_dark),
+            light: wire.light.unwrap_or_else(default_light),
+        })
+    }
+}
+
+impl Serialize for ThemeConfig {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            mode: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            dark: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            light: Option<&'a str>,
+        }
+        Wire {
+            mode: self.mode.as_deref(),
+            dark: self.dark_is_explicit().then_some(self.dark.as_str()),
+            light: self.light_is_explicit().then_some(self.light.as_str()),
+        }
+        .serialize(serializer)
     }
 }
 
@@ -348,62 +384,36 @@ fn default_light() -> String {
     "default-light".to_string()
 }
 
-/// Theme slots that were explicitly authored in a valid config file.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct ConfigPresence {
-    pub(crate) dark: bool,
-    pub(crate) light: bool,
-}
-
 impl Config {
-    /// Load production configuration and report whether a valid file won
-    /// over the built-in fallback.
-    pub(crate) fn load_with_presence() -> (Self, ConfigPresence) {
-        Self::load_from_path_with_presence(&config_path())
+    /// Load the standalone configuration, using defaults if it is unavailable.
+    pub(crate) fn load_production() -> Self {
+        Self::load_from_path(&config_path())
     }
 
     pub(crate) fn load_from_path(path: &Path) -> Self {
-        Self::load_from_path_with_presence(path).0
-    }
-
-    fn load_from_path_with_presence(path: &Path) -> (Self, ConfigPresence) {
         match std::fs::read_to_string(path) {
-            Ok(contents) => match toml::from_str::<toml::Value>(&contents) {
-                Ok(value) => match value.clone().try_into() {
-                    Ok(config) => {
-                        let theme = value.get("theme").and_then(toml::Value::as_table);
-                        (
-                            config,
-                            ConfigPresence {
-                                dark: theme.is_some_and(|theme| theme.contains_key("dark")),
-                                light: theme.is_some_and(|theme| theme.contains_key("light")),
-                            },
-                        )
-                    }
-                    Err(e) => {
-                        eprintln!("oom-edit: config parse error: {e}, using defaults");
-                        (Config::default(), ConfigPresence::default())
-                    }
-                },
-                Err(e) => {
-                    eprintln!("oom-edit: config parse error: {e}, using defaults");
-                    (Config::default(), ConfigPresence::default())
+            Ok(contents) => match toml::from_str::<Self>(&contents) {
+                Ok(config) => config,
+                Err(error) => {
+                    eprintln!("oom-edit: config parse error: {error}, using defaults");
+                    Self::default()
                 }
             },
-            Err(e) => {
-                // File not found is normal — use defaults silently.
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!("oom-edit: config read error: {e}, using defaults");
+            Err(error) => {
+                if error.kind() != io::ErrorKind::NotFound {
+                    eprintln!("oom-edit: config read error: {error}, using defaults");
                 }
-                (Config::default(), ConfigPresence::default())
+                Self::default()
             }
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn save_to_path(&self, path: &Path) -> Result<(), String> {
         self.save_to_path_using(path, &mut FileSystemConfigSave)
     }
 
+    #[cfg(test)]
     fn save_to_path_using<O: ConfigSaveOperations>(
         &self,
         path: &Path,
@@ -416,6 +426,327 @@ impl Config {
             toml::to_string_pretty(self).map_err(|e| format!("failed to serialize config: {e}"))?;
 
         atomic_save_config(operations, path, contents.as_bytes())
+    }
+
+    /// Validate user-controlled settings using a supplied base directory.
+    /// The original configuration is not changed.
+    pub fn validate(&self, base_directory: &Path) -> ConfigValidation {
+        let mut effective = self.clone();
+        let mut warnings = Vec::new();
+        if effective.editor.wrap_width == 0 {
+            effective.editor.wrap_width = DEFAULT_WRAP_WIDTH;
+            warnings.push(ConfigWarning::WrapWidthZero);
+        }
+        if let Some(mode) = &effective.theme.mode {
+            if mode != "dark" && mode != "light" {
+                warnings.push(ConfigWarning::InvalidThemeMode(mode.clone()));
+                effective.theme.mode = Some("dark".to_string());
+            }
+        }
+        if !matches!(
+            effective.spell.language.as_str(),
+            "en_US" | "en_CA" | "en_AU"
+        ) {
+            warnings.push(ConfigWarning::UnknownSpellLanguage(
+                effective.spell.language.clone(),
+            ));
+            effective.spell.language = default_spell_language();
+        }
+        for path in self.additional_dictionary_paths(base_directory) {
+            if let Err(error) = std::fs::File::open(&path).and_then(|file| {
+                if file.metadata()?.is_file() {
+                    Ok(())
+                } else {
+                    Err(io::Error::new(io::ErrorKind::InvalidInput, "not a file"))
+                }
+            }) {
+                effective.spell.enabled = false;
+                warnings.push(ConfigWarning::UnreadableDictionary {
+                    path,
+                    detail: error.to_string(),
+                });
+            }
+        }
+        ConfigValidation {
+            effective,
+            warnings,
+        }
+    }
+
+    /// Resolve additional dictionary paths relative to the supplied base.
+    pub fn additional_dictionary_paths(&self, base_directory: &Path) -> Vec<PathBuf> {
+        self.spell
+            .additional_dictionaries
+            .iter()
+            .map(|path| {
+                if path.is_absolute() {
+                    path.clone()
+                } else {
+                    base_directory.join(path)
+                }
+            })
+            .collect()
+    }
+}
+
+/// Typed validation outcomes; callers may display warnings without parsing text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigWarning {
+    /// Zero cannot be used as a wrap width; the default is used.
+    WrapWidthZero,
+    /// Unknown theme mode was replaced with dark.
+    InvalidThemeMode(String),
+    /// Unknown built-in dictionary dialect was replaced with en_US.
+    UnknownSpellLanguage(String),
+    /// One declared additional dictionary could not be opened as a file.
+    UnreadableDictionary {
+        /// Resolved path that failed.
+        path: PathBuf,
+        /// Operating-system detail.
+        detail: String,
+    },
+}
+
+/// Effective configuration and all non-fatal validation warnings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigValidation {
+    /// Safe values to use for this run.
+    pub effective: Config,
+    /// Every fallback applied in declaration order.
+    pub warnings: Vec<ConfigWarning>,
+}
+
+/// Named configuration setting in a live-update report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigField {
+    /// Theme appearance mode.
+    ThemeMode,
+    /// Dark appearance's configured theme name and presence.
+    ThemeDark,
+    /// Light appearance's configured theme name and presence.
+    ThemeLight,
+    /// Whether source and rendered lines wrap.
+    Wrap,
+    /// Whether gutter numbers are relative to the cursor.
+    RelativeLineNumbers,
+    /// Whether the host should use mode-specific cursor shapes.
+    CursorShapes,
+    /// Selected clipboard representation.
+    ClipboardCopyFormat,
+    /// Whether spelling is enabled for this session.
+    SpellEnabled,
+    /// Construction-time wrapping width.
+    WrapWidth,
+    /// Construction-time bundled dictionary dialect.
+    SpellLanguage,
+    /// Construction-time additional dictionary paths.
+    AdditionalDictionaries,
+}
+
+/// Exact changes that can apply now and those that need a new pane.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConfigApplyReport {
+    /// Runtime-safe changes in stable field order.
+    pub applied_now: Vec<ConfigField>,
+    /// Resource/layout settings requiring new pane construction.
+    pub requires_new_pane: Vec<ConfigField>,
+}
+
+impl ConfigApplyReport {
+    /// Compare a running configuration with a candidate value.
+    pub fn between(old: &Config, new: &Config) -> Self {
+        let mut report = Self::default();
+        if old.theme.mode != new.theme.mode {
+            report.applied_now.push(ConfigField::ThemeMode);
+        }
+        if old.theme.dark != new.theme.dark
+            || old.theme.dark_is_explicit() != new.theme.dark_is_explicit()
+        {
+            report.applied_now.push(ConfigField::ThemeDark);
+        }
+        if old.theme.light != new.theme.light
+            || old.theme.light_is_explicit() != new.theme.light_is_explicit()
+        {
+            report.applied_now.push(ConfigField::ThemeLight);
+        }
+        if old.editor.wrap != new.editor.wrap {
+            report.applied_now.push(ConfigField::Wrap);
+        }
+        if old.relative_line_numbers != new.relative_line_numbers {
+            report.applied_now.push(ConfigField::RelativeLineNumbers);
+        }
+        if old.editor.cursor_shapes != new.editor.cursor_shapes {
+            report.applied_now.push(ConfigField::CursorShapes);
+        }
+        if old.clipboard.copy_format != new.clipboard.copy_format {
+            report.applied_now.push(ConfigField::ClipboardCopyFormat);
+        }
+        if old.spell.enabled != new.spell.enabled {
+            report.applied_now.push(ConfigField::SpellEnabled);
+        }
+        if old.editor.wrap_width != new.editor.wrap_width {
+            report.requires_new_pane.push(ConfigField::WrapWidth);
+        }
+        if old.spell.language != new.spell.language {
+            report.requires_new_pane.push(ConfigField::SpellLanguage);
+        }
+        if old.spell.additional_dictionaries != new.spell.additional_dictionaries {
+            report
+                .requires_new_pane
+                .push(ConfigField::AdditionalDictionaries);
+        }
+        report
+    }
+}
+
+/// Active appearance slot selected for theme-name persistence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemeSlot {
+    /// Dark appearance.
+    Dark,
+    /// Light appearance.
+    Light,
+}
+
+impl ThemeSlot {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Dark => "dark",
+            Self::Light => "light",
+        }
+    }
+}
+
+/// Typed failure from a host-provided theme persistence sink.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigPersistError {
+    /// The existing file is not valid UTF-8/TOML or has an invalid theme table.
+    Malformed(String),
+    /// The file changed during read/prepare; no replacement was attempted.
+    ConcurrentChange,
+    /// An I/O step failed before replacement.
+    Io(String),
+    /// Replacement committed but directory durability could not be confirmed.
+    CommittedUncertain(String),
+}
+
+impl std::fmt::Display for ConfigPersistError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed(message) => write!(formatter, "invalid config file: {message}"),
+            Self::ConcurrentChange => write!(formatter, "config file changed while saving"),
+            Self::Io(message) => write!(formatter, "config I/O error: {message}"),
+            Self::CommittedUncertain(message) => {
+                write!(
+                    formatter,
+                    "config replacement committed but durability is uncertain: {message}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ConfigPersistError {}
+
+/// Host-injected persistence boundary for a user-initiated theme cycle.
+pub trait ThemePersistenceSink {
+    /// Persist only the selected appearance/name pair.
+    fn persist_theme(&mut self, slot: ThemeSlot, name: &str) -> Result<(), ConfigPersistError>;
+}
+
+/// Standalone file-backed theme sink. Hosts may supply a different sink.
+#[derive(Debug, Clone)]
+pub struct FileThemeSink {
+    path: PathBuf,
+}
+
+impl FileThemeSink {
+    /// Bind this sink to a standalone config file path.
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    fn persist_with_hook(
+        &mut self,
+        slot: ThemeSlot,
+        name: &str,
+        before_revalidation: impl FnOnce(),
+    ) -> Result<(), ConfigPersistError> {
+        let expected = oom_edit_core::DiskVersion::observe(&self.path)
+            .map_err(|error| ConfigPersistError::Io(error.message().to_string()))?;
+        let bytes = match std::fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(ConfigPersistError::Io(error.to_string())),
+        };
+        let after_read = oom_edit_core::DiskVersion::observe(&self.path)
+            .map_err(|error| ConfigPersistError::Io(error.message().to_string()))?;
+        if expected != after_read {
+            return Err(ConfigPersistError::ConcurrentChange);
+        }
+        let contents = String::from_utf8(bytes)
+            .map_err(|error| ConfigPersistError::Malformed(error.to_string()))?;
+        let mut document: toml::Value = if contents.is_empty() {
+            toml::Value::Table(toml::Table::new())
+        } else {
+            toml::from_str(&contents).map_err(|error: toml::de::Error| {
+                ConfigPersistError::Malformed(error.to_string())
+            })?
+        };
+        if !contents.is_empty() {
+            toml::from_str::<Config>(&contents)
+                .map_err(|error| ConfigPersistError::Malformed(error.to_string()))?;
+        }
+        let root = document.as_table_mut().ok_or_else(|| {
+            ConfigPersistError::Malformed("top-level config is not a table".to_string())
+        })?;
+        let theme = root
+            .entry("theme")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        let theme = theme.as_table_mut().ok_or_else(|| {
+            ConfigPersistError::Malformed("theme section is not a table".to_string())
+        })?;
+        theme.insert(
+            slot.key().to_string(),
+            toml::Value::String(name.to_string()),
+        );
+        let updated = toml::to_string_pretty(&document)
+            .map_err(|error| ConfigPersistError::Malformed(error.to_string()))?;
+        let parent = parent_directory(&self.path);
+        std::fs::create_dir_all(parent)
+            .map_err(|error| ConfigPersistError::Io(error.to_string()))?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)
+            .map_err(|error| ConfigPersistError::Io(error.to_string()))?;
+        match std::fs::metadata(&self.path) {
+            Ok(metadata) => temporary
+                .as_file()
+                .set_permissions(metadata.permissions())
+                .map_err(|error| ConfigPersistError::Io(error.to_string()))?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ConfigPersistError::Io(error.to_string())),
+        }
+        temporary
+            .write_all(updated.as_bytes())
+            .and_then(|()| temporary.as_file().sync_all())
+            .map_err(|error| ConfigPersistError::Io(error.to_string()))?;
+        before_revalidation();
+        let current = oom_edit_core::DiskVersion::observe(&self.path)
+            .map_err(|error| ConfigPersistError::Io(error.message().to_string()))?;
+        if current != expected {
+            return Err(ConfigPersistError::ConcurrentChange);
+        }
+        temporary
+            .persist(&self.path)
+            .map_err(|error| ConfigPersistError::Io(error.to_string()))?;
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| ConfigPersistError::CommittedUncertain(error.to_string()))
+    }
+}
+
+impl ThemePersistenceSink for FileThemeSink {
+    fn persist_theme(&mut self, slot: ThemeSlot, name: &str) -> Result<(), ConfigPersistError> {
+        self.persist_with_hook(slot, name, || {})
     }
 }
 
@@ -551,6 +882,20 @@ mod tests {
     }
 
     #[test]
+    fn theme_sink_rejects_an_intervening_write_without_touching_its_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "[theme]\ndark = \"original\"\n").unwrap();
+        let latest = "[theme]\ndark = \"other writer\"\n[unknown]\nkeep = true\n";
+        let mut sink = FileThemeSink::new(path.clone());
+        let error = sink.persist_with_hook(ThemeSlot::Dark, "ours", || {
+            std::fs::write(&path, latest).unwrap();
+        });
+        assert_eq!(error, Err(ConfigPersistError::ConcurrentChange));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), latest);
+    }
+
+    #[test]
     fn config_clipboard_copy_format_defaults_validates_and_roundtrips() {
         let missing: Config = toml::from_str("[editor]\nwrap = false\n").unwrap();
         assert_eq!(missing.clipboard.copy_format, ClipboardCopyFormat::Markdown);
@@ -612,7 +957,10 @@ additional_dictionaries = ["team.txt", "/opt/shared.txt"]
             configured
         );
 
-        assert!(toml::from_str::<Config>("[editor]\nwrap_width = 0\n").is_err());
+        let zero: Config = toml::from_str("[editor]\nwrap_width = 0\n").unwrap();
+        let validation = zero.validate(Path::new("."));
+        assert_eq!(validation.effective.editor.wrap_width, DEFAULT_WRAP_WIDTH);
+        assert_eq!(validation.warnings, [ConfigWarning::WrapWidthZero]);
         assert!(toml::from_str::<Config>("[editor]\nwrap_width = 70000\n").is_err());
     }
 
@@ -674,6 +1022,7 @@ additional_dictionaries = ["team.txt", "/opt/shared.txt"]
                 mode: Some("light".to_string()),
                 dark: "my-dark".to_string(),
                 light: "my-light".to_string(),
+                ..ThemeConfig::default()
             },
             editor: EditorConfig {
                 wrap: false,
@@ -720,8 +1069,9 @@ additional_dictionaries = ["team.txt", "/opt/shared.txt"]
         // Write malformed TOML.
         std::fs::write(&config_file, "{{{not valid toml}}").unwrap();
 
-        let (config, present) = Config::load_from_path_with_presence(&config_file);
-        assert_eq!(present, ConfigPresence::default());
+        let config = Config::load_from_path(&config_file);
+        assert!(!config.theme.dark_is_explicit());
+        assert!(!config.theme.light_is_explicit());
         assert_eq!(config.theme.dark, "default-dark");
         assert_eq!(config.theme.light, "default-light");
     }
@@ -736,8 +1086,9 @@ additional_dictionaries = ["team.txt", "/opt/shared.txt"]
         )
         .unwrap();
 
-        let (config, present) = Config::load_from_path_with_presence(&config_file);
-        assert_eq!(present, ConfigPresence::default());
+        let config = Config::load_from_path(&config_file);
+        assert!(!config.theme.dark_is_explicit());
+        assert!(!config.theme.light_is_explicit());
         assert_eq!(config, Config::default());
         assert_eq!(config.clipboard.copy_format, ClipboardCopyFormat::Markdown);
     }
@@ -779,22 +1130,18 @@ mode = "light"
         let config_file = temp_dir.path().join("config.toml");
 
         std::fs::write(&config_file, "[editor]\nwrap = false\n").unwrap();
-        let (_, presence) = Config::load_from_path_with_presence(&config_file);
-        assert_eq!(presence, ConfigPresence::default());
+        let config = Config::load_from_path(&config_file);
+        assert!(!config.theme.dark_is_explicit());
+        assert!(!config.theme.light_is_explicit());
 
         std::fs::write(
             &config_file,
             "[theme]\ndark = \"accessible\"\nmode = \"dark\"\n",
         )
         .unwrap();
-        let (_, presence) = Config::load_from_path_with_presence(&config_file);
-        assert_eq!(
-            presence,
-            ConfigPresence {
-                dark: true,
-                light: false,
-            }
-        );
+        let config = Config::load_from_path(&config_file);
+        assert!(config.theme.dark_is_explicit());
+        assert!(!config.theme.light_is_explicit());
     }
 
     /// Empty config file uses all defaults.

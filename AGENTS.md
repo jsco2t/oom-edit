@@ -27,7 +27,7 @@ These are the application's established patterns. Extend them instead of introdu
 
 #### Public API and crate boundaries
 
-- **Curated crate-root facades.** Implementation modules in `oom-edit-core` stay private; the re-exports in `crates/oom-edit-core/src/lib.rs` are the complete supported API. The `oom-edit` crate exports only `Args`, `ParseOutcome`, and `run`. Add public API deliberately at the crate root and extend the compile-time API guards in the same change.
+- **Curated crate-root facades.** Implementation modules in both editor crates stay private; their crate-root re-exports are the complete supported API. `oom-edit-core` exports the editing session and read-only Markdown analysis. `oom-edit` exports `EditorPane`, its owned input/frame/metadata and lifecycle protocol, configuration, themes, clipboard services, notices, terminal guard and standalone entry points. Both crates deny missing public documentation. Add public API deliberately at the crate root and extend the exact compile-time API/privacy guards in the same change.
 - **Owned boundary types.** Public errors and DTOs are project-owned. Do not expose third-party parser, terminal, renderer, or `hjkl` types in public signatures.
 - **Dependency direction is one-way.** `oom-edit` may depend on `oom-edit-core`; core must not know about App, ratatui, crossterm, terminal capabilities, overlays, or screen geometry beyond explicit renderer-neutral inputs such as width and viewport.
 
@@ -35,7 +35,8 @@ These are the application's established patterns. Extend them instead of introdu
 
 - **One owner for live text.** Private `LiveDocument` is the sole owner of mutable editor text and synchronously-derived highlighting/front-matter caches. `VimCore` supplies the authoritative text. `Document` owns file identity, serialization policy, and I/O metadata; saves receive the authoritative text explicitly. Never add a second mutable text copy.
 - **Atomic mutation gateway.** Text changes go through `LiveDocument` and return `MutationOutcome`; the gateway refreshes every derived cache before control returns. Do not mutate the Vim buffer, highlighter, front matter, or rendered invalidation state independently.
-- **One session facade.** Hosts interact through `EditorSession`: feed terminal-neutral input, query state/layout, and consume typed effects. New editing behavior belongs behind that facade unless it is strictly App-owned presentation or lifecycle orchestration.
+- **One session facade.** Core-only hosts interact through `EditorSession`; full terminal-editor hosts use `EditorPane`, including the standalone binary. The pane retains the single private `App` and does not expose mutable sessions or a second dispatcher. New editing behavior belongs behind the session facade unless it is strictly App-owned presentation or lifecycle orchestration.
+- **Explicit host boundary.** Hosts own process configuration/environment discovery, terminal setup, event translation, clocks, focus, surrounding chrome and filesystem transactions. Pane construction takes owned explicit inputs and services and performs no terminal or process-global setup. Frames are immutable owned grids with pane-local coordinates; only hosts emit terminal escapes. Injected clipboard output is the explicit exception. Host-global keys are intercepted before pane dispatch; editor binding/reference metadata is not a new command executor.
 - **Closed state machines over flag bags.** Modes, selections, search prompts, registers, pending chords, confirmations, and lifecycle requests use enums whose variants contain all state needed for that state. Avoid parallel `Option` fields and booleans that can encode stale or impossible combinations.
 
 #### Input, commands, and effects
@@ -55,6 +56,7 @@ These are the application's established patterns. Extend them instead of introdu
 #### Lifecycle, determinism, and verification
 
 - **One lifecycle executor.** `App::execute_lifecycle` is the sole workflow for save, close, replace, open-tab, and quit-all actions. `LifecycleAction` values capture target tab indices; confirmations own the complete action/continuation. Never re-read the active tab to finish a target-relative continuation.
+- **Stable host transactions.** Public requests capture pane-generation-scoped `TabId` values and emit correlated typed events. Prepared close/retarget tokens are single-use and validate all targets before changing identities. Host filesystem failure aborts the token; dropping it cancels at the next pane boundary. External-change leases allow editing but suspend document I/O and polling. Never add a mutable session escape or silently accept a stale disk version.
 - **Modal interactions are exclusive.** While an overlay, prompt, or confirmation owns input, background command routing does not also act on that input. Destructive transitions preserve the no-data-loss rules; force behavior exists only behind an explicit bang/force request.
 - **Inject nondeterminism at boundaries.** Pure builders receive clocks and other environmental inputs. Sample an event timestamp after reading the event and before dispatch. Capture environment into owned values and query through adapters; do not leak data to manufacture `'static` lifetimes.
 - **Guard architectural constraints with tests.** Add or update public-API compile tests, dependency-hygiene guards, registry completeness/uniqueness tests, exact mode/command meta-tests, and focused transition tests whenever a boundary changes. A passing end-to-end snapshot is not a substitute for these guards.
@@ -120,9 +122,17 @@ The canonical targets (all cargo invocations use `--offline --locked` except `ve
 | `make lint` / `make lint-fix` | `cargo clippy -- -D warnings` (CI gate) / apply safe suggestions       |
 | `make check`                  | fmt-check + lint + build + test + deny + audit — **the local CI gate** |
 | `make deny` / `make audit`    | License/ban/advisory checks (CI gates)                                 |
-| `make doc`                    | `cargo doc --no-deps`                                                  |
-| `make vendor`                 | Re-vendor deps (the only target that needs network)                    |
-| `make bench`                  | Criterion benchmarks (NFR performance budgets)                         |
+| `make doc`                    | Warning-free public API documentation                                 |
+| `make vendor`                 | Re-vendor deps (network-enabled preparation)                           |
+| `make bench`                  | Asserting release benchmarks with unchanged performance budgets       |
+| `make ci`                     | Release + check + strict coverage + examples + docs + performance      |
+| `make coverage-check`         | Validate requirement inventory against compiled executable cases      |
+| `make run-embedded`            | Run the public split-pane integration example                          |
+| `make terminal-guard-pty-test` | Native terminal acquisition/restoration and signal checks             |
+| `make downstream-prepare`     | Prepare an independent consumer of a full Git revision                |
+| `make downstream-candidate-check` | Offline/locked isolated consumer compile, tests and provenance     |
+| `make downstream-negative-check` | Reject bad provenance and corrupted vendored source                |
+| `make downstream-tag-check`   | Verify the separately authorized published tag's exact revision       |
 | `make run ARGS=...`           | Run the editor                                                         |
 | `make clean`                  | Remove build artifacts                                                 |
 

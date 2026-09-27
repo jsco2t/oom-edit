@@ -6,8 +6,6 @@
 //!
 //! Goldens live in `tests/snapshots/*.txt`. The `make test-update-snapshots` target
 //! (which sets `OOM_UPDATE_SNAPSHOTS=1`) recreates them.
-//!
-//! T17.
 
 use std::path::PathBuf;
 
@@ -19,7 +17,7 @@ use oom_edit_core::RecordingClipboardSink;
 use oom_edit_core::{EditorSession, SemanticStyle};
 use oom_spell::{BuildProgress, SpellEngineBuilder};
 
-use crate::app::App;
+use crate::app::{App, AppRenderOptions};
 use crate::command::Contexts;
 use crate::theme::{
     get_theme, EnvParts, PaletteKind, ThemeSource, Tier, UiSlot, ZED_CYAN, ZED_UI_TEXT, ZED_YELLOW,
@@ -50,7 +48,6 @@ fn resolve_test_theme_at(name: &str, capability: Tier) -> crate::theme::Resolved
         &crate::theme::ThemeCatalog::builtins(),
         Some(name),
         &config,
-        crate::config::ConfigPresence::default(),
         &env,
     )
 }
@@ -60,6 +57,45 @@ fn resolve_test_theme_at(name: &str, capability: Tier) -> crate::theme::Resolved
 /// Directory under `crates/oom-edit/tests/snapshots/` where goldens live.
 fn snapshot_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots")
+}
+
+#[test]
+fn golden_owned_pane_sizes() {
+    let mut app =
+        test_app("# Heading\n\n界 e\u{301} 🙂 and a long rendered paragraph for clipping.\n");
+    let now = std::time::Instant::now();
+    let mut lines = Vec::new();
+    for (width, height) in [
+        (0, 0),
+        (19, 4),
+        (20, 5),
+        (60, 20),
+        (80, 24),
+        (100, 30),
+        (200, 60),
+    ] {
+        let frame = app.render_owned(width, height, now, AppRenderOptions::standalone(), None);
+        let exact = format!("{:?}|{:?}", frame.cells, frame.cursor);
+        let fingerprint = exact.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+        });
+        lines.push(format!(
+            "{width}x{height} {fingerprint:016x} {:?}",
+            frame.cursor
+        ));
+    }
+    let local =
+        crate::overlay::confirm::centered_area(40, 7, ratatui::layout::Rect::new(0, 0, 80, 24));
+    let translated =
+        crate::overlay::confirm::centered_area(40, 7, ratatui::layout::Rect::new(7, 11, 80, 24));
+    assert_eq!(translated.x, local.x + 7);
+    assert_eq!(translated.y, local.y + 11);
+    assert_eq!(translated.width, local.width);
+    assert_eq!(translated.height, local.height);
+    lines.push(format!(
+        "overlay local {local:?}; at host origin (7, 11) {translated:?}"
+    ));
+    assert_snapshot(&lines, "owned_pane_sizes");
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -89,6 +125,9 @@ fn confirm_quit_overlay() -> crate::overlay::Overlay {
 }
 
 fn confirm_overwrite_overlay() -> crate::overlay::Overlay {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fixture.md");
+    std::fs::write(&path, "fixture\n").unwrap();
     crate::overlay::Overlay::open_confirm_overwrite(
         crate::lifecycle::SaveRequest {
             target: 0,
@@ -98,6 +137,7 @@ fn confirm_overwrite_overlay() -> crate::overlay::Overlay {
             continuation: crate::lifecycle::SaveContinuation::StayOpen,
         },
         PathBuf::from("fixture.md"),
+        oom_edit_core::DiskVersion::observe(&path).unwrap(),
     )
 }
 
@@ -774,7 +814,7 @@ fn golden_palette_vim_reference() {
     let mut app = test_app(kitchen_sink());
     open_palette_with_space_h(&mut app);
     // Navigate into the Vim reference section and beyond the list viewport.
-    for _ in 0..crate::command::COMMANDS.len() {
+    for _ in 0..crate::command::registry::primary_commands().count() {
         app.handle_event(&crossterm::event::Event::Key(
             crossterm::event::KeyEvent::new(
                 crossterm::event::KeyCode::Down,
@@ -1427,7 +1467,7 @@ fn drift_hint_bar_matches_registry() {
 #[test]
 fn drift_palette_lists_every_command() {
     use crate::command::registry::{BindingRole, Contexts, COMMANDS};
-    use crate::overlay::palette::{PaletteState, VIM_REFERENCE};
+    use crate::overlay::palette::PaletteState;
 
     let state = PaletteState::default();
     let rows = state.build_rows(Contexts::ALL);
@@ -1446,7 +1486,11 @@ fn drift_palette_lists_every_command() {
             .count(),
         "palette executable rows must exactly match App-owned bindings"
     );
-    assert_eq!(rows.len(), COMMANDS.len() + VIM_REFERENCE.len());
+    assert_eq!(
+        rows.len(),
+        crate::command::registry::primary_commands().count()
+            + crate::command::registry::reference_presentations().len()
+    );
 }
 
 /// Every overlay variant returns a non-empty `hints()` string.
@@ -1462,8 +1506,15 @@ fn drift_overlay_hints_nonempty() {
         trouble_overlay(),
         confirm_quit_overlay(),
         confirm_overwrite_overlay(),
+        {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("disk.md");
+            std::fs::write(&path, "changed").unwrap();
+            let version = oom_edit_core::DiskVersion::observe(&path).unwrap();
+            Overlay::open_disk_change(0, path, version)
+        },
     ];
-    assert_eq!(overlays.len(), 6, "current Overlay variant list is stale");
+    assert_eq!(overlays.len(), 7, "current Overlay variant list is stale");
 
     for overlay in overlays {
         match &overlay {
@@ -1472,7 +1523,8 @@ fn drift_overlay_hints_nonempty() {
             | Overlay::SpellSuggest(_)
             | Overlay::Trouble(_)
             | Overlay::ConfirmQuit(_)
-            | Overlay::ConfirmOverwrite(_) => {}
+            | Overlay::ConfirmOverwrite(_)
+            | Overlay::DiskChange(_) => {}
         }
         let _ = overlay.geometry();
         let _ = overlay.selected_command();

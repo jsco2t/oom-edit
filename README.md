@@ -37,6 +37,18 @@ or user theme for one run:
 oom-edit --theme accessible notes.md
 ```
 
+Open files are checked every two seconds. A clean externally modified file
+reloads only when its tab is active in focused Normal mode with no pending
+input, prompt, overlay or lifecycle action. Dirty tabs offer **Keep mine** (`k`),
+**Reload disk** (`r`) or cancel; each decision is bound to the disk version
+displayed, and a later change requires a new decision. Background changes show
+`[disk changed]` and an `!` tab marker without stealing focus.
+
+If an already-open file disappears, its tab, text and undo history remain with a
+`[missing]` marker. Saving asks for explicit recreation; cancellation writes
+nothing, and recreation cannot overwrite a new file that appeared afterward.
+`[disk error]` distinguishes unreadable or non-file paths from missing files.
+
 The interface includes a context-sensitive hint bar. A few useful starting
 points are:
 
@@ -194,13 +206,15 @@ appearance-incompatible selected name uses that matching default; it does not
 implicitly select `accessible`. `NO_COLOR` and `TERM=dumb` select monochrome
 terminal output. `Space t` cycles compatible built-ins followed by compatible
 user themes in lexical order and saves only the active light or dark config
-slot.
+slot. This atomic update preserves unrelated TOML values, refuses malformed
+configuration and rejects an intervening write instead of overwriting it.
+Comments and original formatting are not preserved.
 
 Themes style the document body and the complete line-number gutter. Published
 Trouble diagnostics add one fixed marker before the aligned line number on each
-affected source line: `E`, `W`, `I`, or `H` for error, warning, info, or hint.
-The highest severity wins when a line has more than one diagnostic; glyphs and
-modifiers preserve the signal without color.
+affected source line: a bold `•`, additionally underlined for an error.
+The highest severity wins when a line has more than one diagnostic. The marker
+remains visible without color; Trouble rows provide the severity and message.
 
 Wrapping can also be changed for the running session with `:set wrap` and
 `:set nowrap`; `wrap_width` is read at startup. Spell checking can be toggled
@@ -216,6 +230,24 @@ and produces a warning. The personal dictionary is stored as `dictionary.txt`
 beside `config.toml`; `Space a` adds the word at the cursor. Use `Space s` for
 suggestions, `[s` and `]s` to move between diagnostics, and `Space d` to view
 all document diagnostics.
+
+## Embedding reference
+
+The public `EditorPane` facade can be driven and rendered by another terminal
+host. Run the split-pane reference with `make run-embedded ARGS=file.md` (or
+add `--legacy-keys` to disable optional keyboard enhancement). `F1` is handled
+by the host before editor routing; `Alt-q` requests safe close-all. Click the
+host panel or editor to change focus. The host owns its bottom status row,
+shows exported hints/which-key, drains typed events and handles unnamed-save
+paths. This demonstration deliberately uses monochrome and disables clipboard
+and theme persistence; the editor's ordinary file writes remain enabled.
+
+`make build-examples` builds it; `make test-embedding-example` exercises the
+same host logic headlessly. See [independent consumer verification](docs/downstream-consumer.md)
+for canonical Git consumption, all four mandatory patches, isolated vendoring
+and candidate checks. [DEVELOPER.md](DEVELOPER.md) covers construction, services,
+owned cells/input, focus and time, lifecycle transactions and terminal ownership
+with a snippet compiled by both the workspace and independent consumer.
 
 ## Project status
 

@@ -1,7 +1,7 @@
 //! App — the single source of truth for the running TUI.
 //!
 //! Holds the tab stack, scroll positions, last status message, overlay
-//! state, and the quit flag. After each event: drain effects, scroll-follow,
+//! state. After each event: drain effects, scroll-follow,
 //! update status message.
 //!
 //! ## Key routing order (arch §7.1)
@@ -12,37 +12,53 @@
 //! 3. Everything else → active session's `handle_key(key)`, then drain `Effect`s.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 
+#[cfg(test)]
 use crossterm::event::{
     Event, KeyCode as CrosstermKeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 };
+use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
+use ratatui::Terminal;
 
 use oom_edit_core::ClipboardSink;
 use oom_edit_core::{
-    CommandHistory, EditorSession, Effect, KeyCode, KeyCodeKind, KeyInput, Modifiers,
-    RenderedPoint, Viewport,
+    CommandHistory, EditorSession, Effect, KeyCodeKind, KeyInput, RenderedPoint, Viewport,
 };
+#[cfg(test)]
+use oom_edit_core::{KeyCode, Modifiers};
 
+#[cfg(test)]
+use crate::terminal_input::{crossterm_key_to_core, crossterm_mouse_to_pane};
+#[cfg(test)]
 use crossterm::event::MouseEventKind;
 
 use crate::command::keymap::{
     resolve as resolve_app_input, AppInputTransition, PendingAppInput, TabAction,
 };
 use crate::command::AppCommand;
-use crate::config::{ClipboardCopyFormat, ConfigStore};
+use crate::config::{ClipboardCopyFormat, ThemePersistenceSink, ThemeSlot};
 use crate::gutter::{GutterTroubleItem, GutterTroubleSnapshot, PendingGutterTroubleBuild};
 use crate::lifecycle::{
-    CloseTabRequest, DirtyClosePolicy, LifecycleAction, SaveContinuation, SaveRequest,
+    CloseTabRequest, DirtyClosePolicy, LifecycleAction, LifecycleOutcome, SaveContinuation,
+    SaveRequest,
 };
 use crate::overlay::{
     Overlay, PaletteAction, SpellSuggestAction, TroubleAction, TroubleEntry, TroubleProgress,
 };
+use crate::pane::{
+    resolve_host_path, AllowAllFileAccess, CommandPolicy, DiskChange, FileAccessPolicy,
+    FileOperation, OpenOptions, OpenOutcome, PaneError, PaneErrorKind, PaneEvent, PaneInputState,
+    PaneMouse, PaneMouseKind, RequestId, TabId, TabSnapshot,
+};
+use crate::pane_frame::{PaneCursor, PaneFrame};
 use crate::screens::editor::{
-    render_editor_with_gutter, render_status_row, source_text_width, DocumentPresentation,
-    EditorViewport,
+    render_editor_with_gutter, render_status_row_with_options, source_text_width,
+    DocumentPresentation, EditorViewport, StatusRowOptions,
 };
 use crate::screens::rendered::{render_rendered_with_settings, RenderedSettings, RenderedViewport};
 use crate::spell_host::SpellHost;
@@ -51,6 +67,12 @@ use crate::theme;
 use crate::theme::{ResolvedTheme, Theme, ThemeCatalog, Tier};
 use crate::widgets::status_bar;
 use crate::widgets::which_key;
+
+mod disk_watch;
+mod lifecycle_protocol;
+#[cfg(test)]
+mod metadata_tests;
+use lifecycle_protocol::{ClosePreparation, SaveProgress, Suspension};
 
 /// Scrolloff: keep this many lines of context around the cursor.
 const SCROLLOFF: usize = 3;
@@ -146,6 +168,12 @@ fn rendered_scroll_left(
 
 /// A single tab entry: an [`EditorSession`] with per-tab UI state.
 pub(crate) struct TabEntry {
+    /// Stable identity within this App generation.
+    serial: u64,
+    /// Monotonic activation clock for host MRU ordering.
+    last_activated: u64,
+    /// Cached external-change marker, populated by disk reconciliation.
+    disk_change: disk_watch::DiskObservation,
     /// The core editing session for this tab.
     session: EditorSession,
     /// The first visible line (owned by the TUI for scroll-follow).
@@ -174,15 +202,16 @@ pub(crate) struct TabEntry {
 /// Explicit host-side services injected when constructing the TUI state.
 pub(crate) struct AppServices {
     clipboard_sink: Box<dyn ClipboardSink>,
-    config_store: Box<dyn ConfigStore>,
+    config_store: Box<dyn ThemePersistenceSink>,
     spell_host: SpellHost,
     launch_dir: PathBuf,
+    file_access_policy: Arc<dyn FileAccessPolicy>,
 }
 
 impl AppServices {
     pub(crate) fn new(
         clipboard_sink: Box<dyn ClipboardSink>,
-        config_store: Box<dyn ConfigStore>,
+        config_store: Box<dyn ThemePersistenceSink>,
         spell_host: SpellHost,
         launch_dir: PathBuf,
     ) -> Self {
@@ -191,7 +220,13 @@ impl AppServices {
             config_store,
             spell_host,
             launch_dir,
+            file_access_policy: Arc::new(AllowAllFileAccess),
         }
+    }
+
+    pub(crate) fn with_file_access_policy(mut self, policy: Arc<dyn FileAccessPolicy>) -> Self {
+        self.file_access_policy = policy;
+        self
     }
 }
 
@@ -203,9 +238,40 @@ pub(crate) struct AppStartupOptions {
     relative_line_numbers: bool,
     clipboard_copy_format: ClipboardCopyFormat,
     spell_enabled: bool,
+    cursor_shapes: bool,
+}
+
+/// Presentation choices supplied by a host without changing editor state.
+#[derive(Clone, Copy)]
+pub(crate) struct AppRenderOptions<'a> {
+    pub(crate) inline_hints: bool,
+    pub(crate) always_tab_bar: bool,
+    pub(crate) empty_state_lines: &'a [String],
+}
+
+impl AppRenderOptions<'_> {
+    #[cfg(test)]
+    pub(crate) const fn standalone() -> Self {
+        Self {
+            inline_hints: true,
+            always_tab_bar: false,
+            empty_state_lines: &[],
+        }
+    }
 }
 
 impl AppStartupOptions {
+    pub(crate) fn from_config(config: &crate::config::Config) -> Self {
+        Self::new(
+            config.editor.wrap,
+            config.relative_line_numbers,
+            config.clipboard.copy_format,
+            config.spell.enabled,
+        )
+        .with_wrap_width(config.editor.wrap_width)
+        .with_cursor_shapes(config.editor.cursor_shapes)
+    }
+
     pub(crate) fn new(
         wrap_enabled: bool,
         relative_line_numbers: bool,
@@ -218,6 +284,7 @@ impl AppStartupOptions {
             relative_line_numbers,
             clipboard_copy_format,
             spell_enabled,
+            cursor_shapes: true,
         }
     }
 
@@ -225,11 +292,19 @@ impl AppStartupOptions {
         self.wrap_width = wrap_width;
         self
     }
+
+    pub(crate) const fn with_cursor_shapes(mut self, cursor_shapes: bool) -> Self {
+        self.cursor_shapes = cursor_shapes;
+        self
+    }
 }
 
 impl TabEntry {
     fn new(session: EditorSession) -> Self {
         Self {
+            serial: 0,
+            last_activated: 0,
+            disk_change: disk_watch::DiskObservation::Current,
             session,
             top_line: 0,
             left_col: 0,
@@ -312,6 +387,17 @@ impl TabEntry {
 
 /// App state for the TUI.
 pub struct App {
+    /// Strong generation token; host TabIds retain only weak references.
+    pane_identity: Arc<()>,
+    next_request_serial: u64,
+    lifecycle_events: Vec<PaneEvent>,
+    lifecycle_state: LifecycleState,
+    #[cfg(test)]
+    save_observer: Option<Box<dyn oom_edit_core::SaveObserver>>,
+    next_tab_serial: u64,
+    activation_serial: u64,
+    command_policy: CommandPolicy,
+    file_access_policy: Arc<dyn FileAccessPolicy>,
     /// The tab stack. Each tab is an independent [`EditorSession`] with its own
     /// scroll position and UI state.
     tabs: Vec<TabEntry>,
@@ -319,7 +405,8 @@ pub struct App {
     command_history: CommandHistory,
     /// Index of the currently active tab.
     active_tab: usize,
-    /// Whether the app should quit.
+    /// Legacy characterization only; production hosts consume lifecycle events.
+    #[cfg(test)]
     pub should_quit: bool,
     /// The last status message to display in the status bar.
     status_message: String,
@@ -335,6 +422,11 @@ pub struct App {
     body_area: Rect,
     pointer_gesture: PointerGesture,
     frame_generation: u64,
+    /// Reusable presentation buffers; never owns editor text or session state.
+    offscreen: Option<Terminal<TestBackend>>,
+    presentation_revision: u64,
+    next_disk_poll: Instant,
+    disk_probe: Box<dyn disk_watch::DiskProbe>,
     /// Follow requested by a state transition that returns before the normal
     /// event tail (tab switches and registry-dispatched session commands).
     pending_scroll_follow: bool,
@@ -345,6 +437,10 @@ pub struct App {
     wrap_enabled: bool,
     /// Configured prose layout limit; physical viewport width remains separate.
     wrap_width: u16,
+    /// Whether the terminal cursor shape follows the active mode.
+    cursor_shapes: bool,
+    /// Whether this pane owns the host cursor and pending App chord.
+    focus: PaneFocus,
     /// Whether rendered Normal, Select, and Command use hybrid-relative numbers.
     relative_line_numbers: bool,
     /// Current time (injected by tick for testability of which-key delay gate).
@@ -361,7 +457,7 @@ pub struct App {
     /// Whether the active display mode was resolved as light at startup.
     is_light: bool,
     /// Explicitly injected persistence for theme changes.
-    config_store: Box<dyn ConfigStore>,
+    config_store: Box<dyn ThemePersistenceSink>,
     /// One resumable spell engine shared by every tab.
     spell_host: SpellHost,
     /// Configured default applied independently to every newly-created session.
@@ -380,6 +476,41 @@ pub struct App {
     scroll_follow_count: usize,
 }
 
+#[derive(Clone)]
+struct LifecycleContext {
+    request: RequestId,
+    target: Option<TabId>,
+}
+
+enum LifecycleState {
+    Idle,
+    Executing(LifecycleContext),
+    Confirmation(LifecycleContext),
+    Preparing(ClosePreparation),
+    Suspended(Suspension),
+}
+
+/// The engine clock advances only while the pane accepts input. Other App
+/// timers continue to use the host's unpaused monotonic clock.
+enum PaneFocus {
+    Focused {
+        elapsed: std::time::Duration,
+        since: Instant,
+    },
+    Unfocused {
+        elapsed: std::time::Duration,
+    },
+}
+
+impl PaneFocus {
+    fn elapsed(&self, now: Instant) -> std::time::Duration {
+        match self {
+            Self::Focused { elapsed, since } => *elapsed + now.saturating_duration_since(*since),
+            Self::Unfocused { elapsed } => *elapsed,
+        }
+    }
+}
+
 /// Result of advancing App-owned timers at one event-loop timestamp.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct TickResult {
@@ -389,7 +520,31 @@ pub(crate) struct TickResult {
     pub(crate) redraw: bool,
 }
 
+/// Outcome of a host-owned theme request, with an owned change payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ThemeSetOutcome {
+    Unavailable,
+    Unchanged,
+    Changed(ResolvedTheme),
+}
+
 impl App {
+    fn invalidate_presentation(&mut self) {
+        self.presentation_revision = self.presentation_revision.wrapping_add(1);
+    }
+
+    /// Cache key for the presentation only. All mutations remain App-owned;
+    /// time alone can change paint at the which-key visibility boundary.
+    pub(crate) fn presentation_key(&mut self, now: Instant) -> (u64, bool) {
+        self.sync_abandoned_transaction();
+        self.now = now;
+        let which_key_visible = match self.pending_input {
+            PendingAppInput::Space { since } => which_key::should_show(Some(since), now),
+            PendingAppInput::Idle => false,
+        };
+        (self.presentation_revision, which_key_visible)
+    }
+
     /// Create a new App from an open session (starts with one tab).
     #[cfg(test)]
     pub fn new(
@@ -398,7 +553,7 @@ impl App {
         wrap_enabled: bool,
         relative_line_numbers: bool,
         clipboard_sink: Box<dyn ClipboardSink>,
-        config_store: Box<dyn ConfigStore>,
+        config_store: Box<dyn ThemePersistenceSink>,
         initial_time: Instant,
     ) -> Self {
         Self::new_with_spell(
@@ -436,6 +591,7 @@ impl App {
             relative_line_numbers,
             clipboard_copy_format,
             spell_enabled: spell_enabled_default,
+            cursor_shapes,
         } = options;
         let is_light = resolved_theme.is_light();
         let tier = resolved_theme.capability;
@@ -444,9 +600,25 @@ impl App {
         let mut session = Self::seed_spell_config(session, spell_enabled_default);
         session.set_command_history(command_history.clone());
         Self {
-            tabs: vec![TabEntry::new(session)],
+            pane_identity: Arc::new(()),
+            next_request_serial: 0,
+            lifecycle_events: Vec::new(),
+            lifecycle_state: LifecycleState::Idle,
+            #[cfg(test)]
+            save_observer: None,
+            next_tab_serial: 1,
+            activation_serial: 1,
+            command_policy: CommandPolicy::Standalone,
+            file_access_policy: services.file_access_policy,
+            tabs: vec![{
+                let mut entry = TabEntry::new(session);
+                entry.serial = 1;
+                entry.last_activated = 1;
+                entry
+            }],
             command_history,
             active_tab: 0,
+            #[cfg(test)]
             should_quit: false,
             status_message: String::new(),
             overlay: Overlay::default(),
@@ -456,10 +628,19 @@ impl App {
             body_area: Rect::new(0, 0, 0, 0),
             pointer_gesture: PointerGesture::Idle,
             frame_generation: 0,
+            offscreen: None,
+            presentation_revision: 0,
+            next_disk_poll: initial_time + disk_watch::POLL_INTERVAL,
+            disk_probe: Box::new(disk_watch::FilesystemProbe),
             pending_scroll_follow: true,
             last_follow_geometry: None,
             wrap_enabled,
             wrap_width,
+            cursor_shapes,
+            focus: PaneFocus::Focused {
+                elapsed: std::time::Duration::ZERO,
+                since: initial_time,
+            },
             relative_line_numbers,
             now: initial_time,
             transient: None,
@@ -479,9 +660,352 @@ impl App {
         }
     }
 
+    /// Build an empty embedded App using the same state owner as standalone.
+    pub(crate) fn new_empty(
+        theme_catalog: ThemeCatalog,
+        resolved_theme: ResolvedTheme,
+        options: AppStartupOptions,
+        services: AppServices,
+        initial_time: Instant,
+        command_policy: CommandPolicy,
+    ) -> Self {
+        let mut app = Self::new_with_spell(
+            EditorSession::from_text(""),
+            theme_catalog,
+            resolved_theme,
+            options,
+            services,
+            initial_time,
+        );
+        app.tabs.clear();
+        app.next_tab_serial = 0;
+        app.activation_serial = 0;
+        app.command_policy = command_policy;
+        app
+    }
+
+    fn id_for(&self, entry: &TabEntry) -> TabId {
+        TabId {
+            pane: Arc::downgrade(&self.pane_identity),
+            serial: entry.serial,
+        }
+    }
+
+    pub(crate) fn active_tab_id(&self) -> Option<TabId> {
+        self.active().map(|entry| self.id_for(entry))
+    }
+
+    pub(crate) fn contains_tab_id(&self, id: &TabId) -> bool {
+        Weak::ptr_eq(&id.pane, &Arc::downgrade(&self.pane_identity))
+            && id.pane.upgrade().is_some()
+            && self.tabs.iter().any(|entry| entry.serial == id.serial)
+    }
+
+    pub(crate) fn tab_text(&self, id: &TabId) -> Option<String> {
+        if !self.contains_tab_id(id) {
+            return None;
+        }
+        self.tabs
+            .iter()
+            .find(|entry| entry.serial == id.serial)
+            .map(|entry| entry.session.document())
+    }
+
+    pub(crate) fn tab_cursor(&self, id: &TabId) -> Option<(usize, usize)> {
+        if !self.contains_tab_id(id) {
+            return None;
+        }
+        self.tabs
+            .iter()
+            .find(|entry| entry.serial == id.serial)
+            .map(|entry| entry.session.cursor())
+    }
+
+    pub(crate) fn find_tab_by_path(&self, path: &std::path::Path) -> Option<TabId> {
+        self.tabs
+            .iter()
+            .find(|entry| entry.session.path() == Some(path))
+            .map(|entry| self.id_for(entry))
+    }
+
+    pub(crate) fn append_tab(&mut self, session: EditorSession) -> TabId {
+        let session = self.prepare_session(session);
+        self.next_tab_serial = self
+            .next_tab_serial
+            .checked_add(1)
+            .expect("tab identity space exhausted");
+        self.activation_serial = self
+            .activation_serial
+            .checked_add(1)
+            .expect("tab activation space exhausted");
+        let mut entry = TabEntry::new(session);
+        entry.serial = self.next_tab_serial;
+        entry.last_activated = self.activation_serial;
+        let id = self.id_for(&entry);
+        if let Some(old) = self.tabs.get_mut(self.active_tab) {
+            old.session.clear_pending_input();
+        }
+        self.pending_input = PendingAppInput::Idle;
+        self.pointer_gesture = PointerGesture::Idle;
+        self.tabs.push(entry);
+        self.active_tab = self.tabs.len() - 1;
+        self.record_input(self.now);
+        self.pending_scroll_follow = true;
+        let request = self.event_request();
+        let path = self
+            .tabs
+            .last()
+            .and_then(|entry| entry.session.path().map(PathBuf::from));
+        self.lifecycle_events.push(PaneEvent::Opened {
+            request: request.clone(),
+            tab: id.clone(),
+            path,
+        });
+        self.lifecycle_events.push(PaneEvent::ActiveTabChanged {
+            request,
+            tab: id.clone(),
+        });
+        id
+    }
+
+    fn activate_index(&mut self, index: usize) -> bool {
+        if index >= self.tabs.len() || index == self.active_tab {
+            return false;
+        }
+        self.invalidate_presentation();
+        if let Some(old) = self.tabs.get_mut(self.active_tab) {
+            old.session.clear_pending_input();
+        }
+        self.pending_input = PendingAppInput::Idle;
+        self.pointer_gesture = PointerGesture::Idle;
+        self.active_tab = index;
+        self.activation_serial = self
+            .activation_serial
+            .checked_add(1)
+            .expect("tab activation space exhausted");
+        self.tabs[index].last_activated = self.activation_serial;
+        self.pending_scroll_follow = true;
+        let request = self.event_request();
+        let tab = self.id_for(&self.tabs[index]);
+        self.lifecycle_events.push(PaneEvent::ActiveTabChanged {
+            request: request.clone(),
+            tab,
+        });
+        if matches!(self.lifecycle_state, LifecycleState::Idle) {
+            self.lifecycle_events.push(PaneEvent::Completed { request });
+        }
+        true
+    }
+
+    pub(crate) fn focus_tab_id(&mut self, id: &TabId) -> bool {
+        self.sync_abandoned_transaction();
+        if !self.contains_tab_id(id) {
+            return false;
+        }
+        self.tabs
+            .iter()
+            .position(|entry| entry.serial == id.serial)
+            .is_some_and(|index| self.activate_index(index))
+    }
+
+    pub(crate) fn tab_snapshots(&self) -> Vec<TabSnapshot> {
+        let mut activation_order = (0..self.tabs.len()).collect::<Vec<_>>();
+        activation_order
+            .sort_by_key(|&index| (std::cmp::Reverse(self.tabs[index].last_activated), index));
+        let mut ranks = vec![0; self.tabs.len()];
+        for (rank, index) in activation_order.into_iter().enumerate() {
+            ranks[index] = rank;
+        }
+        self.tabs
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let path = entry.session.path().map(std::path::Path::to_path_buf);
+                let title = path
+                    .as_ref()
+                    .and_then(|path| path.file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "[No Name]".to_string());
+                TabSnapshot {
+                    id: self.id_for(entry),
+                    path,
+                    title,
+                    dirty: entry.session.is_dirty(),
+                    active: index == self.active_tab,
+                    is_new: entry.session.is_new(),
+                    changed_on_disk: entry.disk_change.marker().is_some(),
+                    mru_rank: ranks[index],
+                    mode: entry.session.mode(),
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) fn is_focused(&self) -> bool {
+        matches!(self.focus, PaneFocus::Focused { .. })
+    }
+
+    pub(crate) fn input_state(&self) -> PaneInputState {
+        let modal = self.overlay.is_some();
+        let text_entry = if modal {
+            matches!(self.overlay, Overlay::Palette(_))
+        } else {
+            self.session().is_some_and(|session| {
+                matches!(
+                    session.mode(),
+                    oom_edit_core::Mode::Insert | oom_edit_core::Mode::Command
+                ) || session.rendered_search_prompt().is_some()
+            })
+        };
+        PaneInputState { text_entry, modal }
+    }
+
+    pub(crate) fn input_grammar_pending(&self) -> bool {
+        self.pending_input != PendingAppInput::Idle
+            || self.session().is_some_and(EditorSession::has_pending_input)
+    }
+
+    pub(crate) fn current_hints(&self) -> Vec<crate::HintCell> {
+        if self.session().is_none() {
+            return Vec::new();
+        }
+        crate::widgets::hint_bar::context_hints(self.mode_context(), self.overlay.hints())
+    }
+
+    pub(crate) fn current_status(&self) -> Option<crate::EditorStatus> {
+        self.active().map(|entry| {
+            crate::pane_metadata::editor_status(&entry.session, entry.disk_change.marker())
+        })
+    }
+
+    pub(crate) fn current_which_key(&self) -> Option<crate::WhichKey> {
+        if !self.is_focused() || !self.in_chord_context() || self.overlay.is_some() {
+            return None;
+        }
+        let PendingAppInput::Space { since } = self.pending_input else {
+            return None;
+        };
+        which_key::should_show(Some(since), self.now)
+            .then(|| which_key::build_content(self.mode_context()))
+            .flatten()
+    }
+
+    pub(crate) fn key_ownership(&self, key: KeyInput) -> crate::KeyOwnership {
+        use crate::KeyOwnership;
+        if !self.is_focused() || self.tabs.is_empty() {
+            return KeyOwnership::Unclaimed;
+        }
+        let state = self.input_state();
+        let pending = self.input_grammar_pending();
+        let unsupported = matches!(key.code.kind, KeyCodeKind::Noop | KeyCodeKind::F(_));
+        if unsupported && !state.modal && !state.text_entry && !pending {
+            return KeyOwnership::Unclaimed;
+        }
+        if self.active_tab_frozen() {
+            return KeyOwnership::Lifecycle;
+        }
+        if state.modal {
+            return KeyOwnership::Modal;
+        }
+        if state.text_entry {
+            return KeyOwnership::TextEntry;
+        }
+        if unsupported {
+            return KeyOwnership::Pending;
+        }
+        if self.in_chord_context() {
+            match resolve_app_input(self.pending_input, self.mode_context(), key, self.now) {
+                AppInputTransition::Pending(_) => return KeyOwnership::Pending,
+                AppInputTransition::AppCommand(command) => {
+                    return KeyOwnership::AppCommand(crate::command::registry::app_command_id(
+                        command,
+                    ))
+                }
+                AppInputTransition::TabAction(_) => {
+                    return KeyOwnership::AppCommand(crate::BindingId::SpaceDigitTab)
+                }
+                AppInputTransition::Forward(_) => {}
+            }
+        }
+        if pending {
+            KeyOwnership::Pending
+        } else {
+            KeyOwnership::CoreGrammar
+        }
+    }
+
     fn seed_spell_config(mut session: EditorSession, enabled: bool) -> EditorSession {
         session.set_spell_enabled(enabled);
         session
+    }
+
+    /// Change appearance in memory and enqueue a notification; the caller owns persistence.
+    pub(crate) fn set_theme(&mut self, name: &str) -> ThemeSetOutcome {
+        let mode = if self.is_light {
+            crate::theme::DisplayMode::Light
+        } else {
+            crate::theme::DisplayMode::Dark
+        };
+        let Some(resolved) = self.theme_catalog.resolve_name(name, mode, self.tier) else {
+            return ThemeSetOutcome::Unavailable;
+        };
+        if self.theme_name == name {
+            return ThemeSetOutcome::Unchanged;
+        }
+        self.theme_name = name.to_string();
+        self.invalidate_presentation();
+        self.lifecycle_events.push(PaneEvent::ThemeChanged {
+            theme: resolved.clone(),
+        });
+        ThemeSetOutcome::Changed(resolved)
+    }
+
+    /// Apply settings that do not require rebuilding spell or layout resources.
+    /// Returns an owned change payload for host event delivery when needed.
+    pub(crate) fn apply_runtime_config(
+        &mut self,
+        config: &crate::config::Config,
+        selection: &crate::theme::ThemeSelection,
+    ) -> Option<ResolvedTheme> {
+        self.invalidate_presentation();
+        let resolved = self
+            .theme_catalog
+            .resolve_explicit(&config.theme, selection);
+        let theme_changed = self.theme_name != resolved.name
+            || self.is_light != resolved.is_light()
+            || self.tier != resolved.capability;
+        let is_light = resolved.is_light();
+        self.theme_name = resolved.name.clone();
+        self.is_light = is_light;
+        self.tier = resolved.capability;
+
+        if self.wrap_enabled != config.editor.wrap {
+            self.wrap_enabled = config.editor.wrap;
+            if self.wrap_enabled {
+                self.set_left_col(0);
+            }
+            self.pending_scroll_follow = true;
+        }
+        self.relative_line_numbers = config.relative_line_numbers;
+        self.cursor_shapes = config.editor.cursor_shapes;
+        self.clipboard_copy_format = config.clipboard.copy_format;
+        if self.spell_enabled_default != config.spell.enabled {
+            self.spell_enabled_default = config.spell.enabled;
+            for tab in &mut self.tabs {
+                tab.session.set_spell_enabled(config.spell.enabled);
+            }
+        }
+        if theme_changed {
+            self.lifecycle_events.push(PaneEvent::ThemeChanged {
+                theme: resolved.clone(),
+            });
+        }
+        theme_changed.then_some(resolved)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cursor_shapes(&self) -> bool {
+        self.cursor_shapes
     }
 
     fn prepare_session(&self, session: EditorSession) -> EditorSession {
@@ -498,12 +1022,14 @@ impl App {
     /// Get a mutable reference to the active tab entry.
     #[cfg(test)]
     pub fn active_mut(&mut self) -> Option<&mut TabEntry> {
+        self.invalidate_presentation();
         self.tabs.get_mut(self.active_tab)
     }
 
     /// Set the overlay (test-only).
     #[cfg(test)]
     pub fn set_overlay(&mut self, overlay: Overlay) {
+        self.invalidate_presentation();
         self.overlay = overlay;
     }
 
@@ -529,6 +1055,7 @@ impl App {
     /// Advances `self.now`, expires any TTL'd transient messages, and
     /// computes the minimum of transient expiry and which-key pending+150ms.
     pub(crate) fn tick(&mut self, now: Instant) -> TickResult {
+        let abandoned = self.sync_abandoned_transaction();
         let which_key_was_visible = match self.pending_input {
             PendingAppInput::Space { since } => which_key::should_show(Some(since), self.now),
             PendingAppInput::Idle => false,
@@ -546,6 +1073,11 @@ impl App {
             self.status_message.clear();
         }
 
+        let revision = self.presentation_revision;
+        self.poll_disk(now);
+        self.reconcile_safe_disk_change();
+        let disk_redraw = revision != self.presentation_revision;
+
         // Compute next deadline: min(transient.expires_at, which_key_pending+150ms).
         let transient_deadline = self.transient.as_ref().map(|t| t.expires_at);
         let which_key_deadline = match self.pending_input {
@@ -556,6 +1088,7 @@ impl App {
         let deadline = transient_deadline
             .into_iter()
             .chain(which_key_deadline)
+            .chain(self.disk_poll_deadline())
             .min()
             .filter(|deadline| *deadline >= now);
         let which_key_is_visible = match self.pending_input {
@@ -563,10 +1096,12 @@ impl App {
             PendingAppInput::Idle => false,
         };
 
-        TickResult {
-            deadline,
-            redraw: expired || which_key_was_visible != which_key_is_visible,
+        let redraw =
+            abandoned || expired || disk_redraw || which_key_was_visible != which_key_is_visible;
+        if redraw {
+            self.invalidate_presentation();
         }
+        TickResult { deadline, redraw }
     }
 
     /// Record the post-read timestamp for any terminal input event.
@@ -574,9 +1109,10 @@ impl App {
         self.last_input = now;
     }
 
-    /// Return whether the app has been input-idle for at least `duration`.
-    pub(crate) fn input_idle_for(&self, now: Instant, duration: std::time::Duration) -> bool {
-        now.saturating_duration_since(self.last_input) >= duration
+    pub(crate) fn idle_start_deadline(&self) -> Option<Instant> {
+        self.active()
+            .is_some_and(|entry| entry.session.spell_enabled())
+            .then(|| self.last_input + std::time::Duration::from_secs(5))
     }
 
     /// Advance one bounded host, scan, or gutter-projection unit.
@@ -616,6 +1152,9 @@ impl App {
             })
         };
         self.refresh_trouble_snapshot();
+        if worked {
+            self.invalidate_presentation();
+        }
         worked
     }
 
@@ -689,6 +1228,7 @@ impl App {
     /// Install a completed marker snapshot outside a timed presentation region.
     #[cfg(test)]
     pub(crate) fn performance_set_gutter_snapshot(&mut self, source_lines: &[usize]) {
+        self.invalidate_presentation();
         let items = source_lines
             .iter()
             .map(|line| (*line, oom_edit_core::DiagnosticSeverity::Warning))
@@ -703,6 +1243,7 @@ impl App {
     /// Restart projection from the current clean diagnostic publication.
     #[cfg(test)]
     pub(crate) fn performance_restart_gutter_projection(&mut self) {
+        self.invalidate_presentation();
         if let Some(entry) = self.tabs.get_mut(self.active_tab) {
             entry.begin_gutter_publication();
         }
@@ -711,6 +1252,7 @@ impl App {
     /// Cancel completed and pending marker presentation state in constant time.
     #[cfg(test)]
     pub(crate) fn performance_cancel_gutter_projection(&mut self) {
+        self.invalidate_presentation();
         if let Some(entry) = self.tabs.get_mut(self.active_tab) {
             entry.invalidate_gutter_trouble();
         }
@@ -748,17 +1290,91 @@ impl App {
         self.tabs.iter().any(|t| t.session.is_dirty())
     }
 
+    /// Change the one focus state used by input and cursor presentation.
+    pub(crate) fn set_focused(&mut self, focused: bool) {
+        self.invalidate_presentation();
+        if self.is_focused() == focused {
+            return;
+        }
+        let elapsed = self.focus.elapsed(self.now);
+        self.focus = if focused {
+            PaneFocus::Focused {
+                elapsed,
+                since: self.now,
+            }
+        } else {
+            PaneFocus::Unfocused { elapsed }
+        };
+        if !focused {
+            self.pending_input = PendingAppInput::Idle;
+            self.pointer_gesture = PointerGesture::Idle;
+        }
+    }
+
+    /// Draw into an off-screen ratatui buffer, then return only owned cells.
+    pub(crate) fn render_owned(
+        &mut self,
+        width: u16,
+        height: u16,
+        now: Instant,
+        options: AppRenderOptions<'_>,
+        previous: Option<&PaneFrame>,
+    ) -> PaneFrame {
+        self.now = now;
+        let mut result = if width < 20 || height < 5 {
+            self.offscreen = None;
+            PaneFrame::too_small(width, height)
+        } else {
+            let mut terminal = self.offscreen.take().unwrap_or_else(|| {
+                Terminal::new(TestBackend::new(width, height))
+                    .expect("off-screen backend construction is infallible")
+            });
+            if terminal.backend().buffer().area != Rect::new(0, 0, width, height) {
+                terminal.backend_mut().resize(width, height);
+            }
+            terminal
+                .draw(|frame| self.render_with_options(frame, options))
+                .expect("off-screen drawing is infallible");
+            let backend = terminal.backend();
+            let cursor = (self.is_focused() && backend.cursor_visible()).then(|| {
+                let position = backend.cursor_position();
+                PaneCursor {
+                    column: position.x,
+                    row: position.y,
+                    shape: crate::event::cursor_shape(
+                        self.session()
+                            .map_or(oom_edit_core::Mode::Normal, EditorSession::mode),
+                        self.cursor_shapes,
+                    ),
+                }
+            });
+            let frame = PaneFrame::from_buffer(backend.buffer(), cursor);
+            self.offscreen = Some(terminal);
+            frame
+        };
+        result.changed = previous.is_none_or(|previous| !result.visually_equals(previous));
+        result
+    }
+
     /// Render the current frame.
+    #[cfg(test)]
     pub fn render(&mut self, frame: &mut Frame<'_>) {
+        self.render_with_options(frame, AppRenderOptions::standalone());
+    }
+
+    /// Render the complete UI using pane-local geometry and host presentation
+    /// preferences. Standalone calls this with its existing defaults.
+    fn render_with_options(&mut self, frame: &mut Frame<'_>, options: AppRenderOptions<'_>) {
         self.frame_generation = self.frame_generation.wrapping_add(1);
         let area = frame.area();
 
         // Compute viewport height from terminal size.
         // When >1 tab: tab bar (1) + body + status (1).
         // When 1 tab: body + status (1).
-        let tab_bar_height = if self.has_multiple_tabs() { 1 } else { 0 };
+        let show_tab_bar = self.has_multiple_tabs() || options.always_tab_bar;
+        let tab_bar_height = u16::from(show_tab_bar);
         let status_height: u16 = 1;
-        let body_height = body_height(area.height, self.has_multiple_tabs());
+        let body_height = body_height(area.height, show_tab_bar);
 
         let viewport_height = body_height as usize;
         let viewport_width = self
@@ -827,7 +1443,7 @@ impl App {
         };
 
         // Render the appropriate screen behind the overlay.
-        let document_cursor_visible = !self.overlay.is_some();
+        let document_cursor_visible = self.is_focused() && !self.overlay.is_some();
         if let Some(ref mut entry) = self.tabs.get_mut(self.active_tab) {
             if entry.session.mode() != oom_edit_core::Mode::Insert {
                 render_rendered_with_settings(
@@ -857,6 +1473,11 @@ impl App {
                     DocumentPresentation::new(active_theme, self.tier, &entry.gutter_trouble),
                 );
             }
+        } else if !options.empty_state_lines.is_empty() {
+            frame.render_widget(
+                Paragraph::new(options.empty_state_lines.join("\n")),
+                body_area,
+            );
         }
         if let Some(anchor) = self
             .active()
@@ -873,11 +1494,15 @@ impl App {
 
         // Render status row.
         if let Some(entry) = self.active() {
-            render_status_row(
+            render_status_row_with_options(
                 frame,
                 &entry.session,
                 self.transient.as_ref(),
-                self.overlay.hints(),
+                StatusRowOptions {
+                    text: self.overlay.hints(),
+                    inline: options.inline_hints,
+                    disk_marker: entry.disk_change.marker(),
+                },
                 status_area,
                 active_theme,
                 self.tier,
@@ -885,7 +1510,9 @@ impl App {
         }
 
         // Render which-key hint bar if conditions are met.
-        self.render_which_key(frame, status_area);
+        if options.inline_hints && self.is_focused() {
+            self.render_which_key(frame, status_area);
+        }
 
         // Render overlay on top if open.
         if self.overlay.is_some() {
@@ -927,20 +1554,8 @@ impl App {
     /// only after 150ms of pending Space prefix, in Normal/rendered mode,
     /// and only when there are ≥2 continuations.
     fn render_which_key(&self, frame: &mut Frame<'_>, status_area: ratatui::layout::Rect) {
-        if !self.in_chord_context() {
-            return;
-        }
-
-        let PendingAppInput::Space { since } = self.pending_input else {
-            return;
-        };
-
-        if !which_key::should_show(Some(since), self.now) {
-            return;
-        }
-
-        let ctx = self.mode_context();
-        if let Some(text) = which_key::build_hint(ctx) {
+        if let Some(content) = self.current_which_key() {
+            let text = content.display_text();
             let content_offset =
                 crate::widgets::status_bar::STATUS_CONTENT_OFFSET.min(status_area.width);
             let flexible_area = ratatui::layout::Rect::new(
@@ -1016,87 +1631,87 @@ impl App {
     }
 
     /// Handle one event stamped with the exact post-read time.
+    #[cfg(test)]
     pub fn handle_event_at(&mut self, event: &Event, now: Instant) {
         self.now = now;
-        self.record_input(now);
-        // Handle resize events — rebuild rendered layout on width change.
-        if let Event::Resize(_width, height) = event {
-            self.pointer_gesture = PointerGesture::Idle;
-            // Clamp viewport height using the same chrome rows as render().
-            self.viewport_height = body_height(*height, self.has_multiple_tabs()) as usize;
-            self.viewport_width = self
-                .active()
-                .map(|entry| {
-                    source_text_width(
-                        *_width,
-                        entry.session.line_count(),
-                        self.relative_line_numbers
-                            && entry.session.mode() != oom_edit_core::Mode::Insert,
-                    ) as usize
-                })
-                .unwrap_or(*_width as usize);
-            self.body_area = Rect::new(
-                0,
-                u16::from(self.has_multiple_tabs()),
-                *_width,
-                self.viewport_height.min(usize::from(u16::MAX)) as u16,
-            );
-            self.last_follow_geometry = Some((self.viewport_height, self.viewport_width));
-            if let Some(ref mut entry) = self.tabs.get_mut(self.active_tab) {
-                if entry.session.mode() != oom_edit_core::Mode::Insert {
-                    let text_width = source_text_width(
-                        *_width,
-                        entry.session.line_count(),
-                        self.relative_line_numbers,
-                    );
-                    entry.session.render_layout(text_width.min(self.wrap_width));
-                }
-            }
-            self.scroll_follow();
-            self.pending_scroll_follow = false;
+        if !self.is_focused() && !matches!(event, Event::Resize(_, _)) {
             return;
         }
-
-        // Modal overlays exclusively own the document surface.
-        if self.overlay.is_some() && matches!(event, Event::Mouse(_)) {
-            self.pointer_gesture = PointerGesture::Idle;
+        self.record_input(now);
+        // Handle resize events — rebuild rendered layout on width change.
+        if let Event::Resize(width, height) = event {
+            self.resize(*width, *height, now, self.has_multiple_tabs());
             return;
         }
 
         if let Event::Paste(text) = event {
-            if self.overlay.is_some() {
-                return;
-            }
-            let effects = self
-                .tabs
-                .get_mut(self.active_tab)
-                .map(|entry| {
-                    let effects = entry.session.insert_paste(text);
-                    if entry.session.diagnostics_pending() {
-                        entry.invalidate_gutter_trouble_if_present();
-                    }
-                    effects
-                })
-                .unwrap_or_default();
-            for effect in effects {
-                self.handle_effect(effect);
-            }
-            self.pending_scroll_follow = true;
+            self.handle_paste(text, now);
             return;
         }
 
         if let Event::Mouse(mouse) = event {
-            self.handle_mouse(*mouse);
+            self.handle_pane_mouse(crossterm_mouse_to_pane(*mouse), now);
             return;
         }
-
-        self.pointer_gesture = PointerGesture::Idle;
 
         // Translate crossterm event → core KeyInput.
         let key_input = match event {
             Event::Key(key) => crossterm_key_to_core(key),
             _ => return,
         };
+        self.handle_key_input(key_input, now);
+    }
+
+    /// Update geometry once for a coalesced host resize.
+    pub(crate) fn resize(&mut self, width: u16, height: u16, now: Instant, show_tab_bar: bool) {
+        self.invalidate_presentation();
+        self.now = now;
+        self.record_input(now);
+        self.pointer_gesture = PointerGesture::Idle;
+        // Clamp viewport height using the same chrome rows as render().
+        self.viewport_height = body_height(height, show_tab_bar) as usize;
+        self.viewport_width = self
+            .active()
+            .map(|entry| {
+                source_text_width(
+                    width,
+                    entry.session.line_count(),
+                    self.relative_line_numbers
+                        && entry.session.mode() != oom_edit_core::Mode::Insert,
+                ) as usize
+            })
+            .unwrap_or(width as usize);
+        self.body_area = Rect::new(
+            0,
+            u16::from(show_tab_bar),
+            width,
+            self.viewport_height.min(usize::from(u16::MAX)) as u16,
+        );
+        self.last_follow_geometry = Some((self.viewport_height, self.viewport_width));
+        if let Some(ref mut entry) = self.tabs.get_mut(self.active_tab) {
+            if entry.session.mode() != oom_edit_core::Mode::Insert {
+                let text_width = source_text_width(
+                    width,
+                    entry.session.line_count(),
+                    self.relative_line_numbers,
+                );
+                entry.session.render_layout(text_width.min(self.wrap_width));
+            }
+        }
+        self.scroll_follow();
+        self.pending_scroll_follow = false;
+    }
+
+    /// Feed a terminal-neutral key without manufacturing a terminal event.
+    pub(crate) fn handle_key_input(&mut self, key_input: KeyInput, now: Instant) {
+        self.invalidate_presentation();
+        self.sync_abandoned_transaction();
+        self.now = now;
+        if !self.is_focused() || self.active_tab_frozen() {
+            return;
+        }
+        self.record_input(now);
+        self.pointer_gesture = PointerGesture::Idle;
 
         // Unsupported terminal keys are global no-ops. Consume them before
         // overlays and chord state so they cannot cancel an in-progress key
@@ -1136,7 +1751,7 @@ impl App {
             let consumed = self.overlay.handle_key(&key_input);
             if !consumed {
                 // Esc or other close key: close overlay and fall through.
-                if matches!(event, Event::Key(key) if key.code == CrosstermKeyCode::Esc)
+                if matches!(key_input.code.kind, KeyCodeKind::Esc)
                     || matches!(key_input.code.kind, KeyCodeKind::Char('c') if key_input.mods.ctrl)
                 {
                     self.overlay.close();
@@ -1200,8 +1815,9 @@ impl App {
         };
 
         // 3. Everything else → session.handle_key(key).
+        let host_elapsed = self.focus.elapsed(now);
         let effects = if let Some(ref mut entry) = self.tabs.get_mut(self.active_tab) {
-            let effects = entry.session.handle_key(key_input);
+            let effects = entry.session.handle_key_at(key_input, host_elapsed);
             if entry.session.diagnostics_pending() {
                 entry.invalidate_gutter_trouble_if_present();
             }
@@ -1219,49 +1835,112 @@ impl App {
         self.pending_scroll_follow = true;
     }
 
+    /// Insert one bracketed-paste payload as a single core operation.
+    pub(crate) fn handle_paste(&mut self, text: &str, now: Instant) {
+        self.invalidate_presentation();
+        self.sync_abandoned_transaction();
+        self.now = now;
+        if !self.is_focused() || self.active_tab_frozen() {
+            return;
+        }
+        self.record_input(now);
+        if self.overlay.is_some() {
+            return;
+        }
+        let effects = self
+            .tabs
+            .get_mut(self.active_tab)
+            .map(|entry| {
+                let effects = entry.session.insert_paste(text);
+                if entry.session.diagnostics_pending() {
+                    entry.invalidate_gutter_trouble_if_present();
+                }
+                effects
+            })
+            .unwrap_or_default();
+        for effect in effects {
+            self.handle_effect(effect);
+        }
+        self.pending_scroll_follow = true;
+    }
+
+    /// Feed a pane-local mouse action through the one App pointer state machine.
+    pub(crate) fn handle_pane_mouse(&mut self, mouse: PaneMouse, now: Instant) {
+        self.invalidate_presentation();
+        self.sync_abandoned_transaction();
+        self.now = now;
+        if !self.is_focused() || self.active_tab_frozen() {
+            return;
+        }
+        self.record_input(now);
+        if self.overlay.is_some() {
+            self.pointer_gesture = PointerGesture::Idle;
+            return;
+        }
+        self.handle_mouse(mouse);
+    }
+
     /// Open a new tab with the given file path.
     fn open_tab(&mut self, path: &std::path::Path) {
-        match EditorSession::open(path) {
-            Ok(session) => {
-                let session = self.prepare_session(session);
-                let idx = self.tabs.len();
-                self.tabs.push(TabEntry::new(session));
-                self.active_tab = idx;
-                self.pending_scroll_follow = true;
+        match self.execute_open(
+            path,
+            OpenOptions::default(),
+            false,
+            self.command_policy == CommandPolicy::Embedded,
+        ) {
+            Ok(_) => {
                 self.set_transient(
                     format!("Opened: {}", path.display()),
                     oom_edit_core::Severity::Info,
                 );
             }
-            Err(e) => {
-                self.set_transient(format!("Open error: {e}"), oom_edit_core::Severity::Error);
+            Err(error) => {
+                self.lifecycle_failure(error.clone());
+                self.set_transient(
+                    format!("Open error: {error}"),
+                    oom_edit_core::Severity::Error,
+                );
             }
         }
     }
 
     /// Actually close a tab at the given index (no dirty check).
     fn do_close_tab(&mut self, idx: usize) {
+        let request = self.event_request();
+        let tab = self.id_for(&self.tabs[idx]);
+        let path = self.tabs[idx].session.path().map(PathBuf::from);
+        let old_active = self.active_tab_id();
         self.tabs.remove(idx);
         if idx < self.active_tab {
             self.active_tab -= 1;
         } else if self.active_tab >= self.tabs.len() {
             self.active_tab = self.tabs.len().saturating_sub(1);
         }
-        // If no tabs left, quit.
-        if self.tabs.is_empty() {
+        #[cfg(test)]
+        if self.tabs.is_empty() && self.command_policy == CommandPolicy::Standalone {
             self.should_quit = true;
         }
         self.pending_scroll_follow = true;
+        self.lifecycle_events.push(PaneEvent::Closed {
+            request: request.clone(),
+            tab,
+            path,
+        });
+        if self.active_tab_id() != old_active {
+            if let Some(tab) = self.active_tab_id() {
+                self.activation_serial += 1;
+                self.tabs[self.active_tab].last_activated = self.activation_serial;
+                self.lifecycle_events
+                    .push(PaneEvent::ActiveTabChanged { request, tab });
+            }
+        }
     }
 
     /// Switch to tab by 1-based index.
     fn jump_to_tab(&mut self, index: usize) {
         // Convert 1-based to 0-based.
         let idx = index.saturating_sub(1);
-        if idx < self.tabs.len() {
-            self.active_tab = idx;
-            self.pending_scroll_follow = true;
-        }
+        self.activate_index(idx);
     }
 
     /// Next tab (wrap).
@@ -1269,8 +1948,7 @@ impl App {
         if self.tabs.len() <= 1 {
             return;
         }
-        self.active_tab = (self.active_tab + 1) % self.tabs.len();
-        self.pending_scroll_follow = true;
+        self.activate_index((self.active_tab + 1) % self.tabs.len());
     }
 
     /// Previous tab (wrap).
@@ -1278,8 +1956,7 @@ impl App {
         if self.tabs.len() <= 1 {
             return;
         }
-        self.active_tab = (self.active_tab + self.tabs.len() - 1) % self.tabs.len();
-        self.pending_scroll_follow = true;
+        self.activate_index((self.active_tab + self.tabs.len() - 1) % self.tabs.len());
     }
 
     fn execute_tab_action(&mut self, action: TabAction) {
@@ -1297,7 +1974,12 @@ impl App {
     }
 
     fn execute_confirmation(&mut self, resolution: crate::overlay::ConfirmationResolution) {
-        use crate::overlay::{DirtyCloseChoice, ExternalSaveChoice};
+        use crate::overlay::DirtyCloseChoice;
+
+        if matches!(self.lifecycle_state, LifecycleState::Preparing(_)) {
+            self.resolve_preparation_confirmation(resolution);
+            return;
+        }
 
         match resolution {
             crate::overlay::ConfirmationResolution::DirtyClose { action, choice } => match choice {
@@ -1311,28 +1993,41 @@ impl App {
                     }));
                 }
                 DirtyCloseChoice::Discard => {
-                    if action.target < self.tabs.len() {
-                        self.do_close_tab(action.target);
-                    } else {
-                        self.invalid_lifecycle_target(action.target);
-                    }
+                    self.execute_lifecycle(LifecycleAction::CloseTab(CloseTabRequest {
+                        force: true,
+                        ..action
+                    }));
                 }
-                DirtyCloseChoice::Cancel => {}
+                DirtyCloseChoice::Cancel => {
+                    self.execute_lifecycle(LifecycleAction::CancelConfirmation);
+                }
             },
             crate::overlay::ConfirmationResolution::ExternalSave {
-                mut request,
+                request,
                 disk_path,
+                version,
                 choice,
-            } => match choice {
-                ExternalSaveChoice::Overwrite => {
-                    request.force = true;
-                    self.execute_lifecycle(LifecycleAction::Save(request));
-                }
-                ExternalSaveChoice::Reload => {
-                    self.replace_tab_from_disk(request.target, &disk_path, true);
-                }
-                ExternalSaveChoice::Cancel => {}
-            },
+            } => {
+                self.execute_lifecycle(LifecycleAction::ResolveSave {
+                    request,
+                    disk_path,
+                    version,
+                    choice,
+                });
+            }
+            crate::overlay::ConfirmationResolution::DiskChange {
+                target,
+                path,
+                version,
+                choice,
+            } => {
+                self.execute_lifecycle(LifecycleAction::ResolveDiskChange {
+                    target,
+                    path,
+                    version,
+                    choice,
+                });
+            }
         }
     }
 
@@ -1364,24 +2059,26 @@ impl App {
                     .theme_catalog
                     .cycle_theme(&self.theme_name, self.is_light)
                     .to_string();
-                self.theme_name.clone_from(&next);
-                // Persist to config.
-                let mut config = self.config_store.load();
-                if self.is_light {
-                    config.theme.light.clone_from(&next);
+                assert!(matches!(self.set_theme(&next), ThemeSetOutcome::Changed(_)));
+                let slot = if self.is_light {
+                    ThemeSlot::Light
                 } else {
-                    config.theme.dark.clone_from(&next);
-                }
-                if let Err(e) = self.config_store.save(&config) {
-                    eprintln!("oom-edit: failed to save config: {e}");
-                }
+                    ThemeSlot::Dark
+                };
+                let persistence = self.config_store.persist_theme(slot, &next);
                 self.set_transient(
-                    if next == "accessible" {
-                        "theme: accessible (monochrome)".to_string()
-                    } else {
-                        format!("theme: {next}")
+                    match &persistence {
+                        Err(error) => format!("theme: {next} (not saved: {error})"),
+                        Ok(()) if next == "accessible" => {
+                            "theme: accessible (monochrome)".to_string()
+                        }
+                        Ok(()) => format!("theme: {next}"),
                     },
-                    oom_edit_core::Severity::Info,
+                    if persistence.is_err() {
+                        oom_edit_core::Severity::Warning
+                    } else {
+                        oom_edit_core::Severity::Info
+                    },
                 );
             }
             AppCommand::DefaultFrontMatter => {
@@ -1691,21 +2388,214 @@ impl App {
         self.set_transient(message, oom_edit_core::Severity::Warning);
     }
 
-    fn execute_lifecycle(&mut self, action: LifecycleAction) {
+    pub(crate) fn execute_lifecycle(&mut self, action: LifecycleAction) -> LifecycleOutcome {
+        self.invalidate_presentation();
+        self.sync_abandoned_transaction();
+        let event_start = self.lifecycle_events.len();
+        let continuation = matches!(
+            action,
+            LifecycleAction::ResolveClose { .. }
+                | LifecycleAction::CancelConfirmation
+                | LifecycleAction::CancelRequest { .. }
+                | LifecycleAction::ProvideSavePath { .. }
+                | LifecycleAction::ResolveSave { .. }
+                | LifecycleAction::ResolveDiskChange { .. }
+                | LifecycleAction::CommitRetarget { .. }
+                | LifecycleAction::CommitClose { .. }
+                | LifecycleAction::CommitExternalChange { .. }
+                | LifecycleAction::AbortToken { .. }
+        );
+        if continuation && matches!(self.lifecycle_state, LifecycleState::Idle) {
+            return LifecycleOutcome::Failed(Self::stale_token_error());
+        }
+        if matches!(
+            self.lifecycle_state,
+            LifecycleState::Preparing(_) | LifecycleState::Suspended(_)
+        ) && !continuation
+        {
+            let error = Self::busy_error();
+            self.set_transient(error.detail.clone(), oom_edit_core::Severity::Warning);
+            return LifecycleOutcome::Failed(error);
+        }
+        if matches!(
+            action,
+            LifecycleAction::HostOpen { .. } | LifecycleAction::NewBuffer { .. }
+        ) && self.overlay.is_confirmation()
+        {
+            return LifecycleOutcome::Failed(PaneError {
+                kind: PaneErrorKind::Busy,
+                path: None,
+                detail: "a lifecycle confirmation is pending".into(),
+            });
+        }
+        let target_index = match &action {
+            LifecycleAction::Save(request) => Some(request.target),
+            LifecycleAction::CloseTab(request) => Some(request.target),
+            LifecycleAction::ResolveSave { request, .. } => Some(request.target),
+            LifecycleAction::ReloadVersion { target, .. } => Some(*target),
+            LifecycleAction::ReconcileDiskChange { target, .. }
+            | LifecycleAction::ResolveDiskChange { target, .. } => Some(*target),
+            LifecycleAction::ReplaceTab { target, .. } => Some(*target),
+            _ => None,
+        };
+        let context = match &self.lifecycle_state {
+            LifecycleState::Confirmation(context) | LifecycleState::Executing(context) => {
+                context.clone()
+            }
+            LifecycleState::Preparing(flow) => LifecycleContext {
+                request: flow.request.clone(),
+                target: flow.current_tab(),
+            },
+            LifecycleState::Suspended(flow) => LifecycleContext {
+                request: flow.request.clone(),
+                target: None,
+            },
+            LifecycleState::Idle => LifecycleContext {
+                request: self.next_request(),
+                target: target_index
+                    .and_then(|index| self.tabs.get(index).map(|entry| self.id_for(entry))),
+            },
+        };
+        if !continuation {
+            self.lifecycle_state = LifecycleState::Executing(context.clone());
+        }
+        if let (Some(expected), Some(index)) = (&context.target, target_index) {
+            if self
+                .tabs
+                .get(index)
+                .is_none_or(|entry| self.id_for(entry) != *expected)
+            {
+                let error = PaneError {
+                    kind: PaneErrorKind::Stale,
+                    path: None,
+                    detail: "captured lifecycle target changed".into(),
+                };
+                self.lifecycle_failure(error.clone());
+                self.lifecycle_state = LifecycleState::Idle;
+                return LifecycleOutcome::Failed(error);
+            }
+        }
+        let mut outcome = LifecycleOutcome::Applied;
         match action {
-            LifecycleAction::Save(request) => self.execute_save(request),
+            LifecycleAction::ReconcileDiskChange { target, version } => {
+                self.execute_disk_change(target, version);
+            }
+            LifecycleAction::ResolveDiskChange {
+                target,
+                path,
+                version,
+                choice,
+            } => {
+                self.resolve_disk_change(target, &path, &version, choice);
+            }
+            LifecycleAction::CancelRequest { request } => {
+                outcome = self.cancel_pending_request(&request);
+            }
+            LifecycleAction::CancelConfirmation => {
+                if matches!(self.lifecycle_state, LifecycleState::Confirmation(_)) {
+                    self.cancel_lifecycle();
+                } else {
+                    outcome = LifecycleOutcome::Failed(Self::busy_error());
+                }
+            }
+            LifecycleAction::PrepareRetarget { targets } => {
+                outcome = self.start_retarget_preparation(context.request.clone(), targets);
+            }
+            LifecycleAction::CommitRetarget { request } => {
+                outcome = self.finish_retarget(&request);
+            }
+            LifecycleAction::PrepareClose {
+                targets,
+                auto_commit,
+                all,
+            } => {
+                outcome = self.start_close_preparation(
+                    context.request.clone(),
+                    targets,
+                    auto_commit,
+                    all,
+                );
+            }
+            LifecycleAction::ResolveClose { choice } => {
+                outcome = self.resolve_close_choice(choice);
+            }
+            LifecycleAction::ResolveSave {
+                request,
+                disk_path,
+                version,
+                choice,
+            } => {
+                outcome = self.resolve_save_choice(request, disk_path, version, choice);
+            }
+            LifecycleAction::ReloadVersion {
+                target,
+                path,
+                version,
+            } => {
+                self.reload_version(target, &path, &version);
+            }
+            LifecycleAction::ProvideSavePath { request, path } => {
+                outcome = self.supply_prepared_save_path(&request, path);
+            }
+            LifecycleAction::CommitClose { request } => {
+                outcome = self.commit_prepared_close(&request);
+            }
+            LifecycleAction::BeginExternalChange => {
+                outcome = self.start_external_change(context.request.clone());
+            }
+            LifecycleAction::CommitExternalChange { request, paths } => {
+                outcome = self.finish_external_change(&request, paths);
+            }
+            LifecycleAction::AbortToken { request } => {
+                outcome = self.abort_owned_transaction(&request);
+            }
+            LifecycleAction::HostOpen {
+                path,
+                options,
+                existing_only,
+            } => {
+                outcome = match self.execute_open(&path, options, existing_only, true) {
+                    Ok(result) => LifecycleOutcome::Open(result),
+                    Err(error) => LifecycleOutcome::Failed(error),
+                };
+            }
+            LifecycleAction::NewBuffer { options } => {
+                let mut session = EditorSession::from_text("");
+                crate::pane::EditorPane::apply_open_options(&mut session, options);
+                outcome = LifecycleOutcome::Open(OpenOutcome::Opened(self.append_tab(session)));
+            }
+            LifecycleAction::Save(request) => {
+                self.execute_save(request);
+            }
             LifecycleAction::CloseTab(request) => self.execute_close_tab(request),
             LifecycleAction::ReplaceTab {
                 target,
                 path,
                 force,
             } => {
+                if self.command_policy == CommandPolicy::Embedded {
+                    if let Ok(resolved) = self.authorize_file(FileOperation::Open, &path) {
+                        if let Some(id) = self.find_tab_by_path(&resolved) {
+                            self.focus_tab_id(&id);
+                            self.lifecycle_events.push(PaneEvent::Completed {
+                                request: context.request.clone(),
+                            });
+                            self.lifecycle_state = LifecycleState::Idle;
+                            return LifecycleOutcome::Applied;
+                        }
+                    }
+                }
                 if !force
                     && self
                         .tabs
                         .get(target)
                         .is_some_and(|entry| entry.session.is_dirty())
                 {
+                    self.lifecycle_failure(PaneError {
+                        kind: PaneErrorKind::Dirty,
+                        path: Some(path.clone()),
+                        detail: "unsaved buffer cannot be replaced".into(),
+                    });
                     self.set_transient(
                         "No write since last change (use :e! to override)".to_string(),
                         oom_edit_core::Severity::Error,
@@ -1720,27 +2610,209 @@ impl App {
             LifecycleAction::OpenTab { path } => self.open_tab(&path),
             LifecycleAction::QuitAll { force } => {
                 if !force && self.any_tab_dirty() {
+                    self.lifecycle_failure(PaneError {
+                        kind: PaneErrorKind::Dirty,
+                        path: None,
+                        detail: "quit-all refused because tabs are unsaved".into(),
+                    });
                     let dirty_count = self.tabs.iter().filter(|t| t.session.is_dirty()).count();
                     self.set_transient(
                         format!("{dirty_count} unsaved tab(s) — use :qa! to discard"),
                         oom_edit_core::Severity::Error,
                     );
                 } else {
-                    self.should_quit = true;
+                    self.lifecycle_events.push(PaneEvent::QuitAllRequested {
+                        request: context.request.clone(),
+                        force,
+                    });
+                    #[cfg(test)]
+                    {
+                        self.should_quit = self.command_policy == CommandPolicy::Standalone;
+                    }
                 }
             }
         }
+        if matches!(self.lifecycle_state, LifecycleState::Executing(_)) {
+            self.lifecycle_state = if self.overlay.is_confirmation() {
+                LifecycleState::Confirmation(context.clone())
+            } else {
+                LifecycleState::Idle
+            };
+        }
+        if matches!(self.lifecycle_state, LifecycleState::Idle) && !self.overlay.is_confirmation() {
+            let request = context.request;
+            let terminal = self.lifecycle_events[event_start..].iter().any(|event| matches!(event,
+                PaneEvent::Completed { request: id } | PaneEvent::Cancelled { request: id } | PaneEvent::Failed { request: id, .. } | PaneEvent::DiskWriteCommitted { request: id, .. }
+                if id == &request));
+            if !terminal {
+                self.lifecycle_events.push(match &outcome {
+                    LifecycleOutcome::Failed(error) => PaneEvent::Failed {
+                        request,
+                        tab: context.target,
+                        error: error.clone(),
+                    },
+                    _ => PaneEvent::Completed { request },
+                });
+            }
+        }
+        outcome
     }
 
-    fn execute_save(&mut self, request: SaveRequest) {
+    fn execute_open(
+        &mut self,
+        path: &std::path::Path,
+        options: OpenOptions,
+        existing_only: bool,
+        deduplicate: bool,
+    ) -> Result<OpenOutcome, PaneError> {
+        let resolved = self.authorize_file(
+            if existing_only {
+                FileOperation::OpenExisting
+            } else {
+                FileOperation::Open
+            },
+            path,
+        )?;
+        if existing_only {
+            std::fs::metadata(&resolved).map_err(|error| PaneError {
+                kind: if error.kind() == std::io::ErrorKind::NotFound {
+                    PaneErrorKind::Missing
+                } else {
+                    PaneErrorKind::Io
+                },
+                path: Some(resolved.clone()),
+                detail: error.to_string(),
+            })?;
+        }
+        if deduplicate {
+            if let Some(id) = self.find_tab_by_path(&resolved) {
+                self.focus_tab_id(&id);
+                return Ok(OpenOutcome::FocusedExisting(id));
+            }
+        }
+        let mut session = if existing_only {
+            EditorSession::open_existing(&resolved)
+        } else {
+            EditorSession::open(&resolved)
+        }
+        .map_err(|error| PaneError::from_open_error(resolved, error))?;
+        crate::pane::EditorPane::apply_open_options(&mut session, options);
+        Ok(OpenOutcome::Opened(self.append_tab(session)))
+    }
+
+    fn next_request(&mut self) -> RequestId {
+        self.next_request_serial = self
+            .next_request_serial
+            .checked_add(1)
+            .expect("request identity space exhausted");
+        RequestId {
+            pane: Arc::downgrade(&self.pane_identity),
+            serial: self.next_request_serial,
+        }
+    }
+
+    fn event_request(&mut self) -> RequestId {
+        match &self.lifecycle_state {
+            LifecycleState::Executing(context) | LifecycleState::Confirmation(context) => {
+                context.request.clone()
+            }
+            LifecycleState::Preparing(flow) => flow.request.clone(),
+            LifecycleState::Suspended(flow) => flow.request.clone(),
+            LifecycleState::Idle => self.next_request(),
+        }
+    }
+
+    fn lifecycle_failure(&mut self, error: PaneError) {
+        let request = self.event_request();
+        let tab = match &self.lifecycle_state {
+            LifecycleState::Executing(context) | LifecycleState::Confirmation(context) => {
+                context.target.clone()
+            }
+            LifecycleState::Idle => None,
+            LifecycleState::Preparing(flow) => flow.current_tab(),
+            LifecycleState::Suspended(_) => None,
+        };
+        self.lifecycle_events.push(PaneEvent::Failed {
+            request,
+            tab,
+            error,
+        });
+    }
+
+    pub(crate) fn drain_lifecycle_events(&mut self) -> Vec<PaneEvent> {
+        self.sync_abandoned_transaction();
+        std::mem::take(&mut self.lifecycle_events)
+    }
+
+    fn cancel_lifecycle(&mut self) {
+        let request = self.event_request();
+        self.lifecycle_events.push(PaneEvent::Cancelled { request });
+        self.lifecycle_state = LifecycleState::Idle;
+    }
+
+    fn execute_save(&mut self, request: SaveRequest) -> SaveProgress {
+        self.execute_save_version(request, None)
+    }
+
+    fn execute_save_version(
+        &mut self,
+        request: SaveRequest,
+        expected: Option<&oom_edit_core::DiskVersion>,
+    ) -> SaveProgress {
+        let target_path = request.path.clone().or_else(|| {
+            self.tabs
+                .get(request.target)
+                .and_then(|entry| entry.session.path().map(PathBuf::from))
+        });
+        let operation = if request.path.is_some() && !request.retarget {
+            FileOperation::SaveCopy
+        } else if request.path.is_some() {
+            FileOperation::SaveAs
+        } else {
+            FileOperation::Save
+        };
+        let mut request = request;
+        if let Some(path) = target_path {
+            match self.authorize_file(operation, &path) {
+                Ok(resolved) => {
+                    if request.path.is_some() {
+                        request.path = Some(resolved);
+                    }
+                }
+                Err(error) => {
+                    self.lifecycle_failure(error.clone());
+                    self.set_transient(
+                        format!("Save denied: {error}"),
+                        oom_edit_core::Severity::Error,
+                    );
+                    return SaveProgress::Failed;
+                }
+            }
+        }
         let Some(entry) = self.tabs.get_mut(request.target) else {
             self.invalid_lifecycle_target(request.target);
-            return;
+            return SaveProgress::Failed;
         };
 
+        #[cfg(test)]
+        let observer = self.save_observer.as_deref_mut();
+        #[cfg(not(test))]
+        let observer: Option<&mut dyn oom_edit_core::SaveObserver> = None;
         let result = if let Some(copy_path) = request.path.as_deref().filter(|_| !request.retarget)
         {
-            entry.session.save_copy(copy_path)
+            if let Some(observer) = observer {
+                entry.session.save_copy_with_observer(copy_path, observer)
+            } else {
+                entry.session.save_copy(copy_path)
+            }
+        } else if let Some(expected) = expected {
+            entry
+                .session
+                .save_if_version(request.path.as_deref(), expected)
+        } else if let Some(observer) = observer {
+            entry
+                .session
+                .save_with_observer(request.path.as_deref(), request.force, observer)
         } else {
             entry.session.save(request.path.as_deref(), request.force)
         };
@@ -1749,6 +2821,7 @@ impl App {
             Ok(()) => {
                 if request.retarget || request.path.is_none() {
                     entry.session.save_point();
+                    entry.disk_change = disk_watch::DiskObservation::Current;
                 }
                 let line_count = entry.session.line_count();
                 let file_name = entry
@@ -1757,6 +2830,28 @@ impl App {
                     .and_then(|path| path.file_name())
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "buffer".to_string());
+                let path = request
+                    .path
+                    .clone()
+                    .or_else(|| entry.session.path().map(PathBuf::from));
+                let tab = self.id_for(&self.tabs[request.target]);
+                let request_id = self.event_request();
+                if let Some(path) = path {
+                    self.lifecycle_events
+                        .push(if request.path.is_some() && !request.retarget {
+                            PaneEvent::SavedCopy {
+                                request: request_id,
+                                tab,
+                                path,
+                            }
+                        } else {
+                            PaneEvent::Saved {
+                                request: request_id,
+                                tab,
+                                path,
+                            }
+                        });
+                }
                 self.set_transient(
                     format!("Saved {file_name} ({line_count} lines)"),
                     oom_edit_core::Severity::Success,
@@ -1764,19 +2859,63 @@ impl App {
                 if request.continuation == SaveContinuation::CloseSavedTab {
                     self.do_close_tab(request.target);
                 }
+                SaveProgress::Saved
             }
-            Err(oom_edit_core::SaveError::ExternallyModified(path)) if !request.force => {
+            Err(
+                oom_edit_core::SaveError::ExternallyModified(path)
+                | oom_edit_core::SaveError::Missing(path),
+            ) => {
                 self.set_transient(
                     format!("File modified on disk: {}", path.display()),
                     oom_edit_core::Severity::Warning,
                 );
-                self.overlay = Overlay::open_confirm_overwrite(request, path);
+                match oom_edit_core::DiskVersion::observe(&path) {
+                    Ok(version) => {
+                        self.overlay = Overlay::open_confirm_overwrite(request, path, version);
+                        SaveProgress::Pending
+                    }
+                    Err(error) => {
+                        self.lifecycle_failure(PaneError {
+                            kind: PaneErrorKind::Io,
+                            path: Some(path),
+                            detail: error.message().into(),
+                        });
+                        SaveProgress::Failed
+                    }
+                }
             }
             Err(error) => {
+                let path = request
+                    .path
+                    .clone()
+                    .or_else(|| self.tabs[request.target].session.path().map(PathBuf::from));
+                if matches!(error, oom_edit_core::SaveError::CommittedUncertain(_)) {
+                    if request.retarget || request.path.is_none() {
+                        self.tabs[request.target].disk_change =
+                            disk_watch::DiskObservation::Current;
+                    }
+                    if let Some(path) = path.clone() {
+                        let request_id = self.event_request();
+                        let tab = self.id_for(&self.tabs[request.target]);
+                        self.lifecycle_events.push(PaneEvent::DiskWriteCommitted {
+                            request: request_id,
+                            tab,
+                            path,
+                            detail: error.to_string(),
+                        });
+                    }
+                } else {
+                    self.lifecycle_failure(PaneError {
+                        kind: PaneErrorKind::Io,
+                        path,
+                        detail: error.to_string(),
+                    });
+                }
                 self.set_transient(
                     format!("Save error: {error}"),
                     oom_edit_core::Severity::Error,
                 );
+                SaveProgress::Failed
             }
         }
     }
@@ -1792,6 +2931,11 @@ impl App {
                     self.overlay = Overlay::open_confirm_quit(request);
                 }
                 DirtyClosePolicy::Refuse => {
+                    self.lifecycle_failure(PaneError {
+                        kind: PaneErrorKind::Dirty,
+                        path: entry.session.path().map(PathBuf::from),
+                        detail: "tab has unsaved changes".into(),
+                    });
                     self.set_transient(
                         "No write since last change (use :tabclose! to override)".to_string(),
                         oom_edit_core::Severity::Error,
@@ -1808,15 +2952,41 @@ impl App {
             self.invalid_lifecycle_target(target);
             return;
         }
-        let opened = if reloading {
-            EditorSession::open_existing(path)
+        let operation = if reloading {
+            FileOperation::Reload
         } else {
-            EditorSession::open(path)
+            FileOperation::Open
+        };
+        let resolved = match self.authorize_file(operation, path) {
+            Ok(path) => path,
+            Err(error) => {
+                self.lifecycle_failure(error.clone());
+                self.set_transient(
+                    format!("Open denied: {error}"),
+                    oom_edit_core::Severity::Error,
+                );
+                return;
+            }
+        };
+        if !reloading && self.command_policy == CommandPolicy::Embedded {
+            if let Some(id) = self.find_tab_by_path(&resolved) {
+                self.focus_tab_id(&id);
+                return;
+            }
+        }
+        let opened = if reloading {
+            EditorSession::open_existing(&resolved)
+        } else {
+            EditorSession::open(&resolved)
         };
         match opened {
             Ok(session) => {
                 let session = self.prepare_session(session);
+                let serial = self.tabs[target].serial;
+                let last_activated = self.tabs[target].last_activated;
                 self.tabs[target] = TabEntry::new(session);
+                self.tabs[target].serial = serial;
+                self.tabs[target].last_activated = last_activated;
                 self.pending_scroll_follow = true;
                 self.set_transient(
                     if reloading {
@@ -1827,13 +2997,17 @@ impl App {
                     oom_edit_core::Severity::Info,
                 );
             }
-            Err(error) => self.set_transient(
-                format!(
-                    "{} error: {error}",
-                    if reloading { "Reload" } else { "Open" }
-                ),
-                oom_edit_core::Severity::Error,
-            ),
+            Err(error) => {
+                let error = PaneError::from_open_error(resolved, error);
+                self.lifecycle_failure(error.clone());
+                self.set_transient(
+                    format!(
+                        "{} error: {error}",
+                        if reloading { "Reload" } else { "Open" }
+                    ),
+                    oom_edit_core::Severity::Error,
+                );
+            }
         }
     }
 
@@ -1858,12 +3032,26 @@ impl App {
                 );
                 return;
             };
-            match EditorSession::open_existing(path) {
+            let path = path.to_path_buf();
+            let resolved = match self.authorize_file(FileOperation::Reload, &path) {
+                Ok(path) => path,
+                Err(error) => {
+                    self.lifecycle_failure(error.clone());
+                    self.set_transient(
+                        format!("Reload denied: {error}"),
+                        oom_edit_core::Severity::Error,
+                    );
+                    return;
+                }
+            };
+            match EditorSession::open_existing(&resolved) {
                 Ok(session) => replacements.push((target, session)),
                 Err(error) => {
+                    let detail = error.to_string();
+                    self.lifecycle_failure(PaneError::from_open_error(resolved, error));
                     self.set_transient(
                         format!(
-                            "Reload error for tab {} ({}): {error}",
+                            "Reload error for tab {} ({}): {detail}",
                             target + 1,
                             path.display()
                         ),
@@ -1876,7 +3064,17 @@ impl App {
         let count = replacements.len();
         for (target, session) in replacements {
             let session = self.prepare_session(session);
+            let serial = self.tabs[target].serial;
+            let last_activated = self.tabs[target].last_activated;
             self.tabs[target] = TabEntry::new(session);
+            self.tabs[target].serial = serial;
+            self.tabs[target].last_activated = last_activated;
+            if let Some(path) = self.tabs[target].session.path().map(PathBuf::from) {
+                let request = self.event_request();
+                let tab = self.id_for(&self.tabs[target]);
+                self.lifecycle_events
+                    .push(PaneEvent::Reloaded { request, tab, path });
+            }
         }
         self.pending_scroll_follow = true;
         self.set_transient(
@@ -1886,10 +3084,52 @@ impl App {
     }
 
     fn invalid_lifecycle_target(&mut self, target: usize) {
+        self.lifecycle_failure(PaneError {
+            kind: PaneErrorKind::UnknownTab,
+            path: None,
+            detail: format!("captured tab {} no longer exists", target + 1),
+        });
+        self.lifecycle_failure(PaneError {
+            kind: PaneErrorKind::UnknownTab,
+            path: None,
+            detail: "lifecycle target no longer exists".into(),
+        });
         self.set_transient(
             format!("Lifecycle target tab {} no longer exists", target + 1),
             oom_edit_core::Severity::Error,
         );
+    }
+
+    /// Resolve the operation's current target immediately before its I/O.
+    fn authorize_file(
+        &self,
+        operation: FileOperation,
+        path: &std::path::Path,
+    ) -> Result<PathBuf, PaneError> {
+        let resolved = resolve_host_path(&self.launch_dir, path)?;
+        self.file_access_policy
+            .authorize(operation, &resolved)
+            .map_err(|error| PaneError {
+                kind: PaneErrorKind::Denied,
+                path: Some(resolved.clone()),
+                detail: error.reason,
+            })?;
+        let checked = resolve_host_path(&self.launch_dir, &resolved)?;
+        if checked != resolved {
+            self.file_access_policy
+                .authorize(operation, &checked)
+                .map_err(|error| PaneError {
+                    kind: PaneErrorKind::Denied,
+                    path: Some(checked.clone()),
+                    detail: error.reason,
+                })?;
+            return Err(PaneError {
+                kind: PaneErrorKind::Stale,
+                path: Some(checked),
+                detail: "path changed during policy validation; retry the operation".into(),
+            });
+        }
+        Ok(resolved)
     }
 
     /// Handle a single core effect.
@@ -2013,6 +3253,7 @@ impl App {
     /// Set a transient status message with TTL expiry.
     #[cfg(test)]
     pub fn set_transient(&mut self, text: String, severity: oom_edit_core::Severity) {
+        self.invalidate_presentation();
         self.transient = Some(status_bar::Transient {
             text,
             severity,
@@ -2023,6 +3264,7 @@ impl App {
     /// Set a transient status message with TTL expiry.
     #[cfg(not(test))]
     fn set_transient(&mut self, text: String, severity: oom_edit_core::Severity) {
+        self.invalidate_presentation();
         self.transient = Some(status_bar::Transient {
             text,
             severity,
@@ -2263,7 +3505,7 @@ impl App {
         (top_line, skip_rows, 0)
     }
 
-    fn pointer_cell(&self, mouse: MouseEvent, source_surface: bool) -> Option<(usize, usize)> {
+    fn pointer_cell(&self, mouse: PaneMouse, source_surface: bool) -> Option<(usize, usize)> {
         let area = self.body_area;
         let row = mouse.row.checked_sub(area.y)?;
         let column = mouse.column.checked_sub(area.x)?;
@@ -2304,7 +3546,7 @@ impl App {
         })
     }
 
-    fn handle_mouse(&mut self, mouse: MouseEvent) {
+    fn handle_mouse(&mut self, mouse: PaneMouse) {
         if self.active().is_some_and(|entry| {
             entry.session.mode() == oom_edit_core::Mode::Command
                 || entry.session.rendered_search_prompt().is_some()
@@ -2313,15 +3555,15 @@ impl App {
             return;
         }
         match mouse.kind {
-            MouseEventKind::ScrollUp => {
+            PaneMouseKind::ScrollUp => {
                 self.pointer_gesture = PointerGesture::Idle;
                 self.scroll_pointer(mouse, -3);
             }
-            MouseEventKind::ScrollDown => {
+            PaneMouseKind::ScrollDown => {
                 self.pointer_gesture = PointerGesture::Idle;
                 self.scroll_pointer(mouse, 3);
             }
-            MouseEventKind::Down(MouseButton::Left) => {
+            PaneMouseKind::LeftDown => {
                 self.pointer_gesture = PointerGesture::Idle;
                 let Some((row, column)) = self.pointer_cell(mouse, false) else {
                     return;
@@ -2357,7 +3599,7 @@ impl App {
                 self.pointer_gesture = PointerGesture::Pressed(anchor);
                 self.pending_scroll_follow = false;
             }
-            MouseEventKind::Drag(MouseButton::Left) => {
+            PaneMouseKind::LeftDrag => {
                 let gesture = self.pointer_gesture;
                 let source_surface = match gesture {
                     PointerGesture::Pressed(PointerAnchor::Source { .. }) => true,
@@ -2443,11 +3685,11 @@ impl App {
                     PointerGesture::Idle => {}
                 }
             }
-            MouseEventKind::Up(MouseButton::Left) => {
+            PaneMouseKind::LeftUp => {
                 self.pointer_gesture = PointerGesture::Idle;
             }
-            MouseEventKind::Moved => {}
-            _ => {
+            PaneMouseKind::Moved => {}
+            PaneMouseKind::Other => {
                 self.pointer_gesture = PointerGesture::Idle;
             }
         }
@@ -2475,7 +3717,7 @@ impl App {
         rows
     }
 
-    fn scroll_pointer(&mut self, mouse: MouseEvent, delta: isize) {
+    fn scroll_pointer(&mut self, mouse: PaneMouse, delta: isize) {
         let area = self.body_area;
         if mouse.column < area.x
             || mouse.column >= area.x.saturating_add(area.width)
@@ -2628,106 +3870,6 @@ impl App {
     }
 }
 
-/// Translate a crossterm [`KeyEvent`] to a core [`KeyInput`].
-fn crossterm_key_to_core(key: &KeyEvent) -> KeyInput {
-    let code = match key.code {
-        CrosstermKeyCode::Char(c) => KeyCode {
-            kind: KeyCodeKind::Char(c),
-        },
-        CrosstermKeyCode::Backspace => KeyCode {
-            kind: KeyCodeKind::Backspace,
-        },
-        CrosstermKeyCode::Enter => KeyCode {
-            kind: KeyCodeKind::Enter,
-        },
-        CrosstermKeyCode::Left => KeyCode {
-            kind: KeyCodeKind::Left,
-        },
-        CrosstermKeyCode::Right => KeyCode {
-            kind: KeyCodeKind::Right,
-        },
-        CrosstermKeyCode::Up => KeyCode {
-            kind: KeyCodeKind::Up,
-        },
-        CrosstermKeyCode::Down => KeyCode {
-            kind: KeyCodeKind::Down,
-        },
-        CrosstermKeyCode::Tab => KeyCode {
-            kind: KeyCodeKind::Tab,
-        },
-        CrosstermKeyCode::BackTab => KeyCode {
-            kind: KeyCodeKind::BackTab,
-        },
-        CrosstermKeyCode::Home => KeyCode {
-            kind: KeyCodeKind::Home,
-        },
-        CrosstermKeyCode::End => KeyCode {
-            kind: KeyCodeKind::End,
-        },
-        CrosstermKeyCode::PageUp => KeyCode {
-            kind: KeyCodeKind::PageUp,
-        },
-        CrosstermKeyCode::PageDown => KeyCode {
-            kind: KeyCodeKind::PageDown,
-        },
-        CrosstermKeyCode::Delete => KeyCode {
-            kind: KeyCodeKind::Delete,
-        },
-        CrosstermKeyCode::Insert => KeyCode {
-            kind: KeyCodeKind::Noop,
-        },
-        CrosstermKeyCode::F(n) => KeyCode {
-            kind: KeyCodeKind::F(n),
-        },
-        CrosstermKeyCode::Null => KeyCode {
-            kind: KeyCodeKind::Noop,
-        },
-        CrosstermKeyCode::Esc => KeyCode {
-            kind: KeyCodeKind::Esc,
-        },
-        CrosstermKeyCode::CapsLock => KeyCode {
-            kind: KeyCodeKind::Noop,
-        },
-        CrosstermKeyCode::Menu => KeyCode {
-            kind: KeyCodeKind::Noop,
-        },
-        CrosstermKeyCode::ScrollLock => KeyCode {
-            kind: KeyCodeKind::Noop,
-        },
-        CrosstermKeyCode::Pause => KeyCode {
-            kind: KeyCodeKind::Noop,
-        },
-        CrosstermKeyCode::NumLock => KeyCode {
-            kind: KeyCodeKind::Noop,
-        },
-        CrosstermKeyCode::PrintScreen => KeyCode {
-            kind: KeyCodeKind::Noop,
-        },
-        CrosstermKeyCode::KeypadBegin => KeyCode {
-            kind: KeyCodeKind::Noop,
-        },
-        CrosstermKeyCode::Media(_) => KeyCode {
-            kind: KeyCodeKind::Noop,
-        },
-        CrosstermKeyCode::Modifier(_) => KeyCode {
-            kind: KeyCodeKind::Noop,
-        },
-    };
-
-    let mut mods = Modifiers::default();
-    if key.modifiers.contains(KeyModifiers::CONTROL) {
-        mods.ctrl = true;
-    }
-    if key.modifiers.contains(KeyModifiers::ALT) {
-        mods.alt = true;
-    }
-    if key.modifiers.contains(KeyModifiers::SHIFT) {
-        mods.shift = true;
-    }
-
-    KeyInput { code, mods }
-}
-
 /// Render the tab bar.
 fn render_tab_bar(
     frame: &mut Frame<'_>,
@@ -2748,6 +3890,7 @@ fn render_tab_bar(
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|| "untitled.md".to_string()),
             dirty: t.session.is_dirty(),
+            disk_changed: t.disk_change.marker().is_some(),
         })
         .collect();
 
@@ -2794,6 +3937,225 @@ mod tests {
             self.captures.lock().unwrap().push(text.to_string());
             Ok(())
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct FailingThemeSink {
+        calls: Arc<Mutex<Vec<(ThemeSlot, String)>>>,
+    }
+
+    impl ThemePersistenceSink for FailingThemeSink {
+        fn persist_theme(
+            &mut self,
+            slot: ThemeSlot,
+            name: &str,
+        ) -> Result<(), crate::config::ConfigPersistError> {
+            self.calls.lock().unwrap().push((slot, name.to_string()));
+            Err(crate::config::ConfigPersistError::Io("denied".to_string()))
+        }
+    }
+
+    #[test]
+    fn standalone_startup_options_use_the_public_config_fields() {
+        let config: crate::config::Config = toml::from_str(
+            "relative_line_numbers = true\n\
+             [editor]\nwrap = false\nwrap_width = 73\ncursor_shapes = false\n\
+             [clipboard]\ncopy_format = 'plain-text'\n\
+             [spell]\nenabled = false\nlanguage = 'en_CA'\n",
+        )
+        .unwrap();
+        let options = AppStartupOptions::from_config(&config);
+        assert_eq!(options.wrap_enabled, config.editor.wrap);
+        assert_eq!(options.wrap_width, config.editor.wrap_width);
+        assert_eq!(options.relative_line_numbers, config.relative_line_numbers);
+        assert_eq!(options.clipboard_copy_format, config.clipboard.copy_format);
+        assert_eq!(options.spell_enabled, config.spell.enabled);
+    }
+
+    #[test]
+    fn host_theme_change_restyles_without_calling_persistence() {
+        let mut app = test_app(EditorSession::from_text("hello"));
+        let sink = FailingThemeSink::default();
+        let calls = sink.calls.clone();
+        app.config_store = Box::new(sink);
+
+        assert!(matches!(
+            app.set_theme("nord"),
+            ThemeSetOutcome::Changed(ResolvedTheme { name, .. }) if name == "nord"
+        ));
+        assert_eq!(app.theme_name, "nord");
+        assert!(calls.lock().unwrap().is_empty());
+        assert_eq!(app.set_theme("nord"), ThemeSetOutcome::Unchanged);
+        assert_eq!(app.set_theme("default-light"), ThemeSetOutcome::Unavailable);
+        assert_eq!(app.theme_name, "nord");
+    }
+
+    #[test]
+    fn runtime_config_applies_safe_fields_to_existing_tabs() {
+        let mut app = test_app(EditorSession::from_text("hello"));
+        app.tabs
+            .push(TabEntry::new(EditorSession::from_text("second")));
+        let mut config = crate::config::Config::default();
+        config.editor.wrap = false;
+        config.editor.cursor_shapes = false;
+        config.relative_line_numbers = true;
+        config.clipboard.copy_format = ClipboardCopyFormat::PlainText;
+        config.spell.enabled = false;
+        config.theme.set_dark("nord".to_string());
+        let selection = crate::theme::ThemeSelection::new(
+            None,
+            crate::theme::DisplayMode::Dark,
+            crate::theme::Tier::Color16,
+        );
+
+        let change = app.apply_runtime_config(&config, &selection).unwrap();
+        assert_eq!(change.name, "nord");
+        assert_eq!(app.theme_name, "nord");
+        assert!(!app.wrap_enabled);
+        assert!(app.relative_line_numbers);
+        assert!(!app.cursor_shapes);
+        assert_eq!(app.clipboard_copy_format, ClipboardCopyFormat::PlainText);
+        assert!(!app.spell_enabled_default);
+        assert!(app.tabs.iter().all(|tab| !tab.session.spell_enabled()));
+        assert_eq!(app.wrap_width, crate::config::DEFAULT_WRAP_WIDTH);
+    }
+
+    #[test]
+    fn owned_frames_are_bounded_deterministic_and_report_visible_changes() {
+        let mut app = test_app(EditorSession::from_text("# Heading\n\n界 e\u{301} 🙂\n"));
+        let now = std::time::Instant::now();
+        for (width, height) in [
+            (0, 0),
+            (19, 4),
+            (20, 5),
+            (60, 20),
+            (80, 24),
+            (100, 30),
+            (200, 60),
+        ] {
+            let first = app.render_owned(width, height, now, AppRenderOptions::standalone(), None);
+            assert_eq!(first.cells.len(), usize::from(width) * usize::from(height));
+            assert!(first.changed);
+            if let Some(cursor) = first.cursor {
+                assert!(cursor.column < width && cursor.row < height);
+            }
+            let repeated = app.render_owned(
+                width,
+                height,
+                now,
+                AppRenderOptions::standalone(),
+                Some(&first),
+            );
+            assert!(!repeated.changed, "{width}x{height}");
+            assert!(repeated.visually_equals(&first));
+            if width == 19 {
+                let line = (0..width)
+                    .map(|column| repeated.cell(column, height / 2).unwrap().symbol.as_str())
+                    .collect::<String>();
+                assert!(line.contains("Pane too small"));
+            }
+        }
+    }
+
+    #[test]
+    fn owned_frame_focus_and_empty_state_are_pane_local() {
+        let mut app = test_app(EditorSession::from_text("hello\n"));
+        let now = std::time::Instant::now();
+        let focused = app.render_owned(80, 24, now, AppRenderOptions::standalone(), None);
+        assert_eq!(focused.cursor.unwrap().shape, crate::PaneCursorShape::Block);
+        app.set_focused(false);
+        let unfocused =
+            app.render_owned(80, 24, now, AppRenderOptions::standalone(), Some(&focused));
+        assert!(unfocused.cursor.is_none());
+        assert!(unfocused.changed);
+        app.handle_event_at(
+            &Event::Key(KeyEvent::new(
+                CrosstermKeyCode::Char('i'),
+                KeyModifiers::NONE,
+            )),
+            now,
+        );
+        assert_eq!(app.mode(), oom_edit_core::Mode::Normal);
+
+        app.tabs.clear();
+        let empty_lines = vec!["No notes yet".to_string()];
+        let empty = app.render_owned(
+            20,
+            5,
+            now,
+            AppRenderOptions {
+                inline_hints: false,
+                always_tab_bar: true,
+                empty_state_lines: &empty_lines,
+            },
+            None,
+        );
+        assert!(empty.cursor.is_none());
+        let body = (0..empty.width)
+            .map(|column| empty.cell(column, 1).unwrap().symbol.as_str())
+            .collect::<String>();
+        assert!(body.starts_with("No notes yet"));
+        assert_eq!(empty.cell(0, 1).unwrap().symbol, "N");
+    }
+
+    #[test]
+    fn owned_cursor_shapes_and_editor_line_follow_mode_and_presentation_options() {
+        let mut app = test_app(EditorSession::from_text("hello\n"));
+        let now = std::time::Instant::now();
+        let render = |app: &mut App, inline_hints| {
+            app.render_owned(
+                80,
+                24,
+                now,
+                AppRenderOptions {
+                    inline_hints,
+                    always_tab_bar: false,
+                    empty_state_lines: &[],
+                },
+                None,
+            )
+        };
+        let inline = render(&mut app, true);
+        let embedded = render(&mut app, false);
+        assert_eq!(inline.cursor.unwrap().shape, crate::PaneCursorShape::Block);
+        let row_text = |frame: &PaneFrame| {
+            (0..frame.width)
+                .map(|column| {
+                    frame
+                        .cell(column, frame.height - 1)
+                        .unwrap()
+                        .symbol
+                        .as_str()
+                })
+                .collect::<String>()
+        };
+        assert_ne!(row_text(&inline), row_text(&embedded));
+        assert!(row_text(&embedded).contains("(new)"));
+
+        let press = |app: &mut App, key| {
+            app.handle_event_at(&Event::Key(KeyEvent::new(key, KeyModifiers::NONE)), now);
+        };
+        press(&mut app, CrosstermKeyCode::Char('i'));
+        assert_eq!(
+            render(&mut app, false).cursor.unwrap().shape,
+            crate::PaneCursorShape::Bar
+        );
+        press(&mut app, CrosstermKeyCode::Esc);
+        press(&mut app, CrosstermKeyCode::Char('v'));
+        assert_eq!(
+            render(&mut app, false).cursor.unwrap().shape,
+            crate::PaneCursorShape::Underscore
+        );
+        press(&mut app, CrosstermKeyCode::Esc);
+        press(&mut app, CrosstermKeyCode::Char(':'));
+        let command = render(&mut app, false);
+        assert_eq!(command.cursor.unwrap().shape, crate::PaneCursorShape::Bar);
+        assert!(row_text(&command).contains(':'));
+        app.cursor_shapes = false;
+        assert_eq!(
+            render(&mut app, false).cursor.unwrap().shape,
+            crate::PaneCursorShape::Block
+        );
     }
 
     /// Create a test App with a recording clipboard sink.
@@ -4400,6 +5762,163 @@ mod tests {
         app
     }
 
+    #[test]
+    fn prepared_close_save_fault_never_prepares_or_closes_a_retained_buffer() {
+        struct Reject(oom_edit_core::SaveBoundary);
+        impl oom_edit_core::SaveObserver for Reject {
+            fn observe(
+                &mut self,
+                boundary: oom_edit_core::SaveBoundary,
+                _: &std::path::Path,
+            ) -> Result<(), oom_edit_core::DiskIoError> {
+                if boundary == self.0 {
+                    Err(oom_edit_core::DiskIoError::new(
+                        oom_edit_core::DiskIoErrorKind::Other,
+                        "injected prerequisite save failure",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        for boundary in [
+            oom_edit_core::SaveBoundary::BeforeReplace,
+            oom_edit_core::SaveBoundary::ConfirmDurability,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("one.md");
+            let mut app = file_backed_app(dir.path(), &[("one.md", "original\n")]);
+            dirty_tab(&mut app, 0, "memory ");
+            app.save_observer = Some(Box::new(Reject(boundary)));
+            let mut pane = crate::EditorPane::from_app_for_test(app);
+            let tab = pane.active_tab().unwrap();
+            pane.drain_events();
+            let request = pane.prepare_close(std::slice::from_ref(&tab)).unwrap();
+            pane.handle_input(
+                crate::PaneInput::Key(KeyInput {
+                    code: KeyCode {
+                        kind: KeyCodeKind::Char('y'),
+                    },
+                    mods: Modifiers::default(),
+                }),
+                Instant::now(),
+            );
+            assert!(pane.take_prepared_close(&request).is_err());
+            assert_eq!(pane.tabs().len(), 1);
+            assert!(pane.tabs()[0].dirty);
+            assert_eq!(pane.text(&tab).unwrap(), "memory original\n");
+            let events = pane.drain_events();
+            assert_eq!(events.iter().filter(|event| matches!(event, PaneEvent::Failed { request: id, .. } | PaneEvent::DiskWriteCommitted { request: id, .. } if id == &request)).count(), 1);
+            assert!(!events.iter().any(|event| matches!(
+                event,
+                PaneEvent::PreparedClose { .. }
+                    | PaneEvent::Saved { .. }
+                    | PaneEvent::Closed { .. }
+            )));
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap(),
+                if boundary == oom_edit_core::SaveBoundary::BeforeReplace {
+                    "original\n"
+                } else {
+                    "memory original\n"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn save_and_copy_faults_never_publish_saved_or_close_a_retained_buffer() {
+        struct Reject(oom_edit_core::SaveBoundary);
+        impl oom_edit_core::SaveObserver for Reject {
+            fn observe(
+                &mut self,
+                boundary: oom_edit_core::SaveBoundary,
+                _: &std::path::Path,
+            ) -> Result<(), oom_edit_core::DiskIoError> {
+                if boundary == self.0 {
+                    Err(oom_edit_core::DiskIoError::new(
+                        oom_edit_core::DiskIoErrorKind::Other,
+                        "injected save boundary failure",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        for boundary in [
+            oom_edit_core::SaveBoundary::BeforeReplace,
+            oom_edit_core::SaveBoundary::ConfirmDurability,
+        ] {
+            for copy in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let mut app = file_backed_app(dir.path(), &[("one.md", "original\n")]);
+                let copy_path = dir.path().join("copy.md");
+                if copy {
+                    std::fs::write(&copy_path, "original\n").unwrap();
+                }
+                let target = if copy {
+                    copy_path.clone()
+                } else {
+                    dir.path().join("one.md")
+                };
+                dirty_tab(&mut app, 0, "memory ");
+                let tab = app.active_tab_id().unwrap();
+                app.lifecycle_events.clear();
+                app.save_observer = Some(Box::new(Reject(boundary)));
+                app.execute_lifecycle(LifecycleAction::Save(SaveRequest {
+                    target: 0,
+                    path: copy.then_some(copy_path),
+                    force: false,
+                    retarget: !copy,
+                    continuation: if copy {
+                        SaveContinuation::StayOpen
+                    } else {
+                        SaveContinuation::CloseSavedTab
+                    },
+                }));
+                assert_eq!(app.tab_count(), 1);
+                assert_eq!(app.active_tab_id(), Some(tab));
+                assert_eq!(app.tabs[0].session.document(), "memory original\n");
+                assert!(app.tabs[0].session.is_dirty());
+                assert!(!app.lifecycle_events.iter().any(|event| matches!(
+                    event,
+                    PaneEvent::Saved { .. }
+                        | PaneEvent::SavedCopy { .. }
+                        | PaneEvent::Closed { .. }
+                        | PaneEvent::Completed { .. }
+                )));
+                if boundary == oom_edit_core::SaveBoundary::BeforeReplace {
+                    assert_eq!(std::fs::read_to_string(&target).unwrap(), "original\n");
+                    assert!(matches!(
+                        &app.lifecycle_events[..],
+                        [PaneEvent::Failed { .. }]
+                    ));
+                } else {
+                    assert_eq!(
+                        std::fs::read_to_string(&target).unwrap(),
+                        "memory original\n"
+                    );
+                    assert!(matches!(
+                        &app.lifecycle_events[..],
+                        [PaneEvent::DiskWriteCommitted { .. }]
+                    ));
+                    assert!(matches!(
+                        app.tabs[0].session.disk_state(),
+                        oom_edit_core::DiskState::Unchanged { .. }
+                    ));
+                }
+                if copy {
+                    assert_eq!(
+                        std::fs::read_to_string(dir.path().join("one.md")).unwrap(),
+                        "original\n"
+                    );
+                }
+                press(&mut app, CrosstermKeyCode::Char('u'));
+                assert_eq!(app.tabs[0].session.document(), "original\n");
+            }
+        }
+    }
+
     fn dirty_tab(app: &mut App, index: usize, inserted: &str) {
         let session = &mut app.tabs[index].session;
         session.render_layout(74);
@@ -4430,7 +5949,7 @@ mod tests {
 
     #[test]
     fn tabnew_resolves_relative_and_absolute_paths_from_launch_directory() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         std::fs::create_dir(dir.path().join("examples")).unwrap();
         let relative_target = dir.path().join("examples/kitchen-sink.md");
         let absolute_target = dir.path().join("absolute file.md");
@@ -4453,6 +5972,40 @@ mod tests {
         assert_eq!(
             app.session().unwrap().path(),
             Some(absolute_target.as_path())
+        );
+    }
+
+    #[test]
+    fn standalone_tabnew_keeps_duplicate_file_tabs() {
+        let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let path = dir.path().join("same.md");
+        std::fs::write(&path, "original\n").unwrap();
+        let mut app = file_backed_app(dir.path(), &[("same.md", "original\n")]);
+
+        type_ex(&mut app, &format!("tabnew {}", path.display()));
+        assert_eq!(app.tab_count(), 2);
+        assert_eq!(app.active_tab, 1);
+        assert_eq!(app.tabs[0].session.path(), Some(path.as_path()));
+        assert_eq!(app.tabs[1].session.path(), Some(path.as_path()));
+
+        dirty_tab(&mut app, 1, "changed ");
+        assert_eq!(app.tabs[0].session.document(), "original\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original\n");
+    }
+
+    #[test]
+    fn standalone_wqa_is_not_an_ex_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = file_backed_app(dir.path(), &[("same.md", "original\n")]);
+        dirty_tab(&mut app, 0, "changed ");
+
+        type_ex(&mut app, "wqa");
+        assert!(!app.should_quit);
+        assert_eq!(app.tab_count(), 1);
+        assert!(app.tabs[0].session.is_dirty());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("same.md")).unwrap(),
+            "original\n"
         );
     }
 
@@ -4575,6 +6128,84 @@ mod tests {
         let key = KeyEvent::new(CrosstermKeyCode::F(5), KeyModifiers::NONE);
         let core = crossterm_key_to_core(&key);
         assert_eq!(core.code.kind, KeyCodeKind::F(5));
+    }
+
+    #[test]
+    fn terminal_key_vectors_cover_legacy_and_enhanced_equivalence() {
+        use crossterm::event::KeyEventKind;
+
+        let code = |value: &str| match value {
+            "Esc" => CrosstermKeyCode::Esc,
+            "Tab" => CrosstermKeyCode::Tab,
+            "Enter" => CrosstermKeyCode::Enter,
+            "Backspace" => CrosstermKeyCode::Backspace,
+            "BackTab" => CrosstermKeyCode::BackTab,
+            "Char:[" => CrosstermKeyCode::Char('['),
+            "Char:i" => CrosstermKeyCode::Char('i'),
+            "Char:m" => CrosstermKeyCode::Char('m'),
+            "Char:h" => CrosstermKeyCode::Char('h'),
+            "Char:I" => CrosstermKeyCode::Char('I'),
+            "Char:V" => CrosstermKeyCode::Char('V'),
+            "Char:c" => CrosstermKeyCode::Char('c'),
+            _ => panic!("unknown vector code: {value}"),
+        };
+        let mods = |value: &str| match value {
+            "none" => KeyModifiers::NONE,
+            "ctrl" => KeyModifiers::CONTROL,
+            "shift" => KeyModifiers::SHIFT,
+            "ctrl_alt" => KeyModifiers::CONTROL | KeyModifiers::ALT,
+            _ => panic!("unknown vector modifiers: {value}"),
+        };
+        let expected_code = |value: &str| match value {
+            "Esc" => KeyCodeKind::Esc,
+            "Tab" => KeyCodeKind::Tab,
+            "Enter" => KeyCodeKind::Enter,
+            "Backspace" => KeyCodeKind::Backspace,
+            "BackTab" => KeyCodeKind::BackTab,
+            "Char:I" => KeyCodeKind::Char('I'),
+            "Char:V" => KeyCodeKind::Char('V'),
+            "Char:c" => KeyCodeKind::Char('c'),
+            _ => panic!("unknown expected code: {value}"),
+        };
+        let vectors = include_str!("../tests/data/terminal_keys.tsv");
+        for enhancement in [false, true] {
+            let mut count = 0;
+            for line in vectors.lines().filter(|line| !line.starts_with('#')) {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                assert_eq!(fields.len(), 6, "enhancement={enhancement}: {line}");
+                let kind = match fields[2] {
+                    "Press" => KeyEventKind::Press,
+                    "Repeat" => KeyEventKind::Repeat,
+                    "Release" => KeyEventKind::Release,
+                    _ => panic!("unknown event kind: {}", fields[2]),
+                };
+                let event = KeyEvent::new_with_kind(code(fields[0]), mods(fields[1]), kind);
+                let translated = crossterm_key_to_core(&event);
+                assert_eq!(translated.code.kind, expected_code(fields[3]), "{line}");
+                assert_eq!(
+                    translated.mods.ctrl,
+                    mods(fields[4]).contains(KeyModifiers::CONTROL),
+                    "{line}"
+                );
+                assert_eq!(
+                    translated.mods.alt,
+                    mods(fields[4]).contains(KeyModifiers::ALT),
+                    "{line}"
+                );
+                assert_eq!(
+                    translated.mods.shift,
+                    mods(fields[4]).contains(KeyModifiers::SHIFT),
+                    "{line}"
+                );
+                assert_eq!(
+                    crate::event::accepts_key_event(kind),
+                    fields[5] == "yes",
+                    "{line}"
+                );
+                count += 1;
+            }
+            assert_eq!(count, 17, "the shared keyboard vector inventory changed");
+        }
     }
 
     #[test]
@@ -6397,7 +8028,7 @@ mod tests {
 
     #[test]
     fn palette_ex_templates_prefill_editable_paths_and_cancel_cleanly() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let first = dir.path().join("first.md");
         let second = dir.path().join("second.md");
         let third = dir.path().join("third.md");
@@ -6408,7 +8039,9 @@ mod tests {
 
         open_palette_with_space_h(&mut app);
         type_chars(&mut app, ":e {path}".chars());
-        for _ in 0..crate::command::COMMANDS.len() + crate::overlay::palette::VIM_REFERENCE.len() {
+        for _ in 0..crate::command::registry::primary_commands().count()
+            + crate::command::registry::reference_presentations().len()
+        {
             if app.overlay.selected_action() == Some(PaletteAction::ExPrefill("e ")) {
                 break;
             }
@@ -6428,7 +8061,9 @@ mod tests {
 
         open_palette_with_space_h(&mut app);
         type_chars(&mut app, ":tabnew {path}".chars());
-        for _ in 0..crate::command::COMMANDS.len() + crate::overlay::palette::VIM_REFERENCE.len() {
+        for _ in 0..crate::command::registry::primary_commands().count()
+            + crate::command::registry::reference_presentations().len()
+        {
             if app.overlay.selected_action() == Some(PaletteAction::ExPrefill("tabnew ")) {
                 break;
             }
@@ -6623,7 +8258,7 @@ mod tests {
         let session = EditorSession::from_text("hello");
         let mut app = test_app(session);
         let temp_dir = tempfile::tempdir().unwrap();
-        app.config_store = Box::new(crate::config::FileConfigStore::new(
+        app.config_store = Box::new(crate::config::FileThemeSink::new(
             temp_dir.path().join("oom-edit/config.toml"),
         ));
 
@@ -6642,6 +8277,23 @@ mod tests {
     }
 
     #[test]
+    fn theme_cycle_calls_sink_once_and_shows_persistence_failure_in_editor() {
+        let mut app = test_app(EditorSession::from_text("hello"));
+        let sink = FailingThemeSink::default();
+        let calls = sink.calls.clone();
+        app.config_store = Box::new(sink);
+        app.execute_command(AppCommand::CycleTheme);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[(ThemeSlot::Dark, "catppuccin-mocha".to_string())]
+        );
+        let message = app.transient.as_ref().unwrap();
+        assert!(message.text.contains("not saved"));
+        assert!(message.text.contains("denied"));
+        assert_eq!(message.severity, oom_edit_core::Severity::Warning);
+    }
+
+    #[test]
     fn generic_test_app_cannot_persist_config() {
         let mut app = test_app(EditorSession::from_text("hello"));
         let original = app.theme_name.clone();
@@ -6651,11 +8303,11 @@ mod tests {
             .transient
             .as_ref()
             .is_some_and(|message| message.text.contains("theme:")));
-        // `test_app` injects DisabledConfigStore, whose save operation has no
+        // `test_app` injects DisabledConfigStore, whose theme sink has no
         // filesystem path and therefore cannot resolve the production config.
         assert!(app
             .config_store
-            .save(&crate::config::Config::default())
+            .persist_theme(crate::config::ThemeSlot::Dark, "default-dark")
             .is_ok());
     }
 
@@ -6710,7 +8362,7 @@ mod tests {
                 initial_config.editor.wrap,
                 initial_config.relative_line_numbers,
                 Box::new(RecordingClipboardSink::default()),
-                Box::new(crate::config::FileConfigStore::new(config_path.clone())),
+                Box::new(crate::config::FileThemeSink::new(config_path.clone())),
                 std::time::Instant::now(),
             );
 
@@ -6719,9 +8371,13 @@ mod tests {
             let persisted = crate::config::Config::load_from_path(&config_path);
             let mut expected_config = initial_config.clone();
             if case.is_light {
-                expected_config.theme.light = case.expected_theme.to_string();
+                expected_config
+                    .theme
+                    .set_light(case.expected_theme.to_string());
             } else {
-                expected_config.theme.dark = case.expected_theme.to_string();
+                expected_config
+                    .theme
+                    .set_dark(case.expected_theme.to_string());
             }
             assert_eq!(app.theme_name, case.expected_theme, "{}", case.name);
             assert_eq!(persisted, expected_config, "{}", case.name);
@@ -6808,7 +8464,7 @@ mod tests {
                 AppStartupOptions::new(true, false, ClipboardCopyFormat::Markdown, true),
                 AppServices::new(
                     Box::new(RecordingClipboardSink::default()),
-                    Box::new(crate::config::FileConfigStore::new(config_path.clone())),
+                    Box::new(crate::config::FileThemeSink::new(config_path.clone())),
                     SpellHost::testing("custom\ntheme\n"),
                     PathBuf::from("/"),
                 ),
@@ -6878,7 +8534,7 @@ mod tests {
                 true,
                 false,
                 Box::new(RecordingClipboardSink::default()),
-                Box::new(crate::config::FileConfigStore::new(config_path.clone())),
+                Box::new(crate::config::FileThemeSink::new(config_path.clone())),
                 std::time::Instant::now(),
             );
 
@@ -6887,9 +8543,9 @@ mod tests {
             let persisted = crate::config::Config::load_from_path(&config_path);
             let mut expected_config = initial_config.clone();
             if resolved.is_light() {
-                expected_config.theme.light = expected_theme.to_string();
+                expected_config.theme.set_light(expected_theme.to_string());
             } else {
-                expected_config.theme.dark = expected_theme.to_string();
+                expected_config.theme.set_dark(expected_theme.to_string());
             }
             assert_eq!(app.theme_name, expected_theme, "{mode} mode");
             assert_eq!(persisted, expected_config, "{mode} mode");
@@ -7332,7 +8988,7 @@ mod tests {
 
     #[test]
     fn reload_all_commits_every_tab_and_preserves_identity_and_active_index() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let mut app = file_backed_app(dir.path(), &[("one.md", "one\n"), ("two.md", "two\n")]);
         app.active_tab = 1;
         dirty_tab(&mut app, 0, "dirty ");
@@ -7682,7 +9338,7 @@ mod tests {
 
     #[test]
     fn overwrite_reload_targets_original_tab_and_resets_scroll() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let target = dir.path().join("target.md");
         let mut app = file_backed_app(
             dir.path(),

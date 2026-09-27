@@ -210,7 +210,10 @@ for literal in \
 done
 
 require_literal "$ARGS_FILE" '"--licenses"'
-require_literal "$ARGS_FILE" 'include_str!("../../../THIRD-PARTY-NOTICES.md")'
+require_literal "$ARGS_FILE" 'include_str!("../assets/THIRD-PARTY-NOTICES.md")'
+require_literal "$ROOT_DIR/crates/oom-edit/src/lib.rs" 'include_str!("../assets/THIRD-PARTY-NOTICES.md")'
+cmp -s "$NOTICE_FILE" "$ROOT_DIR/crates/oom-edit/assets/THIRD-PARTY-NOTICES.md" ||
+    fail 'crate-local notices must exactly match the canonical root notices (make sync-notices)'
 
 for literal in \
     'retrieved = "2026-08-25"' \

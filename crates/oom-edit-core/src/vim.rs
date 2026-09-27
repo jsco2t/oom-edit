@@ -134,6 +134,7 @@ impl ProjectedSelection {
 struct ClipboardCapturingHost {
     inner: DefaultHost,
     pending_writes: Vec<String>,
+    host_time_override: Option<core::time::Duration>,
 }
 
 impl ClipboardCapturingHost {
@@ -141,11 +142,16 @@ impl ClipboardCapturingHost {
         Self {
             inner: DefaultHost::new(),
             pending_writes: Vec::new(),
+            host_time_override: None,
         }
     }
 
     fn take_clipboard_writes(&mut self) -> Vec<String> {
         std::mem::take(&mut self.pending_writes)
+    }
+
+    fn set_host_time(&mut self, now: Option<core::time::Duration>) {
+        self.host_time_override = now;
     }
 }
 
@@ -162,7 +168,7 @@ impl Host for ClipboardCapturingHost {
     }
 
     fn now(&self) -> core::time::Duration {
-        self.inner.now()
+        self.host_time_override.unwrap_or_else(|| self.inner.now())
     }
 
     fn prompt_search(&mut self) -> Option<String> {
@@ -340,6 +346,10 @@ pub(crate) struct VimCore {
 }
 
 impl VimCore {
+    pub(crate) fn set_host_time(&mut self, now: Option<core::time::Duration>) {
+        self.editor.host_mut().set_host_time(now);
+    }
+
     /// Create a new `VimCore` from initial text. Starts in Normal mode.
     pub(crate) fn new(text: &str) -> Self {
         let view = View::from_str(text);
@@ -595,7 +605,15 @@ impl VimCore {
     }
 
     pub(crate) fn has_pending_input(&self) -> bool {
-        self.hjkl_state().pending != HjklPending::None
+        let state = self.hjkl_state();
+        state.pending != HjklPending::None
+            || state.count != 0
+            || state.pending_register.is_some()
+            || state.insert_pending_register
+    }
+
+    pub(crate) fn clear_pending_input(&mut self) {
+        self.hjkl_state_mut().clear_pending_prefix();
     }
 
     fn hjkl_state_mut(&mut self) -> &mut HjklVimState {
@@ -1225,14 +1243,11 @@ impl VimCore {
         // Convert col (character index) to byte offset within the line
         let byte_offset: usize = current_line.chars().take(col).map(|c| c.len_utf8()).sum();
 
-        // Calculate global byte offset
-        let mut global_offset = 0;
-        for i in 0..line {
+        // Resolve the line start through the rope index, without copying prior lines.
+        let global_offset = {
             let rope = buffer.rope();
-            let l = hjkl_buffer::rope_line_str(&rope, i);
-            global_offset += l.len() + 1; // +1 for newline
-        }
-        global_offset += byte_offset;
+            rope.line_to_byte(line) + byte_offset
+        };
 
         // Insert the text at the byte offset
         let full_text = buffer.as_string();
@@ -2388,6 +2403,21 @@ mod private_conformance_tests {
         let mut vim = VimCore::new("one\ntwo\nthree\nfour");
         feed(&mut vim, "Ggg3G2gg");
         assert_eq!(vim.cursor().0, 1);
+    }
+
+    #[test]
+    fn injected_host_time_controls_native_prefix_timeout() {
+        let mut vim = VimCore::new("one\ntwo\nthree\n");
+        vim.jump_to(2, 0);
+        vim.set_host_time(Some(core::time::Duration::from_millis(0)));
+        vim.handle_key(key('g'));
+        vim.set_host_time(Some(core::time::Duration::from_secs(2)));
+        vim.handle_key(key('g'));
+        assert_eq!(vim.cursor().0, 2, "the first g expired before the second");
+        vim.set_host_time(Some(core::time::Duration::from_millis(2100)));
+        vim.handle_key(key('g'));
+        assert_eq!(vim.cursor().0, 0);
+        vim.set_host_time(None);
     }
 
     #[test]

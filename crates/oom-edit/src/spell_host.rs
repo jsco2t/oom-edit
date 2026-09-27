@@ -57,10 +57,10 @@ pub(crate) struct WordlistResolution {
 }
 
 /// Select the built-in dialect and resolve additional paths relative to the
-/// directory containing `config.toml`.
+/// host-supplied configuration base directory.
 pub(crate) fn resolve_wordlist_source(
     config: &SpellConfig,
-    config_path: &Path,
+    base_directory: &Path,
 ) -> WordlistResolution {
     let (builtin, warning) = match config.language.as_str() {
         "en_US" => (EN_US, None),
@@ -73,10 +73,6 @@ pub(crate) fn resolve_wordlist_source(
             )),
         ),
     };
-    let config_directory = config_path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
     let additional_dictionaries = config
         .additional_dictionaries
         .iter()
@@ -84,7 +80,7 @@ pub(crate) fn resolve_wordlist_source(
             if path.is_absolute() {
                 path.clone()
             } else {
-                config_directory.join(path)
+                base_directory.join(path)
             }
         })
         .collect();
@@ -1031,7 +1027,7 @@ mod tests {
                 PathBuf::from("later.txt"),
             ],
         };
-        let resolved = resolve_wordlist_source(&config, Path::new("/tmp/config/config.toml"));
+        let resolved = resolve_wordlist_source(&config, Path::new("/tmp/config"));
         assert!(resolved.warning.is_none());
         assert!(resolved.source.builtin.contains("colour"));
         assert_eq!(
@@ -1055,7 +1051,7 @@ mod tests {
                 language: language.to_string(),
                 ..SpellConfig::default()
             };
-            let resolved = resolve_wordlist_source(&config, Path::new("config.toml"));
+            let resolved = resolve_wordlist_source(&config, Path::new("."));
             let entries: Vec<_> = resolved.source.builtin.lines().collect();
             assert!(entries.contains(&present), "{language} lacks {present}");
             assert!(
@@ -1068,7 +1064,7 @@ mod tests {
             language: "xx_YY".to_string(),
             ..SpellConfig::default()
         };
-        let resolved = resolve_wordlist_source(&config, Path::new("config.toml"));
+        let resolved = resolve_wordlist_source(&config, Path::new("."));
         assert!(resolved.source.builtin.lines().any(|line| line == "color"));
         assert_eq!(
             resolved.warning.as_deref(),
@@ -1290,6 +1286,21 @@ mod tests {
             drain_personal_store(&mut store).unwrap(),
             ["apple", "zebra"]
         );
+    }
+
+    #[test]
+    fn production_personal_dictionary_uses_the_supplied_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let configuration_base = directory.path().join("configuration");
+        let personal_path = directory.path().join("elsewhere").join("mine.words");
+        fs::create_dir_all(&configuration_base).unwrap();
+        let mut host =
+            SpellHost::production(WordlistSource::testing("known\n"), personal_path.clone());
+        drain(&mut host);
+        assert_eq!(host.phase(), HostPhase::Ready);
+        host.add_personal_word("customword").unwrap();
+        assert_eq!(fs::read_to_string(&personal_path).unwrap(), "customword\n");
+        assert!(!configuration_base.join("dictionary.txt").exists());
     }
 
     #[test]

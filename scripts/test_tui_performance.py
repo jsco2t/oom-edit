@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import tui_performance as perf
 
@@ -44,6 +45,41 @@ def evidence(
 
 
 class TuiPerformanceTests(unittest.TestCase):
+    def test_make_baseline_capture_preserves_the_active_worktree(self):
+        makefile = (Path(__file__).resolve().parents[1] / "Makefile").read_text()
+        preparation = makefile.split("tui-perf-baseline-prepare:", 1)[1].split(".PHONY:", 1)[0]
+        self.assertIn('test -n "$(BASELINE_DIR)"', preparation)
+        self.assertIn('test -n "$(BASELINE_REV)"', preparation)
+        self.assertIn('git clone --local --no-hardlinks --no-checkout "$(CURDIR)" "$(BASELINE_DIR)"', preparation)
+        self.assertIn('git -C "$(BASELINE_DIR)" checkout --detach "$(BASELINE_REV)"', preparation)
+        self.assertNotIn("reset", preparation)
+        self.assertIn('--root "$(PERF_ROOT)" record', makefile)
+
+    def test_missing_system_time_uses_direct_process_measurement(self):
+        executable = Path("/tmp/perf-case")
+        with mock.patch.object(perf.Path, "is_file", return_value=False):
+            self.assertEqual(perf._timing_command(executable), [str(executable)])
+        with mock.patch.object(perf.Path, "is_file", return_value=True):
+            command = perf._timing_command(executable)
+        self.assertEqual(command[0], "/usr/bin/time")
+        self.assertEqual(command[-1], str(executable))
+
+    def test_baseline_can_record_preexisting_absolute_failure_but_candidate_cannot(self):
+        baseline = evidence("baseline")
+        failing = next(row for row in baseline if row["case"] == "source-first-frame")
+        failing["status"] = "fail-absolute-limit"
+        candidate = evidence("candidate")
+        self.assertTrue(perf.compare_records(baseline, candidate))
+        self.assertEqual(perf.record_failure_count("baseline", baseline), 1)
+        failing_candidate = next(
+            row for row in candidate if row["case"] == "source-first-frame"
+        )
+        failing_candidate["status"] = "fail-absolute-limit"
+        with self.assertRaisesRegex(perf.EvidenceError, "did not pass"):
+            perf.compare_records(baseline, candidate)
+        self.assertEqual(perf.record_failure_count("candidate", candidate), 1)
+
+
     def test_tsv_v1_round_trips_fixed_columns_and_rejects_control_characters(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "evidence.tsv"

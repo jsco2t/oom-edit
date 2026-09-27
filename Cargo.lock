@@ -1013,7 +1013,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "oom-edit"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "crossterm",
  "libc",
@@ -1027,7 +1027,7 @@ dependencies = [
 
 [[package]]
 name = "oom-edit-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "gray_matter",
  "hjkl-buffer",
@@ -1036,6 +1036,7 @@ dependencies = [
  "oom-spell",
  "proptest",
  "pulldown-cmark",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "tree-sitter",

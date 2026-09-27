@@ -49,6 +49,20 @@ fn cargo_tree_output() -> String {
 }
 
 #[test]
+fn paste_byte_offsets_use_the_rope_index() {
+    let source = include_str!("../src/vim.rs");
+    let paste = source
+        .split("pub(crate) fn insert_text(&mut self, text: &str)")
+        .nth(1)
+        .expect("paste implementation")
+        .split("/// Apply the engine's right-to-left multi-split operation")
+        .next()
+        .unwrap();
+    assert!(paste.contains("rope.line_to_byte(line)"));
+    assert!(!paste.contains("for i in 0..line"));
+}
+
+#[test]
 fn workspace_is_exactly_three_crates_with_the_spell_dependency_diamond() {
     let root = workspace_root();
     let workspace = std::fs::read_to_string(root.join("Cargo.toml"))
@@ -70,12 +84,16 @@ fn workspace_is_exactly_three_crates_with_the_spell_dependency_diamond() {
         "workspace membership must have one source of truth"
     );
     assert!(
-        tui.contains("oom-edit-core = { path = \"../oom-edit-core\", version = \"=0.5.0\" }"),
+        tui.contains("oom-edit-core = { path = \"../oom-edit-core\", version = \"=0.6.0\" }"),
         "TUI must depend directly on the exact-pinned core crate"
     );
     assert!(
         core.contains("oom-spell = { path = \"../oom-spell\", version = \"=0.1.0\" }"),
         "core must depend directly on the exact-pinned spell crate"
+    );
+    assert!(
+        core.contains("sha2 = \"=0.10.9\""),
+        "content-validated disk versions must use the reviewed exact-pinned hash crate"
     );
     assert!(
         tui.contains("oom-spell = { path = \"../oom-spell\", version = \"=0.1.0\" }"),
@@ -131,6 +149,23 @@ fn renderer_implementation_module_is_not_public_api() {
     let lib_src = include_str!("../src/lib.rs");
     assert!(!lib_src.contains("pub mod rendered;"));
     assert!(!lib_src.contains("pub use rendered::"));
+}
+
+#[test]
+fn markdown_generated_parsers_respect_optimized_cargo_profiles() {
+    let root = workspace_root().join("patches/tree-sitter-md");
+    let build = std::fs::read_to_string(root.join("bindings/rust/build.rs")).unwrap();
+    assert!(build.contains("std::env::var(\"OPT_LEVEL\").unwrap() != \"0\""));
+    assert!(build.contains("c_config.define(\"TREE_SITTER_MD_OPTIMIZED_BUILD\", None)"));
+    for grammar in ["tree-sitter-markdown", "tree-sitter-markdown-inline"] {
+        let parser = std::fs::read_to_string(root.join(grammar).join("src/parser.c")).unwrap();
+        let optimization = parser.split("#define LANGUAGE_VERSION").next().unwrap();
+        assert!(optimization.contains("#ifndef TREE_SITTER_MD_OPTIMIZED_BUILD"));
+        assert!(optimization.contains("#pragma optimize(\"\", off)"));
+        assert!(optimization.contains("#pragma clang optimize off"));
+        assert!(optimization.contains("#pragma GCC optimize (\"O0\")"));
+        assert!(optimization.ends_with("#endif\n#endif\n\n"));
+    }
 }
 
 #[test]

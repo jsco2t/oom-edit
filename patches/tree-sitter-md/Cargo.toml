@@ -23,8 +23,9 @@ include = [
     "tree-sitter-markdown-inline/grammar.js",
     "tree-sitter-markdown/queries/*",
     "tree-sitter-markdown-inline/queries/*",
-    "common/grammar.js",
+    "common/common.js",
     "common/html_entities.json",
+    "tree-sitter.json",
 ]
 autolib = false
 autobins = false

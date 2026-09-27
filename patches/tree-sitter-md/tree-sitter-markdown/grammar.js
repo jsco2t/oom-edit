@@ -389,7 +389,10 @@ module.exports = grammar({
             optional($.block_continuation)
         ),
         // Some symbols get parsed as single tokens so that html blocks get detected properly
-        _line: $ => prec.right(repeat1(choice($._word, $._whitespace, common.punctuation_without($, [])))),
+        _line: $ => choice(
+            $._fast_prose_line,
+            prec.right(repeat1(choice($._word, $._whitespace, common.punctuation_without($, []))))
+        ),
         _word: $ => choice(
             new RegExp('[^' + PUNCTUATION_CHARACTERS_REGEX + ' \\t\\n\\r]+'),
             common.EXTENSION_TASK_LIST ? choice(
@@ -580,6 +583,7 @@ module.exports = grammar({
 
         $._pipe_table_start,
         $._pipe_table_line_ending,
+        $._fast_prose_line,
     ],
     precedences: $ => [
         [$._setext_heading1, $._block],

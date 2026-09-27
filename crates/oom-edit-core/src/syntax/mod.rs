@@ -1728,6 +1728,96 @@ mod tests {
     }
 
     #[test]
+    fn prose_batching_preserves_named_tree_ranges_and_complete_highlighting() {
+        use sha2::{Digest, Sha256};
+        use std::fmt::Write;
+
+        fn record(node: tree_sitter::Node<'_>, output: &mut String) {
+            if node.is_named() {
+                writeln!(
+                    output,
+                    "{} {:?} {:?}",
+                    node.kind(),
+                    node.byte_range(),
+                    node.range()
+                )
+                .unwrap();
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                record(child, output);
+            }
+        }
+
+        let cases = [
+            "Ordinary words *emphasis* **strong** `code` λ &amp; \\* literal.\n\nNext words here.\n",
+            "Title words with *emphasis*\n===\n\nSecond title\n---\n",
+            "First line *starts\nand ends* on the second line.  \nThird line.\n",
+            "Header words | second\n--- | ---\ncell words | other words\n",
+            "Ordinary escaped \\| pipe.\n\nNot a table | words\n\nNext paragraph.\n",
+            "[id]:\nurl/path \"title words\"\n\nLinked [words][id].\n",
+            "[id]: /path\n  \"second line title words\"\n\nNormal words.\n",
+            "[unfinished reference words]\nNormal words on next line.\n\nPlain [link](url) and ![image](image).\n",
+            "# Heading words\n\n- list words\n  continued words\n\n> quote words\n> next words\n",
+            "```rust extra words\nfn main() {}\n\nOther raw words\n```\n\nPlain words.\n",
+            "---\ntitle: Words here\n---\n\nFirst prose words.\n",
+            "<script>\nfirst words\n\nsecond words\n</script>\n\nPlain words.\n",
+            "First CRLF words.\r\n\r\nSecond CRLF words.\r\n",
+            "λ first Unicode words.\n\nAlpha e\u{301} and 世界 words.\n",
+        ];
+        let mut output = String::new();
+        for text in cases {
+            let highlighter = Highlighter::new(text);
+            record(highlighter.md_tree.root_node(), &mut output);
+            writeln!(output, "{:?}", highlighter.highlight_lines(0..usize::MAX)).unwrap();
+            writeln!(output, "{:?}", highlighter.spell_reference_labels).unwrap();
+        }
+        assert_eq!(
+            format!("{:x}", Sha256::digest(output)),
+            "204fe1f5973599c2f2778221ba4c4b84ebf0325c4d1b74c34ed2c392521d9dd7"
+        );
+    }
+
+    #[test]
+    fn prose_batching_incremental_structural_edits_match_fresh_parses() {
+        for initial in [
+            "Alpha *words* λ.\n\nBeta `words`.\n",
+            "Alpha words.\r\n\r\nBeta words.\r\n",
+            "Title words\n---\n\nBeta words.\n",
+            "[id]:\nurl/path \"title words\"\n\nBeta [words][id].\n",
+            "> Alpha words\n>\n> Beta words\n\nGamma words.\n",
+            "- Alpha words\n\n  Beta words\n\nGamma words.\n",
+            "```rust\nAlpha words\n\nBeta words\n```\n\nGamma words.\n",
+            "<script>\nAlpha words\n\nBeta words\n</script>\n\nGamma words.\n",
+        ] {
+            for offset in initial
+                .char_indices()
+                .map(|(offset, _)| offset)
+                .chain([initial.len()])
+            {
+                for replacement in ["\n", "\r\n", "# ", "|", "[", "é", "```\n"] {
+                    let edit = TextEdit {
+                        range: offset..offset,
+                        new_text_len: replacement.len(),
+                        new_text: replacement.into(),
+                    };
+                    assert_edit_matches_fresh(initial, edit);
+                }
+            }
+            for (offset, character) in initial.char_indices() {
+                assert_edit_matches_fresh(
+                    initial,
+                    TextEdit {
+                        range: offset..offset + character.len_utf8(),
+                        new_text_len: 0,
+                        new_text: String::new(),
+                    },
+                );
+            }
+        }
+    }
+
+    #[test]
     fn source_headings_preserve_atx_and_setext_levels() {
         let text = concat!(
             "# h1_é\n",

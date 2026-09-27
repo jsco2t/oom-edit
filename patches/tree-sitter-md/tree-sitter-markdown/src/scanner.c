@@ -54,6 +54,7 @@ typedef enum {
     PLUS_METADATA,
     PIPE_TABLE_START,
     PIPE_TABLE_LINE_ENDING,
+    FAST_PROSE_LINE,
 } TokenType;
 
 // Description of a block on the block stack.
@@ -169,6 +170,7 @@ static const bool paragraph_interrupt_symbols[] = {
     false, // PLUS_METADATA,
     true,  // PIPE_TABLE_START,
     false, // PIPE_TABLE_LINE_ENDING,
+    false, // FAST_PROSE_LINE,
 };
 
 // State bitflags used with `Scanner.state`
@@ -177,6 +179,9 @@ static const bool paragraph_interrupt_symbols[] = {
 static const uint8_t STATE_MATCHING = 0x1 << 0;
 // Last line break was inside a paragraph
 static const uint8_t STATE_WAS_SOFT_LINE_BREAK = 0x1 << 1;
+// Only a fresh document or a completed blank line can begin batched prose.
+static const uint8_t STATE_AFTER_BLANK = 0x1 << 2;
+static const uint8_t STATE_BLANK_LINE = 0x1 << 3;
 // Block should be closed after next line break
 static const uint8_t STATE_CLOSE_BLOCK = 0x1 << 4;
 
@@ -257,7 +262,7 @@ static unsigned serialize(Scanner *s, char *buffer) {
 static void deserialize(Scanner *s, const char *buffer, unsigned length) {
     s->open_blocks.size = 0;
     s->open_blocks.capacity = 0;
-    s->state = 0;
+    s->state = STATE_AFTER_BLANK;
     s->matched = 0;
     s->indentation = 0;
     s->column = 0;
@@ -1177,7 +1182,7 @@ static bool parse_html_block(Scanner *s, TSLexer *lexer,
 }
 
 static bool parse_pipe_table(Scanner *s, TSLexer *lexer,
-                             const bool *valid_symbols) {
+                             const bool *valid_symbols, bool fast_prose) {
 
     // unused
     (void)(valid_symbols);
@@ -1216,6 +1221,15 @@ static bool parse_pipe_table(Scanner *s, TSLexer *lexer,
         }
     }
     if (empty && cell_count == 0 && !(starting_pipe && ending_pipe)) {
+        // With no table pipes, an unindented word-starting line after a blank
+        // is ordinary prose (possibly a Setext heading). Keep its complete
+        // byte span; inline syntax is still parsed by the inline grammar.
+        if (fast_prose) {
+            lexer->mark_end(lexer);
+            lexer->result_symbol = FAST_PROSE_LINE;
+            s->state &= ~STATE_AFTER_BLANK;
+            return true;
+        }
         return false;
     }
     if (!ending_pipe) {
@@ -1376,6 +1390,8 @@ static bool scan(Scanner *s, TSLexer *lexer, const bool *valid_symbols) {
                     // A blank line token is actually just 0 width, so do not
                     // consume the characters
                     lexer->result_symbol = BLANK_LINE_START;
+                    if (!s->simulate)
+                        s->state |= STATE_BLANK_LINE;
                     return true;
                 }
                 break;
@@ -1428,7 +1444,12 @@ static bool scan(Scanner *s, TSLexer *lexer, const bool *valid_symbols) {
         }
         if (lexer->lookahead != '\r' && lexer->lookahead != '\n' &&
             valid_symbols[PIPE_TABLE_START]) {
-            return parse_pipe_table(s, lexer, valid_symbols);
+            bool ascii_letter = (lexer->lookahead >= 'a' && lexer->lookahead <= 'z') ||
+                                (lexer->lookahead >= 'A' && lexer->lookahead <= 'Z');
+            bool fast_prose = valid_symbols[FAST_PROSE_LINE] && ascii_letter &&
+                              !s->simulate && s->open_blocks.size == 0 &&
+                              (s->state & STATE_AFTER_BLANK) && lexer->get_column(lexer) == 0;
+            return parse_pipe_table(s, lexer, valid_symbols, fast_prose);
         }
     } else { // we are in the state of trying to match all currently open blocks
         bool partial_success = false;
@@ -1471,6 +1492,12 @@ static bool scan(Scanner *s, TSLexer *lexer, const bool *valid_symbols) {
     if ((valid_symbols[LINE_ENDING] || valid_symbols[SOFT_LINE_ENDING] ||
          valid_symbols[PIPE_TABLE_LINE_ENDING]) &&
         (lexer->lookahead == '\n' || lexer->lookahead == '\r')) {
+        if (s->state & STATE_BLANK_LINE) {
+            s->state |= STATE_AFTER_BLANK;
+        } else {
+            s->state &= ~STATE_AFTER_BLANK;
+        }
+        s->state &= ~STATE_BLANK_LINE;
         if (lexer->lookahead == '\r') {
             advance(s, lexer);
             if (lexer->lookahead == '\n') {

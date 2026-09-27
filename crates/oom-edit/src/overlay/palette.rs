@@ -18,98 +18,6 @@ use crate::command::rendered_binding;
 use crate::command::{rendered_binding_for, AppCommand, BindingRole, Contexts};
 use crate::theme::{Theme, Tier, UiSlot};
 
-// ── Vim reference table ─────────────────────────────────────────────────────
-
-/// Static reference entries for the supported four-mode interaction model.
-/// Format: `(keys, description, row-id, editable ex prefill)`.
-pub static VIM_REFERENCE: &[(&str, &str, &str, Option<&str>)] = &[
-    ("j/k, ↑/↓", "Move by rendered row.", "R-N1", None),
-    (
-        "gg / G",
-        "Jump to the first / last rendered row.",
-        "R-N2",
-        None,
-    ),
-    (
-        "Tab / S-Tab",
-        "Move between rendered jump targets.",
-        "R-N3",
-        None,
-    ),
-    ("/pattern⏎", "Search rendered text forward.", "R-N4", None),
-    ("n / N", "Repeat the rendered search.", "R-N4", None),
-    ("i/a/I/A/o/O", "Enter source Insert mode.", "R-I1", None),
-    (
-        "Esc",
-        "Return from Insert to rendered Normal.",
-        "R-I2",
-        None,
-    ),
-    ("u / <C-r>", "Undo / redo.", "R-E1", None),
-    (":w", "Save (atomic).", "V-X1", Some("w")),
-    (
-        ":w {path}",
-        "Save a copy to path without retargeting buffer.",
-        "V-X1",
-        Some("w "),
-    ),
-    (":q", "Quit; refuses if dirty.", "V-X2", Some("q")),
-    (":q!", "Quit; discards changes.", "V-X2", Some("q!")),
-    (":wq", "Save then quit.", "V-X3", Some("wq")),
-    (":x", "Save then quit (if changed).", "V-X3", Some("x")),
-    (
-        ":e {path}",
-        "Open file; refuses if dirty without !.",
-        "V-X4",
-        Some("e "),
-    ),
-    (":e!", "Reload current file from disk.", "V-X4", Some("e!")),
-    (
-        ":reload",
-        "Reload current file from disk.",
-        "V-X4",
-        Some("reload"),
-    ),
-    (
-        ":reload-all",
-        "Reload every open tab from disk.",
-        "V-X4",
-        Some("reload-all"),
-    ),
-    (
-        ":saveas {path}",
-        "Save to path and retarget buffer.",
-        "V-X5",
-        Some("saveas "),
-    ),
-    (":{number}", "Jump to line.", "V-X6", None),
-    (
-        ":s/pat/rep/",
-        "Substitute on current line.",
-        "V-X7",
-        Some("s/"),
-    ),
-    (
-        ":s/pat/rep/g",
-        "Substitute all on current line.",
-        "V-X7",
-        Some("s/"),
-    ),
-    (
-        ":%s/pat/rep/g",
-        "Substitute all in document.",
-        "V-X7",
-        Some("%s/"),
-    ),
-    (
-        ":noh",
-        "Clear search-match highlighting.",
-        "V-X8",
-        Some("noh"),
-    ),
-    (":help", "Open the command palette.", "V-X8", Some("help")),
-];
-
 // ── Palette state ───────────────────────────────────────────────────────────
 
 const FLOOR_W: u16 = 40;
@@ -183,12 +91,12 @@ pub(crate) enum PaletteAction {
 }
 
 impl PaletteState {
-    /// Build the full row list from the registry and Vim reference table.
+    /// Project both sections from the canonical registry.
     pub(crate) fn build_rows(&self, ctx: Contexts) -> Vec<PaletteRow> {
         let mut rows = Vec::new();
 
         // App commands section.
-        for spec in crate::command::COMMANDS {
+        for spec in crate::command::registry::primary_commands() {
             let enabled = spec.contexts.contains(ctx);
             let keys = rendered_binding_for(spec, ctx);
             match spec.binding {
@@ -213,16 +121,19 @@ impl PaletteState {
                     row_id: spec.conformance_id.unwrap_or(spec.name).to_string(),
                     prefill,
                 }),
+                BindingRole::ReferenceOnly => {
+                    unreachable!("primary projection excludes references")
+                }
             }
         }
 
         // Vim reference section.
-        for (keys, desc, row_id, prefill) in VIM_REFERENCE {
+        for reference in crate::command::registry::reference_presentations() {
             rows.push(PaletteRow::Reference {
-                keys: keys.to_string(),
-                desc: desc.to_string(),
-                row_id: row_id.to_string(),
-                prefill: *prefill,
+                keys: reference.keys.to_string(),
+                desc: reference.desc.to_string(),
+                row_id: reference.conformance_id.to_string(),
+                prefill: reference.prefill,
             });
         }
 
@@ -941,10 +852,11 @@ mod tests {
         let rows = palette.build_rows(Contexts::ALL);
         assert_eq!(
             rows.len(),
-            crate::command::COMMANDS.len() + VIM_REFERENCE.len()
+            crate::command::registry::primary_commands().count()
+                + crate::command::registry::reference_presentations().len()
         );
 
-        for spec in crate::command::COMMANDS {
+        for spec in crate::command::registry::primary_commands() {
             let binding = rendered_binding(spec);
             assert!(rows.iter().any(|row| match row {
                 PaletteRow::Command { name, keys, .. } => name == spec.name && keys == &binding,
@@ -1000,9 +912,18 @@ mod tests {
 
     #[test]
     fn vim_reference_has_entries() {
-        assert!(!VIM_REFERENCE.is_empty());
+        assert_eq!(
+            crate::command::registry::reference_presentations().len(),
+            25
+        );
         // Check that every entry has its required display fields.
-        for (keys, desc, row_id, prefill) in VIM_REFERENCE {
+        for reference in crate::command::registry::reference_presentations() {
+            let (keys, desc, row_id, prefill) = (
+                reference.keys,
+                reference.desc,
+                reference.conformance_id,
+                reference.prefill,
+            );
             assert!(!keys.is_empty(), "keys should not be empty");
             assert!(!desc.is_empty(), "desc should not be empty");
             assert!(!row_id.is_empty(), "row_id should not be empty");
@@ -1054,14 +975,35 @@ mod tests {
 
     #[test]
     fn vim_reference_covers_all_sections() {
-        let row_ids: Vec<&str> = VIM_REFERENCE.iter().map(|(_, _, id, _)| *id).collect();
+        let row_ids: Vec<&str> = crate::command::registry::reference_presentations()
+            .iter()
+            .map(|reference| reference.conformance_id)
+            .collect();
         let sections = ["R-N", "R-I", "R-E", "V-X"];
         for section in sections {
             assert!(
                 row_ids.iter().any(|id| id.starts_with(section)),
-                "VIM_REFERENCE should cover section {}",
+                "registry references should cover section {}",
                 section
             );
         }
+    }
+
+    #[test]
+    fn compact_palette_keeps_a_far_selected_row_visible() {
+        let mut palette = PaletteState::new(Contexts::NORMAL);
+        palette.selected = 12;
+        let mut terminal = Terminal::new(TestBackend::new(20, 5)).unwrap();
+        terminal
+            .draw(|frame| palette.render(frame, &DEFAULT_DARK, Tier::Color16))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = (1..19)
+            .map(|column| buffer[(column, 3)].symbol())
+            .collect::<String>();
+        assert!(!row.trim().is_empty());
+        assert!((1..19).any(|column| buffer[(column, 3)]
+            .modifier
+            .contains(ratatui::style::Modifier::REVERSED)));
     }
 }

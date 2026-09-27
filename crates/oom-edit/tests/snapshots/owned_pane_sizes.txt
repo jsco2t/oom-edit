@@ -1,0 +1,8 @@
+0x0 11c46ca31175335d None
+19x4 abb071aa7780fa18 None
+20x5 b3c602afab02eebe Some(PaneCursor { column: 5, row: 0, shape: Block })
+60x20 470a6b04874873be Some(PaneCursor { column: 5, row: 0, shape: Block })
+80x24 95a528ead3bd2a56 Some(PaneCursor { column: 5, row: 0, shape: Block })
+100x30 9e37106d465cad57 Some(PaneCursor { column: 5, row: 0, shape: Block })
+200x60 21cb278a1dab37a9 Some(PaneCursor { column: 5, row: 0, shape: Block })
+overlay local Rect { x: 19, y: 8, width: 40, height: 7 }; at host origin (7, 11) Rect { x: 26, y: 19, width: 40, height: 7 }

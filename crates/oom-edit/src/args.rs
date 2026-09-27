@@ -7,8 +7,6 @@
 
 use std::path::PathBuf;
 
-const LICENSES_TEXT: &str = include_str!("../../../THIRD-PARTY-NOTICES.md");
-
 /// The parsed CLI arguments.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Args {
@@ -69,7 +67,9 @@ impl Args {
                 "--version" | "-V" => return Ok(ParseOutcome::Message(version_text())),
                 "--licenses" => {
                     reject_inline(&flag, inline.as_deref())?;
-                    return Ok(ParseOutcome::Message(LICENSES_TEXT.to_string()));
+                    return Ok(ParseOutcome::Message(
+                        crate::third_party_notices().to_string(),
+                    ));
                 }
                 "--theme" => {
                     args.theme = Some(take_value(&flag, inline, &mut it)?);
@@ -224,7 +224,7 @@ mod tests {
     fn licenses_is_exact_pre_terminal_message() {
         match parse(&["--licenses"]) {
             Ok(ParseOutcome::Message(message)) => {
-                assert_eq!(message, include_str!("../../../THIRD-PARTY-NOTICES.md"));
+                assert_eq!(message, include_str!("../assets/THIRD-PARTY-NOTICES.md"));
                 for required in [
                     "SCOWL generated word-list data",
                     "Catppuccin Mocha bundled theme",

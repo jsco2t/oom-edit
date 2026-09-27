@@ -52,9 +52,13 @@ class CiWorkflowTests(unittest.TestCase):
         )
         self.assertIn("fallback: none", self.workflow)
 
-    def test_workflow_uses_only_the_make_owned_ci_entry_point(self):
+    def test_workflow_uses_only_make_owned_checks_and_candidate_preparation(self):
         run_commands = re.findall(r"(?m)^\s+run:\s+(.+)$", self.workflow)
-        self.assertEqual(run_commands, ["make ci"])
+        self.assertEqual(run_commands, ["make ci", "make downstream-prepare", "make downstream-candidate-check", "make downstream-negative-check"])
+        self.assertIn("DOWNSTREAM_REV: ${{ github.sha }}", self.workflow)
+        self.assertIn("DOWNSTREAM_SOURCE: ${{ github.workspace }}", self.workflow)
+        self.assertIn("DOWNSTREAM_DIR: ${{ runner.temp }}/oom-edit-consumer", self.workflow)
+        self.assertIn("persist-credentials: false", self.workflow)
 
     def test_make_ci_runs_release_build_before_check(self):
         target = re.search(
@@ -63,7 +67,10 @@ class CiWorkflowTests(unittest.TestCase):
         )
         self.assertIsNotNone(target)
         recipes = target.group("recipes").splitlines()
-        self.assertEqual(recipes, ["\t$(MAKE) build-release", "\t$(MAKE) check"])
+        self.assertEqual(recipes, [f"\t$(MAKE) {name}" for name in [
+            "build-release", "check", "coverage-check", "build-examples",
+            "doc", "bench-check", "bench",
+        ]])
 
     def test_contract_test_is_in_both_test_paths(self):
         self.assertRegex(

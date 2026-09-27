@@ -11,6 +11,67 @@
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use unicode_width::UnicodeWidthChar;
 
+#[cfg(test)]
+mod first_frame_tests {
+    use super::*;
+
+    #[test]
+    fn unchanged_parser_leaf_preserves_each_utf8_display_group() {
+        let raw = "é e\u{301} λ 👩\u{200d}💻";
+        let document = format!("## {raw}");
+        let leaf = mapped_leaf(raw, 3..document.len(), &document, true, false);
+        assert_eq!(leaf.text, raw);
+        assert_eq!(
+            leaf.atoms,
+            [
+                ("é", 3..5),
+                (" ", 5..6),
+                ("e\u{301}", 6..9),
+                (" ", 9..10),
+                ("λ", 10..12),
+                (" ", 12..13),
+                ("👩\u{200d}", 13..20),
+                ("💻", 20..24),
+            ]
+            .into_iter()
+            .map(|(text, source)| InlineAtom {
+                text: text.into(),
+                source
+            })
+            .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn unchanged_escaped_parser_leaf_keeps_the_escape_byte() {
+        let document = "α \\*same";
+        let leaf = mapped_leaf("*same", 4..9, document, true, false);
+        assert_eq!(
+            leaf.atoms[0],
+            InlineAtom {
+                text: "*".into(),
+                source: 3..5
+            }
+        );
+        assert_eq!(leaf.atoms.last().unwrap().source, 8..9);
+    }
+
+    #[test]
+    fn decoded_and_normalized_leaves_keep_exact_token_ranges() {
+        let entity = mapped_leaf("& é", 0..12, "&amp; &#233;", true, false);
+        assert_eq!(entity.atoms[0].source, 0..5);
+        assert_eq!(entity.atoms[2].source, 6..12);
+        let code = mapped_leaf("a b", 0..3, "a\nb", false, true);
+        assert_eq!(
+            code.atoms[1],
+            InlineAtom {
+                text: " ".into(),
+                source: 1..2
+            }
+        );
+    }
+}
+
 // ── BlockModel ─────────────────────────────────────────────────────────────
 
 /// A typed block tree of a markdown document.
@@ -233,8 +294,35 @@ fn mapped_leaf(
     decode_markdown: bool,
     normalize_code: bool,
 ) -> InlineLeaf {
-    let desired = display_groups(rendered);
     let raw = document.get(source.clone()).unwrap_or_default();
+    // Most parser leaves are already literal text. Map their exact bytes once
+    // without allocating a second display-group list for normalization.
+    if raw == rendered && !raw.contains(['\r', '\n']) {
+        let mut atoms = Vec::with_capacity(raw.chars().count());
+        let mut offset = 0;
+        while offset < raw.len() {
+            let (end, text) = raw_display_group(raw, offset);
+            atoms.push(InlineAtom {
+                text,
+                source: source.start + offset..source.start + end,
+            });
+            offset = end;
+        }
+        if decode_markdown
+            && source.start > 0
+            && document.as_bytes().get(source.start - 1) == Some(&b'\\')
+        {
+            if let Some(first) = atoms.first_mut() {
+                first.source.start = source.start - 1;
+            }
+        }
+        return InlineLeaf {
+            text: rendered.to_string(),
+            atoms,
+        };
+    }
+
+    let desired = display_groups(rendered);
     let mut atoms = Vec::with_capacity(desired.len());
     let mut desired_index = 0;
     let mut offset = 0;
@@ -429,11 +517,7 @@ impl BlockModel {
         }
 
         // Set up pulldown-cmark with required extensions
-        let mut opts = Options::empty();
-        opts.insert(Options::ENABLE_TABLES);
-        opts.insert(Options::ENABLE_FOOTNOTES);
-        opts.insert(Options::ENABLE_TASKLISTS);
-        opts.insert(Options::ENABLE_STRIKETHROUGH);
+        let opts = markdown_options();
 
         // Build the block tree using a single-pass stack machine
         let mut builder = BlockBuilder::new(text, parse_start);
@@ -463,6 +547,15 @@ impl BlockModel {
 
         Self { blocks }
     }
+}
+
+pub(crate) fn markdown_options() -> Options {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_FOOTNOTES);
+    options.insert(Options::ENABLE_TASKLISTS);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options
 }
 
 // ── BlockBuilder (stack machine) ───────────────────────────────────────────

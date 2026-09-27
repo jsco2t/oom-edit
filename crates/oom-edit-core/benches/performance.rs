@@ -1,4 +1,4 @@
-//! Hand-rolled release benchmarks for NFR-1..NFR-4.
+//! Hand-rolled asserting release performance benchmarks.
 //!
 //! Run through `make bench`; every row reports its fixture, iterations,
 //! average, worst observation, and exact documented target.
@@ -7,10 +7,14 @@
 mod fixtures;
 #[path = "../perf/layout_metrics.rs"]
 mod layout_metrics;
+#[path = "../perf/timing.rs"]
+mod timing;
 
 use std::time::{Duration, Instant};
 
-use oom_edit_core::{EditorSession, KeyCode, KeyCodeKind, KeyInput, Mode, Modifiers, Viewport};
+use oom_edit_core::{
+    analyze_markdown, EditorSession, KeyCode, KeyCodeKind, KeyInput, Mode, Modifiers, Viewport,
+};
 use oom_spell::{BuildProgress, SpellEngine, SpellEngineBuilder};
 
 const ONE_MIB: usize = 1024 * 1024;
@@ -88,11 +92,12 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
-fn duration_gate_passes(observed: Duration, target: Duration) -> bool {
-    observed < target
+fn report(name: &str, target: Duration, bytes: usize, lines: usize, stats: Stats) {
+    assert!(!stats.worst.is_zero(), "{name} measured no work");
+    report_duration_gate(name, target, bytes, lines, stats);
 }
 
-fn report(name: &str, target: Duration, bytes: usize, lines: usize, stats: Stats) {
+fn report_duration_gate(name: &str, target: Duration, bytes: usize, lines: usize, stats: Stats) {
     println!(
         "{name}: {bytes} bytes, {lines} lines, {} iterations, avg {}, worst {}, target <{}",
         stats.iterations,
@@ -100,15 +105,14 @@ fn report(name: &str, target: Duration, bytes: usize, lines: usize, stats: Stats
         format_duration(stats.worst),
         format_duration(target),
     );
-    assert!(!stats.worst.is_zero(), "{name} measured no work");
     let lowered = stats.worst.saturating_sub(Duration::from_nanos(1));
     assert!(
-        !duration_gate_passes(stats.worst, lowered),
+        !timing::duration_gate_passes(stats.worst, lowered),
         "{name} must reject its intentionally lowered threshold {}",
         format_duration(lowered)
     );
     assert!(
-        duration_gate_passes(stats.worst, target),
+        timing::duration_gate_passes(stats.worst, target),
         "{name} worst {} exceeded target {}",
         format_duration(stats.worst),
         format_duration(target)
@@ -522,14 +526,23 @@ fn benchmark_spell() {
             }
             assert_eq!(session.diagnostics().len(), 1_000);
             assert_eq!(session.diagnostics()[0].source_text, "wrng");
+            let baseline_text = baseline.document();
+            assert_eq!(baseline_text, session.document());
+            assert_eq!(&baseline_text[edit_offset..edit_offset + 5], "xhelo");
             assert_eq!(
                 session.diagnostics().last().unwrap().range,
                 last_range.start + 1..last_range.end + 1
             );
         }
-        dirty_total.saturating_sub(baseline_total) / PAIRS
+        println!(
+            "NFR-10 timed_edit_pair: baseline {:?}, with diagnostics {:?}, {PAIRS} edits each",
+            baseline_total, dirty_total
+        );
+        timing::checked_additional_duration(baseline_total, dirty_total)
+            .expect("dirty-mark comparison requires two nonempty timed operations")
+            / PAIRS
     });
-    report(
+    report_duration_gate(
         "NFR-10 spell_dirty_mark_and_shift",
         Duration::from_micros(100),
         dirty_document.len(),
@@ -539,6 +552,14 @@ fn benchmark_spell() {
 }
 
 fn main() {
+    if std::env::var_os("OOM_BENCH_FIRST_FRAME_PROFILE").is_some() {
+        profile_first_frame();
+        return;
+    }
+    if std::env::var_os("OOM_BENCH_ANALYSIS_ONLY").is_some() {
+        benchmark_analysis_batch();
+        return;
+    }
     let source = source_fixture_1mb();
     let line_count = source.matches('\n').count() + 1;
     benchmark_open_to_first_frame(&source);
@@ -551,4 +572,69 @@ fn main() {
     benchmark_rendered(&rendered_5000_line_fixture());
     benchmark_large_rendered_layout();
     benchmark_spell();
+    benchmark_analysis_batch();
+}
+
+fn profile_first_frame() {
+    let source = source_fixture_1mb();
+    let language = tree_sitter_md::LANGUAGE.into();
+    let started = Instant::now();
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&language).unwrap();
+    println!("markdown parser setup: {:?}", started.elapsed());
+    let started = Instant::now();
+    let tree = parser.parse(&source, None).unwrap();
+    println!("markdown block parse: {:?}", started.elapsed());
+    assert!(!tree.root_node().has_error());
+    let started = Instant::now();
+    let mut session = EditorSession::from_text(&source);
+    println!("session construction: {:?}", started.elapsed());
+    let started = Instant::now();
+    let frame = session.render_source(viewport(0));
+    println!("source viewport: {:?}", started.elapsed());
+    std::hint::black_box(frame);
+    let started = Instant::now();
+    let layout = session.render_layout(96);
+    println!("cold rendered layout: {:?}", started.elapsed());
+    std::hint::black_box(layout);
+}
+
+fn benchmark_analysis_batch() {
+    let documents: Vec<String> = (0..64)
+        .map(|index| {
+            format!(
+                "---\ntitle: Note {index}\ntags: [alpha, beta]\n---\n# Note {index} &amp; More\n{}",
+                "Body words and links [example](https://example.invalid).\n".repeat(24)
+            )
+        })
+        .collect();
+    let bytes = documents.iter().map(String::len).sum();
+    let lines = documents
+        .iter()
+        .map(|text| text.matches('\n').count())
+        .sum();
+    let stats = bench_run(Duration::from_millis(200), || {
+        let retained = documents
+            .iter()
+            .map(|document| {
+                let result = analyze_markdown(document);
+                assert!(result.first_h1.is_some());
+                layout_metrics::analysis_retained_bytes(&result)
+            })
+            .sum::<usize>();
+        std::hint::black_box(retained);
+    });
+    let retained = documents
+        .iter()
+        .map(|document| layout_metrics::analysis_retained_bytes(&analyze_markdown(document)))
+        .sum::<usize>();
+    println!("analysis_batch_64: retained-owned-capacity lower bound {retained} bytes");
+    assert!(retained < 16 * 1024);
+    report(
+        "analysis_batch_64",
+        Duration::from_millis(10),
+        bytes,
+        lines,
+        stats,
+    );
 }

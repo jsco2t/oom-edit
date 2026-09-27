@@ -8,6 +8,30 @@ change the resolved third-party graph or `vendor/`. The 0.5.0 spell-checking
 release adds only the first-party `oom-spell` package and the pinned static data
 described below; the resolved third-party graph and `vendor/` remain unchanged.
 
+## Direct SHA-256 dependency for disk versions
+
+The editor core promotes already-locked and already-vendored `sha2 =0.10.9` to a
+direct dependency for content-validated disk versions. This changes only the
+`oom-edit-core` dependency edge in `Cargo.lock`; it adds no resolved package,
+build script, or changed file under `vendor/`.
+
+- **License:** `MIT OR Apache-2.0` in the pinned vendored manifest and upstream
+  [crate manifest](https://github.com/RustCrypto/hashes/blob/master/sha2/Cargo.toml),
+  both allowed by repository policy.
+- **Maintenance:** the upstream [changelog](https://github.com/RustCrypto/hashes/blob/master/sha2/CHANGELOG.md)
+  records 0.10.9 and the later 0.11.0 release; the RustCrypto hashes repository
+  remains active. The exact 0.10.9 pin is retained because it is already in the
+  locked, audited graph.
+- **Popularity baseline:** the upstream [RustCrypto hashes repository](https://github.com/RustCrypto/hashes)
+  has roughly 2.2k stars as checked on 2026-09-25, and the crate is already a
+  transitive dependency of this workspace.
+- **Vendored diff:** none. Review of the lockfile shows one added direct edge;
+  the 0.10.9 vendored source, checksum and transitive packages are unchanged.
+- **Could we hand-roll this?** A small noncryptographic hash would be easy but
+  would weaken the version identity used to authorize overwrites and reloads.
+  Writing our own SHA-256 would add security-sensitive code and test burden for
+  no supply-chain reduction because `sha2` is already resolved and vendored.
+
 ## First-party `oom-spell` crate
 
 FR-9 adds `oom-spell =0.1.0` as an exact local path dependency of
@@ -94,7 +118,7 @@ dependencies, and add no package or transitive code to the resolved Cargo graph.
 | `dirs-sys` | `0.5.0` (local fork) | MIT OR Apache-2.0 | Removed transitive dependency on `option-ext` (MPL-2.0, copyleft). Hand-rolled the 3-line `OptionExt::contains` utility locally. | `crates/dirs-sys-patched/` + `[patch.crates-io]` in root `Cargo.toml` |
 | `hjkl-buffer` | `0.39.0` (local fork) | MIT | Exposes the current undo node's stable sequence through one read-only accessor. Dirty tracking cannot derive this identity from undo depth, while serializing the full undo tree on each history key violates the editor latency budget. | `patches/hjkl-buffer/` + `[patch.crates-io]` in root `Cargo.toml` |
 | `hjkl-engine` | `0.39.0` (local fork) | MIT | Uses Ropey character boundaries to strip CRLF and Unicode line separators from row snapshots. Upstream subtracts one byte, which can split NEL and panic on Insert exit. | `patches/hjkl-engine/` + `[patch.crates-io]` in root `Cargo.toml` |
-| `tree-sitter-md` | `0.5.3` (local fork) | MIT | Replaces two unsafe `isdigit` calls in the Markdown external scanner with explicit ASCII digit checks. `TSLexer::lookahead` is a full Unicode code point, while C character-classification functions only accept `EOF` or values representable as `unsigned char`; glibc can segfault on valid high Unicode input. | `patches/tree-sitter-md/` + `[patch.crates-io]` in root `Cargo.toml` |
+| `tree-sitter-md` | `0.5.3` (local fork) | MIT | Replaces two unsafe `isdigit` calls with ASCII checks; honors optimized Cargo profiles; batches eligible top-level prose into one block token while retaining full inline parsing, named nodes and source ranges. | `patches/tree-sitter-md/` + `[patch.crates-io]` in root `Cargo.toml` |
 
 The `hjkl-buffer` patch does not change the dependency graph or existing engine
 behavior, but it does add one public read-only API. oom-edit calls that API when
@@ -107,13 +131,40 @@ pruning semantics and could silently diverge from the engine. Version 0.41.2,
 the latest release checked on 2026-08-07, still does not expose an equivalent
 public O(1) accessor. The license and transitive dependency tree are unchanged.
 
-The `tree-sitter-md` patch changes only the ordered-list scanner's two digit
-checks. An explicit `'0'..='9'` comparison preserves CommonMark's ASCII marker
+The Unicode-safety part of the `tree-sitter-md` scanner patch changes the ordered-list
+scanner's two digit checks. An explicit `'0'..='9'` comparison preserves CommonMark's ASCII marker
 semantics without truncating Unicode input to `unsigned char`. Restricting
 editor input or the property-test generator was rejected because the scanner
 bug is reachable with valid Markdown in production. The pinned release and
 current upstream source both contain the unsafe calls, so no released upgrade
 is available. The license and transitive dependency tree are unchanged.
+
+The generated block and inline parsers also contain pragmas that force
+optimization off on GCC, Clang and MSVC even in release builds. The local build
+script defines `TREE_SITTER_MD_OPTIMIZED_BUILD` only when Cargo's `OPT_LEVEL` is
+nonzero; a guard around those pragmas then leaves optimization to the existing
+compiler profile. Debug level zero retains upstream's setting.
+
+The block grammar additionally accepts one external token for an unindented,
+ASCII-letter-starting top-level line at document start or after a completed blank
+line, provided the existing table-header scan finds no unescaped table pipe.
+That scan already consumes the complete line; returning one token avoids repeated
+word/whitespace/punctuation reductions. Containers, continuation lines, table
+headers, reference definitions, fences and other block starts retain their
+original paths. The complete block tree is still built synchronously, and the
+unchanged inline grammar still parses actual Markdown syntax over each full
+inline source range. No highlighting is deferred to make the first frame faster.
+
+This narrow scanner/grammar change is hand-written; replacing Markdown parsing
+or importing another parser would expand the dependency and compatibility surface.
+The original MIT license, versions and transitive graph are unchanged. Restored
+`common/common.js` and `tree-sitter.json` inputs come from the recorded upstream
+commit. `make grammar-generate` reproduces the block tables offline with exactly
+Tree-sitter 0.26.3 and ABI 15, preserves pinned headers and reapplies the build guard.
+Named-tree byte/point ranges and complete highlights are characterized against
+the pre-batching parser, with structural-edit equivalence, provenance, Markdown
+conformance, build-profile guards and unchanged release benchmarks protecting
+the patch. See [patch provenance](../patches/README.md) for regeneration details.
 
 The `hjkl-engine` patch changes only the two rope row-string helpers and adds
 focused tests. Ropey treats NEL and Unicode separators as line breaks, so

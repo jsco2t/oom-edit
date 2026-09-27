@@ -1037,6 +1037,89 @@ fn capital_v_enters_line_selection() {
 }
 
 #[test]
+fn shift_v_enters_line_selection_with_exact_source_range() {
+    let text = "# alpha λ\n\nsecond\n";
+    for shift in [false, true] {
+        let mut session = EditorSession::from_text(text);
+        session.render_layout(5);
+        let mut input = key('V');
+        input.mods.shift = shift;
+        let effects = session.handle_key(input);
+        assert_eq!(session.mode(), Mode::Select, "shift={shift}");
+        assert!(effects.contains(&Effect::ModeChanged(Mode::Select)));
+        let selection = session.rendered_selection().unwrap();
+        assert_eq!(selection.shape, SelectionShape::Line);
+        assert_eq!(
+            selection.source_ranges,
+            vec![0..text.find('\n').unwrap() + 1]
+        );
+        assert_eq!(session.document(), text);
+    }
+}
+
+#[test]
+fn shift_v_switches_and_cancels_line_selection() {
+    for initial in [key('v'), ctrl('v')] {
+        for shift in [false, true] {
+            for cancel_shift in [false, true] {
+                let mut session = EditorSession::from_text("# alpha λ\n\nsecond\n");
+                session.render_layout(40);
+                session.handle_key(initial);
+                let mut input = key('V');
+                input.mods.shift = shift;
+                session.handle_key(input);
+                assert_eq!(session.mode(), Mode::Select);
+                assert_eq!(
+                    session.rendered_selection().unwrap().shape,
+                    SelectionShape::Line
+                );
+                input.mods.shift = cancel_shift;
+                let effects = session.handle_key(input);
+                assert_eq!(session.mode(), Mode::Normal);
+                assert!(session.rendered_selection().is_none());
+                assert!(effects.contains(&Effect::ModeChanged(Mode::Normal)));
+            }
+        }
+    }
+}
+
+#[test]
+fn shift_v_preserves_control_and_alt_boundaries() {
+    for shift in [false, true] {
+        let mut session = EditorSession::from_text("# alpha\n");
+        session.render_layout(40);
+        let mut input = key('V');
+        input.mods = Modifiers {
+            ctrl: true,
+            alt: false,
+            shift,
+        };
+        session.handle_key(input);
+        assert_eq!(
+            session.rendered_selection().unwrap().shape,
+            SelectionShape::Block
+        );
+        session.handle_key(input);
+        assert_eq!(session.mode(), Mode::Normal);
+
+        input.mods = Modifiers {
+            ctrl: false,
+            alt: true,
+            shift,
+        };
+        session.handle_key(input);
+        assert_eq!(session.mode(), Mode::Normal);
+        assert!(session.rendered_selection().is_none());
+        session.handle_key(key('v'));
+        session.handle_key(input);
+        assert_eq!(
+            session.rendered_selection().unwrap().shape,
+            SelectionShape::Character
+        );
+    }
+}
+
+#[test]
 fn ctrl_v_enters_block_selection() {
     let mut session = EditorSession::from_text("# alpha\n");
     session.render_layout(40);

@@ -30,7 +30,6 @@ pub struct Osc52Clipboard {
 
 impl Osc52Clipboard {
     /// Create a new `Osc52Clipboard` that writes to the given writer.
-    #[allow(dead_code)]
     pub fn new<W: Write + Send + 'static>(writer: W) -> Self {
         Self {
             writer: Box::new(writer),
