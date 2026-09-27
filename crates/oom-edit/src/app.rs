@@ -5949,7 +5949,7 @@ mod tests {
 
     #[test]
     fn tabnew_resolves_relative_and_absolute_paths_from_launch_directory() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         std::fs::create_dir(dir.path().join("examples")).unwrap();
         let relative_target = dir.path().join("examples/kitchen-sink.md");
         let absolute_target = dir.path().join("absolute file.md");
@@ -5977,7 +5977,7 @@ mod tests {
 
     #[test]
     fn standalone_tabnew_keeps_duplicate_file_tabs() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let path = dir.path().join("same.md");
         std::fs::write(&path, "original\n").unwrap();
         let mut app = file_backed_app(dir.path(), &[("same.md", "original\n")]);
@@ -8028,7 +8028,7 @@ mod tests {
 
     #[test]
     fn palette_ex_templates_prefill_editable_paths_and_cancel_cleanly() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let first = dir.path().join("first.md");
         let second = dir.path().join("second.md");
         let third = dir.path().join("third.md");
@@ -8988,7 +8988,7 @@ mod tests {
 
     #[test]
     fn reload_all_commits_every_tab_and_preserves_identity_and_active_index() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let mut app = file_backed_app(dir.path(), &[("one.md", "one\n"), ("two.md", "two\n")]);
         app.active_tab = 1;
         dirty_tab(&mut app, 0, "dirty ");
@@ -9338,7 +9338,7 @@ mod tests {
 
     #[test]
     fn overwrite_reload_targets_original_tab_and_resets_scroll() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let target = dir.path().join("target.md");
         let mut app = file_backed_app(
             dir.path(),

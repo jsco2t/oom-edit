@@ -302,7 +302,7 @@ fn host_quit_all_is_a_request_not_a_close_or_process_exit() {
 #[test]
 fn every_command_path_rejects_outside_symlinks_and_bang_targets() {
     use std::os::unix::fs::symlink;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let inside = dir.path().join("inside");
     std::fs::create_dir(&inside).unwrap();
     let note = inside.join("safe.md");
@@ -423,7 +423,7 @@ fn path_revalidation_rejects_a_parent_symlink_swapped_during_authorization() {
             Ok(())
         }
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let inside = dir.path().join("inside");
     let docs = inside.join("docs");
     let outside = dir.path().join("outside");
@@ -636,7 +636,7 @@ fn missing_recreation_choice_cannot_overwrite_a_later_replacement() {
 
 #[test]
 fn batch_retarget_preserves_ids_dirty_cursor_and_undo() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let (mut pane, ids, paths) = dirty_three(dir.path());
     let before = ids
         .iter()
@@ -759,7 +759,7 @@ fn retarget_follows_the_observed_modified_file_without_accepting_its_bytes() {
 
 #[test]
 fn bang_save_and_save_copy_cannot_override_host_policy() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let path = dir.path().join("note.md");
     let copy = dir.path().join("copy.md");
     std::fs::write(&path, "original\n").unwrap();
@@ -800,7 +800,7 @@ fn denied_reload_preserves_the_stable_id_buffer_cursor_and_undo() {
 
 #[test]
 fn embedded_last_tab_close_leaves_an_empty_reusable_pane() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let path = dir.path().join("note.md");
     std::fs::write(&path, "original\n").unwrap();
     let mut pane = pane(
@@ -981,7 +981,7 @@ fn external_lease_allows_edits_blocks_io_and_abort_restores_requests() {
 
 #[test]
 fn unnamed_close_requires_explicit_host_path_and_cancel_invents_nothing() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let mut pane = pane(dir.path(), vec![], Box::new(oom_edit::AllowAllFileAccess));
     let id = pane.new_buffer(OpenOptions::default()).unwrap();
     edit(&mut pane, "unnamed");

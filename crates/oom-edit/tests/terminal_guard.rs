@@ -163,7 +163,53 @@ fn stty_state() -> Vec<u8> {
         .output()
         .unwrap();
     assert!(output.status.success(), "stty failed: {output:?}");
-    output.stdout
+    #[cfg(target_os = "macos")]
+    {
+        comparable_stty_state(&output.stdout)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        output.stdout
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn comparable_stty_state(state: &[u8]) -> Vec<u8> {
+    // Darwin sets PENDIN when restoring ICANON; it is kernel state, not a setting.
+    String::from_utf8(state.to_vec())
+        .unwrap()
+        .split(':')
+        .map(|field| match field.strip_prefix("lflag=") {
+            Some(flags) => format!(
+                "lflag={:x}",
+                libc::tcflag_t::from_str_radix(flags, 16).unwrap() & !libc::PENDIN
+            ),
+            None => field.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(":")
+        .into_bytes()
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn stty_comparison_excludes_only_kernel_pending_input_state() {
+    let before = b"gfmt1:cflag=4b00:iflag=2b02:lflag=5cb:oflag=3:min=1:time=0\n";
+    let pending = b"gfmt1:cflag=4b00:iflag=2b02:lflag=200005cb:oflag=3:min=1:time=0\n";
+    assert_eq!(
+        comparable_stty_state(before),
+        comparable_stty_state(pending)
+    );
+    for changed in [
+        b"gfmt1:cflag=4b00:iflag=2b02:lflag=200004cb:oflag=3:min=1:time=0\n".as_slice(),
+        b"gfmt1:cflag=4b00:iflag=2b02:lflag=200005c3:oflag=3:min=1:time=0\n".as_slice(),
+        b"gfmt1:cflag=4b00:iflag=2b02:lflag=200005cb:oflag=3:min=2:time=0\n".as_slice(),
+    ] {
+        assert_ne!(
+            comparable_stty_state(before),
+            comparable_stty_state(changed)
+        );
+    }
 }
 
 #[cfg(unix)]

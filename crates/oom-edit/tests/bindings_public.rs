@@ -742,7 +742,7 @@ fn core_key_metadata_drives_real_modes_selections_and_tab_effects() {
 
 #[test]
 fn ex_metadata_has_a_core_dispatcher_without_executable_palette_actions() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let now = Instant::now();
     let path = directory.path().join("note.md");
     std::fs::write(&path, "note\n").unwrap();
@@ -792,7 +792,7 @@ fn ex_metadata_has_a_core_dispatcher_without_executable_palette_actions() {
 
 #[test]
 fn status_tracks_named_paths_active_tabs_prompts_spell_and_disk_markers() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let now = Instant::now();
     let path = directory.path().join("界 note.md");
     std::fs::write(&path, "first\nsecond\n").unwrap();

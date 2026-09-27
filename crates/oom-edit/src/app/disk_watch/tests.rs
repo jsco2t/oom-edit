@@ -75,7 +75,7 @@ fn input(app: &mut App, text: &str, now: Instant) {
 
 #[test]
 fn nfr_003_fifty_tab_metadata_and_content_counters() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let now = Instant::now();
     let paths = (0..50)
         .map(|index| {
@@ -190,7 +190,7 @@ enum Surface {
 
 #[test]
 fn automatic_reload_preserves_then_clamps_viewport_and_source_cursor() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let path = directory.path().join("viewport.md");
     let original = (0..100)
         .map(|index| format!("line {index}\n\n"))
@@ -256,7 +256,8 @@ fn clean_dirty_observation_and_safe_point_matrix() {
                 Surface::Overlay,
                 Surface::Lifecycle,
             ] {
-                let directory = tempfile::tempdir().unwrap();
+                let directory =
+                    tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
                 let path = directory.path().join("matrix.md");
                 std::fs::write(&path, "original\nsecond\n").unwrap();
                 let now = Instant::now();

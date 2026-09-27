@@ -58,7 +58,7 @@ sync-notices: ## Refresh the byte-identical crate-local copy of canonical third-
 # Test
 # ---------------------------------------------------------------------------
 .PHONY: test
-test: feature-workflow-test tui-perf-test ci-workflow-test drd-coverage-test grammar-generation-test downstream-tool-test ## Run the full test suite
+test: feature-workflow-test tui-perf-test ci-workflow-test drd-coverage-test grammar-generation-test downstream-tool-test terminal-guard-tool-test ## Run the full test suite
 	bash scripts/with-isolated-config.sh cargo test --workspace --offline --locked
 
 .PHONY: downstream-tool-test
@@ -193,8 +193,12 @@ test-all: test ## Tests + example builds
 	cargo build --examples --offline --locked
 
 .PHONY: terminal-guard-pty-test
-terminal-guard-pty-test: ## Run the terminal guard's native PTY and signal tests
+terminal-guard-pty-test: terminal-guard-tool-test ## Run the terminal guard's native PTY and signal tests
 	cargo test --package oom-edit --test terminal_guard --offline --locked
+
+.PHONY: terminal-guard-tool-test
+terminal-guard-tool-test: ## Verify native PTY terminal-state comparison guards
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_terminal_guard_pty.py'
 
 # ---------------------------------------------------------------------------
 # Format
@@ -273,6 +277,7 @@ check: ## Run fmt-check + lint + build + test + deny + audit + data-license-chec
 		&& PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_drd_coverage.py' 2>&1 \
 		&& PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_regenerate_markdown.py' 2>&1 \
 		&& PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_downstream.py' 2>&1 \
+		&& PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_terminal_guard_pty.py' 2>&1 \
 		&& bash scripts/with-isolated-config.sh cargo test --workspace --offline --locked 2>&1; then \
 		echo "[PASS] test"; PASS=$$((PASS + 1)); \
 	else \

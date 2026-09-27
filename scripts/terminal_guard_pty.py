@@ -10,9 +10,17 @@ import termios
 import time
 
 
+def comparable_termios(attributes):
+    snapshot = attributes.copy()
+    if sys.platform == "darwin":
+        # Darwin sets this transient flag when canonical input is restored.
+        snapshot[3] &= ~termios.PENDIN
+    return snapshot
+
+
 def main() -> int:
     master, slave = pty.openpty()
-    before = termios.tcgetattr(slave)
+    before = termios.tcgetattr(master)
 
     def attach_terminal() -> None:
         os.setsid()
@@ -37,6 +45,7 @@ def main() -> int:
                 print("GUARD_PROBE_TIMEOUT", flush=True)
                 return 1
             readable, _, _ = select.select([master], [], [], 0.05)
+            chunk = b""
             if readable:
                 try:
                     chunk = os.read(master, 65536)
@@ -53,12 +62,14 @@ def main() -> int:
                         elif response_mode == "unsupported":
                             os.write(master, b"\x1b[?1;2c")
                             responded = True
-            if child.poll() is not None and not readable:
+            if child.poll() is not None and not chunk:
                 break
-        after = termios.tcgetattr(slave)
+        # The master retains termios after Darwin revokes the exited session's slave.
+        after = termios.tcgetattr(master)
+        restored = comparable_termios(before) == comparable_termios(after)
         print(f"GUARD_CHILD_EXIT={child.returncode}", flush=True)
-        print(f"GUARD_TERMIOS_RESTORED={before == after}", flush=True)
-        return 0 if before == after else 1
+        print(f"GUARD_TERMIOS_RESTORED={restored}", flush=True)
+        return 0 if restored else 1
     finally:
         os.close(master)
         os.close(slave)

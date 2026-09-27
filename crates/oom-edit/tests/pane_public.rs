@@ -573,7 +573,7 @@ fn zero_tab_host_renders_and_old_tab_ids_never_address_a_recreated_pane() {
 
 #[test]
 fn initial_paths_report_each_success_and_failure_without_discarding_open_tabs() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let good = dir.path().join("good.md");
     let invalid = dir.path().join("invalid.md");
     let later = dir.path().join("later.md");
@@ -881,7 +881,7 @@ fn host_open_deduplicates_even_when_commands_use_standalone_policy() {
 #[cfg(unix)]
 #[test]
 fn canonical_symlink_alias_focuses_the_same_tab_and_preserves_dirty_text() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let path = dir.path().join("note.md");
     let alias = dir.path().join("alias.md");
     std::fs::write(&path, "hello\n").unwrap();
@@ -1162,7 +1162,7 @@ fn construction_is_silent_in_a_subprocess_with_conflicting_environment() {
 
 #[test]
 fn unnamed_tab_metadata_and_open_events_preserve_optional_paths() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let mut pane = construct(dir.path(), vec![]).pane;
     let id = pane
         .new_buffer(OpenOptions {

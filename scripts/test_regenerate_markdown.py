@@ -50,7 +50,7 @@ class RegenerationTests(unittest.TestCase):
                 (headers / name).write_bytes(b"pinned\x00header")
 
             def generate(command, **kwargs):
-                self.assertEqual(command, ["generator", "generate", "--abi", "15", "--output", str(output)])
+                self.assertEqual(command, ["generator", "generate", "--abi", "15", "--output", str(output.resolve())])
                 self.assertEqual(kwargs["cwd"], "grammar")
                 self.assertTrue(kwargs["check"])
                 self.assertFalse(any(key.startswith("EXTENSION_") for key in kwargs["env"]))
@@ -67,6 +67,22 @@ class RegenerationTests(unittest.TestCase):
             self.assertEqual((output / "parser.c").read_text(), regenerate_markdown.guard_generated_parser(PARSER))
             for header in headers.iterdir():
                 self.assertEqual(header.read_bytes(), b"pinned\x00header")
+
+    def test_resolves_symlinked_output_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "generated"
+            output.mkdir()
+            alias = Path(temporary) / "alias"
+            alias.symlink_to(output, target_is_directory=True)
+
+            def generate(command, **kwargs):
+                self.assertEqual(command[-2:], ["--output", str(output.resolve())])
+                (output / "parser.c").write_text(PARSER, encoding="utf-8")
+
+            with patch.object(subprocess, "check_output", return_value="tree-sitter 0.26.3\n"), \
+                    patch.object(subprocess, "run", side_effect=generate):
+                regenerate_markdown.regenerate("generator", alias, "grammar")
+            self.assertEqual((alias / "parser.c").read_text(), regenerate_markdown.guard_generated_parser(PARSER))
 
     def test_restores_headers_even_when_generation_fails(self):
         with tempfile.TemporaryDirectory() as temporary:

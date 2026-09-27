@@ -522,7 +522,7 @@ fn compact_disk_prompt_has_reachable_choices_and_non_color_markers() {
 #[test]
 fn fr_054_notification_content_validation() {
     for policy in [CommandPolicy::Standalone, CommandPolicy::Embedded] {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let path = directory.path().join("equal.md");
         std::fs::write(&path, "before\n").unwrap();
         let reference = oom_edit_core::EditorSession::open_existing(&path).unwrap();
