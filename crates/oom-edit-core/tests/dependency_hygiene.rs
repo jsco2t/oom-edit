@@ -49,6 +49,20 @@ fn cargo_tree_output() -> String {
 }
 
 #[test]
+fn paste_byte_offsets_use_the_rope_index() {
+    let source = include_str!("../src/vim.rs");
+    let paste = source
+        .split("pub(crate) fn insert_text(&mut self, text: &str)")
+        .nth(1)
+        .expect("paste implementation")
+        .split("/// Apply the engine's right-to-left multi-split operation")
+        .next()
+        .unwrap();
+    assert!(paste.contains("rope.line_to_byte(line)"));
+    assert!(!paste.contains("for i in 0..line"));
+}
+
+#[test]
 fn workspace_is_exactly_three_crates_with_the_spell_dependency_diamond() {
     let root = workspace_root();
     let workspace = std::fs::read_to_string(root.join("Cargo.toml"))

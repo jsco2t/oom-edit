@@ -251,7 +251,7 @@ mod tests {
             left_col: 0,
             skip_rows: 0,
         });
-        assert_eq!(session.live.work_counters(), (2, 1));
+        assert_eq!(session.live.work_counters(), (1, 1));
         assert_eq!(crate::syntax::line_index_build_count(), line_index_builds);
 
         session.handle_key(esc());

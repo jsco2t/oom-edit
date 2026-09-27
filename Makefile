@@ -99,6 +99,12 @@ test-release-versions: ## Verify candidate versions, exact workspace pins and de
 	cargo test --package oom-edit --test dependency_hygiene --offline --locked
 	cargo test --package oom-edit-core --test dependency_hygiene --offline --locked
 
+.PHONY: test-paste-work
+test-paste-work: ## Verify bounded paste indexing and atomic borrowed front-matter refresh
+	cargo test --package oom-edit-core --lib --offline --locked paste_refresh_borrows_updated_text
+	cargo test --package oom-edit-core --test dependency_hygiene --offline --locked paste_byte_offsets_use_the_rope_index -- --exact
+	cargo test --package oom-edit-core --lib --offline --locked navigation_and_frames_reuse_materialization_layout_and_line_index_work
+
 .PHONY: test-public-api
 test-public-api: ## Compile the curated editor APIs and all privacy/boundary compile-fail cases
 	cargo test --package oom-edit --test public_api --offline --locked

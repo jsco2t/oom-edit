@@ -41,6 +41,9 @@ published release.
 
 ### Changed
 
+- Paste uses the rope's byte index instead of copying preceding lines, and
+  atomic front-matter refresh borrows the synchronously updated text cache.
+
 - Theme persistence updates the latest valid TOML semantically and atomically,
   retaining unrelated values and refusing malformed or concurrently changed data.
 

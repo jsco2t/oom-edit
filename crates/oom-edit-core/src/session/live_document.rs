@@ -247,7 +247,7 @@ impl LiveDocument {
             }
         }
         if edited {
-            self.front_matter = parse_front_matter(&self.vim.text());
+            self.front_matter = parse_front_matter(self.highlighter.text());
         }
     }
 
@@ -259,5 +259,36 @@ impl LiveDocument {
     #[cfg(test)]
     pub(super) fn work_counters(&self) -> (usize, usize) {
         self.vim.work_counters()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LiveDocument;
+    use crate::frontmatter::parse_front_matter;
+
+    #[test]
+    fn paste_refresh_borrows_updated_text() {
+        let many_lines = format!("{}Cafe body\n", "λ preceding\r\n".repeat(10_000));
+        for (initial, row, column) in [
+            ("---\ntitle: \"Cafe\"\n---\n\nBody\n", 1, 8),
+            ("---\r\ntitle: \"Cafe\"\r\n---\r\n\r\nBody\r\n", 1, 8),
+            ("+++\ntitle = \"Cafe\"\n+++\n\nBody\n", 1, 9),
+            ("---\ntitle: [Cafe\n---\n\nBody\n", 1, 8),
+            ("Cafe body\n", 0, 0),
+            (many_lines.as_str(), 10_000, 0),
+        ] {
+            let expected = initial.replacen("Cafe", "éCafe", 1);
+            let mut live = LiveDocument::new(initial);
+            live.jump_to(row, column);
+            live.reset_work_counters();
+            let outcome = live.insert_text("é");
+            assert_eq!(outcome.effects.len(), 1);
+            assert_eq!(live.work_counters(), (0, 0));
+            assert_eq!(live.text_ref(), expected);
+            assert_eq!(live.front_matter(), &parse_front_matter(&expected));
+            assert_eq!(live.cursor(), (row, column + 1));
+            assert_eq!(live.text(), expected);
+        }
     }
 }

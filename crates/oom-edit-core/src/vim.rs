@@ -1243,14 +1243,11 @@ impl VimCore {
         // Convert col (character index) to byte offset within the line
         let byte_offset: usize = current_line.chars().take(col).map(|c| c.len_utf8()).sum();
 
-        // Calculate global byte offset
-        let mut global_offset = 0;
-        for i in 0..line {
+        // Resolve the line start through the rope index, without copying prior lines.
+        let global_offset = {
             let rope = buffer.rope();
-            let l = hjkl_buffer::rope_line_str(&rope, i);
-            global_offset += l.len() + 1; // +1 for newline
-        }
-        global_offset += byte_offset;
+            rope.line_to_byte(line) + byte_offset
+        };
 
         // Insert the text at the byte offset
         let full_text = buffer.as_string();
