@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "work_id": "2026-09-25-embeddable-editor-pane",
+  "title": "Embeddable Editor Pane and Standalone Parity",
+  "created_at": "2026-09-25T16:59:29Z",
+  "approved_at": "2026-09-27T14:35:30Z",
+  "completed_at": "2026-09-27T18:01:30Z",
+  "archived_at": "2026-09-27T18:08:29Z",
+  "baseline_sha": "eafaa6afa796d0258b72a6e5ab6ca5a3699d600a",
+  "final_sha": "87d5b48f766eb35f30c2136e23d2a4448329713b",
+  "approved_plan_sha256": "c750cc88e70cccb9392b9c74aab93d75da004b86adf29cd74c51cd3a74033a9b",
+  "acceptance_rounds": 1,
+  "prior_completed_rounds": 0,
+  "task_count": 15,
+  "tasks_completed": 15,
+  "result": "DONE",
+  "final_evidence": "evidence/final.md"
+}

@@ -1,0 +1,6 @@
+package	version	source	verification_kind
+oom-edit	0.5.0	git+https://github.com/jsco2t/oom-edit?rev=b609e7bfcf28ccd5ebd9c34d9aa4794e29b658c9#b609e7bfcf28ccd5ebd9c34d9aa4794e29b658c9	temporary-source-snapshot
+hjkl-buffer	0.39.0	git+https://github.com/jsco2t/oom-edit?rev=b609e7bfcf28ccd5ebd9c34d9aa4794e29b658c9#b609e7bfcf28ccd5ebd9c34d9aa4794e29b658c9	temporary-source-snapshot
+hjkl-engine	0.39.0	git+https://github.com/jsco2t/oom-edit?rev=b609e7bfcf28ccd5ebd9c34d9aa4794e29b658c9#b609e7bfcf28ccd5ebd9c34d9aa4794e29b658c9	temporary-source-snapshot
+tree-sitter-md	0.5.3	git+https://github.com/jsco2t/oom-edit?rev=b609e7bfcf28ccd5ebd9c34d9aa4794e29b658c9#b609e7bfcf28ccd5ebd9c34d9aa4794e29b658c9	temporary-source-snapshot
+dirs-sys	0.5.0	git+https://github.com/jsco2t/oom-edit?rev=b609e7bfcf28ccd5ebd9c34d9aa4794e29b658c9#b609e7bfcf28ccd5ebd9c34d9aa4794e29b658c9	temporary-source-snapshot
