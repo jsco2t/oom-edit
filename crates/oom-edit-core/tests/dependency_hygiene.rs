@@ -84,7 +84,7 @@ fn workspace_is_exactly_three_crates_with_the_spell_dependency_diamond() {
         "workspace membership must have one source of truth"
     );
     assert!(
-        tui.contains("oom-edit-core = { path = \"../oom-edit-core\", version = \"=0.6.0\" }"),
+        tui.contains("oom-edit-core = { path = \"../oom-edit-core\", version = \"=0.6.5\" }"),
         "TUI must depend directly on the exact-pinned core crate"
     );
     assert!(

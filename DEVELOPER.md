@@ -16,21 +16,20 @@ The canonical origin is `https://github.com/jsco2t/oom-edit`. The editor and
 **all four downstream patches** must select one immutable revision. A
 dependency's Cargo patches do not propagate into its consumer's workspace.
 
-This guide's preliminary verified source snapshot is
-`b609e7bfcf28ccd5ebd9c34d9aa4794e29b658c9`, not a published revision or final
-0.6.0 release commit. Until the real candidate is committed/published, use the
-[make-owned local source preparation](docs/downstream-consumer.md). Do not try
-to fetch this temporary snapshot from GitHub or substitute a nonexistent tag.
+The example below pins the published `v0.6.0` commit. To consume the untagged
+0.6.5 candidate, replace all five revisions with its same full commit SHA and
+use the [make-owned source verification](docs/downstream-consumer.md). Do not
+substitute a `v0.6.5` tag before it exists.
 
 ```toml
 [dependencies]
-oom-edit = { git = "https://github.com/jsco2t/oom-edit", rev = "b609e7bfcf28ccd5ebd9c34d9aa4794e29b658c9" }
+oom-edit = { git = "https://github.com/jsco2t/oom-edit", rev = "87d5b48f766eb35f30c2136e23d2a4448329713b" }
 
 [patch.crates-io]
-hjkl-buffer = { git = "https://github.com/jsco2t/oom-edit", rev = "b609e7bfcf28ccd5ebd9c34d9aa4794e29b658c9" }
-hjkl-engine = { git = "https://github.com/jsco2t/oom-edit", rev = "b609e7bfcf28ccd5ebd9c34d9aa4794e29b658c9" }
-tree-sitter-md = { git = "https://github.com/jsco2t/oom-edit", rev = "b609e7bfcf28ccd5ebd9c34d9aa4794e29b658c9" }
-dirs-sys = { git = "https://github.com/jsco2t/oom-edit", rev = "b609e7bfcf28ccd5ebd9c34d9aa4794e29b658c9" }
+hjkl-buffer = { git = "https://github.com/jsco2t/oom-edit", rev = "87d5b48f766eb35f30c2136e23d2a4448329713b" }
+hjkl-engine = { git = "https://github.com/jsco2t/oom-edit", rev = "87d5b48f766eb35f30c2136e23d2a4448329713b" }
+tree-sitter-md = { git = "https://github.com/jsco2t/oom-edit", rev = "87d5b48f766eb35f30c2136e23d2a4448329713b" }
+dirs-sys = { git = "https://github.com/jsco2t/oom-edit", rev = "87d5b48f766eb35f30c2136e23d2a4448329713b" }
 ```
 
 Replace all five revisions together for another candidate. Retain your own

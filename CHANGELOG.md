@@ -7,9 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-The changes below form the 0.6.0 release candidate. Native platform verification
-and separate publication authorization are still required; this is not a
-published release.
+The 0.6.5 release candidate is not yet tagged or published.
+
+### Changed
+
+- Retained source analysis, rendered blocks, rows, and indexes across ordinary
+  edits so large-note editing and navigation avoid full-document rebuilds.
+- Made rendered Select, full-line deletion and change, and large code-fence
+  edits responsive while preserving exact source mapping and yank behavior.
+- Added a 1 MiB kitchen-sink fixture, public-pane interaction benchmarks,
+  host-parity checks, and repeated RSS-stability gates.
+
+## [0.6.0] - 2026-09-27
+
+This release introduced the embeddable editor pane and standalone parity.
 
 ### Added
 

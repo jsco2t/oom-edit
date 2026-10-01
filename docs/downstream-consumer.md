@@ -5,23 +5,21 @@ Cargo patches belong to the consuming workspace: a dependency's root patches
 do not propagate. Pin the editor and all four patches to one full immutable
 commit, not a branch or an unapproved future tag.
 
-The Task 013 preliminary source snapshot is
-`b609e7bfcf28ccd5ebd9c34d9aa4794e29b658c9`. It is a local temporary Git commit,
-not a published revision or the final release candidate. Its actual library
-sources are consumed through the canonical manifest below using an isolated
-local Git URL rewrite during preparation. The working repository and its Git
-history are untouched. Task 015 must repeat verification against the real
-committed candidate and, only after publication authorization, the exact tag.
+The example below uses the published `v0.6.0` commit. For an untagged 0.6.5
+candidate, use its full committed SHA for all five sources. A local candidate
+can be prepared through an isolated Git URL rewrite without changing the
+working repository or its Git history. Verify the exact tag only after that
+tag has been separately created and published.
 
 ```toml
 [dependencies]
-oom-edit = { git = "https://github.com/jsco2t/oom-edit", rev = "b609e7bfcf28ccd5ebd9c34d9aa4794e29b658c9" }
+oom-edit = { git = "https://github.com/jsco2t/oom-edit", rev = "87d5b48f766eb35f30c2136e23d2a4448329713b" }
 
 [patch.crates-io]
-hjkl-buffer = { git = "https://github.com/jsco2t/oom-edit", rev = "b609e7bfcf28ccd5ebd9c34d9aa4794e29b658c9" }
-hjkl-engine = { git = "https://github.com/jsco2t/oom-edit", rev = "b609e7bfcf28ccd5ebd9c34d9aa4794e29b658c9" }
-tree-sitter-md = { git = "https://github.com/jsco2t/oom-edit", rev = "b609e7bfcf28ccd5ebd9c34d9aa4794e29b658c9" }
-dirs-sys = { git = "https://github.com/jsco2t/oom-edit", rev = "b609e7bfcf28ccd5ebd9c34d9aa4794e29b658c9" }
+hjkl-buffer = { git = "https://github.com/jsco2t/oom-edit", rev = "87d5b48f766eb35f30c2136e23d2a4448329713b" }
+hjkl-engine = { git = "https://github.com/jsco2t/oom-edit", rev = "87d5b48f766eb35f30c2136e23d2a4448329713b" }
+tree-sitter-md = { git = "https://github.com/jsco2t/oom-edit", rev = "87d5b48f766eb35f30c2136e23d2a4448329713b" }
+dirs-sys = { git = "https://github.com/jsco2t/oom-edit", rev = "87d5b48f766eb35f30c2136e23d2a4448329713b" }
 ```
 
 Replace **all five** `rev` values together when testing another candidate. A
@@ -80,7 +78,7 @@ actual checkout SHA after `make ci`, using the same preparation and offline
 validation targets; it does not depend on a tag that does not yet exist.
 
 After separate publication authorization and a successful release push, prepare
-a **new** consumer with `DOWNSTREAM_TAG=v0.6.0` and the gated SHA still supplied
+a **new** consumer with `DOWNSTREAM_TAG=v0.6.5` and the gated SHA still supplied
 as `DOWNSTREAM_REV`. Then run `make downstream-tag-check` with those same
 variables. This selects the actual tag for all five Git sources and asserts
 that their resolved commit equals the gated SHA. The tag target is never part
