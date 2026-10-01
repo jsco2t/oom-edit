@@ -16,6 +16,8 @@
 
 mod blocks;
 pub mod nav;
+mod retained;
+mod rows;
 mod table;
 mod wrap;
 
@@ -53,6 +55,7 @@ impl RenderedLayout {
     }
 
     /// Build a layout and its private fenced-code provenance companion.
+    #[cfg(test)]
     pub(crate) fn build_with_fence_regions(
         model: &BlockModel,
         width: u16,
@@ -65,6 +68,21 @@ impl RenderedLayout {
 
         let layout = RenderedLayoutBuilder::new(model, width, highlighter, front_matter_collapsed);
         layout.build()
+    }
+
+    /// Build once and record the exact rows and metadata emitted by each
+    /// top-level semantic block, footnotes, and the link appendix.
+    pub(crate) fn build_with_boundaries(
+        model: &BlockModel,
+        width: u16,
+        highlighter: &syntax::Highlighter,
+        front_matter_collapsed: bool,
+    ) -> (Self, Vec<RenderedCodeFenceRegion>, Vec<LayoutBoundary>) {
+        if width == 0 {
+            return (Self::default(), Vec::new(), Vec::new());
+        }
+        RenderedLayoutBuilder::new(model, width, highlighter, front_matter_collapsed)
+            .build_with_boundaries()
     }
 }
 
@@ -84,14 +102,61 @@ struct RenderedLayoutBuilder<'a> {
     code_fence_regions: Vec<RenderedCodeFenceRegion>,
 }
 
+/// Half-open output ranges owned by one top-level block or by the appendices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LayoutBoundary {
+    pub rows: Range<usize>,
+    pub targets: Range<usize>,
+    pub links: Range<usize>,
+    pub fences: Range<usize>,
+}
+
+/// One independently rendered block using the canonical builder.
+pub(crate) struct BlockRows {
+    pub(crate) lines: Vec<RenderedLine>,
+    pub(crate) jump_targets: Vec<JumpTarget>,
+    pub(crate) link_index: Vec<(usize, String)>,
+    pub(crate) code_fence_regions: Vec<RenderedCodeFenceRegion>,
+}
+
+pub(crate) fn render_block_chunk(
+    model: &BlockModel,
+    index: usize,
+    width: u16,
+    highlighter: &syntax::Highlighter,
+    preceding_source: Option<Range<usize>>,
+    has_previous_rows: bool,
+    first_link_marker: usize,
+) -> BlockRows {
+    let mut builder = RenderedLayoutBuilder::new(model, width, highlighter, false);
+    builder.last_content_source = preceding_source;
+    builder.next_link_marker = first_link_marker;
+    let block = &model.blocks[index];
+    if has_previous_rows {
+        builder.add_separator_before(block.span.clone());
+    }
+    builder.render_block(block);
+    for target in &mut builder.jump_targets {
+        if let TargetKind::Link(index) = &mut target.kind {
+            *index += first_link_marker;
+        }
+    }
+    BlockRows {
+        lines: builder.lines,
+        jump_targets: builder.jump_targets,
+        link_index: builder.link_index,
+        code_fence_regions: builder.code_fence_regions,
+    }
+}
+
 #[derive(Debug, Default)]
-struct MappedInlineLines {
-    lines: Vec<MappedLine>,
+struct MappedInlineLines<'a> {
+    lines: Vec<MappedLine<'a>>,
     breaks: Vec<Range<usize>>,
 }
 
-impl MappedInlineLines {
-    fn one(line: MappedLine) -> Self {
+impl<'a> MappedInlineLines<'a> {
+    fn one(line: MappedLine<'a>) -> Self {
         Self {
             lines: vec![line],
             breaks: Vec::new(),
@@ -155,25 +220,48 @@ impl<'a> RenderedLayoutBuilder<'a> {
         }
     }
 
-    fn build(mut self) -> (RenderedLayout, Vec<RenderedCodeFenceRegion>) {
+    #[cfg(test)]
+    fn build(self) -> (RenderedLayout, Vec<RenderedCodeFenceRegion>) {
+        let (layout, fences, _) = self.build_with_boundaries();
+        (layout, fences)
+    }
+
+    fn build_with_boundaries(
+        mut self,
+    ) -> (
+        RenderedLayout,
+        Vec<RenderedCodeFenceRegion>,
+        Vec<LayoutBoundary>,
+    ) {
+        let mut boundaries = Vec::with_capacity(self.model.blocks.len() + 2);
         // Process top-level blocks
         for (i, block) in self.model.blocks.iter().enumerate() {
+            let before = self.boundary_start();
             if i > 0 && !self.lines.is_empty() {
                 self.add_separator_before(block.span.clone());
             }
             self.render_block(block);
+            boundaries.push(self.boundary_since(before));
         }
 
+        let appendix_start = self.boundary_start();
         // Append footnote definitions at document end
         self.append_footnotes();
+        boundaries.push(self.boundary_since(appendix_start));
 
+        let link_start = self.boundary_start();
         // Append link index at document end (if any links were found)
         if !self.link_index.is_empty() {
             self.add_synthetic_blank(Range { start: 0, end: 0 });
             self.append_link_index();
         }
+        boundaries.push(self.boundary_since(link_start));
 
-        let line_numbers = rendered_line_numbers(&self.lines, self.highlighter.text());
+        let line_numbers = rendered_line_numbers(
+            &self.lines,
+            self.highlighter.text().len(),
+            self.highlighter.line_starts(),
+        );
         (
             RenderedLayout {
                 lines: self.lines,
@@ -182,7 +270,25 @@ impl<'a> RenderedLayoutBuilder<'a> {
                 link_index: self.link_index,
             },
             self.code_fence_regions,
+            boundaries,
         )
+    }
+
+    fn boundary_start(&self) -> LayoutBoundary {
+        LayoutBoundary {
+            rows: self.lines.len()..self.lines.len(),
+            targets: self.jump_targets.len()..self.jump_targets.len(),
+            links: self.link_index.len()..self.link_index.len(),
+            fences: self.code_fence_regions.len()..self.code_fence_regions.len(),
+        }
+    }
+
+    fn boundary_since(&self, mut start: LayoutBoundary) -> LayoutBoundary {
+        start.rows.end = self.lines.len();
+        start.targets.end = self.jump_targets.len();
+        start.links.end = self.link_index.len();
+        start.fences.end = self.code_fence_regions.len();
+        start
     }
 
     fn add_synthetic_blank(&mut self, source: Range<usize>) {
@@ -222,7 +328,7 @@ impl<'a> RenderedLayoutBuilder<'a> {
         self.last_content_source = Some(source);
     }
 
-    fn make_content_line(&mut self, mapped: MappedLine, source: Range<usize>) {
+    fn make_content_line(&mut self, mapped: MappedLine<'_>, source: Range<usize>) {
         let (styled, atoms) = mapped.into_parts();
         self.lines.push(RenderedLine {
             styled,
@@ -234,7 +340,7 @@ impl<'a> RenderedLayoutBuilder<'a> {
         self.set_last_content_source(source);
     }
 
-    fn make_synthetic_line(&mut self, mapped: MappedLine, source: Range<usize>) {
+    fn make_synthetic_line(&mut self, mapped: MappedLine<'_>, source: Range<usize>) {
         let source = self.last_content_source.clone().unwrap_or(source);
         let (styled, atoms) = mapped.into_parts();
         self.lines.push(RenderedLine {
@@ -427,23 +533,57 @@ impl<'a> RenderedLayoutBuilder<'a> {
 
     // ── VW-3: Emphasis / VW-4: Inline code ───────────────────────────
 
-    fn render_inlines_preserving_breaks(
+    fn render_inlines_preserving_breaks<'b>(
         &mut self,
-        inlines: &[Inline],
+        inlines: &'b [Inline],
         default_style: SemanticStyle,
-    ) -> MappedInlineLines {
+    ) -> MappedInlineLines<'b> {
         let mut mapped = MappedInlineLines::one(MappedLine::default());
         for inline in inlines {
-            mapped.append(self.render_inline_preserving_breaks(inline, default_style));
+            match inline {
+                Inline::Text(leaf) => append_leaf(
+                    mapped
+                        .lines
+                        .last_mut()
+                        .expect("inline composition has one line"),
+                    leaf,
+                    default_style,
+                ),
+                Inline::Code(leaf) => append_leaf(
+                    mapped
+                        .lines
+                        .last_mut()
+                        .expect("inline composition has one line"),
+                    leaf,
+                    SemanticStyle::CodeSpan,
+                ),
+                Inline::FootnoteRef(leaf) => append_leaf(
+                    mapped
+                        .lines
+                        .last_mut()
+                        .expect("inline composition has one line"),
+                    leaf,
+                    SemanticStyle::Link,
+                ),
+                Inline::Html(leaf) => append_leaf(
+                    mapped
+                        .lines
+                        .last_mut()
+                        .expect("inline composition has one line"),
+                    leaf,
+                    SemanticStyle::HtmlRaw,
+                ),
+                _ => mapped.append(self.render_inline_preserving_breaks(inline, default_style)),
+            }
         }
         mapped
     }
 
-    fn render_inline_preserving_breaks(
+    fn render_inline_preserving_breaks<'b>(
         &mut self,
-        inline: &Inline,
+        inline: &'b Inline,
         default_style: SemanticStyle,
-    ) -> MappedInlineLines {
+    ) -> MappedInlineLines<'b> {
         let mut line = MappedLine::default();
         match inline {
             Inline::Text(leaf) => append_leaf(&mut line, leaf, default_style),
@@ -503,26 +643,14 @@ impl<'a> RenderedLayoutBuilder<'a> {
         // Fenced code block with gutter
         let gutter = "▏";
         let lang_tag = lang.as_deref().unwrap_or("");
-
-        // Get fence content
-        let fence_content = if content_span.start < content_span.end {
-            &self.highlighter.text()[content_span.clone()]
-        } else {
-            ""
-        };
-
-        // If we have a highlighter, use it; otherwise render plain
-        let highlighted = if let Some(_hl) = self.highlighter_as_ref() {
-            syntax::highlight_snippet(lang_tag, fence_content)
-        } else {
-            fence_content
-                .lines()
-                .map(|line| StyledLine {
-                    text: line.to_string(),
-                    spans: Vec::new(),
-                })
-                .collect()
-        };
+        let fence_content = self
+            .highlighter
+            .text()
+            .get(content_span.clone())
+            .unwrap_or("");
+        let highlighted = self
+            .highlighter
+            .highlight_fence_span(lang_tag, content_span);
 
         // Build gutter lines
         let lang_line_text = format!("{} {}", gutter, lang_tag);
@@ -538,13 +666,19 @@ impl<'a> RenderedLayoutBuilder<'a> {
             source.start..content_span.start.min(source.end),
         );
 
-        let content_lines = source_line_spans(self.highlighter.text(), content_span);
-        for (index, line) in highlighted.iter().enumerate() {
-            let line_source = content_lines
-                .get(index)
-                .cloned()
-                .unwrap_or_else(|| content_span.clone());
-            let mut mapped = mapped_code_from_styled(line.clone(), line_source.start);
+        let mut line_start = content_span.start;
+        let mut source_lines = fence_content.split_inclusive('\n');
+        for line in highlighted {
+            let line_source = source_lines.next().map_or_else(
+                || content_span.clone(),
+                |source_line| {
+                    let end = line_start + source_line.len();
+                    let span = line_start..end;
+                    line_start = end;
+                    span
+                },
+            );
+            let mut mapped = mapped_code_from_styled(line, line_source.start);
             mapped.prepend_generated("▏ ", SemanticStyle::Muted);
             self.make_content_line(mapped, line_source);
         }
@@ -944,41 +1078,13 @@ impl<'a> RenderedLayoutBuilder<'a> {
         }
 
         // Links separator
-        let separator = "─ links ─";
-        self.make_synthetic_styled_line(
-            StyledLine {
-                text: separator.to_string(),
-                spans: vec![Span {
-                    start_col: 0,
-                    end_col: separator.chars().count(),
-                    style: SemanticStyle::Rule,
-                }],
-            },
-            Range { start: 0, end: 0 },
-        );
+        self.make_synthetic_styled_line(link_footer_separator_style(), Range { start: 0, end: 0 });
 
         let link_index = self.link_index.clone();
         for (index, (marker, dest)) in link_index.iter().enumerate() {
             let line = self.lines.len();
-            let line_text = format!("[{}] {}", marker, dest);
-            let marker_end = format!("[{}]", marker).chars().count();
-            let destination_start = marker_end + 1;
             self.make_synthetic_styled_line(
-                StyledLine {
-                    text: line_text,
-                    spans: vec![
-                        Span {
-                            start_col: 0,
-                            end_col: marker_end,
-                            style: SemanticStyle::Link,
-                        },
-                        Span {
-                            start_col: destination_start,
-                            end_col: destination_start + dest.chars().count(),
-                            style: SemanticStyle::LinkUrl,
-                        },
-                    ],
-                },
+                link_footer_entry_style(*marker, dest),
                 Range { start: 0, end: 0 },
             );
             self.jump_targets.push(JumpTarget {
@@ -1069,7 +1175,7 @@ impl<'a> RenderedLayoutBuilder<'a> {
         }
     }
 
-    fn make_metadata_line(&mut self, mapped: MappedLine, source: Range<usize>) {
+    fn make_metadata_line(&mut self, mapped: MappedLine<'_>, source: Range<usize>) {
         let (styled, atoms) = mapped.into_parts();
         self.lines.push(RenderedLine {
             styled,
@@ -1108,21 +1214,14 @@ impl<'a> RenderedLayoutBuilder<'a> {
             self.make_metadata_line(line, source.clone());
         }
     }
-
-    fn highlighter_as_ref(&self) -> Option<&syntax::Highlighter> {
-        Some(self.highlighter)
-    }
 }
 
-fn rendered_line_numbers(lines: &[RenderedLine], text: &str) -> Vec<Option<usize>> {
+fn rendered_line_numbers(
+    lines: &[RenderedLine],
+    text_len: usize,
+    line_starts: &[usize],
+) -> Vec<Option<usize>> {
     let mut previous_content_source: Option<Range<usize>> = None;
-    let mut line_starts = Vec::with_capacity(text.len() / 80 + 1);
-    line_starts.push(0);
-    line_starts.extend(
-        text.bytes()
-            .enumerate()
-            .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
-    );
     lines
         .iter()
         .map(|line| {
@@ -1132,10 +1231,69 @@ fn rendered_line_numbers(lines: &[RenderedLine], text: &str) -> Vec<Option<usize
                 return None;
             }
             previous_content_source = Some(line.source.clone());
-            let start = line.source.start.min(text.len());
+            let start = line.source.start.min(text_len);
             Some(line_starts.partition_point(|line_start| *line_start <= start))
         })
         .collect()
+}
+
+fn link_footer_separator_style() -> StyledLine {
+    let separator = "─ links ─";
+    StyledLine {
+        text: separator.to_string(),
+        spans: vec![Span {
+            start_col: 0,
+            end_col: separator.chars().count(),
+            style: SemanticStyle::Rule,
+        }],
+    }
+}
+
+fn link_footer_entry_style(marker: usize, destination: &str) -> StyledLine {
+    let marker_text = format!("[{marker}]");
+    let marker_end = marker_text.chars().count();
+    StyledLine {
+        text: format!("{marker_text} {destination}"),
+        spans: vec![
+            Span {
+                start_col: 0,
+                end_col: marker_end,
+                style: SemanticStyle::Link,
+            },
+            Span {
+                start_col: marker_end + 1,
+                end_col: marker_end + 1 + destination.chars().count(),
+                style: SemanticStyle::LinkUrl,
+            },
+        ],
+    }
+}
+
+/// Synthesize one appendix row with the same mapped-cell path as a full build.
+pub(crate) fn link_footer_row(
+    row: usize,
+    link: Option<(usize, &str)>,
+    source: Range<usize>,
+) -> RenderedLine {
+    let styled = match row {
+        0 => StyledLine {
+            text: String::new(),
+            spans: Vec::new(),
+        },
+        1 => link_footer_separator_style(),
+        _ => {
+            let (marker, destination) = link.expect("link appendix entry must have a destination");
+            link_footer_entry_style(marker, destination)
+        }
+    };
+    let (styled, atoms) = mapped_from_styled(styled, None).into_parts();
+    RenderedLine {
+        styled,
+        source,
+        kind: LineKind::Synthetic,
+        role: RenderedLineRole::Document,
+        atoms,
+    }
 }
 
 fn source_blank_line_before(text: &str, next_source_start: usize) -> Option<Range<usize>> {
@@ -1213,6 +1371,76 @@ fn source_line_spans(text: &str, source: &Range<usize>) -> Vec<Range<usize>> {
     spans
 }
 
+/// Render one existing fenced-code source line with the same mapped atoms and
+/// generated gutter as the complete block builder.
+pub(crate) fn code_fence_line_from_source(
+    highlighter: &syntax::Highlighter,
+    lang: &str,
+    source: Range<usize>,
+) -> Option<RenderedLine> {
+    let line_index = highlighter
+        .line_starts()
+        .partition_point(|start| *start <= source.start)
+        .saturating_sub(1);
+    let styled = if highlighter.line_starts()[line_index] == source.start {
+        highlighter
+            .highlight_lines(line_index..line_index + 1)
+            .pop()?
+    } else {
+        highlighter
+            .highlight_snippet(lang, &highlighter.text()[source.clone()])
+            .into_iter()
+            .next()?
+    };
+    Some(mapped_code_fence_line(styled, source))
+}
+
+pub(crate) fn code_fence_lines_from_source(
+    highlighter: &syntax::Highlighter,
+    lang: &str,
+    sources: &[Range<usize>],
+) -> Option<Vec<RenderedLine>> {
+    let first = sources.first()?;
+    let first_line = highlighter
+        .line_starts()
+        .partition_point(|start| *start <= first.start)
+        .saturating_sub(1);
+    if highlighter.line_starts()[first_line] == first.start
+        && sources.iter().enumerate().all(|(index, source)| {
+            highlighter.line_starts().get(first_line + index) == Some(&source.start)
+        })
+    {
+        let styles = highlighter.highlight_lines(first_line..first_line + sources.len());
+        if styles.len() == sources.len() {
+            return Some(
+                styles
+                    .into_iter()
+                    .zip(sources.iter().cloned())
+                    .map(|(styled, source)| mapped_code_fence_line(styled, source))
+                    .collect(),
+            );
+        }
+    }
+    sources
+        .iter()
+        .cloned()
+        .map(|source| code_fence_line_from_source(highlighter, lang, source))
+        .collect()
+}
+
+fn mapped_code_fence_line(styled: StyledLine, source: Range<usize>) -> RenderedLine {
+    let mut mapped = mapped_code_from_styled(styled, source.start);
+    mapped.prepend_generated("▏ ", SemanticStyle::Muted);
+    let (styled, atoms) = mapped.into_parts();
+    RenderedLine {
+        styled,
+        source,
+        kind: LineKind::Content,
+        role: RenderedLineRole::CodeFence,
+        atoms,
+    }
+}
+
 fn paragraph_source_lines(
     text: &str,
     source: &Range<usize>,
@@ -1243,17 +1471,18 @@ fn inline_leaf_source(leaf: &InlineLeaf) -> Range<usize> {
         .expect("break leaves always carry their parser span")
 }
 
-fn append_leaf(line: &mut MappedLine, leaf: &InlineLeaf, style: SemanticStyle) {
+fn append_leaf<'a>(line: &mut MappedLine<'a>, leaf: &'a InlineLeaf, style: SemanticStyle) {
+    line.fragments.reserve(leaf.atoms.len());
     for atom in &leaf.atoms {
-        line.push(atom.text.clone(), style, Some(atom.source.clone()));
+        line.push(atom.text.as_str(), style, Some(atom.source.clone()));
     }
 }
 
-fn mapped_from_styled(styled: StyledLine, visible_start: Option<usize>) -> MappedLine {
+fn mapped_from_styled(styled: StyledLine, visible_start: Option<usize>) -> MappedLine<'static> {
     mapped_from_styled_with_tab_stops(styled, visible_start, None)
 }
 
-fn mapped_code_from_styled(styled: StyledLine, visible_start: usize) -> MappedLine {
+fn mapped_code_from_styled(styled: StyledLine, visible_start: usize) -> MappedLine<'static> {
     mapped_from_styled_with_tab_stops(styled, Some(visible_start), Some(4))
 }
 
@@ -1261,7 +1490,7 @@ fn mapped_from_styled_with_tab_stops(
     styled: StyledLine,
     visible_start: Option<usize>,
     tab_stop: Option<usize>,
-) -> MappedLine {
+) -> MappedLine<'static> {
     let mut mapped = MappedLine::default();
     let mut char_offset = 0;
     let mut byte_offset = 0;
@@ -1331,11 +1560,144 @@ fn metadata_border(width: usize, opening: bool) -> String {
 // ── Re-exports ─────────────────────────────────────────────────────────────
 
 pub(crate) use blocks::*;
+pub(crate) use retained::ModelChange;
+pub(crate) use retained::ModelEditScope;
+#[cfg(test)]
+pub(crate) use retained::ModelWork;
+pub(crate) use retained::RetainedBlockModel;
+pub(crate) use rows::{RetainedRows, RowShift, RowWindowChange};
 pub(crate) use wrap::{text_width, wrap_source_line};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "exact 1 MiB code-row feasibility diagnostic is run by its benchmark target"]
+    fn acceptance_1mb_source_highlight_builds_exact_code_rows() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/kitchen-sink-1mb.md");
+        let text = std::fs::read_to_string(path).unwrap();
+        let highlighter = syntax::Highlighter::new(&text);
+        let model = BlockModel::build(&text, crate::frontmatter::front_matter_span(&text));
+        let layout = RenderedLayout::build(&model, 100, &highlighter);
+        for (language, first_line) in [("rust", 3000), ("go", 20000)] {
+            let started = std::time::Instant::now();
+            let highlighted = highlighter.highlight_lines(first_line..first_line + 15);
+            let highlight_ns = started.elapsed().as_nanos();
+            let started = std::time::Instant::now();
+            assert_eq!(
+                highlighted,
+                highlighter.highlight_lines(first_line..first_line + 15)
+            );
+            let warm_ns = started.elapsed().as_nanos();
+            for (index, styled) in highlighted.into_iter().enumerate() {
+                let line = first_line + index;
+                let source = highlighter.line_starts()[line]..highlighter.line_starts()[line + 1];
+                let mut mapped = mapped_code_from_styled(styled, source.start);
+                mapped.prepend_generated("▏ ", SemanticStyle::Muted);
+                let (styled, atoms) = mapped.into_parts();
+                let candidate = RenderedLine {
+                    styled,
+                    source: source.clone(),
+                    kind: LineKind::Content,
+                    role: RenderedLineRole::CodeFence,
+                    atoms,
+                };
+                let expected = layout
+                    .lines
+                    .iter()
+                    .find(|row| {
+                        row.role == RenderedLineRole::CodeFence
+                            && row.kind == LineKind::Content
+                            && row.source == source
+                    })
+                    .unwrap();
+                assert_eq!(candidate, *expected, "{language} line {line}");
+            }
+            println!("CODE_ROWS\t{language}\t{highlight_ns}\t{warm_ns}\t15");
+        }
+    }
+
+    #[test]
+    fn inline_composition_borrows_parser_leaf_until_row_materialization() {
+        let leaf = InlineLeaf {
+            text: "é".to_string(),
+            atoms: vec![crate::rendered::blocks::InlineAtom {
+                text: "é".to_string(),
+                source: 3..5,
+            }],
+        };
+        let mut line = MappedLine::default();
+        append_leaf(&mut line, &leaf, SemanticStyle::Emphasis);
+        assert!(matches!(
+            line.fragments[0].text,
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(line.fragments[0].text.as_ptr(), leaf.atoms[0].text.as_ptr());
+        let (styled, atoms) = line.into_parts();
+        assert_eq!(styled.text, "é");
+        assert_eq!(atoms[0].source, Some(3..5));
+    }
+
+    #[test]
+    fn block_boundaries_partition_rows_and_global_metadata_without_copying() {
+        let text = concat!(
+            "---\ntitle: Demo\n---\n\n",
+            "# Heading [link](https://example.invalid)\n\n",
+            "```rust\nfn main() {}\n```\n\n",
+            "A [^note] and [second](https://example.invalid/second).\n\n",
+            "[^note]: Footnote body.\n",
+        );
+        let model = BlockModel::build(text, crate::frontmatter::front_matter_span(text));
+        let highlighter = syntax::Highlighter::new(text);
+        let (layout, fences, boundaries) =
+            RenderedLayout::build_with_boundaries(&model, 42, &highlighter, false);
+        assert_eq!(boundaries.len(), model.blocks.len() + 2);
+        for (ranges, total) in [
+            (
+                boundaries.iter().map(|part| &part.rows).collect::<Vec<_>>(),
+                layout.lines.len(),
+            ),
+            (
+                boundaries
+                    .iter()
+                    .map(|part| &part.targets)
+                    .collect::<Vec<_>>(),
+                layout.jump_targets.len(),
+            ),
+            (
+                boundaries
+                    .iter()
+                    .map(|part| &part.links)
+                    .collect::<Vec<_>>(),
+                layout.link_index.len(),
+            ),
+            (
+                boundaries
+                    .iter()
+                    .map(|part| &part.fences)
+                    .collect::<Vec<_>>(),
+                fences.len(),
+            ),
+        ] {
+            assert_eq!(ranges.first().unwrap().start, 0);
+            assert_eq!(ranges.last().unwrap().end, total);
+            assert!(ranges.windows(2).all(|pair| pair[0].end == pair[1].start));
+        }
+        assert_eq!(layout.line_numbers.len(), layout.lines.len());
+        let footer = &boundaries.last().unwrap().rows;
+        assert!(footer.len() > 2);
+        for (local, row) in footer.clone().enumerate() {
+            let link = local
+                .checked_sub(2)
+                .map(|index| (index, layout.link_index[index].1.as_str()));
+            assert_eq!(
+                link_footer_row(local, link, layout.lines[row].source.clone()),
+                layout.lines[row]
+            );
+        }
+    }
 
     #[test]
     fn blank_line_before_block_is_exact_for_lf_crlf_and_container_spans() {
@@ -1407,7 +1769,11 @@ mod tests {
             line(13..18, LineKind::Content),
         ];
         assert_eq!(
-            rendered_line_numbers(&lines, text),
+            rendered_line_numbers(
+                &lines,
+                text.len(),
+                syntax::Highlighter::new(text).line_starts()
+            ),
             vec![Some(1), None, None, Some(2), Some(3)]
         );
     }

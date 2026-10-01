@@ -10,6 +10,7 @@
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use std::borrow::Cow;
 use std::ops::Range;
 
 use crate::style::{RenderedSourceAtom, SemanticStyle, Span, StyledLine};
@@ -17,27 +18,27 @@ use crate::style::{RenderedSourceAtom, SemanticStyle, Span, StyledLine};
 /// One owned visible display group. Text, style, and source ownership always
 /// move together through composition and wrapping.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct MappedFragment {
-    pub(super) text: String,
+pub(super) struct MappedFragment<'a> {
+    pub(super) text: Cow<'a, str>,
     pub(super) style: SemanticStyle,
     pub(super) source: Option<Range<usize>>,
 }
 
 /// A private line of mapped display groups used by the rendered pipeline.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(super) struct MappedLine {
-    pub(super) fragments: Vec<MappedFragment>,
+pub(super) struct MappedLine<'a> {
+    pub(super) fragments: Vec<MappedFragment<'a>>,
 }
 
-impl MappedLine {
+impl<'a> MappedLine<'a> {
     pub(super) fn push(
         &mut self,
-        text: String,
+        text: impl Into<Cow<'a, str>>,
         style: SemanticStyle,
         source: Option<Range<usize>>,
     ) {
         self.fragments.push(MappedFragment {
-            text,
+            text: text.into(),
             style,
             source,
         });
@@ -56,7 +57,7 @@ impl MappedLine {
         self.fragments = prefix.fragments;
     }
 
-    pub(super) fn append(&mut self, mut other: MappedLine) {
+    pub(super) fn append(&mut self, mut other: MappedLine<'a>) {
         self.fragments.append(&mut other.fragments);
     }
 
@@ -64,7 +65,7 @@ impl MappedLine {
     pub(super) fn text(&self) -> String {
         self.fragments
             .iter()
-            .map(|fragment| fragment.text.as_str())
+            .map(|fragment| fragment.text.as_ref())
             .collect()
     }
 
@@ -75,6 +76,7 @@ impl MappedLine {
             .sum()
     }
 
+    #[cfg(test)]
     fn styled_line(&self) -> StyledLine {
         let mut text = String::with_capacity(
             self.fragments
@@ -144,12 +146,26 @@ impl MappedLine {
 }
 
 /// Wrap mapped display groups without separating their source ownership.
-pub(super) fn wrap_mapped_line(
-    input: MappedLine,
+pub(super) fn wrap_mapped_line<'a>(
+    input: MappedLine<'a>,
     width: u16,
     hanging_indent: u16,
-) -> Vec<MappedLine> {
-    let visual = wrap_lines(&input.styled_line(), width, hanging_indent);
+) -> Vec<MappedLine<'a>> {
+    // Wrapping chooses break points from text alone. The fragments below carry
+    // the authoritative styles and source ownership into the output rows.
+    let text = input
+        .fragments
+        .iter()
+        .map(|fragment| fragment.text.as_ref())
+        .collect();
+    let visual = wrap_lines(
+        &StyledLine {
+            text,
+            spans: Vec::new(),
+        },
+        width,
+        hanging_indent,
+    );
     let mut fragments = input.fragments.into_iter();
     visual
         .into_iter()
@@ -230,16 +246,23 @@ pub fn wrap_lines(input: &StyledLine, width: u16, hanging_indent: u16) -> Vec<St
         }];
     }
 
-    // Build a mapping from character index to span index.
-    // Each character position maps to the span that covers it (if any).
-    let mut char_to_span: Vec<Option<usize>> = vec![None; char_count];
-    for (si, span) in input.spans.iter().enumerate() {
-        for item in char_to_span
-            .iter_mut()
-            .take(span.end_col.min(char_count))
-            .skip(span.start_col)
-        {
-            *item = Some(si);
+    // Unstyled mapped lines need only break points; their source fragments
+    // carry the styles through wrapping without a per-character style index.
+    let unstyled = input.spans.is_empty();
+    let mut char_to_span = if unstyled {
+        Vec::new()
+    } else {
+        vec![None; char_count]
+    };
+    if !unstyled {
+        for (si, span) in input.spans.iter().enumerate() {
+            for item in char_to_span
+                .iter_mut()
+                .take(span.end_col.min(char_count))
+                .skip(span.start_col)
+            {
+                *item = Some(si);
+            }
         }
     }
 
@@ -263,7 +286,11 @@ pub fn wrap_lines(input: &StyledLine, width: u16, hanging_indent: u16) -> Vec<St
         if available == 0 {
             // Width too small — hard-break the next character
             let ch = chars[pos];
-            let style = char_to_span[pos].map(|si| input.spans[si].style);
+            let style = if unstyled {
+                None
+            } else {
+                char_to_span[pos].map(|si| input.spans[si].style)
+            };
             let style_spans = style.map(|s| {
                 vec![Span {
                     start_col: hi,
@@ -302,7 +329,9 @@ pub fn wrap_lines(input: &StyledLine, width: u16, hanging_indent: u16) -> Vec<St
         let _line_text_width = text_width(&text);
         let col_offset = if is_first { 0 } else { hi };
 
-        let spans: Vec<Span> = {
+        let spans: Vec<Span> = if unstyled {
+            Vec::new()
+        } else {
             // Determine which character indices in the original text are on this line
             let line_char_start = pos;
             let line_char_end = pos + line_chars.len();
@@ -536,14 +565,79 @@ pub fn text_width(s: &str) -> usize {
 mod tests {
     use super::*;
 
+    fn reference_mapped_wrap(
+        input: MappedLine,
+        width: u16,
+        hanging_indent: u16,
+    ) -> Vec<MappedLine> {
+        let visual = wrap_lines(&input.styled_line(), width, hanging_indent);
+        let mut fragments = input.fragments.into_iter();
+        visual
+            .into_iter()
+            .enumerate()
+            .map(|(line_index, visual_line)| {
+                let mut line = MappedLine::default();
+                let indent = if line_index == 0 {
+                    0
+                } else {
+                    usize::from(hanging_indent).min(visual_line.text.len())
+                };
+                if indent > 0 {
+                    line.push_generated(&" ".repeat(indent), SemanticStyle::Text);
+                }
+                for group in display_groups(&visual_line.text[indent..]) {
+                    if let Some(fragment) = fragments.find(|fragment| fragment.text == group) {
+                        line.fragments.push(fragment);
+                    } else {
+                        line.push_generated(group, SemanticStyle::Text);
+                    }
+                }
+                line
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mapped_wrap_matches_complete_style_aware_reference() {
+        for text in [
+            "",
+            "same same same",
+            " long words and   spaces  ",
+            "e\u{301} 界👩\u{200d}💻\t repeated e\u{301} ",
+            "a\u{301}b\u{301}c\u{301}d\u{301}",
+        ] {
+            let mut mapped = MappedLine::default();
+            for (index, group) in display_groups(text).enumerate() {
+                mapped.push(
+                    group.to_owned(),
+                    if index % 2 == 0 {
+                        SemanticStyle::Strong
+                    } else {
+                        SemanticStyle::Text
+                    },
+                    Some(index..index + group.len()),
+                );
+            }
+            for width in 0..18 {
+                for indent in 0..6 {
+                    assert_eq!(
+                        wrap_mapped_line(mapped.clone(), width, indent),
+                        reference_mapped_wrap(mapped.clone(), width, indent),
+                        "{text:?} width={width} indent={indent}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn mapped_borrowed_styles_match_owned_projection() {
         let mut input = MappedLine::default();
-        input.push("e\u{301}".into(), SemanticStyle::Emphasis, Some(0..3));
-        input.push(" ".into(), SemanticStyle::Text, None);
-        input.push("界".into(), SemanticStyle::CodeSpan, Some(4..7));
-        input.push("👩\u{200d}".into(), SemanticStyle::Strong, Some(7..14));
-        input.push("💻".into(), SemanticStyle::Strong, Some(14..18));
+        input.push("e\u{301}", SemanticStyle::Emphasis, Some(0..3));
+        input.push(" ", SemanticStyle::Text, None);
+        input.push("界", SemanticStyle::CodeSpan, Some(4..7));
+        input.push("👩\u{200d}", SemanticStyle::Strong, Some(7..14));
+        input.push("💻", SemanticStyle::Strong, Some(14..18));
         input.push(String::new(), SemanticStyle::HtmlRaw, None);
         assert_eq!(input.styled_line(), input.clone().into_parts().0);
         assert_eq!(

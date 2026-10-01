@@ -57,10 +57,10 @@ pub(crate) fn rendered_selection_content(
     layout: &RenderedLayout,
     document: &str,
 ) -> ClipboardContent {
-    let constructs = inline_construct_spans(document);
-    let visible_sources = visible_source_ranges(layout);
     match selection.shape {
         SelectionShape::Character => {
+            let constructs = inline_construct_spans(document);
+            let visible_sources = visible_source_ranges(layout);
             let markdown = markdown_for_ranges(
                 &selection.source_ranges,
                 &selection.source_ranges,
@@ -75,6 +75,8 @@ pub(crate) fn rendered_selection_content(
             ClipboardContent::from_markdown(markdown)
         }
         SelectionShape::Block => {
+            let constructs = inline_construct_spans(document);
+            let visible_sources = visible_source_ranges(layout);
             let mut markdown_rows = Vec::with_capacity(selection.rows.len());
             let mut plain_rows = Vec::with_capacity(selection.rows.len());
             for row in &selection.rows {

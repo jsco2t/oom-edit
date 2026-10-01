@@ -1,11 +1,14 @@
 #[path = "../examples/support/embedded_host.rs"]
 mod embedded_host;
+#[path = "support/incremental_host_vector.rs"]
+mod incremental_host_vector;
 
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use embedded_host::{translate_key, EmbeddedHost};
 use oom_edit::{KeyCodeKind, Modifiers, OpenOptions, PaneEvent, PaneInput};
+use oom_edit_core::EditorSession;
 use ratatui::{backend::TestBackend, layout::Rect, Terminal};
 
 fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
@@ -301,6 +304,212 @@ fn fr_117_two_public_hosts() {
         );
     }
     assert_eq!(embedded.pane.text(&embedded_id).unwrap(), "same λ text\n");
+}
+
+#[test]
+fn shared_incremental_vector_matches_core_and_both_public_host_policies() {
+    let directory = tempfile::tempdir().unwrap();
+    let embedded_dir = directory.path().join("embedded");
+    let standalone_dir = directory.path().join("standalone");
+    let core_dir = directory.path().join("core");
+    std::fs::create_dir(&embedded_dir).unwrap();
+    std::fs::create_dir(&standalone_dir).unwrap();
+    std::fs::create_dir(&core_dir).unwrap();
+    let embedded_path = embedded_dir.join("note.md");
+    let standalone_path = standalone_dir.join("note.md");
+    let core_path = core_dir.join("note.md");
+    std::fs::write(&embedded_path, incremental_host_vector::MARKDOWN).unwrap();
+    std::fs::write(&standalone_path, incremental_host_vector::MARKDOWN).unwrap();
+    std::fs::write(&core_path, incremental_host_vector::MARKDOWN).unwrap();
+    let initial = Instant::now();
+    let mut embedded = EmbeddedHost::new(directory.path(), vec![embedded_path.clone()], initial);
+    let mut standalone = EmbeddedHost::with_options(
+        directory.path(),
+        vec![standalone_path.clone()],
+        oom_edit::PaneOptions {
+            command_policy: oom_edit::CommandPolicy::Standalone,
+            ..oom_edit::PaneOptions::default()
+        },
+        initial,
+    )
+    .pane;
+    let embedded_id = embedded.pane.active_tab().unwrap();
+    let standalone_id = standalone.active_tab().unwrap();
+    let mut core = EditorSession::open_existing(&core_path).unwrap();
+    let (mut width, mut height) = (96, 24);
+    let _ = core.render_layout(width - 4);
+    embedded.pane.render(width, height, initial);
+    standalone.render(width, height, initial);
+
+    for (index, step) in incremental_host_vector::steps().into_iter().enumerate() {
+        let now = initial + Duration::from_millis(index as u64 * 10);
+        match step {
+            incremental_host_vector::Step::Event(event) => {
+                let Event::Key(key) = &event else {
+                    panic!("shared edit vector must contain key events");
+                };
+                let translated = translate_key(key).unwrap();
+                core.handle_key(translated);
+                standalone.handle_input(PaneInput::Key(translated), now);
+                embedded.handle_event(event, Rect::new(24, 0, width, height), now);
+            }
+            incremental_host_vector::Step::PaneSize(next_width, next_height) => {
+                (width, height) = (next_width, next_height);
+                let _ = core.render_layout(width - 4);
+                standalone.resize(width, height, now);
+                embedded.handle_event(
+                    Event::Resize(width + 24, height + 1),
+                    Rect::new(24, 0, width, height),
+                    now,
+                );
+            }
+        }
+        assert_eq!(
+            core.document(),
+            standalone.text(&standalone_id).unwrap(),
+            "core text step {index}"
+        );
+        assert_eq!(
+            core.document(),
+            embedded.pane.text(&embedded_id).unwrap(),
+            "embedded text step {index}"
+        );
+        assert_eq!(
+            core.mode(),
+            standalone.status().unwrap().mode,
+            "standalone mode step {index}"
+        );
+        assert_eq!(
+            core.mode(),
+            embedded.pane.status().unwrap().mode,
+            "embedded mode step {index}"
+        );
+        assert_eq!(
+            core.cursor(),
+            standalone.source_cursor(&standalone_id).unwrap(),
+            "standalone cursor step {index}"
+        );
+        assert_eq!(
+            core.cursor(),
+            embedded.pane.source_cursor(&embedded_id).unwrap(),
+            "embedded cursor step {index}"
+        );
+        match index {
+            1 | 4 => assert!(core.document().starts_with("X---")),
+            3 => assert_eq!(core.document(), incremental_host_vector::MARKDOWN),
+            8 | 12 => assert!(core.document().contains('Z')),
+            10 => assert!(!core.document().contains('Z')),
+            13 => assert_eq!(core.mode(), oom_edit_core::Mode::Select),
+            16 => assert_eq!(core.mode(), oom_edit_core::Mode::Command),
+            17 => assert_eq!(core.mode(), oom_edit_core::Mode::Normal),
+            _ => {}
+        }
+        let current = core.render_layout(width - 4).clone();
+        let mut fresh = EditorSession::from_text(&core.document());
+        assert_eq!(
+            current,
+            *fresh.render_layout(width - 4),
+            "semantic rows and atoms step {index}"
+        );
+        let standalone_frame = standalone.render(width, height, now);
+        let embedded_frame = embedded.pane.render(width, height, now);
+        if let Some((cell_index, (standalone_cell, embedded_cell))) = standalone_frame
+            .cells
+            .iter()
+            .zip(embedded_frame.cells.iter())
+            .enumerate()
+            .find(|(_, (left, right))| left != right)
+        {
+            panic!(
+                "owned cell step {index} at row {} column {}: {standalone_cell:?} != {embedded_cell:?}",
+                cell_index / usize::from(width),
+                cell_index % usize::from(width)
+            );
+        }
+        assert_eq!(
+            standalone_frame.cursor, embedded_frame.cursor,
+            "owned cursor step {index}"
+        );
+    }
+
+    for character in [':', 'w', '\n'] {
+        let event = key(
+            if character == '\n' {
+                KeyCode::Enter
+            } else {
+                KeyCode::Char(character)
+            },
+            KeyModifiers::NONE,
+        );
+        let Event::Key(terminal_key) = &event else {
+            unreachable!()
+        };
+        let translated = translate_key(terminal_key).unwrap();
+        core.handle_key(translated);
+        standalone.handle_input(PaneInput::Key(translated), initial);
+        embedded.handle_event(event, Rect::new(24, 0, width, height), initial);
+    }
+    core.save(None, false).unwrap();
+    for path in [&core_path, &standalone_path, &embedded_path] {
+        assert_eq!(std::fs::read_to_string(path).unwrap(), core.document());
+    }
+    assert_eq!(standalone.tabs()[0].dirty, embedded.pane.tabs()[0].dirty);
+    assert!(!standalone.tabs()[0].dirty);
+
+    let replacement = "# Reloaded λ\n\nA [link][ref].\n\n[ref]: /fresh\n";
+    for path in [&core_path, &standalone_path, &embedded_path] {
+        std::fs::write(path, replacement).unwrap();
+    }
+    let oom_edit_core::DiskState::Modified { version } = core.disk_state() else {
+        panic!("core must observe the external version");
+    };
+    core.reload_from_disk(&version).unwrap();
+    standalone
+        .notify_paths_changed(std::slice::from_ref(&standalone_path))
+        .unwrap();
+    let _ = standalone.tick(initial);
+    embedded
+        .pane
+        .notify_paths_changed(std::slice::from_ref(&embedded_path))
+        .unwrap();
+    embedded.tick(initial);
+    assert_eq!(core.document(), replacement);
+    assert_eq!(standalone.text(&standalone_id).unwrap(), replacement);
+    assert_eq!(embedded.pane.text(&embedded_id).unwrap(), replacement);
+    assert_eq!(
+        core.cursor(),
+        standalone.source_cursor(&standalone_id).unwrap()
+    );
+    assert_eq!(
+        core.cursor(),
+        embedded.pane.source_cursor(&embedded_id).unwrap()
+    );
+    assert_eq!(
+        core.render_layout(width - 4).clone(),
+        *EditorSession::from_text(replacement).render_layout(width - 4)
+    );
+    assert_eq!(
+        standalone.render(width, height, initial).cells,
+        embedded.pane.render(width, height, initial).cells
+    );
+
+    let standalone_other = standalone.new_buffer(OpenOptions::default()).unwrap();
+    let embedded_other = embedded.pane.new_buffer(OpenOptions::default()).unwrap();
+    assert_eq!(standalone.tabs().len(), embedded.pane.tabs().len());
+    standalone.focus_tab(&standalone_id).unwrap();
+    embedded.pane.focus_tab(&embedded_id).unwrap();
+    assert_eq!(standalone.active_tab(), Some(standalone_id));
+    assert_eq!(embedded.pane.active_tab(), Some(embedded_id));
+    assert_eq!(
+        standalone.render(width, height, initial).cells,
+        embedded.pane.render(width, height, initial).cells
+    );
+    standalone.focus_tab(&standalone_other).unwrap();
+    embedded.pane.focus_tab(&embedded_other).unwrap();
+    assert_eq!(
+        standalone.render(width, height, initial).cells,
+        embedded.pane.render(width, height, initial).cells
+    );
 }
 
 #[test]

@@ -43,8 +43,8 @@ pub fn render_table(
 }
 
 /// One rendered table line plus its content/source-row identity.
-pub(super) struct RenderedTableLine {
-    pub(super) mapped: MappedLine,
+pub(super) struct RenderedTableLine<'a> {
+    pub(super) mapped: MappedLine<'a>,
     pub(super) kind: RenderedTableLineKind,
 }
 
@@ -55,20 +55,20 @@ pub(super) enum RenderedTableLineKind {
     SyntheticNear(usize),
 }
 
-impl RenderedTableLine {
+impl RenderedTableLine<'_> {
     pub(super) fn into_parts(self) -> (StyledLine, Vec<crate::style::RenderedSourceAtom>) {
         self.mapped.into_parts()
     }
 }
 
 /// Render table lines while retaining row identity for source mapping.
-pub(super) fn render_table_with_rows(
+pub(super) fn render_table_with_rows<'a>(
     alignments: &[TableAlignment],
-    header: &[Vec<Inline>],
-    rows: &[Vec<Vec<Inline>>],
+    header: &'a [Vec<Inline>],
+    rows: &'a [Vec<Vec<Inline>>],
     source_span: std::ops::Range<usize>,
     available_width: u16,
-) -> Vec<RenderedTableLine> {
+) -> Vec<RenderedTableLine<'a>> {
     if header.is_empty() || alignments.is_empty() {
         return Vec::new();
     }
@@ -178,7 +178,7 @@ fn shrink_columns_to_fit(widths: &mut [usize], content_budget: usize) {
 }
 
 /// Compute cell text and display width for a row of inlines.
-fn compute_cells(row: &[Vec<Inline>], num_cols: usize) -> Vec<Cell> {
+fn compute_cells<'a>(row: &'a [Vec<Inline>], num_cols: usize) -> Vec<Cell<'a>> {
     let mut cells = Vec::with_capacity(num_cols);
     for ci in 0..num_cols {
         if ci < row.len() {
@@ -199,7 +199,7 @@ fn compute_cells(row: &[Vec<Inline>], num_cols: usize) -> Vec<Cell> {
 }
 
 /// Convert a row of inlines while retaining each leaf's source ownership.
-fn inline_to_mapped(inlines: &[Inline], style: SemanticStyle) -> MappedLine {
+fn inline_to_mapped<'a>(inlines: &'a [Inline], style: SemanticStyle) -> MappedLine<'a> {
     let mut line = MappedLine::default();
     for inline in inlines {
         match inline {
@@ -229,15 +229,16 @@ fn inline_to_mapped(inlines: &[Inline], style: SemanticStyle) -> MappedLine {
     line
 }
 
-fn append_leaf(line: &mut MappedLine, leaf: &InlineLeaf, style: SemanticStyle) {
+fn append_leaf<'a>(line: &mut MappedLine<'a>, leaf: &'a InlineLeaf, style: SemanticStyle) {
+    line.fragments.reserve(leaf.atoms.len());
     for atom in &leaf.atoms {
-        line.push(atom.text.clone(), style, Some(atom.source.clone()));
+        line.push(atom.text.as_str(), style, Some(atom.source.clone()));
     }
 }
 
 /// A single table cell with its text and display width.
-struct Cell {
-    mapped: MappedLine,
+struct Cell<'a> {
+    mapped: MappedLine<'a>,
     display_width: usize,
 }
 
@@ -248,7 +249,7 @@ fn build_border_row(
     top: bool,
     _bottom: bool,
     _source_span: std::ops::Range<usize>,
-) -> MappedLine {
+) -> MappedLine<'static> {
     let start = if top { "┌" } else { "└" };
     let end = if top { "┐" } else { "┘" };
     let mid = if top { "┬" } else { "┴" };
@@ -267,7 +268,7 @@ fn build_border_row(
 }
 
 /// Build a separator row (header/body divider).
-fn build_separator_row(col_widths: &[usize]) -> MappedLine {
+fn build_separator_row(col_widths: &[usize]) -> MappedLine<'static> {
     let mut text = String::from("├");
     let last = col_widths.len() - 1;
     for (ci, &w) in col_widths.iter().enumerate() {
@@ -280,7 +281,7 @@ fn build_separator_row(col_widths: &[usize]) -> MappedLine {
 }
 
 /// Build a faint boundary between adjacent logical body rows.
-fn build_body_row_boundary(col_widths: &[usize]) -> MappedLine {
+fn build_body_row_boundary(col_widths: &[usize]) -> MappedLine<'static> {
     let mut line = MappedLine::default();
     line.push_generated("│", SemanticStyle::Text);
     for &width in col_widths {
@@ -291,7 +292,7 @@ fn build_body_row_boundary(col_widths: &[usize]) -> MappedLine {
 }
 
 /// Wrap a mapped table cell without separating display groups from source ownership.
-fn split_cell_text(line: &MappedLine, max_width: usize) -> Vec<MappedLine> {
+fn split_cell_text<'a>(line: &MappedLine<'a>, max_width: usize) -> Vec<MappedLine<'a>> {
     if max_width == 0 {
         return vec![MappedLine::default()];
     }
@@ -369,13 +370,13 @@ fn split_cell_text(line: &MappedLine, max_width: usize) -> Vec<MappedLine> {
 }
 
 /// Build a data row (header or body).
-fn build_data_row(
-    cells: &[Cell],
+fn build_data_row<'a>(
+    cells: &[Cell<'a>],
     alignments: &[TableAlignment],
     col_widths: &[usize],
     header_style: SemanticStyle,
-) -> Vec<MappedLine> {
-    let wrapped_cells: Vec<Vec<MappedLine>> = cells
+) -> Vec<MappedLine<'a>> {
+    let wrapped_cells: Vec<Vec<MappedLine<'a>>> = cells
         .iter()
         .enumerate()
         .map(|(ci, cell)| {
@@ -448,6 +449,19 @@ fn build_data_row(
 mod tests {
     use super::*;
 
+    #[test]
+    fn table_cell_borrows_parser_leaf_until_row_materialization() {
+        let leaf = make_leaf("é");
+        let mut line = MappedLine::default();
+        append_leaf(&mut line, &leaf, SemanticStyle::Text);
+        assert!(matches!(
+            line.fragments[0].text,
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(line.fragments[0].text.as_ptr(), leaf.atoms[0].text.as_ptr());
+        assert_eq!(line.into_parts().0.text, "é");
+    }
+
     fn make_leaf(text: &str) -> InlineLeaf {
         let mut mapped = MappedLine::default();
         mapped.push_generated(text, SemanticStyle::Text);
@@ -457,14 +471,14 @@ mod tests {
                 .fragments
                 .into_iter()
                 .map(|fragment| crate::rendered::blocks::InlineAtom {
-                    text: fragment.text,
+                    text: fragment.text.into_owned(),
                     source: 0..0,
                 })
                 .collect(),
         }
     }
 
-    fn make_mapped(text: &str) -> MappedLine {
+    fn make_mapped(text: &str) -> MappedLine<'static> {
         let mut mapped = MappedLine::default();
         mapped.push_generated(text, SemanticStyle::Text);
         mapped
@@ -894,7 +908,7 @@ mod tests {
             .collect::<Vec<_>>();
         let visible_text = visible_atoms
             .iter()
-            .map(|fragment| fragment.text.as_str())
+            .map(|fragment| fragment.text.as_ref())
             .collect::<String>();
         assert_eq!(visible_text, "same samerepeated");
         for fragment in visible_atoms {
@@ -1043,7 +1057,8 @@ mod tests {
 
     #[test]
     fn unicode_header_style_excludes_only_character_borders() {
-        let cells = compute_cells(&make_row(&["café東京🙂"]), 1);
+        let source_row = make_row(&["café東京🙂"]);
+        let cells = compute_cells(&source_row, 1);
         let lines = build_data_row(
             &cells,
             &[TableAlignment::Left],

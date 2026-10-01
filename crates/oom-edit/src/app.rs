@@ -1479,16 +1479,21 @@ impl App {
                 body_area,
             );
         }
-        if let Some(anchor) = self
-            .active()
-            .and_then(|entry| entry.session.rendered_selection())
-            .map(|selection| selection.anchor)
-        {
-            if let PointerGesture::Dragging(PointerDrag::Source {
-                rendered_anchor, ..
-            }) = &mut self.pointer_gesture
+        if matches!(
+            self.pointer_gesture,
+            PointerGesture::Dragging(PointerDrag::Source { .. })
+        ) {
+            if let Some(anchor) = self
+                .active()
+                .and_then(|entry| entry.session.rendered_selection())
+                .map(|selection| selection.anchor)
             {
-                *rendered_anchor = anchor;
+                if let PointerGesture::Dragging(PointerDrag::Source {
+                    rendered_anchor, ..
+                }) = &mut self.pointer_gesture
+                {
+                    *rendered_anchor = anchor;
+                }
             }
         }
 
@@ -3289,18 +3294,18 @@ impl App {
             let viewport_width = self.viewport_width.min(usize::from(u16::MAX)) as u16;
             let layout_width = viewport_width.min(self.wrap_width);
             if let Some(entry) = self.tabs.get_mut(self.active_tab) {
-                // Insert edits invalidate the rendered cache. Rebuild before
-                // reading the rendered cursor so Escape can follow a cursor
-                // that moved beyond the current rendered viewport.
-                entry.session.render_layout(layout_width);
-                let cursor = entry.session.rendered_cursor();
+                // Establish current geometry before following the cursor. A
+                // retained edit only reads the cursor's indexed row.
+                let geometry = entry.session.rendered_viewport(layout_width, 0, 0);
+                let cursor = geometry.cursor;
                 let cursor_line = cursor.row;
-                let layout = entry.session.rendered_layout();
-                let layout_height = layout.map(|l| l.lines.len()).unwrap_or(0);
+                let layout_height = geometry.total_rows;
                 let rendered_top = entry.rendered_top;
 
-                let (row_width, cursor_width) = layout
-                    .and_then(|layout| layout.lines.get(cursor.row))
+                let cursor_view = entry.session.rendered_viewport(layout_width, cursor.row, 1);
+                let (row_width, cursor_width) = cursor_view
+                    .lines
+                    .first()
                     .map(|line| {
                         let row_width = line
                             .atoms
@@ -3740,11 +3745,7 @@ impl App {
             return;
         }
         if entry.session.mode() != oom_edit_core::Mode::Insert {
-            entry.session.render_layout(width);
-            let layout_height = entry
-                .session
-                .rendered_layout()
-                .map_or(0, |layout| layout.lines.len());
+            let layout_height = entry.session.rendered_viewport(width, 0, 0).total_rows;
             let old_top = entry.rendered_top;
             let max_top = layout_height.saturating_sub(height);
             let new_top = if delta < 0 {

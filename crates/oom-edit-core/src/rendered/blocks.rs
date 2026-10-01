@@ -8,7 +8,8 @@
 //! Inline text is owned (post-unescape), and every leaf event retains its full
 //! source range so final display atoms can project back to raw Markdown.
 
-use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd};
+use std::cell::Cell;
 use unicode_width::UnicodeWidthChar;
 
 #[cfg(test)]
@@ -75,10 +76,19 @@ mod first_frame_tests {
 // ── BlockModel ─────────────────────────────────────────────────────────────
 
 /// A typed block tree of a markdown document.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct BlockModel {
     /// Top-level blocks, sorted by start byte, non-overlapping.
     pub blocks: Vec<Block>,
+}
+
+/// Parser-resolved reference definition retained without borrowing source text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct OwnedReferenceDefinition {
+    pub label: String,
+    pub destination: String,
+    pub title: String,
+    pub span: std::ops::Range<usize>,
 }
 
 /// One visible display group and the parser leaf bytes that produced it.
@@ -250,6 +260,72 @@ pub enum Inline {
     FootnoteRef(InlineLeaf),
     /// Raw inline HTML.
     Html(InlineLeaf),
+}
+
+fn shift_range(range: &mut std::ops::Range<usize>, delta: isize) {
+    range.start = range.start.checked_add_signed(delta).unwrap();
+    range.end = range.end.checked_add_signed(delta).unwrap();
+}
+
+fn shift_leaf(leaf: &mut InlineLeaf, delta: isize) {
+    for atom in &mut leaf.atoms {
+        shift_range(&mut atom.source, delta);
+    }
+}
+
+fn shift_inlines(inlines: &mut [Inline], delta: isize) {
+    for inline in inlines {
+        match inline {
+            Inline::Text(leaf)
+            | Inline::Code(leaf)
+            | Inline::SoftBreak(leaf)
+            | Inline::HardBreak(leaf)
+            | Inline::FootnoteRef(leaf)
+            | Inline::Html(leaf) => shift_leaf(leaf, delta),
+            Inline::Emph(children) | Inline::Strong(children) | Inline::Strike(children) => {
+                shift_inlines(children, delta);
+            }
+            Inline::Link { text, .. } => shift_inlines(text, delta),
+            Inline::Image { alt, .. } => shift_inlines(alt, delta),
+        }
+    }
+}
+
+/// Rebase every parser-owned source span in a retained block.
+pub(crate) fn shift_block(block: &mut Block, delta: isize) {
+    shift_range(&mut block.span, delta);
+    match &mut block.kind {
+        BlockKind::FrontMatter | BlockKind::Rule => {}
+        BlockKind::Heading { inlines, .. } | BlockKind::Paragraph { inlines } => {
+            shift_inlines(inlines, delta);
+        }
+        BlockKind::CodeFence { content_span, .. } | BlockKind::HtmlBlock { content_span } => {
+            shift_range(content_span, delta);
+        }
+        BlockKind::List { items, .. } => {
+            for item in items {
+                shift_range(&mut item.span, delta);
+                for child in &mut item.children {
+                    shift_block(child, delta);
+                }
+            }
+        }
+        BlockKind::BlockQuote { children } | BlockKind::FootnoteDef { children, .. } => {
+            for child in children {
+                shift_block(child, delta);
+            }
+        }
+        BlockKind::Table { header, rows, .. } => {
+            for cell in header {
+                shift_inlines(cell, delta);
+            }
+            for row in rows {
+                for cell in row {
+                    shift_inlines(cell, delta);
+                }
+            }
+        }
+    }
 }
 
 fn whole_leaf(rendered: &str, source: std::ops::Range<usize>) -> InlineLeaf {
@@ -498,7 +574,17 @@ impl BlockModel {
     ///
     /// Uses exactly `ENABLE_TABLES | ENABLE_FOOTNOTES | ENABLE_TASKLISTS |
     /// ENABLE_STRIKETHROUGH` options.
+    #[cfg(test)]
     pub fn build(text: &str, fm_span: Option<std::ops::Range<usize>>) -> Self {
+        Self::build_with_reference_definitions(text, fm_span).0
+    }
+
+    /// Build the canonical model and retain the parser's resolved definition
+    /// index for exact local reparses of blocks containing reference links.
+    pub(super) fn build_with_reference_definitions(
+        text: &str,
+        fm_span: Option<std::ops::Range<usize>>,
+    ) -> (Self, Vec<OwnedReferenceDefinition>) {
         let mut blocks = Vec::new();
 
         // Determine the text to parse (skip front matter if present)
@@ -513,7 +599,7 @@ impl BlockModel {
                     kind: BlockKind::FrontMatter,
                 });
             }
-            return Self { blocks };
+            return (Self { blocks }, Vec::new());
         }
 
         // Set up pulldown-cmark with required extensions
@@ -522,6 +608,20 @@ impl BlockModel {
         // Build the block tree using a single-pass stack machine
         let mut builder = BlockBuilder::new(text, parse_start);
         let parser = Parser::new_ext(parse_text, opts).into_offset_iter();
+        let mut definitions = parser
+            .reference_definitions()
+            .iter()
+            .map(|(label, definition)| OwnedReferenceDefinition {
+                label: label.to_string(),
+                destination: definition.dest.to_string(),
+                title: definition
+                    .title
+                    .as_ref()
+                    .map_or_else(String::new, ToString::to_string),
+                span: definition.span.start + parse_start..definition.span.end + parse_start,
+            })
+            .collect::<Vec<_>>();
+        definitions.sort_by_key(|definition| definition.span.start);
 
         for (event, range) in parser {
             let global_range = range.start + parse_start..range.end + parse_start;
@@ -545,7 +645,51 @@ impl BlockModel {
             );
         }
 
-        Self { blocks }
+        (Self { blocks }, definitions)
+    }
+
+    /// Parse one proven-local range, resolving external ASCII reference
+    /// definitions through the canonical full parser's retained index.
+    /// Unicode case folding is delegated to the full parser when needed.
+    pub(super) fn build_range_with_reference_definitions(
+        text: &str,
+        range: std::ops::Range<usize>,
+        definitions: &[OwnedReferenceDefinition],
+        reference_budget_safe: bool,
+    ) -> Option<Self> {
+        let unsupported_reference = Cell::new(false);
+        let has_unicode_definition = definitions
+            .iter()
+            .any(|definition| !definition.label.is_ascii());
+        let callback = |broken: pulldown_cmark::BrokenLink<'_>| {
+            let label = broken.reference.as_ref();
+            if !reference_budget_safe || has_unicode_definition || !label.is_ascii() {
+                unsupported_reference.set(true);
+                return None;
+            }
+            definitions
+                .iter()
+                .find(|definition| definition.label.eq_ignore_ascii_case(label))
+                .map(|definition| {
+                    (
+                        CowStr::from(definition.destination.clone()),
+                        CowStr::from(definition.title.clone()),
+                    )
+                })
+        };
+        let parser = Parser::new_with_broken_link_callback(
+            &text[range.clone()],
+            markdown_options(),
+            Some(callback),
+        );
+        let mut builder = BlockBuilder::new(text, range.start);
+        for (event, local) in parser.into_offset_iter() {
+            builder.feed(event, local.start + range.start..local.end + range.start);
+        }
+        let mut blocks = Vec::new();
+        blocks.append(&mut builder.blocks);
+        builder.flush_remaining(&mut blocks);
+        (!unsupported_reference.get()).then_some(Self { blocks })
     }
 }
 
@@ -571,9 +715,9 @@ enum InlineStackKind {
 }
 
 /// Single-pass stack machine that converts pulldown-cmark events into blocks.
-struct BlockBuilder {
+struct BlockBuilder<'a> {
     /// The full source text (for extracting inline text).
-    text: String,
+    text: &'a str,
     /// Byte offset of where parsing starts in the full text.
     _offset: usize,
     /// Stack of open block contexts.
@@ -636,10 +780,10 @@ enum BuildContext {
     },
 }
 
-impl BlockBuilder {
-    fn new(text: &str, offset: usize) -> Self {
+impl<'a> BlockBuilder<'a> {
+    fn new(text: &'a str, offset: usize) -> Self {
         Self {
-            text: text.to_string(),
+            text,
             _offset: offset,
             stack: Vec::new(),
             blocks: Vec::new(),
@@ -1126,13 +1270,13 @@ impl BlockBuilder {
 
             // ── Inline events ──────────────────────────────────────────
             Event::Text(text) => {
-                let leaf = mapped_leaf(text, span.clone(), &self.text, true, false);
+                let leaf = mapped_leaf(text, span.clone(), self.text, true, false);
                 self.push_inline(Inline::Text(leaf), span.start);
             }
 
             Event::Code(code) => {
-                let payload = code_payload_span(span.clone(), &self.text);
-                let leaf = mapped_leaf(code, payload, &self.text, false, true);
+                let payload = code_payload_span(span.clone(), self.text);
+                let leaf = mapped_leaf(code, payload, self.text, false, true);
                 self.push_inline(Inline::Code(leaf), span.start);
             }
 
@@ -1152,12 +1296,12 @@ impl BlockBuilder {
             }
 
             Event::Html(html) => {
-                let leaf = mapped_leaf(html, span.clone(), &self.text, false, false);
+                let leaf = mapped_leaf(html, span.clone(), self.text, false, false);
                 self.push_inline(Inline::Html(leaf), span.start);
             }
 
             Event::InlineHtml(html) => {
-                let leaf = mapped_leaf(html, span.clone(), &self.text, false, false);
+                let leaf = mapped_leaf(html, span.clone(), self.text, false, false);
                 self.push_inline(Inline::Html(leaf), span.start);
             }
 

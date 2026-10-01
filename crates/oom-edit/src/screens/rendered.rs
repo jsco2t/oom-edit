@@ -6,7 +6,9 @@
 //!
 //! See plan §6.3, VN-1, VN-3.
 
-use oom_edit_core::{EditorSession, RenderedLine, RenderedLineRole};
+#[cfg(test)]
+use oom_edit_core::RenderedLine;
+use oom_edit_core::{EditorSession, RenderedLineRole};
 use ratatui::buffer::CellWidth;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -29,6 +31,7 @@ fn line_surface(theme: &Theme, tier: Tier, role: RenderedLineRole) -> Option<Sty
     }
 }
 
+#[cfg(test)]
 fn gutter_continuation_sources(
     lines: &[RenderedLine],
     line_numbers: &[Option<usize>],
@@ -148,28 +151,21 @@ pub(crate) fn render_rendered_with_settings(
         .left
         .saturating_add(usize::from(text_width))
         .min(usize::from(u16::MAX)) as u16;
-    session.render_layout(text_width.min(settings.wrap_width));
-    let cursor = session.rendered_cursor();
-    let cursor_line = cursor.row;
+    let layout_width = text_width.min(settings.wrap_width);
     let selection = session.rendered_selection();
+    let viewport_frame = session.rendered_viewport(layout_width, viewport.top, height);
+    let cursor = viewport_frame.cursor;
+    let cursor_line = cursor.row;
     let search = session.rendered_search().cloned();
-    let max_lines = session
-        .rendered_layout()
-        .expect("rendered layout was built for this frame")
-        .lines
-        .len();
+    let max_lines = viewport_frame.total_rows;
     if max_lines == 0 {
         return;
     }
 
     // Compute visible line range.
-    let rendered_top = viewport.top.min(max_lines.saturating_sub(1));
-    let rendered_bottom = (rendered_top + height).min(max_lines);
+    let rendered_top = viewport_frame.first_row;
+    let rendered_bottom = rendered_top + viewport_frame.lines.len();
     let decorations = session.diagnostic_decoration_rows(rendered_top..rendered_bottom);
-    let layout = session
-        .rendered_layout()
-        .expect("rendered layout was built for this frame");
-    let gutter_continuations = gutter_continuation_sources(&layout.lines, &layout.line_numbers);
 
     if gutter_width > 0 {
         let gutter_area = Rect::new(area.x, area.y, gutter_width, area.height);
@@ -178,8 +174,8 @@ pub(crate) fn render_rendered_with_settings(
             mode,
             source_cursor_line,
             GutterRows::new(
-                &layout.line_numbers[rendered_top..rendered_bottom],
-                &gutter_continuations[rendered_top..rendered_bottom],
+                &viewport_frame.line_numbers,
+                &viewport_frame.gutter_continuations,
             ),
             settings.relative_line_numbers,
             gutter_area,
@@ -197,7 +193,7 @@ pub(crate) fn render_rendered_with_settings(
     let mut lines: Vec<Line<'_>> = Vec::with_capacity(height);
 
     for i in rendered_top..rendered_bottom {
-        let rendered_line = &layout.lines[i];
+        let rendered_line = &viewport_frame.lines[i - rendered_top];
         let mut spans = spans::build_spans(
             &rendered_line.styled.text,
             &rendered_line.styled.spans,
@@ -480,6 +476,9 @@ mod tests {
                     );
                 })
                 .unwrap();
+            session.render_layout(
+                18u16.saturating_sub(status_bar::gutter_width(session.line_count(), false) as u16),
+            );
             let line_numbers = session
                 .rendered_layout()
                 .unwrap()
@@ -979,6 +978,11 @@ mod tests {
                         );
                     })
                     .unwrap();
+                session.render_layout(
+                    40u16.saturating_sub(
+                        status_bar::gutter_width(session.line_count(), false) as u16
+                    ),
+                );
                 let boundary_row = session
                     .rendered_layout()
                     .unwrap()
@@ -1723,6 +1727,9 @@ mod tests {
                     );
                 })
                 .unwrap();
+            session.render_layout(24u16.saturating_sub(
+                status_bar::gutter_width(session.line_count(), relative) as u16,
+            ));
             let layout = session.rendered_layout().unwrap();
             let buffer = terminal.backend().buffer();
             let marker_column = status_bar::gutter_width(session.line_count(), relative) - 2;
@@ -1839,6 +1846,9 @@ mod tests {
 
             let buffer = terminal.backend().buffer();
             let blank_row = session.rendered_cursor_line();
+            session.render_layout(40u16.saturating_sub(
+                status_bar::gutter_width(session.line_count(), relative) as u16,
+            ));
             assert_eq!(
                 session.rendered_layout().unwrap().line_numbers[blank_row],
                 Some(2)

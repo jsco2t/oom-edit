@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 27a8bffbd46ad6c9c5bc20f0dbe8c09a677025ef1bd9e5a7c206c73ca0426100 # shrinks to language = "rust", crlf = true, index = 0, replacement = "é"
+cc 43944eb3d8c71ccd993991f74bc385b8ef7b92398c264d10d8832c08f0c32bdf # shrinks to language = "rust", crlf = false, index = 63, replacement = "🙂"
