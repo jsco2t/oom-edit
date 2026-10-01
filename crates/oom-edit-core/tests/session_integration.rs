@@ -255,6 +255,219 @@ fn render_and_move_to(session: &mut EditorSession, needle: &str, width: u16) -> 
     target
 }
 
+fn select_visible_source_line(session: &mut EditorSession, text: &str, needle: &str, width: u16) {
+    let layout = session.render_layout(width).clone();
+    let at = text.find(needle).unwrap();
+    let start = text[..at].rfind('\n').map_or(0, |newline| newline + 1);
+    let end = text[start..]
+        .find('\n')
+        .map_or(text.len(), |newline| start + newline);
+    let mut atoms: Vec<_> = layout
+        .lines
+        .iter()
+        .enumerate()
+        .flat_map(|(row, line)| {
+            line.atoms.iter().filter_map(move |atom| {
+                atom.source.as_ref().and_then(|source| {
+                    (start <= source.start && source.end <= end).then_some((
+                        source.clone(),
+                        RenderedPoint {
+                            row,
+                            column: atom.columns.start,
+                        },
+                    ))
+                })
+            })
+        })
+        .collect();
+    assert!(!atoms.is_empty(), "{needle:?}");
+    atoms.sort_by_key(|(source, _)| (source.start, source.end));
+    session.select_rendered_points(atoms.first().unwrap().1, atoms.last().unwrap().1);
+    assert_eq!(session.mode(), Mode::Select);
+}
+
+#[test]
+fn full_visible_character_delete_and_change_remove_physical_source_lines() {
+    let cases = [
+        ("plain café\nnext\n", "plain", 12),
+        ("# Heading &amp; café\nnext\n", "# Heading", 12),
+        (
+            "- wrapped **item text** and more words\nnext\n",
+            "- wrapped",
+            12,
+        ),
+        ("| A | B |\n|---|---|\n| café | tea |\n", "| café", 30),
+        (
+            "```rust\nfn main() { println!(\"hi\"); }\n```\n",
+            "fn main",
+            18,
+        ),
+        (
+            "```go\nfunc main() { println(\"hi\") }\n```\n",
+            "func main",
+            18,
+        ),
+        ("alpha\nbeta\n", "beta", 20),
+    ];
+    for (text, needle, width) in cases {
+        let at = text.find(needle).unwrap();
+        let start = text[..at].rfind('\n').map_or(0, |newline| newline + 1);
+        let end = text[start..]
+            .find('\n')
+            .map_or(text.len(), |newline| start + newline + 1);
+        let expected = format!("{}{}", &text[..start], &text[end..]);
+        for operation in ['d', 'c'] {
+            let mut session = EditorSession::from_text(text);
+            select_visible_source_line(&mut session, text, needle, width);
+            session.handle_key(key(operation));
+            assert_eq!(session.document(), expected, "{needle:?}/{operation}");
+            assert_eq!(
+                session.mode(),
+                if operation == 'c' {
+                    Mode::Insert
+                } else {
+                    Mode::Normal
+                }
+            );
+            if operation == 'c' {
+                session.handle_key(special(KeyCodeKind::Esc));
+            }
+            let actual = session.render_layout(width).clone();
+            let fresh = EditorSession::from_text(&expected)
+                .render_layout(width)
+                .clone();
+            assert_eq!(actual, fresh, "fresh layout {needle:?}/{operation}");
+            session.handle_key(key('u'));
+            assert_eq!(session.document(), text, "undo {needle:?}/{operation}");
+            session.handle_key(ctrl('r'));
+            assert_eq!(session.document(), expected, "redo {needle:?}/{operation}");
+        }
+    }
+}
+
+#[test]
+fn complete_character_line_mutation_does_not_change_yank_geometry() {
+    let text = "# café\nnext\n";
+    let mut yank = EditorSession::from_text(text);
+    select_visible_source_line(&mut yank, text, "# café", 40);
+    let selected = yank.rendered_selection().unwrap();
+    let effects = yank.handle_key(key('y'));
+    assert_eq!(yank.document(), text);
+    assert_eq!(selected.source_ranges, vec![2..7]);
+    assert_eq!(clipboard_contents(&effects)[0].markdown(), "café");
+
+    let mut delete = EditorSession::from_text(text);
+    select_visible_source_line(&mut delete, text, "# café", 40);
+    delete.handle_key(key('d'));
+    assert_eq!(delete.document(), "next\n");
+    delete.render_layout(40);
+    delete.handle_key(key('P'));
+    assert_eq!(delete.document(), text);
+
+    let mut change = EditorSession::from_text(text);
+    select_visible_source_line(&mut change, text, "# café", 40);
+    change.handle_key(key('c'));
+    change.handle_key(special(KeyCodeKind::Esc));
+    change.render_layout(40);
+    change.handle_key(key('P'));
+    assert_eq!(change.document(), text);
+}
+
+#[test]
+fn one_wrapped_display_row_delete_keeps_the_unselected_source_line_and_terminator() {
+    let source = "a very long paragraph that wraps over several display rows\nnext\n";
+    let mut session = EditorSession::from_text(source);
+    let layout = session.render_layout(12).clone();
+    let first_row = layout
+        .lines
+        .iter()
+        .enumerate()
+        .find(|(_, line)| line.atoms.iter().any(|atom| atom.source.is_some()))
+        .unwrap();
+    let atoms: Vec<_> = first_row
+        .1
+        .atoms
+        .iter()
+        .filter(|atom| atom.source.is_some())
+        .collect();
+    let first = RenderedPoint {
+        row: first_row.0,
+        column: atoms.first().unwrap().columns.start,
+    };
+    let last = RenderedPoint {
+        row: first_row.0,
+        column: atoms.last().unwrap().columns.start,
+    };
+    session.select_rendered_points(first, last);
+    let ranges = session.rendered_selection().unwrap().source_ranges;
+    assert!(ranges.last().unwrap().end < source.find('\n').unwrap());
+    let mut expected = source.to_string();
+    for range in ranges.into_iter().rev() {
+        expected.replace_range(range, "");
+    }
+    session.handle_key(key('d'));
+    assert_eq!(session.document(), expected);
+    assert!(session.document().ends_with("\nnext\n"));
+    session.handle_key(key('u'));
+    assert_eq!(session.document(), source);
+}
+
+#[test]
+fn multiline_character_delete_removes_code_body_lines_and_enclosed_blank_line() {
+    for (language, body) in [
+        (
+            "rust",
+            "fn main() {\n    let answer = 42;\n\n    println!(\"{answer}\");\n}\n",
+        ),
+        (
+            "go",
+            "func main() {\n    answer := 42\n\n    fmt.Println(answer)\n}\n",
+        ),
+    ] {
+        let source = format!("```{language}\n{body}```\n");
+        let expected = format!("```{language}\n```\n");
+        let start = source.find(body).unwrap();
+        let end = start + body.trim_end_matches('\n').len() - 1;
+        for operation in ['d', 'c'] {
+            let mut session = EditorSession::from_text(&source);
+            session.select_source_offsets(start, end, 30).unwrap();
+            session.handle_key(key(operation));
+            assert_eq!(session.document(), expected, "{language}/{operation}");
+            if operation == 'c' {
+                session.handle_key(special(KeyCodeKind::Esc));
+            }
+            assert_eq!(
+                session.render_layout(30),
+                EditorSession::from_text(&expected).render_layout(30),
+                "{language}/{operation} rendered"
+            );
+            session.handle_key(key('u'));
+            assert_eq!(session.document(), source, "{language}/{operation} undo");
+        }
+    }
+}
+
+#[test]
+fn one_megabyte_fence_function_delete_removes_source_lines_not_just_glyphs() {
+    let source = include_str!("../../../examples/kitchen-sink-1mb.md");
+    for (current, next) in [
+        ("fn summarize_batch_0000", "fn summarize_batch_0001"),
+        ("func summarizeBatch0000", "func summarizeBatch0001"),
+    ] {
+        let start = source.find(current).unwrap();
+        let next_start = source.find(next).unwrap();
+        let closing = source[start..next_start].rfind("}\n").unwrap() + start;
+        let end = closing + 2;
+        let expected = format!("{}{}", &source[..start], &source[end..]);
+        let mut session = EditorSession::from_text(source);
+        session.select_source_offsets(start, closing, 100).unwrap();
+        session.handle_key(key('d'));
+        assert_eq!(session.document(), expected, "{current}");
+        session.handle_key(key('u'));
+        assert_eq!(session.document(), source, "{current} undo");
+    }
+}
+
 fn first_code_fence_rows(session: &mut EditorSession, width: u16) -> (usize, usize) {
     let layout = session.render_layout(width);
     let first = layout
@@ -688,7 +901,7 @@ fn rendered_complete_fence_plain_text_yank_keeps_exact_markdown_register() {
 }
 
 #[test]
-fn complete_fence_yank_expansion_does_not_broaden_delete_geometry() {
+fn complete_fence_yank_geometry_stays_distinct_from_full_line_delete() {
     let source = "```rust\ncode\n```\n";
     let mut session = EditorSession::from_text(source);
     let (first, last) = first_code_fence_rows(&mut session, 120);
@@ -704,7 +917,7 @@ fn complete_fence_yank_expansion_does_not_broaden_delete_geometry() {
         .iter()
         .all(|range| range.start > 0 && range.end < source.len()));
     session.handle_key(key('x'));
-    assert_eq!(session.document(), "```rust\n\n```\n");
+    assert_eq!(session.document(), "```rust\n```\n");
 }
 
 #[test]
@@ -1954,7 +2167,9 @@ fn leaving_insert_remaps_rendered_cursor_after_motion_and_edits() {
     edited.handle_key(special(KeyCodeKind::Esc));
     assert_eq!(edited.cursor().0, 2);
     let cursor_row = edited.rendered_cursor_line();
-    assert_eq!(cursor_row, 0, "dirty layout remains invalid until rebuild");
+    assert_eq!(cursor_row, 2, "rendered cursor follows the current edit");
+    let current = edited.rendered_viewport(40, cursor_row, 1);
+    assert!(current.lines[0].styled.text.contains('X'));
     edited.render_layout(40);
     let remapped = edited.rendered_cursor_line();
     assert!(edited.rendered_layout().unwrap().lines[remapped]

@@ -113,6 +113,7 @@ impl RenderedSearch {
 ///
 /// `text` is the full document text, needed to convert source byte offsets
 /// to document line numbers.
+#[cfg(test)]
 pub fn enter_rendered(
     edit_line: usize,
     edit_col: usize,
@@ -142,6 +143,49 @@ pub fn enter_rendered(
                 .is_some_and(|byte| *byte == b'\n')
         },
     )
+}
+
+/// Map a source position using the highlighter's maintained line starts.
+/// Unlike `enter_rendered`, this does not rescan source prefixes per row.
+pub(crate) fn enter_rendered_indexed(
+    edit_line: usize,
+    edit_col: usize,
+    layout: &RenderedLayout,
+    text: &str,
+    line_starts: &[usize],
+) -> RenderedCursor {
+    if edit_line >= line_starts.len() {
+        return RenderedCursor::new(layout.lines.len().saturating_sub(1));
+    }
+
+    let line_start = line_starts[edit_line];
+    let line_text = text[line_start..]
+        .split_once('\n')
+        .map_or(&text[line_start..], |(line, _)| line);
+    let col_offset = line_text
+        .char_indices()
+        .nth(edit_col)
+        .map_or(line_text.len(), |(offset, _)| offset);
+    let edit_offset = line_start + col_offset;
+    enter_rendered_at_offset(
+        edit_line,
+        edit_offset,
+        layout,
+        |offset| source_line_for_offset(line_starts, offset),
+        |offset| {
+            offset
+                .checked_sub(1)
+                .and_then(|previous| text.as_bytes().get(previous))
+                .is_some_and(|byte| *byte == b'\n')
+        },
+    )
+}
+
+/// The largest line start at or before a byte offset.
+pub(crate) fn source_line_for_offset(line_starts: &[usize], offset: usize) -> usize {
+    line_starts
+        .partition_point(|line_start| *line_start <= offset)
+        .saturating_sub(1)
 }
 
 /// Map a canonical source byte offset to the nearest source-backed rendered
@@ -252,6 +296,14 @@ pub(crate) fn canonical_source_offset_for_row(
             .find(|line| line.kind == LineKind::Content)
             .map_or(0, |line| line.source.start);
     };
+    canonical_source_offset_for_line(cursor, current_offset, line)
+}
+
+pub(crate) fn canonical_source_offset_for_line(
+    cursor: &RenderedCursor,
+    current_offset: usize,
+    line: &crate::style::RenderedLine,
+) -> usize {
     let selected_source = line
         .atoms
         .iter()
@@ -301,105 +353,105 @@ fn horizontal_point(
     forward: bool,
     count: usize,
 ) -> Option<RenderedPoint> {
-    let row = cursor.line.min(layout.lines.len().checked_sub(1)?);
-    let row_has_source = layout.lines[row]
-        .atoms
-        .iter()
-        .any(|atom| atom.source.is_some());
-    let (mut point, remaining) = if row_has_source {
-        (source_backed_point(cursor.point(), layout)?, count)
-    } else {
-        let point = if forward {
-            layout.lines[row + 1..]
-                .iter()
-                .enumerate()
-                .find_map(|(offset, line)| {
-                    line.atoms
-                        .iter()
-                        .find(|atom| atom.source.is_some())
-                        .map(|atom| RenderedPoint {
-                            row: row + offset + 1,
-                            column: atom.columns.start,
-                        })
-                })
+    horizontal_point_with(cursor, layout.lines.len(), forward, count, |row| {
+        layout.lines.get(row).cloned()
+    })
+}
+
+/// The same atom motion over either a complete or retained row source.
+pub(crate) fn horizontal_point_with(
+    cursor: &RenderedCursor,
+    total: usize,
+    forward: bool,
+    count: usize,
+    mut line_at: impl FnMut(usize) -> Option<crate::style::RenderedLine>,
+) -> Option<RenderedPoint> {
+    let row = cursor.line.min(total.checked_sub(1)?);
+    let line = line_at(row)?;
+    let source_atoms = line.atoms.iter().filter(|atom| atom.source.is_some());
+    let nearest = source_atoms.min_by_key(|atom| {
+        if cursor.column < atom.columns.start {
+            atom.columns.start - cursor.column
+        } else if cursor.column >= atom.columns.end {
+            cursor.column - atom.columns.end + 1
         } else {
-            layout.lines[..row]
-                .iter()
-                .enumerate()
-                .rev()
-                .find_map(|(row, line)| {
-                    line.atoms
-                        .iter()
-                        .rev()
-                        .find(|atom| atom.source.is_some())
-                        .map(|atom| RenderedPoint {
-                            row,
-                            column: atom.columns.start,
-                        })
+            0
+        }
+    });
+    let (mut point, remaining) = if let Some(atom) = nearest {
+        (
+            RenderedPoint {
+                row,
+                column: atom.columns.start,
+            },
+            count,
+        )
+    } else {
+        let candidates: Box<dyn Iterator<Item = usize>> = if forward {
+            Box::new(row + 1..total)
+        } else {
+            Box::new((0..row).rev())
+        };
+        let point = candidates
+            .filter_map(|candidate| {
+                let line = line_at(candidate)?;
+                let atom = if forward {
+                    line.atoms.iter().find(|atom| atom.source.is_some())
+                } else {
+                    line.atoms.iter().rev().find(|atom| atom.source.is_some())
+                }?;
+                Some(RenderedPoint {
+                    row: candidate,
+                    column: atom.columns.start,
                 })
-        }?;
+            })
+            .next()?;
         (point, count.saturating_sub(1))
     };
 
     for _ in 0..remaining {
-        let line = &layout.lines[point.row];
+        let line = line_at(point.row)?;
         let current = line.atoms.iter().position(|atom| {
             atom.source.is_some()
                 && (atom.columns.contains(&point.column) || atom.columns.start == point.column)
         })?;
-        let adjacent =
-            if forward {
-                line.atoms
-                    .iter()
-                    .skip(current + 1)
-                    .find(|atom| atom.source.is_some())
-                    .map(|atom| RenderedPoint {
-                        row: point.row,
-                        column: atom.columns.start,
-                    })
-                    .or_else(|| {
-                        layout.lines[point.row + 1..].iter().enumerate().find_map(
-                            |(offset, line)| {
-                                line.atoms
-                                    .iter()
-                                    .find(|atom| atom.source.is_some())
-                                    .map(|atom| RenderedPoint {
-                                        row: point.row + offset + 1,
-                                        column: atom.columns.start,
-                                    })
-                            },
-                        )
-                    })
-            } else {
-                line.atoms[..current]
-                    .iter()
-                    .rev()
-                    .find(|atom| atom.source.is_some())
-                    .map(|atom| RenderedPoint {
-                        row: point.row,
-                        column: atom.columns.start,
-                    })
-                    .or_else(|| {
-                        layout.lines[..point.row].iter().enumerate().rev().find_map(
-                            |(row, line)| {
-                                line.atoms
-                                    .iter()
-                                    .rev()
-                                    .find(|atom| atom.source.is_some())
-                                    .map(|atom| RenderedPoint {
-                                        row,
-                                        column: atom.columns.start,
-                                    })
-                            },
-                        )
-                    })
-            };
-        let Some(adjacent) = adjacent else {
-            break;
+        let adjacent = if forward {
+            line.atoms
+                .iter()
+                .skip(current + 1)
+                .find(|atom| atom.source.is_some())
+        } else {
+            line.atoms[..current]
+                .iter()
+                .rev()
+                .find(|atom| atom.source.is_some())
         };
-        point = adjacent;
+        if let Some(atom) = adjacent {
+            point.column = atom.columns.start;
+            continue;
+        }
+        let candidates: Box<dyn Iterator<Item = usize>> = if forward {
+            Box::new(point.row + 1..total)
+        } else {
+            Box::new((0..point.row).rev())
+        };
+        let next = candidates
+            .filter_map(|candidate| {
+                let line = line_at(candidate)?;
+                let atom = if forward {
+                    line.atoms.iter().find(|atom| atom.source.is_some())
+                } else {
+                    line.atoms.iter().rev().find(|atom| atom.source.is_some())
+                }?;
+                Some(RenderedPoint {
+                    row: candidate,
+                    column: atom.columns.start,
+                })
+            })
+            .next();
+        let Some(next) = next else { break };
+        point = next;
     }
-
     Some(point)
 }
 
@@ -436,90 +488,174 @@ fn word_point(
     motion: char,
     count: usize,
 ) -> Option<RenderedPoint> {
-    let atoms: Vec<_> = layout
-        .lines
-        .iter()
-        .enumerate()
-        .flat_map(|(row, line)| {
-            line.atoms.iter().filter_map(move |atom| {
-                atom.source.as_ref().map(|_| {
-                    (
-                        RenderedPoint {
-                            row,
-                            column: atom.columns.start,
-                        },
-                        atom,
-                    )
-                })
-            })
-        })
-        .collect();
-    if atoms.is_empty() {
-        return None;
+    word_point_with(cursor, layout.lines.len(), text, motion, count, |row| {
+        layout.lines.get(row).cloned()
+    })
+}
+
+#[derive(Clone)]
+struct AtomPosition {
+    point: RenderedPoint,
+    atom: crate::style::RenderedSourceAtom,
+}
+
+fn atom_position(row: usize, atom: &crate::style::RenderedSourceAtom) -> AtomPosition {
+    AtomPosition {
+        point: RenderedPoint {
+            row,
+            column: atom.columns.start,
+        },
+        atom: atom.clone(),
     }
-    let mut index = atoms
+}
+
+fn adjacent_source_atom(
+    current: &AtomPosition,
+    forward: bool,
+    total: usize,
+    line_at: &mut impl FnMut(usize) -> Option<crate::style::RenderedLine>,
+) -> Option<AtomPosition> {
+    let line = line_at(current.point.row)?;
+    let index = line
+        .atoms
         .iter()
-        .position(|(point, _)| {
-            point.row == cursor.line
-                && (point.column == cursor.column
-                    || layout.lines[point.row]
-                        .atoms
-                        .iter()
-                        .find(|atom| atom.columns.start == point.column)
-                        .is_some_and(|atom| atom.columns.contains(&cursor.column)))
-        })
-        .unwrap_or(0);
+        .position(|atom| atom.source.is_some() && atom.columns.start == current.point.column)?;
+    let within = if forward {
+        line.atoms
+            .iter()
+            .skip(index + 1)
+            .find(|atom| atom.source.is_some())
+    } else {
+        line.atoms[..index]
+            .iter()
+            .rev()
+            .find(|atom| atom.source.is_some())
+    };
+    if let Some(atom) = within {
+        return Some(atom_position(current.point.row, atom));
+    }
+    if forward {
+        for row in current.point.row + 1..total {
+            let line = line_at(row)?;
+            if let Some(atom) = line.atoms.iter().find(|atom| atom.source.is_some()) {
+                return Some(atom_position(row, atom));
+            }
+        }
+    } else {
+        for row in (0..current.point.row).rev() {
+            let line = line_at(row)?;
+            if let Some(atom) = line.atoms.iter().rev().find(|atom| atom.source.is_some()) {
+                return Some(atom_position(row, atom));
+            }
+        }
+    }
+    None
+}
+
+/// Word motion over an indexed source without collecting every document atom.
+pub(crate) fn word_point_with(
+    cursor: &RenderedCursor,
+    total: usize,
+    text: &str,
+    motion: char,
+    count: usize,
+    mut line_at: impl FnMut(usize) -> Option<crate::style::RenderedLine>,
+) -> Option<RenderedPoint> {
+    let current = line_at(cursor.line).and_then(|line| {
+        line.atoms
+            .iter()
+            .find(|atom| {
+                atom.source.is_some()
+                    && (atom.columns.start == cursor.column
+                        || atom.columns.contains(&cursor.column))
+            })
+            .map(|atom| atom_position(cursor.line, atom))
+    });
+    let mut current = if let Some(current) = current {
+        current
+    } else {
+        (0..total).find_map(|row| {
+            line_at(row).and_then(|line| {
+                line.atoms
+                    .iter()
+                    .find(|atom| atom.source.is_some())
+                    .map(|atom| atom_position(row, atom))
+            })
+        })?
+    };
     let big = motion.is_ascii_uppercase();
     for _ in 0..count.max(1) {
         match motion.to_ascii_lowercase() {
             'w' => {
-                let class = atom_class(atoms[index].1, text, big);
-                while index + 1 < atoms.len() && atom_class(atoms[index + 1].1, text, big) == class
-                {
-                    index += 1;
+                let class = atom_class(&current.atom, text, big);
+                while let Some(next) = adjacent_source_atom(&current, true, total, &mut line_at) {
+                    if atom_class(&next.atom, text, big) != class {
+                        break;
+                    }
+                    current = next;
                 }
-                if index + 1 < atoms.len() {
-                    index += 1;
+                if let Some(next) = adjacent_source_atom(&current, true, total, &mut line_at) {
+                    current = next;
                 }
-                while index + 1 < atoms.len()
-                    && atom_class(atoms[index].1, text, big) == WordClass::Whitespace
-                {
-                    index += 1;
+                while atom_class(&current.atom, text, big) == WordClass::Whitespace {
+                    let Some(next) = adjacent_source_atom(&current, true, total, &mut line_at)
+                    else {
+                        break;
+                    };
+                    current = next;
                 }
             }
             'e' => {
-                if index + 1 < atoms.len() {
-                    index += 1;
+                if let Some(next) = adjacent_source_atom(&current, true, total, &mut line_at) {
+                    current = next;
                 }
-                while index + 1 < atoms.len()
-                    && atom_class(atoms[index].1, text, big) == WordClass::Whitespace
-                {
-                    index += 1;
+                while atom_class(&current.atom, text, big) == WordClass::Whitespace {
+                    let Some(next) = adjacent_source_atom(&current, true, total, &mut line_at)
+                    else {
+                        break;
+                    };
+                    current = next;
                 }
-                let class = atom_class(atoms[index].1, text, big);
-                while index + 1 < atoms.len() && atom_class(atoms[index + 1].1, text, big) == class
-                {
-                    index += 1;
+                let class = atom_class(&current.atom, text, big);
+                while let Some(next) = adjacent_source_atom(&current, true, total, &mut line_at) {
+                    if atom_class(&next.atom, text, big) != class {
+                        break;
+                    }
+                    current = next;
                 }
             }
             'b' => {
-                index = index.saturating_sub(1);
-                while index > 0 && atom_class(atoms[index].1, text, big) == WordClass::Whitespace {
-                    index -= 1;
+                if let Some(previous) = adjacent_source_atom(&current, false, total, &mut line_at) {
+                    current = previous;
                 }
-                let class = atom_class(atoms[index].1, text, big);
-                while index > 0 && atom_class(atoms[index - 1].1, text, big) == class {
-                    index -= 1;
+                while atom_class(&current.atom, text, big) == WordClass::Whitespace {
+                    let Some(previous) = adjacent_source_atom(&current, false, total, &mut line_at)
+                    else {
+                        break;
+                    };
+                    current = previous;
+                }
+                let class = atom_class(&current.atom, text, big);
+                while let Some(previous) =
+                    adjacent_source_atom(&current, false, total, &mut line_at)
+                {
+                    if atom_class(&previous.atom, text, big) != class {
+                        break;
+                    }
+                    current = previous;
                 }
             }
             _ => return None,
         }
     }
-    atoms.get(index).map(|(point, _)| *point)
+    Some(current.point)
 }
 
-fn edge_point(row: usize, layout: &RenderedLayout, end: bool) -> Option<RenderedPoint> {
-    let line = layout.lines.get(row)?;
+pub(crate) fn edge_point_with(
+    row: usize,
+    end: bool,
+    line: &crate::style::RenderedLine,
+) -> Option<RenderedPoint> {
     let atom = if end {
         line.atoms.iter().rev().find(|atom| atom.source.is_some())
     } else {
@@ -529,6 +665,23 @@ fn edge_point(row: usize, layout: &RenderedLayout, end: bool) -> Option<Rendered
         row,
         column: atom.columns.start,
     })
+}
+
+fn edge_point(row: usize, layout: &RenderedLayout, end: bool) -> Option<RenderedPoint> {
+    edge_point_with(row, end, layout.lines.get(row)?)
+}
+
+pub(crate) fn target_message_at_row(
+    row: usize,
+    targets: &[JumpTarget],
+    mut link_at: impl FnMut(usize) -> Option<String>,
+) -> Option<String> {
+    let target = targets.iter().find(|target| target.line == row)?;
+    match &target.kind {
+        TargetKind::Heading(_) => Some(format!("Heading at line {}", target.line + 1)),
+        TargetKind::Link(index) => link_at(*index).map(|url| format!("Link: {url}")),
+        TargetKind::Footnote => Some(format!("Footnote at line {}", target.line + 1)),
+    }
 }
 
 /// Project a 2D rendered selection into display intervals and raw-source ranges.
@@ -646,17 +799,273 @@ pub fn project_selection_from_source_positions(
     match shape {
         SelectionShape::Character => {}
         SelectionShape::Line => {
-            let anchor_offset = doc_position_to_byte_offset(anchor_source.0, anchor_source.1, text);
-            let active_offset = doc_position_to_byte_offset(active_source.0, active_source.1, text);
-            let first = anchor_offset.min(active_offset);
-            let last = anchor_offset.max(active_offset);
-            let selected = expand_source_points_to_physical_lines(first, last, text);
+            let selected = physical_lines_for_source_positions(anchor_source, active_source, text);
             selection.rows = line_selection_rows(&selected, layout, text);
             selection.source_ranges = vec![selected];
         }
         SelectionShape::Block => {}
     }
     selection
+}
+
+/// Project only rows involved in a selection, keeping document row numbers.
+/// Callers supply all rows that can contribute to the selected source span.
+pub(crate) fn project_selection_from_rows(
+    anchor: RenderedPoint,
+    active: RenderedPoint,
+    shape: SelectionShape,
+    source_positions: ((usize, usize), (usize, usize)),
+    lines: &[(usize, crate::style::RenderedLine)],
+    character_ranges: Option<&[Range<usize>]>,
+    text: &str,
+) -> RenderedSelection {
+    let (anchor_source, active_source) = source_positions;
+    let empty = || RenderedSelection {
+        anchor,
+        active,
+        shape,
+        source_ranges: Vec::new(),
+        rows: Vec::new(),
+        block_width: (shape == SelectionShape::Block).then_some(0),
+    };
+    if lines.is_empty() {
+        return empty();
+    }
+    let line_at = |point: RenderedPoint| {
+        lines
+            .iter()
+            .find(|(row, _)| *row == point.row)
+            .map(|(_, line)| line)
+    };
+    let source_at = |point: RenderedPoint| {
+        line_at(point).and_then(|line| {
+            line.atoms
+                .iter()
+                .find(|atom| {
+                    atom.columns.contains(&point.column) || atom.columns.start == point.column
+                })
+                .and_then(|atom| atom.source.clone())
+        })
+    };
+    let (first, last) = if anchor <= active {
+        (anchor, active)
+    } else {
+        (active, anchor)
+    };
+    let selected_source = match (character_ranges, source_at(anchor), source_at(active)) {
+        (Some(ranges), _, _) if shape == SelectionShape::Character => Some(ranges.to_vec()),
+        (None, Some(anchor), Some(active)) if shape == SelectionShape::Character => {
+            let start = anchor.start.min(active.start);
+            let end = anchor.end.max(active.end);
+            Some(normalize_ranges(
+                lines
+                    .iter()
+                    .flat_map(|(_, line)| &line.atoms)
+                    .filter_map(|atom| atom.source.clone())
+                    .filter(|source| source.start >= start && source.end <= end)
+                    .collect(),
+            ))
+        }
+        _ => None,
+    };
+    let rows = match shape {
+        SelectionShape::Character => selected_source.as_ref().map_or_else(
+            || {
+                lines
+                    .iter()
+                    .filter(|(row, _)| first.row <= *row && *row <= last.row)
+                    .map(|(row, line)| {
+                        let start = if *row == first.row { first.column } else { 0 };
+                        let end = if *row == last.row {
+                            last.column
+                        } else {
+                            usize::MAX
+                        };
+                        selection_row_for_line(*row, start, end, line)
+                    })
+                    .collect()
+            },
+            |ranges| {
+                character_selection_rows_with(ranges, lines.iter().map(|(row, line)| (*row, line)))
+            },
+        ),
+        SelectionShape::Line => {
+            let selected = physical_lines_for_source_positions(anchor_source, active_source, text);
+            line_selection_rows_with(&selected, text, lines.iter().cloned())
+        }
+        SelectionShape::Block => {
+            let left = anchor.column.min(active.column);
+            let right = [anchor, active]
+                .into_iter()
+                .filter_map(|point| {
+                    line_at(point).and_then(|line| {
+                        line.atoms.iter().find(|atom| {
+                            atom.source.is_some()
+                                && (atom.columns.contains(&point.column)
+                                    || atom.columns.start == point.column)
+                        })
+                    })
+                })
+                .map(|atom| atom.columns.end)
+                .max()
+                .unwrap_or_else(|| anchor.column.max(active.column).saturating_add(1));
+            lines
+                .iter()
+                .filter(|(row, _)| first.row <= *row && *row <= last.row)
+                .map(|(row, line)| {
+                    let mut selected =
+                        selection_row_for_line(*row, left, right.saturating_sub(1), line);
+                    selected.columns = single_interval(left..right);
+                    selected
+                })
+                .collect()
+        }
+    };
+    let source_ranges = match shape {
+        SelectionShape::Line => vec![physical_lines_for_source_positions(
+            anchor_source,
+            active_source,
+            text,
+        )],
+        _ => selected_source.unwrap_or_else(|| {
+            normalize_ranges(
+                rows.iter()
+                    .flat_map(|row| row.source_ranges.iter().cloned())
+                    .collect(),
+            )
+        }),
+    };
+    let block_width = (shape == SelectionShape::Block).then(|| {
+        rows.first()
+            .and_then(|row| row.columns.first())
+            .map_or(0, |columns| columns.end.saturating_sub(columns.start))
+    });
+    RenderedSelection {
+        anchor,
+        active,
+        shape,
+        source_ranges,
+        rows,
+        block_width,
+    }
+}
+
+/// Widen only mutation ranges whose entire physical line of visible text is
+/// selected. Source-less presentation cells do not participate in coverage.
+pub(crate) fn character_mutation_ranges(
+    selected: &[Range<usize>],
+    layout: &RenderedLayout,
+    text: &str,
+) -> Vec<Range<usize>> {
+    character_mutation_ranges_with_lines(selected, layout.lines.iter(), text)
+}
+
+pub(crate) fn character_mutation_ranges_with_lines<'a>(
+    selected: &[Range<usize>],
+    rendered_lines: impl Iterator<Item = &'a crate::style::RenderedLine>,
+    text: &str,
+) -> Vec<Range<usize>> {
+    struct PhysicalLineCoverage {
+        start: usize,
+        content_end: usize,
+        end: usize,
+        has_visible: bool,
+        all_visible_selected: bool,
+    }
+
+    let (Some(first), Some(last)) = (selected.first(), selected.last()) else {
+        return Vec::new();
+    };
+    let start = text[..first.start.min(text.len())]
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1);
+    let limit = last.end.min(text.len());
+    let mut lines = Vec::new();
+    let mut offset = start;
+    while offset < text.len() && offset < limit {
+        let end = text[offset..]
+            .find('\n')
+            .map_or(text.len(), |newline| offset + newline + 1);
+        let content_end = if text.as_bytes().get(end.saturating_sub(1)) == Some(&b'\n') {
+            end - 1 - usize::from(text.as_bytes().get(end.saturating_sub(2)) == Some(&b'\r'))
+        } else {
+            end
+        };
+        lines.push(PhysicalLineCoverage {
+            start: offset,
+            content_end,
+            end,
+            has_visible: false,
+            all_visible_selected: true,
+        });
+        offset = end;
+    }
+    if lines.is_empty() {
+        return selected.to_vec();
+    }
+
+    for atom in rendered_lines.flat_map(|line| &line.atoms) {
+        let Some(source) = &atom.source else {
+            continue;
+        };
+        let index = lines
+            .partition_point(|line| line.start <= source.start)
+            .saturating_sub(1);
+        let Some(line) = lines.get_mut(index) else {
+            continue;
+        };
+        if source.start < line.start || source.start >= line.content_end {
+            continue;
+        }
+        line.has_visible = true;
+        let selected_index = selected
+            .partition_point(|range| range.start <= source.start)
+            .saturating_sub(1);
+        if source.end > line.content_end
+            || !selected
+                .get(selected_index)
+                .is_some_and(|range| range.start <= source.start && source.end <= range.end)
+        {
+            line.all_visible_selected = false;
+        }
+    }
+
+    let full: Vec<bool> = lines
+        .iter()
+        .map(|line| line.has_visible && line.all_visible_selected)
+        .collect();
+    let mut ranges = selected.to_vec();
+    for (index, line) in lines.iter().enumerate() {
+        let enclosed_blank = !full[index]
+            && text[line.start..line.content_end].trim().is_empty()
+            && (0..index)
+                .rev()
+                .find(|&previous| {
+                    !text[lines[previous].start..lines[previous].content_end]
+                        .trim()
+                        .is_empty()
+                })
+                .is_some_and(|previous| full[previous])
+            && (index + 1..lines.len())
+                .find(|&next| {
+                    !text[lines[next].start..lines[next].content_end]
+                        .trim()
+                        .is_empty()
+                })
+                .is_some_and(|next| full[next]);
+        if !full[index] && !enclosed_blank {
+            continue;
+        }
+        let mut range_start = line.start;
+        if line.end == text.len() && line.content_end == line.end && line.start > 0 {
+            range_start -= 1;
+            if range_start > 0 && text.as_bytes()[range_start - 1] == b'\r' {
+                range_start -= 1;
+            }
+        }
+        ranges.push(range_start..line.end);
+    }
+    normalize_ranges(ranges)
 }
 
 pub(crate) fn source_for_point(
@@ -781,33 +1190,70 @@ fn source_atom_for_point(
     })
 }
 
+pub(crate) fn physical_lines_for_source_positions(
+    anchor_source: (usize, usize),
+    active_source: (usize, usize),
+    text: &str,
+) -> Range<usize> {
+    let anchor_offset = doc_position_to_byte_offset(anchor_source.0, anchor_source.1, text);
+    let active_offset = doc_position_to_byte_offset(active_source.0, active_source.1, text);
+    expand_source_points_to_physical_lines(
+        anchor_offset.min(active_offset),
+        anchor_offset.max(active_offset),
+        text,
+    )
+}
+
 fn line_selection_rows(
     selected: &Range<usize>,
     layout: &RenderedLayout,
     text: &str,
 ) -> Vec<RenderedSelectionRow> {
-    layout
-        .lines
-        .iter()
-        .enumerate()
+    line_selection_rows_with(selected, text, layout.lines.iter().cloned().enumerate())
+}
+
+pub(crate) fn line_selection_rows_with(
+    selected: &Range<usize>,
+    text: &str,
+    lines: impl IntoIterator<Item = (usize, crate::style::RenderedLine)>,
+) -> Vec<RenderedSelectionRow> {
+    lines
+        .into_iter()
         .filter_map(|(row, line)| {
-            let source = line
-                .atoms
-                .iter()
-                .filter_map(|atom| atom.source.as_ref())
-                .next()
-                .cloned()
-                .unwrap_or_else(|| line.source.clone());
-            let physical = expand_physical_line(&source, text);
-            (physical.start < selected.end && selected.start < physical.end).then(|| {
-                let mut projected = selection_row(row, 0, usize::MAX, layout);
-                projected.columns =
-                    single_interval(0..line.atoms.last().map_or(0, |atom| atom.columns.end));
-                projected.source_ranges = vec![physical];
-                projected
+            line_row_intersects_source(&line, selected, text).then(|| {
+                let source = line
+                    .atoms
+                    .iter()
+                    .filter_map(|atom| atom.source.as_ref())
+                    .next()
+                    .cloned()
+                    .unwrap_or_else(|| line.source.clone());
+                let physical = expand_physical_line(&source, text);
+                RenderedSelectionRow {
+                    row,
+                    columns: single_interval(
+                        0..line.atoms.last().map_or(0, |atom| atom.columns.end),
+                    ),
+                    source_ranges: vec![physical],
+                }
             })
         })
         .collect()
+}
+
+pub(crate) fn line_row_intersects_source(
+    line: &crate::style::RenderedLine,
+    selected: &Range<usize>,
+    text: &str,
+) -> bool {
+    let source = line
+        .atoms
+        .iter()
+        .filter_map(|atom| atom.source.as_ref())
+        .next()
+        .unwrap_or(&line.source);
+    let physical = expand_physical_line(source, text);
+    physical.start < selected.end && selected.start < physical.end
 }
 
 fn clamp_point(point: RenderedPoint, layout: &RenderedLayout) -> RenderedPoint {
@@ -834,6 +1280,15 @@ fn selection_row(
             source_ranges: Vec::new(),
         };
     };
+    selection_row_for_line(row, start_column, end_column, line)
+}
+
+fn selection_row_for_line(
+    row: usize,
+    start_column: usize,
+    end_column: usize,
+    line: &crate::style::RenderedLine,
+) -> RenderedSelectionRow {
     let selected: Vec<_> = line
         .atoms
         .iter()
@@ -888,10 +1343,15 @@ pub(crate) fn character_selection_rows(
     source_ranges: &[Range<usize>],
     layout: &RenderedLayout,
 ) -> Vec<RenderedSelectionRow> {
-    layout
-        .lines
-        .iter()
-        .enumerate()
+    character_selection_rows_with(source_ranges, layout.lines.iter().enumerate())
+}
+
+fn character_selection_rows_with<'a>(
+    source_ranges: &[Range<usize>],
+    lines: impl IntoIterator<Item = (usize, &'a crate::style::RenderedLine)>,
+) -> Vec<RenderedSelectionRow> {
+    lines
+        .into_iter()
         .filter_map(|(row, line)| {
             let columns = normalize_ranges(
                 source_ranges
@@ -920,30 +1380,6 @@ pub(crate) fn character_selection_rows(
             })
         })
         .collect()
-}
-
-/// Project a source byte range into source-backed rendered display intervals.
-///
-/// Separate intervals are retained when synthetic atoms split source-backed
-/// content, so renderer-created glyphs never inherit a decoration.
-pub(crate) fn project_source_range(
-    source_range: &Range<usize>,
-    visible_rows: Range<usize>,
-    layout: &RenderedLayout,
-) -> Vec<(usize, Range<usize>)> {
-    if source_range.start >= source_range.end || visible_rows.start >= visible_rows.end {
-        return Vec::new();
-    }
-
-    let start = visible_rows.start.min(layout.lines.len());
-    let end = visible_rows.end.min(layout.lines.len());
-    let mut projected = Vec::new();
-    for row in start..end {
-        for columns in project_atom_intervals(source_range, &layout.lines[row].atoms) {
-            projected.push((row, columns));
-        }
-    }
-    projected
 }
 
 pub(crate) fn project_atom_intervals(
@@ -1073,6 +1509,123 @@ pub(crate) fn key_inspects_source(key: crate::input::KeyInput) -> bool {
         && !key.mods.shift
 }
 
+/// Row-only motions shared by complete and retained rendered projections.
+pub(crate) fn vertical_target(
+    key: crate::input::KeyInput,
+    cursor: &RenderedCursor,
+    total: usize,
+    count: usize,
+) -> Option<usize> {
+    use crate::input::KeyCodeKind;
+
+    let last = total.saturating_sub(1);
+    let step = count.max(1);
+    match key.code.kind {
+        KeyCodeKind::Char('j') | KeyCodeKind::Down
+            if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
+        {
+            Some(cursor.line.saturating_add(step).min(last))
+        }
+        KeyCodeKind::Char('k') | KeyCodeKind::Up
+            if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
+        {
+            Some(cursor.line.saturating_sub(step))
+        }
+        KeyCodeKind::Char('g') if !key.mods.ctrl && !key.mods.alt && !key.mods.shift => {
+            Some(count.saturating_sub(1).min(last))
+        }
+        KeyCodeKind::Char('G') if !key.mods.ctrl && !key.mods.alt && !key.mods.shift => {
+            Some(if count > 1 {
+                count.saturating_sub(1).min(last)
+            } else {
+                last
+            })
+        }
+        KeyCodeKind::Char('d') if key.mods.ctrl => Some(
+            cursor
+                .line
+                .saturating_add(if count > 1 { count } else { total / 2 })
+                .min(last),
+        ),
+        KeyCodeKind::Char('u') if key.mods.ctrl => {
+            Some(
+                cursor
+                    .line
+                    .saturating_sub(if count > 1 { count } else { total / 2 }),
+            )
+        }
+        KeyCodeKind::Char('f') if key.mods.ctrl => Some(
+            cursor
+                .line
+                .saturating_add(if count > 1 { count } else { total })
+                .min(last),
+        ),
+        KeyCodeKind::Char('b') if key.mods.ctrl => {
+            Some(
+                cursor
+                    .line
+                    .saturating_sub(if count > 1 { count } else { total }),
+            )
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn horizontal_direction(key: crate::input::KeyInput) -> Option<bool> {
+    use crate::input::KeyCodeKind;
+    if key.mods.ctrl || key.mods.alt || key.mods.shift {
+        return None;
+    }
+    match key.code.kind {
+        KeyCodeKind::Char('h') | KeyCodeKind::Left => Some(false),
+        KeyCodeKind::Char('l') | KeyCodeKind::Right => Some(true),
+        _ => None,
+    }
+}
+
+pub(crate) fn word_motion(key: crate::input::KeyInput) -> Option<char> {
+    if key.mods.ctrl || key.mods.alt || key.mods.shift {
+        return None;
+    }
+    match key.code.kind {
+        crate::input::KeyCodeKind::Char(motion @ ('w' | 'W' | 'e' | 'E' | 'b' | 'B')) => {
+            Some(motion)
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn jump_row_for_key(
+    key: crate::input::KeyInput,
+    cursor: &RenderedCursor,
+    count: usize,
+    targets: &[JumpTarget],
+) -> Option<Option<usize>> {
+    use crate::input::KeyCodeKind;
+    if key.mods.ctrl || key.mods.alt || key.mods.shift {
+        return None;
+    }
+    match key.code.kind {
+        KeyCodeKind::Tab => Some(next_jump_target(cursor, targets, false)),
+        KeyCodeKind::BackTab => Some(next_jump_target(cursor, targets, true)),
+        KeyCodeKind::Char('[') if count > 1 => {
+            let headings = targets
+                .iter()
+                .filter(|target| matches!(target.kind, TargetKind::Heading(_)))
+                .collect::<Vec<_>>();
+            Some(find_prev_by_kind(cursor, &headings, count).map(|target| target.line))
+        }
+        KeyCodeKind::Char(']') if count > 1 => {
+            let headings = targets
+                .iter()
+                .filter(|target| matches!(target.kind, TargetKind::Heading(_)))
+                .collect::<Vec<_>>();
+            Some(find_next_by_kind(cursor, &headings, count).map(|target| target.line))
+        }
+        _ => None,
+    }
+}
+
 /// Handle a key in rendered mode. Returns the effect of the keypress.
 ///
 /// Implements:
@@ -1095,77 +1648,36 @@ pub fn handle_key(
     let mut result = RenderedKeyResult::default();
     let step = if count > 1 { count } else { 1 };
 
+    if let Some(row) = vertical_target(key, cursor, max_rendered_lines, count) {
+        result.cursor_moved = true;
+        result.new_cursor = Some(cursor_for_row(row, cursor.desired_column, layout));
+        return result;
+    }
+    if let Some(forward) = horizontal_direction(key) {
+        if let Some(point) = horizontal_point(cursor, layout, forward, step) {
+            result.cursor_moved = true;
+            result.new_cursor = Some(RenderedCursor::at(point));
+        }
+        return result;
+    }
+    if let Some(motion) = word_motion(key) {
+        if let Some(point) = word_point(cursor, layout, text, motion, step) {
+            result.cursor_moved = true;
+            result.new_cursor = Some(RenderedCursor::at(point));
+        }
+        return result;
+    }
+    if let Some(row) = jump_row_for_key(key, cursor, count, jump_targets) {
+        if let Some(row) = row {
+            result.cursor_moved = true;
+            result.new_cursor = Some(cursor_for_row(row, cursor.desired_column, layout));
+        }
+        return result;
+    }
+
     match key.code.kind {
         // Esc: no-op in rendered mode (handled by session layer)
         crate::input::KeyCodeKind::Esc => {}
-
-        // j / Down: move down one line
-        crate::input::KeyCodeKind::Char('j') | crate::input::KeyCodeKind::Down
-            if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
-        {
-            let new_line = cursor
-                .line
-                .saturating_add(step)
-                .min(max_rendered_lines.saturating_sub(1));
-            result.cursor_moved = true;
-            result.new_cursor = Some(cursor_for_row(new_line, cursor.desired_column, layout));
-        }
-
-        // k / Up: move up one line
-        crate::input::KeyCodeKind::Char('k') | crate::input::KeyCodeKind::Up
-            if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
-        {
-            let new_line = cursor.line.saturating_sub(step);
-            result.cursor_moved = true;
-            result.new_cursor = Some(cursor_for_row(new_line, cursor.desired_column, layout));
-        }
-
-        // h / Left: previous source-backed display atom.
-        crate::input::KeyCodeKind::Char('h') | crate::input::KeyCodeKind::Left
-            if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
-        {
-            if let Some(point) = horizontal_point(cursor, layout, false, step) {
-                result.cursor_moved = true;
-                result.new_cursor = Some(RenderedCursor::at(point));
-            }
-        }
-
-        // l / Right: next source-backed display atom.
-        crate::input::KeyCodeKind::Char('l') | crate::input::KeyCodeKind::Right
-            if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
-        {
-            if let Some(point) = horizontal_point(cursor, layout, true, step) {
-                result.cursor_moved = true;
-                result.new_cursor = Some(RenderedCursor::at(point));
-            }
-        }
-
-        // Rendered word motions traverse source-backed display atoms. Hidden
-        // Markdown delimiters and synthetic cells are never cursor stops.
-        crate::input::KeyCodeKind::Char('w')
-        | crate::input::KeyCodeKind::Char('W')
-        | crate::input::KeyCodeKind::Char('e')
-        | crate::input::KeyCodeKind::Char('E')
-            if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
-        {
-            if let crate::input::KeyCodeKind::Char(motion) = key.code.kind {
-                if let Some(point) = word_point(cursor, layout, text, motion, step) {
-                    result.cursor_moved = true;
-                    result.new_cursor = Some(RenderedCursor::at(point));
-                }
-            }
-        }
-
-        crate::input::KeyCodeKind::Char('b') | crate::input::KeyCodeKind::Char('B')
-            if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
-        {
-            if let crate::input::KeyCodeKind::Char(motion) = key.code.kind {
-                if let Some(point) = word_point(cursor, layout, text, motion, step) {
-                    result.cursor_moved = true;
-                    result.new_cursor = Some(RenderedCursor::at(point));
-                }
-            }
-        }
 
         crate::input::KeyCodeKind::Char('0') | crate::input::KeyCodeKind::Char('^')
             if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
@@ -1182,37 +1694,6 @@ pub fn handle_key(
             if let Some(point) = edge_point(cursor.line, layout, true) {
                 result.cursor_moved = true;
                 result.new_cursor = Some(RenderedCursor::at(point));
-            }
-        }
-
-        // g: go to first line, or the counted rendered line.
-        crate::input::KeyCodeKind::Char('g')
-            if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
-        {
-            let new_line = count
-                .saturating_sub(1)
-                .min(max_rendered_lines.saturating_sub(1));
-            result.cursor_moved = true;
-            result.new_cursor = Some(cursor_for_row(new_line, cursor.desired_column, layout));
-        }
-
-        // G: go to last line (or to line N if count > 0)
-        crate::input::KeyCodeKind::Char('G')
-            if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
-        {
-            if count > 1 {
-                let new_line = count
-                    .saturating_sub(1)
-                    .min(max_rendered_lines.saturating_sub(1));
-                result.cursor_moved = true;
-                result.new_cursor = Some(cursor_for_row(new_line, cursor.desired_column, layout));
-            } else {
-                result.cursor_moved = true;
-                result.new_cursor = Some(cursor_for_row(
-                    max_rendered_lines.saturating_sub(1),
-                    cursor.desired_column,
-                    layout,
-                ));
             }
         }
 
@@ -1234,66 +1715,6 @@ pub fn handle_key(
             new_search.set_direction(SearchDirection::Backward);
             result.search_changed = true;
             result.new_search = Some(new_search);
-        }
-
-        // Tab: jump to next target
-        crate::input::KeyCodeKind::Tab if !key.mods.ctrl && !key.mods.alt && !key.mods.shift => {
-            if let Some(target) = next_jump_target(cursor, jump_targets, false) {
-                result.cursor_moved = true;
-                result.new_cursor = Some(cursor_for_row(target, cursor.desired_column, layout));
-            }
-        }
-
-        // Shift-Tab: jump to previous target
-        crate::input::KeyCodeKind::BackTab
-            if !key.mods.ctrl && !key.mods.alt && !key.mods.shift =>
-        {
-            if let Some(target) = next_jump_target(cursor, jump_targets, true) {
-                result.cursor_moved = true;
-                result.new_cursor = Some(cursor_for_row(target, cursor.desired_column, layout));
-            }
-        }
-
-        // Ctrl-d: scroll down half viewport
-        crate::input::KeyCodeKind::Char('d') if key.mods.ctrl => {
-            let page = if count > 1 {
-                count
-            } else {
-                max_rendered_lines / 2
-            };
-            let new_line =
-                (cursor.line.saturating_add(page)).min(max_rendered_lines.saturating_sub(1));
-            result.cursor_moved = true;
-            result.new_cursor = Some(cursor_for_row(new_line, cursor.desired_column, layout));
-        }
-
-        // Ctrl-u: scroll up half viewport
-        crate::input::KeyCodeKind::Char('u') if key.mods.ctrl => {
-            let page = if count > 1 {
-                count
-            } else {
-                max_rendered_lines / 2
-            };
-            let new_line = cursor.line.saturating_sub(page);
-            result.cursor_moved = true;
-            result.new_cursor = Some(cursor_for_row(new_line, cursor.desired_column, layout));
-        }
-
-        // Ctrl-f: scroll down full viewport
-        crate::input::KeyCodeKind::Char('f') if key.mods.ctrl => {
-            let page = if count > 1 { count } else { max_rendered_lines };
-            let new_line =
-                (cursor.line.saturating_add(page)).min(max_rendered_lines.saturating_sub(1));
-            result.cursor_moved = true;
-            result.new_cursor = Some(cursor_for_row(new_line, cursor.desired_column, layout));
-        }
-
-        // Ctrl-b: scroll up full viewport
-        crate::input::KeyCodeKind::Char('b') if key.mods.ctrl => {
-            let page = if count > 1 { count } else { max_rendered_lines };
-            let new_line = cursor.line.saturating_sub(page);
-            result.cursor_moved = true;
-            result.new_cursor = Some(cursor_for_row(new_line, cursor.desired_column, layout));
         }
 
         // n: repeat search in same direction (with cursor movement)
@@ -1385,55 +1806,11 @@ pub fn handle_key(
             }
         }
 
-        // [[: jump to previous heading
-        crate::input::KeyCodeKind::Char('[')
-            if !key.mods.ctrl && !key.mods.alt && !key.mods.shift && count > 1 =>
-        {
-            let targets: Vec<&JumpTarget> = layout
-                .jump_targets
-                .iter()
-                .filter(|t| matches!(t.kind, TargetKind::Heading(_)))
-                .collect();
-            if let Some(target) = find_prev_by_kind(cursor, &targets, count) {
-                result.cursor_moved = true;
-                result.new_cursor =
-                    Some(cursor_for_row(target.line, cursor.desired_column, layout));
-            }
-        }
-
-        // ]]: jump to next heading
-        crate::input::KeyCodeKind::Char(']')
-            if !key.mods.ctrl && !key.mods.alt && !key.mods.shift && count > 1 =>
-        {
-            let targets: Vec<&JumpTarget> = layout
-                .jump_targets
-                .iter()
-                .filter(|t| matches!(t.kind, TargetKind::Heading(_)))
-                .collect();
-            if let Some(target) = find_next_by_kind(cursor, &targets, count) {
-                result.cursor_moved = true;
-                result.new_cursor =
-                    Some(cursor_for_row(target.line, cursor.desired_column, layout));
-            }
-        }
-
         // Enter: on a link-target line, show destination
         crate::input::KeyCodeKind::Enter if !key.mods.ctrl && !key.mods.alt && !key.mods.shift => {
-            if let Some(target) = layout.jump_targets.iter().find(|t| t.line == cursor.line) {
-                match &target.kind {
-                    TargetKind::Heading(_) => {
-                        result.message = Some(format!("Heading at line {}", target.line + 1));
-                    }
-                    TargetKind::Link(idx) => {
-                        if let Some((_, url)) = layout.link_index.get(*idx) {
-                            result.message = Some(format!("Link: {}", url));
-                        }
-                    }
-                    TargetKind::Footnote => {
-                        result.message = Some(format!("Footnote at line {}", target.line + 1));
-                    }
-                }
-            }
+            result.message = target_message_at_row(cursor.line, &layout.jump_targets, |index| {
+                layout.link_index.get(index).map(|(_, url)| url.clone())
+            });
         }
 
         // z: toggle front-matter collapse
@@ -1540,37 +1917,39 @@ pub fn find_next_match(
     _text: &str,
     direction: SearchDirection,
 ) -> Option<usize> {
-    let mut rendered_lines_with_matches = layout
-        .lines
-        .iter()
-        .enumerate()
-        .filter_map(|(rendered_line, line)| {
-            (line.kind == LineKind::Content && search.matches(&line.styled.text))
-                .then_some(rendered_line)
-        })
-        .collect::<Vec<_>>();
+    matching_row_for_cursor(
+        cursor,
+        direction,
+        layout.lines.iter().enumerate().filter_map(|(row, line)| {
+            (line.kind == LineKind::Content && search.matches(&line.styled.text)).then_some(row)
+        }),
+    )
+}
 
-    if rendered_lines_with_matches.is_empty() {
-        return None;
+/// Resolve a sorted stream of matching rendered rows with wrap-around.
+pub(crate) fn matching_row_for_cursor(
+    cursor: &RenderedCursor,
+    direction: SearchDirection,
+    matches: impl IntoIterator<Item = usize>,
+) -> Option<usize> {
+    let mut first = None;
+    let mut last = None;
+    let mut next = None;
+    let mut previous = None;
+    for row in matches {
+        first.get_or_insert(row);
+        last = Some(row);
+        if row > cursor.line && next.is_none() {
+            next = Some(row);
+        }
+        if row < cursor.line {
+            previous = Some(row);
+        }
     }
-
-    // Deduplicate and sort
-    rendered_lines_with_matches.sort();
-    rendered_lines_with_matches.dedup();
-
     if direction == SearchDirection::Forward {
-        // Find first match after cursor
-        rendered_lines_with_matches
-            .iter()
-            .find_map(|vl| if *vl > cursor.line { Some(*vl) } else { None })
-            .or_else(|| rendered_lines_with_matches.first().copied())
+        next.or(first)
     } else {
-        // Find last match before cursor
-        rendered_lines_with_matches
-            .iter()
-            .rev()
-            .find_map(|vl| if *vl < cursor.line { Some(*vl) } else { None })
-            .or_else(|| rendered_lines_with_matches.last().copied())
+        previous.or(last)
     }
 }
 
@@ -1627,7 +2006,364 @@ fn find_next_by_kind<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rendered::{BlockModel, RetainedRows};
     use crate::style::{RenderedLine, RenderedSourceAtom, StyledLine};
+    use crate::syntax::Highlighter;
+    use proptest::prelude::*;
+
+    fn visible_sources_on_physical_line(
+        layout: &RenderedLayout,
+        start: usize,
+        end: usize,
+    ) -> Vec<Range<usize>> {
+        normalize_ranges(
+            layout
+                .lines
+                .iter()
+                .flat_map(|line| &line.atoms)
+                .filter_map(|atom| atom.source.clone())
+                .filter(|source| start <= source.start && source.end <= end)
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn character_mutation_covers_physical_lines_only_when_all_visible_atoms_are_selected() {
+        let cases = [
+            ("# Heading &amp; café\nnext\n", "# Heading", 12),
+            (
+                "- wrapped **item text** and more words\nnext\n",
+                "- wrapped",
+                12,
+            ),
+            ("| A | B |\n|---|---|\n| café | tea |\n", "| café", 30),
+            (
+                "```rust\nfn main() { println!(\"hi\"); }\n```\n",
+                "fn main",
+                18,
+            ),
+            (
+                "```go\nfunc main() { println(\"hi\") }\n```\n",
+                "func main",
+                18,
+            ),
+            ("alpha\r\nbeta\r\n", "beta", 20),
+        ];
+        for (text, needle, width) in cases {
+            let highlighter = Highlighter::new(text);
+            let model = BlockModel::build(text, crate::frontmatter::front_matter_span(text));
+            let layout = RenderedLayout::build(&model, width, &highlighter);
+            let start = text.find(needle).unwrap();
+            let start = text[..start].rfind('\n').map_or(0, |newline| newline + 1);
+            let end = text[start..]
+                .find('\n')
+                .map_or(text.len(), |newline| start + newline + 1);
+            let selected = visible_sources_on_physical_line(&layout, start, end);
+            assert!(!selected.is_empty(), "{needle:?}");
+            let widened = character_mutation_ranges(&selected, &layout, text);
+            assert_eq!(widened, vec![start..end], "{needle:?}");
+
+            if selected.len() > 1 {
+                let partial = selected[..selected.len() - 1].to_vec();
+                assert_eq!(
+                    character_mutation_ranges(&partial, &layout, text),
+                    partial,
+                    "partial {needle:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn character_mutation_includes_enclosed_blank_but_not_hidden_structural_lines() {
+        let text = "alpha\n\n[ref]: /url\n\nbeta";
+        let highlighter = Highlighter::new(text);
+        let model = BlockModel::build(text, crate::frontmatter::front_matter_span(text));
+        let layout = RenderedLayout::build(&model, 40, &highlighter);
+        let mut selected = visible_sources_on_physical_line(&layout, 0, 6);
+        let beta = text.find("beta").unwrap();
+        selected.extend(visible_sources_on_physical_line(&layout, beta, text.len()));
+        let actual = character_mutation_ranges(&normalize_ranges(selected), &layout, text);
+        assert_eq!(actual, vec![0..6, beta - 1..text.len()]);
+
+        let beta_only = visible_sources_on_physical_line(&layout, beta, text.len());
+        assert_eq!(
+            character_mutation_ranges(&beta_only, &layout, text),
+            vec![beta - 1..text.len()]
+        );
+    }
+
+    fn prototype_bounded_character_selection(
+        rows: &RetainedRows,
+        anchor: RenderedPoint,
+        active: RenderedPoint,
+    ) -> (RenderedSelection, usize) {
+        let first = anchor.row.min(active.row);
+        let last = anchor.row.max(active.row);
+        let visited = (first..=last)
+            .map(|row| (row, rows.row(row).expect("indexed row exists")))
+            .collect::<Vec<_>>();
+        let source_at = |point: RenderedPoint| {
+            visited[point.row - first]
+                .1
+                .atoms
+                .iter()
+                .find(|atom| {
+                    atom.columns.contains(&point.column) || atom.columns.start == point.column
+                })
+                .and_then(|atom| atom.source.clone())
+                .expect("source-backed selection endpoint")
+        };
+        let anchor_source = source_at(anchor);
+        let active_source = source_at(active);
+        let start = anchor_source.start.min(active_source.start);
+        let end = anchor_source.end.max(active_source.end);
+        let source_ranges = normalize_ranges(
+            visited
+                .iter()
+                .flat_map(|(_, line)| line.atoms.iter())
+                .filter_map(|atom| atom.source.clone())
+                .filter(|source| source.start >= start && source.end <= end)
+                .collect(),
+        );
+        let visible = visited
+            .into_iter()
+            .filter_map(|(row, line)| {
+                let columns = normalize_ranges(
+                    source_ranges
+                        .iter()
+                        .flat_map(|source| project_atom_intervals(source, &line.atoms))
+                        .collect(),
+                );
+                if columns.is_empty() {
+                    return None;
+                }
+                let row_sources = normalize_ranges(
+                    line.atoms
+                        .iter()
+                        .filter_map(|atom| atom.source.clone())
+                        .filter(|source| {
+                            source_ranges.iter().any(|selected| {
+                                source.start < selected.end && selected.start < source.end
+                            })
+                        })
+                        .collect(),
+                );
+                Some(RenderedSelectionRow {
+                    row,
+                    columns,
+                    source_ranges: row_sources,
+                })
+            })
+            .collect();
+        (
+            RenderedSelection {
+                anchor,
+                active,
+                shape: SelectionShape::Character,
+                source_ranges,
+                rows: visible,
+                block_width: None,
+            },
+            last - first + 1,
+        )
+    }
+
+    #[test]
+    fn bounded_character_projection_matches_small_markdown_shapes() {
+        let cases = [
+            (
+                "wrapped",
+                "# Café\n\nA long line of repeated words that wraps twice.\nMore prose.\n",
+                18,
+            ),
+            (
+                "list",
+                "- first **bold** item\n- second `code` item\n\nTail\n",
+                28,
+            ),
+            (
+                "table",
+                "| Key | Value |\n|---|---|\n| café | `λ` |\n| tea | &amp; |\n",
+                36,
+            ),
+            (
+                "fence",
+                "```rust\nfn café() {\n  let value = 1;\n}\n```\n",
+                30,
+            ),
+            (
+                "footnote",
+                "A [link](https://example.invalid) and note[^a].\n\n[^a]: footnote text\n",
+                38,
+            ),
+        ];
+        for (name, text, width) in cases {
+            let highlighter = Highlighter::new(text);
+            let model = BlockModel::build(text, crate::frontmatter::front_matter_span(text));
+            let (layout, fences, boundaries) =
+                RenderedLayout::build_with_boundaries(&model, width, &highlighter, false);
+            let retained = RetainedRows::from_complete(layout.clone(), fences, &boundaries);
+            let points = layout
+                .lines
+                .iter()
+                .enumerate()
+                .filter_map(|(row, line)| {
+                    line.atoms
+                        .iter()
+                        .find(|atom| atom.source.is_some())
+                        .map(|atom| RenderedPoint {
+                            row,
+                            column: atom.columns.start,
+                        })
+                })
+                .collect::<Vec<_>>();
+            for (index, &anchor) in points.iter().enumerate() {
+                for &active in points.iter().skip(index).take(5) {
+                    for (from, to) in [(anchor, active), (active, anchor)] {
+                        let (bounded, _) =
+                            prototype_bounded_character_selection(&retained, from, to);
+                        let complete =
+                            project_selection(from, to, SelectionShape::Character, &layout, text);
+                        assert_eq!(bounded, complete, "{name} {from:?}..{to:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "exact 1 MiB selection feasibility diagnostic is run by its benchmark target"]
+    fn acceptance_1mb_bounded_character_projection_matches_complete() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/kitchen-sink-1mb.md");
+        let text = std::fs::read_to_string(path).unwrap();
+        let highlighter = Highlighter::new(&text);
+        let model = BlockModel::build(&text, crate::frontmatter::front_matter_span(&text));
+        let (layout, fences, boundaries) =
+            RenderedLayout::build_with_boundaries(&model, 100, &highlighter, false);
+        let retained = RetainedRows::from_complete(layout.clone(), fences, &boundaries);
+        for (region, line) in [("prose", 600), ("rust", 3000), ("go", 20000)] {
+            let offset = text
+                .split_inclusive('\n')
+                .take(line)
+                .map(str::len)
+                .sum::<usize>();
+            let anchor_row = layout
+                .lines
+                .iter()
+                .position(|rendered| {
+                    rendered.atoms.iter().any(|atom| {
+                        atom.source
+                            .as_ref()
+                            .is_some_and(|source| source.start >= offset)
+                    })
+                })
+                .unwrap();
+            let point_at = |row: usize| {
+                let atom = layout.lines[row]
+                    .atoms
+                    .iter()
+                    .find(|atom| atom.source.is_some())
+                    .unwrap();
+                RenderedPoint {
+                    row,
+                    column: atom.columns.start,
+                }
+            };
+            let anchor = point_at(anchor_row);
+            let active_row = (anchor_row + 15..anchor_row + 30)
+                .find(|&row| {
+                    layout
+                        .lines
+                        .get(row)
+                        .is_some_and(|line| line.atoms.iter().any(|atom| atom.source.is_some()))
+                })
+                .unwrap();
+            let active = point_at(active_row);
+            let started = std::time::Instant::now();
+            let (bounded, visited_rows) =
+                prototype_bounded_character_selection(&retained, anchor, active);
+            let bounded_ns = started.elapsed().as_nanos();
+            let started = std::time::Instant::now();
+            let complete =
+                project_selection(anchor, active, SelectionShape::Character, &layout, &text);
+            let complete_ns = started.elapsed().as_nanos();
+            assert_eq!(bounded, complete, "{region}");
+            assert!(visited_rows <= 30);
+            println!(
+                "SELECT_BOUNDED\t{region}\t{bounded_ns}\t{complete_ns}\t{visited_rows}\t{}",
+                layout.lines.len()
+            );
+        }
+    }
+
+    fn assert_indexed_mapping_matches_reference(text: &str, widths: &[u16]) {
+        let highlighter = Highlighter::new(text);
+        let model = BlockModel::build(text, crate::frontmatter::front_matter_span(text));
+        for &width in widths {
+            let layout = RenderedLayout::build(&model, width, &highlighter);
+            for line in 0..=highlighter.line_starts().len() {
+                for col in [0, 1, 2, 4, 8, 32] {
+                    assert_eq!(
+                        enter_rendered_indexed(line, col, &layout, text, highlighter.line_starts(),),
+                        enter_rendered(line, col, &layout, text),
+                        "mapping differs at line={line}, col={col}, width={width}, text={text:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_mapping_matches_reference_for_source_less_and_utf8_boundaries() {
+        let cases = [
+            "\n# café &amp; tea\n\n- item\\* one\n- item two\n\n| A | B |\n|---|---|\n| x | x |\n",
+            "\r\n```rust\r\nfn main() { println!(\"界\"); }\r\n```\r\n\r\nlast\r\n",
+            "---\ntitle: hello\n---\n\n> quoted &lt;word&gt;\n\n```unknown\nrepeated repeated\n```\n",
+            "\n\n",
+            "no final newline",
+        ];
+        for text in cases {
+            assert_indexed_mapping_matches_reference(text, &[12, 40, 80]);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn indexed_mapping_matches_reference_over_generated_markdown(
+            blocks in prop::collection::vec(0usize..10, 0..16),
+            width in 8u16..80,
+        ) {
+            let fragments = [
+                "", "# heading", "café &amp; tea", "- item", "| x | x |",
+                "|---|---|", "```rust", "fn main() {}", "```", "\\* escaped",
+            ];
+            let text = blocks.iter().map(|index| fragments[*index]).collect::<Vec<_>>().join("\n");
+            assert_indexed_mapping_matches_reference(&text, &[width]);
+        }
+    }
+
+    #[test]
+    fn indexed_line_lookup_has_logarithmic_comparison_bound() {
+        let text = "content\n".repeat(131_072);
+        let highlighter = Highlighter::new(&text);
+        let starts = highlighter.line_starts();
+        let mut comparisons = 0usize;
+        for sample in 0..4096 {
+            let offset = sample * text.len() / 4096;
+            let expected = starts
+                .partition_point(|start| {
+                    comparisons += 1;
+                    *start <= offset
+                })
+                .saturating_sub(1);
+            assert_eq!(source_line_for_offset(starts, offset), expected);
+        }
+        assert!(comparisons <= 4096 * 19, "{comparisons} comparisons");
+    }
 
     #[test]
     fn character_projection_follows_source_through_non_linear_rows() {

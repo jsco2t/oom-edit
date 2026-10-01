@@ -8,9 +8,9 @@ use oom_edit_core::{
     JumpTarget, KeyCode, KeyCodeKind, KeyInput, LineEnding, LineKind, MarkdownAnalysis, Mode,
     Modifiers, Num, OpenError, PositionError, RecordingClipboardSink, ReloadError, RenderedLayout,
     RenderedLine, RenderedLineRole, RenderedPoint, RenderedSearch, RenderedSelection,
-    RenderedSelectionRow, RenderedSourceAtom, RetargetError, SaveError, SearchDirection,
-    SelectionShape, SemanticStyle, Severity, SourceDecoration, SourceFrame, Span, StyledLine,
-    TargetKind, TextPosition, Value, Viewport,
+    RenderedSelectionRow, RenderedSourceAtom, RenderedViewportFrame, RetargetError, SaveError,
+    SearchDirection, SelectionShape, SemanticStyle, Severity, SourceDecoration, SourceFrame, Span,
+    StyledLine, TargetKind, TextPosition, Value, Viewport,
 };
 use std::path::Path;
 
@@ -94,6 +94,7 @@ fn public_facade_types_are_available_at_crate_root() {
     let _: MarkdownAnalysis<'_> = analyze_markdown("# facade\n");
     let _: RenderedPoint = session.rendered_cursor();
     let _: &RenderedLayout = session.render_layout(20);
+    let _: RenderedViewportFrame = session.rendered_viewport(20, 0, 8);
     let _: Option<RenderedSelection> = session.rendered_selection();
     let selection_row = RenderedSelectionRow {
         row: 0,
@@ -172,6 +173,7 @@ fn public_facade_types_are_available_at_crate_root() {
         RenderedSearch,
         RenderedSelectionRow,
         RenderedSourceAtom,
+        RenderedViewportFrame,
         SaveError,
         SearchDirection,
         SelectionShape,
@@ -203,7 +205,7 @@ fn public_facade_remains_curated_without_partial_spell_reexports() {
             "pub use session::{CommandHistory, EditorSession};",
             "pub use session::{Effect, Mode, Severity, Viewport};",
             "pub use spell::{ DecorationKind, Diagnostic, DiagnosticDecorationRow, DiagnosticProvider, DiagnosticSeverity, PositionError, TextPosition, };",
-            "pub use style::{ JumpTarget, LineKind, RenderedLayout, RenderedLine, RenderedLineRole, RenderedPoint, RenderedSearch, RenderedSelection, RenderedSelectionRow, RenderedSourceAtom, SearchDirection, SelectionShape, SemanticStyle, SourceDecoration, SourceFrame, Span, StyledLine, TargetKind, };",
+            "pub use style::{ JumpTarget, LineKind, RenderedLayout, RenderedLine, RenderedLineRole, RenderedPoint, RenderedSearch, RenderedSelection, RenderedSelectionRow, RenderedSourceAtom, RenderedViewportFrame, SearchDirection, SelectionShape, SemanticStyle, SourceDecoration, SourceFrame, Span, StyledLine, TargetKind, };",
         ],
         "crate-root facade changed; update the API contract and this guard together"
     );

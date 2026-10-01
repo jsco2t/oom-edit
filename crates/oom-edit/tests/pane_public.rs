@@ -99,6 +99,29 @@ fn key(ch: char) -> KeyInput {
 }
 
 #[test]
+fn embedded_pane_characterwise_delete_removes_the_complete_source_line() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("note.md");
+    std::fs::write(&path, "# café\n# next\n").unwrap();
+    let mut pane = construct(directory.path(), vec![path]).pane;
+    let tab = pane.active_tab().unwrap();
+    let now = Instant::now();
+    pane.render(80, 24, now);
+    for ch in ['v', '$', 'd'] {
+        pane.handle_input(PaneInput::Key(key(ch)), now);
+    }
+    assert_eq!(pane.text(&tab).unwrap(), "# next\n");
+    let frame = pane.render(80, 24, now);
+    let visible = frame
+        .cells
+        .iter()
+        .map(|cell| cell.symbol.as_str())
+        .collect::<String>();
+    assert!(visible.contains("next"));
+    assert!(!visible.contains("café"));
+}
+
+#[test]
 fn host_dictionary_roots_load_and_persist_only_the_supplied_personal_path() {
     let directory = tempfile::tempdir().unwrap();
     let config_base = directory.path().join("host-config");
@@ -897,6 +920,41 @@ fn canonical_symlink_alias_focuses_the_same_tab_and_preserves_dirty_text() {
     assert_eq!(pane.text(&id).unwrap(), "changed hello\n");
     assert_eq!(pane.tabs()[0].path.as_deref(), Some(path.as_path()));
     assert!(pane.tabs()[0].dirty);
+}
+
+#[test]
+fn save_repaints_status_without_changing_rendered_note_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("note.md");
+    std::fs::write(&path, "# Heading\n\nA paragraph.\n").unwrap();
+    let mut pane = construct(dir.path(), vec![path.clone()]).pane;
+    let now = Instant::now();
+    pane.render(80, 24, now);
+    pane.handle_input(PaneInput::Key(key('i')), now);
+    pane.handle_input(PaneInput::Key(key('X')), now);
+    pane.handle_input(PaneInput::Key(special(KeyCodeKind::Esc)), now);
+    let edited_text = pane.text(&pane.active_tab().unwrap()).unwrap();
+    assert!(pane.tabs()[0].dirty);
+    let before = pane.render(80, 24, now);
+
+    ex(&mut pane, "w", now);
+    let after = pane.render(80, 24, now);
+    assert!(!pane.tabs()[0].dirty);
+    assert_eq!(pane.text(&pane.active_tab().unwrap()).unwrap(), edited_text);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), edited_text);
+    let before_text = before
+        .cells
+        .iter()
+        .map(|cell| cell.symbol.as_str())
+        .collect::<String>();
+    let after_text = after
+        .cells
+        .iter()
+        .map(|cell| cell.symbol.as_str())
+        .collect::<String>();
+    assert!(before_text.contains("Heading"));
+    assert!(after_text.contains("Heading"));
+    assert!(after_text.contains("Saved note.md"));
 }
 
 #[test]

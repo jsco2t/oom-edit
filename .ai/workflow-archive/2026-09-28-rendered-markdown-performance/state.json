@@ -1,0 +1,290 @@
+{
+  "schema_version": 2,
+  "work_id": "2026-09-28-rendered-markdown-performance",
+  "title": "Rendered Markdown performance",
+  "phase": "DONE",
+  "created_at": "2026-09-28T14:51:32Z",
+  "updated_at": "2026-10-01T22:19:03Z",
+  "approved_at": "2026-10-01T17:26:59Z",
+  "completed_at": "2026-10-01T22:08:26Z",
+  "archived_at": "2026-10-01T22:19:03Z",
+  "baseline_sha": "0e26684733551691a49a2ff7111cec9404fdd2d3",
+  "final_sha": "0e26684733551691a49a2ff7111cec9404fdd2d3",
+  "plan_revision": 7,
+  "acceptance_round": 2,
+  "completed_rounds": [
+    {
+      "round": 1,
+      "plan_revision": 3,
+      "approved_at": "2026-09-29T21:11:10+00:00",
+      "completed_at": "2026-09-29T22:36:21+00:00",
+      "approved_plan_sha256": "74af433ed7d7c31b07949eb299d6b96081f05a957a7aad16b4bb7af0478de5d7",
+      "final_sha": "0e26684733551691a49a2ff7111cec9404fdd2d3",
+      "task_ids": [
+        "001",
+        "002",
+        "003",
+        "004",
+        "005",
+        "006",
+        "007",
+        "008",
+        "009",
+        "010",
+        "011",
+        "012"
+      ],
+      "final_evidence": "evidence/final-round-001.md"
+    }
+  ],
+  "approved_plan_sha256": "8c84180c573ced41cb24dfee8aeab19d9b2675ba3b7111d090673f876787929f",
+  "current_task": null,
+  "tasks": [
+    {
+      "id": "001",
+      "path": "tasks/001-performance-harness.md",
+      "round": 1,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/001.md"
+    },
+    {
+      "id": "002",
+      "path": "tasks/002-query-cache.md",
+      "round": 1,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/002.md"
+    },
+    {
+      "id": "003",
+      "path": "tasks/003-cursor-index.md",
+      "round": 1,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/003.md"
+    },
+    {
+      "id": "004",
+      "path": "tasks/004-large-fence-highlighting.md",
+      "round": 1,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/004.md"
+    },
+    {
+      "id": "005",
+      "path": "tasks/005-save-layout-cache.md",
+      "round": 1,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/005.md"
+    },
+    {
+      "id": "006",
+      "path": "tasks/006-layout-efficiency.md",
+      "round": 1,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/006.md"
+    },
+    {
+      "id": "007",
+      "path": "tasks/007-integration-acceptance.md",
+      "round": 1,
+      "status": "COMPLETE",
+      "attempts": 2,
+      "implementation": "main",
+      "evidence": "evidence/007.md"
+    },
+    {
+      "id": "008",
+      "path": "tasks/008-incremental-source-analysis.md",
+      "round": 1,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/008.md"
+    },
+    {
+      "id": "009",
+      "path": "tasks/009-retained-block-model.md",
+      "round": 1,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/009.md"
+    },
+    {
+      "id": "010",
+      "path": "tasks/010-retained-layout.md",
+      "round": 1,
+      "status": "COMPLETE",
+      "attempts": 2,
+      "implementation": "main",
+      "evidence": "evidence/010.md"
+    },
+    {
+      "id": "011",
+      "path": "tasks/011-performance-acceptance.md",
+      "round": 1,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/011.md"
+    },
+    {
+      "id": "012",
+      "path": "tasks/012-host-parity-acceptance.md",
+      "round": 1,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/012.md"
+    },
+    {
+      "id": "013",
+      "path": "tasks/013-real-fixture-interaction-profile.md",
+      "round": 2,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/013.md"
+    },
+    {
+      "id": "014",
+      "path": "tasks/014-interaction-feasibility.md",
+      "round": 2,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/014.md"
+    },
+    {
+      "id": "015",
+      "path": "tasks/015-character-delete-lines.md",
+      "round": 2,
+      "status": "COMPLETE",
+      "attempts": 3,
+      "implementation": "main",
+      "evidence": "evidence/015.md"
+    },
+    {
+      "id": "016",
+      "path": "tasks/016-keyboard-navigation.md",
+      "round": 2,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/016.md"
+    },
+    {
+      "id": "017",
+      "path": "tasks/017-select-projection.md",
+      "round": 2,
+      "status": "COMPLETE",
+      "attempts": 2,
+      "implementation": "main",
+      "evidence": "evidence/017.md"
+    },
+    {
+      "id": "018",
+      "path": "tasks/018-large-fence-edits.md",
+      "round": 2,
+      "status": "COMPLETE",
+      "attempts": 2,
+      "implementation": "main",
+      "evidence": "evidence/018.md"
+    },
+    {
+      "id": "019",
+      "path": "tasks/019-interaction-acceptance.md",
+      "round": 2,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/019.md"
+    },
+    {
+      "id": "020",
+      "path": "tasks/020-recovery-feasibility.md",
+      "round": 2,
+      "status": "COMPLETE",
+      "attempts": 3,
+      "implementation": "main",
+      "evidence": "evidence/020.md"
+    },
+    {
+      "id": "021",
+      "path": "tasks/021-atomic-multi-range-mutation.md",
+      "round": 2,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/021.md"
+    },
+    {
+      "id": "022",
+      "path": "tasks/022-retained-multi-block-publication.md",
+      "round": 2,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/022.md"
+    },
+    {
+      "id": "023",
+      "path": "tasks/023-rust-fence-memory.md",
+      "round": 2,
+      "status": "COMPLETE",
+      "attempts": 2,
+      "implementation": "main",
+      "evidence": "evidence/023.md"
+    },
+    {
+      "id": "024",
+      "path": "tasks/024-recovery-acceptance.md",
+      "round": 2,
+      "status": "COMPLETE",
+      "attempts": 2,
+      "implementation": "main",
+      "evidence": "evidence/024.md"
+    }
+  ],
+  "task_retry_limit": 3,
+  "final_retry_limit": 2,
+  "final_attempts": 1,
+  "stop_continuations": 0,
+  "max_stop_continuations": 50,
+  "block_reason": null,
+  "superseded_plan_approval_revision_6": {
+    "plan_revision": 6,
+    "approved_at": "2026-10-01T14:28:42Z",
+    "approved_plan_sha256": "b3518008e7300380579e55f1ecc56bba4875fc97191c917eb5d07643a721c72e",
+    "reason": "The user approved a modest Rust-only RSS-cap adjustment conditional on a leak-stability gate after the unchanged +10% cap conflicted with retained source trees and responsive first edits. Completed tasks and evidence remain unchanged."
+  },
+  "superseded_plan_approval_revision_5": {
+    "plan_revision": 5,
+    "approved_at": "2026-09-30T21:14:47Z",
+    "approved_plan_sha256": "e518d01a3a3ae37c09b1f89f3821a7480806625f3db937f6640f5e105582a08f",
+    "reason": "The round-2 final gate exhausted its retry budget on Rust-fence peak RSS. The user authorized recovery and rejected the roughly 700 ms prose Select pause; failed-gate evidence and completed tasks remain unchanged."
+  },
+  "superseded_plan_approval_revision_2": {
+    "plan_revision": 2,
+    "approved_at": "2026-09-28T21:18:54Z",
+    "approved_plan_sha256": "f64d8e8b8d40d3e8272a387f31cfd00594847f70a9ac0c18f634303007918db2",
+    "reason": "The first-ever source-to-rendered frame is now classified and gated as a cold transition; ordinary warmed returns retain an explicit <50 ms gate. Completed tasks 001-010 and evidence remain unchanged."
+  },
+  "superseded_plan_approval": {
+    "plan_revision": 1,
+    "approved_at": "2026-09-28T15:11:58Z",
+    "approved_plan_sha256": "77a9375883b242d5a3cd6f1a17dfcd6a7fe53066a019e3ea0619d47a6aadb159",
+    "reason": "The measured 1 MiB interaction stalls require an approved architecture change; completed tasks 001-005 and their evidence remain unchanged."
+  }
+}

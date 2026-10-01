@@ -130,6 +130,46 @@ impl ProjectedSelection {
     }
 }
 
+/// Collapse disjoint right-to-left edits into one equivalent final-text edit.
+/// The returned replacement owns only the affected envelope, not the document.
+pub(crate) fn collapsed_descending_edit(text: &str, edits: &[TextEdit]) -> Option<TextEdit> {
+    let first = edits.first()?;
+    let last = edits.last()?;
+    let start = last.range.start;
+    let end = first.range.end;
+    if start > end
+        || end > text.len()
+        || !text.is_char_boundary(start)
+        || !text.is_char_boundary(end)
+    {
+        return None;
+    }
+    let mut preceding_start = text.len();
+    for edit in edits {
+        if edit.range.start > edit.range.end
+            || edit.range.end > preceding_start
+            || !text.is_char_boundary(edit.range.start)
+            || !text.is_char_boundary(edit.range.end)
+            || edit.new_text_len != edit.new_text.len()
+        {
+            return None;
+        }
+        preceding_start = edit.range.start;
+    }
+    let mut replacement = text[start..end].to_string();
+    for edit in edits {
+        replacement.replace_range(
+            edit.range.start - start..edit.range.end - start,
+            &edit.new_text,
+        );
+    }
+    Some(TextEdit {
+        range: start..end,
+        new_text_len: replacement.len(),
+        new_text: replacement,
+    })
+}
+
 /// Host adapter that exposes engine clipboard writes as drainable events.
 struct ClipboardCapturingHost {
     inner: DefaultHost,
@@ -269,6 +309,42 @@ fn validate_content_edits(
         range: 0..before_len,
         new_text_len: new_text.len(),
         new_text,
+    }]
+}
+
+/// Describe a whole-buffer engine reset as its actual changed byte envelope.
+/// The buffer replacement remains the authoritative mutation; this edit only
+/// lets derived parsers retain unchanged source around it.
+fn changed_envelope(old: &str, new: &str) -> Vec<TextEdit> {
+    let mut prefix = old
+        .bytes()
+        .zip(new.bytes())
+        .take_while(|(left, right)| left == right)
+        .count();
+    while !old.is_char_boundary(prefix) || !new.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+    let mut suffix = old.as_bytes()[prefix..]
+        .iter()
+        .rev()
+        .zip(new.as_bytes()[prefix..].iter().rev())
+        .take_while(|(left, right)| left == right)
+        .count();
+    while suffix > 0
+        && (!old.is_char_boundary(old.len() - suffix) || !new.is_char_boundary(new.len() - suffix))
+    {
+        suffix -= 1;
+    }
+    let old_end = old.len() - suffix;
+    let new_end = new.len() - suffix;
+    if prefix == old_end && prefix == new_end {
+        return Vec::new();
+    }
+    let replacement = new[prefix..new_end].to_string();
+    vec![TextEdit {
+        range: prefix..old_end,
+        new_text_len: replacement.len(),
+        new_text: replacement,
     }]
 }
 
@@ -467,6 +543,9 @@ impl VimCore {
                 |candidate| edits_reproduce!(&before, candidate, &after),
                 || self.materialize_text(),
             );
+            if content_reset && edits.len() == 1 && edits[0].range == (0..before.len_bytes()) {
+                edits = changed_envelope(&before.to_string(), &edits[0].new_text);
+            }
         }
 
         let history_moved =
@@ -1044,7 +1123,18 @@ impl VimCore {
             let _ = self.handle_key(Self::plain_key(KeyCodeKind::Esc));
         }
 
-        let old_text = self.text();
+        if matches!(operator, RangeOperator::Delete | RangeOperator::Change) {
+            if let ProjectedSelection::Character { ranges } = &selection {
+                if let [range] = ranges.as_slice() {
+                    return self.apply_contiguous_character_mutation(
+                        range.clone(),
+                        operator,
+                        register,
+                    );
+                }
+            }
+        }
+
         let target = register.selector();
         let block_width = match &selection {
             ProjectedSelection::Block { width, .. } => *width,
@@ -1057,7 +1147,7 @@ impl VimCore {
                     let mut text = row
                         .ranges
                         .iter()
-                        .filter_map(|range| old_text.get(range.clone()))
+                        .filter_map(|range| self.rope_slice_bytes(range))
                         .collect::<String>();
                     let raw_width = UnicodeWidthStr::width(text.as_str());
                     let padding = block_width.saturating_sub(row.selected_width.max(raw_width));
@@ -1069,7 +1159,7 @@ impl VimCore {
             ProjectedSelection::Character { ranges } | ProjectedSelection::Line { ranges } => {
                 ranges
                     .iter()
-                    .filter_map(|range| old_text.get(range.clone()))
+                    .filter_map(|range| self.rope_slice_bytes(range))
                     .collect()
             }
         });
@@ -1111,47 +1201,120 @@ impl VimCore {
             RangeOperator::Indent | RangeOperator::Outdent => unreachable!(),
         }
 
-        let earliest = source_ranges[0].start.min(old_text.len());
-        let mut new_text = old_text.clone();
+        let earliest = source_ranges[0].start;
         let mut ranges = source_ranges;
         ranges.sort_by_key(|range| (range.start, range.end));
-        for range in ranges.into_iter().rev() {
-            let start = range.start.min(new_text.len());
-            let end = range.end.min(new_text.len());
-            if start < end {
-                new_text.replace_range(start..end, "");
+        let mut edits = Vec::with_capacity(ranges.len());
+        let disjoint = ranges.windows(2).all(|pair| pair[0].end <= pair[1].start);
+        let valid = disjoint
+            && ranges
+                .iter()
+                .all(|range| self.rope_slice_bytes(range).is_some());
+        if valid {
+            let _undo_group = self.editor.undo_group();
+            self.editor.push_undo();
+            for range in ranges.into_iter().rev() {
+                if range.start < range.end {
+                    let (start_row, start_col) = self.position_for_byte_offset(range.start);
+                    let (end_row, end_col) = self.position_for_byte_offset(range.end);
+                    self.editor.mutate_edit(hjkl_buffer::Edit::Replace {
+                        start: hjkl_buffer::Position::new(start_row, start_col),
+                        end: hjkl_buffer::Position::new(end_row, end_col),
+                        with: String::new(),
+                    });
+                    edits.push(TextEdit {
+                        range,
+                        new_text_len: 0,
+                        new_text: String::new(),
+                    });
+                }
             }
-        }
-
-        {
+        } else {
+            let mut new_text = self.text();
+            for range in ranges.into_iter().rev() {
+                let start = range.start.min(new_text.len());
+                let end = range.end.min(new_text.len());
+                if start < end {
+                    new_text.replace_range(start..end, "");
+                    edits.push(TextEdit {
+                        range: start..end,
+                        new_text_len: 0,
+                        new_text: String::new(),
+                    });
+                }
+            }
             let _undo_group = self.editor.undo_group();
             self.editor.push_undo();
             self.editor.buffer_mut().replace_all(&new_text);
         }
         let _ = self.editor.take_content_edits();
         self.modified_since_save = true;
-        let cursor_offset = earliest.min(new_text.len());
-        let row = new_text[..cursor_offset]
-            .bytes()
-            .filter(|byte| *byte == b'\n')
-            .count();
-        let line_start = new_text[..cursor_offset]
-            .rfind('\n')
-            .map_or(0, |newline| newline + 1);
-        let column = new_text[line_start..cursor_offset].chars().count();
+        let (row, column) = self.position_for_byte_offset(earliest);
         self.jump_to(row, column);
 
+        let mut effects = vec![VimEffect::Edited { edits }, VimEffect::CursorMoved];
+        if matches!(register, Register::System) {
+            effects.push(VimEffect::ClipboardYank(payload));
+        }
+        if operator == RangeOperator::Change {
+            effects.push(self.enter_insert_after_change_noundo());
+        }
+        effects
+    }
+
+    fn rope_slice_bytes(&self, range: &Range<usize>) -> Option<String> {
+        let rope = self.editor.buffer().rope();
+        if range.start > range.end || range.end > rope.len_bytes() {
+            return None;
+        }
+        let start = rope.byte_to_char(range.start);
+        let end = rope.byte_to_char(range.end);
+        if rope.char_to_byte(start) != range.start || rope.char_to_byte(end) != range.end {
+            return None;
+        }
+        Some(rope.slice(start..end).to_string())
+    }
+
+    fn apply_contiguous_character_mutation(
+        &mut self,
+        range: Range<usize>,
+        operator: RangeOperator,
+        register: Register,
+    ) -> Vec<VimEffect> {
+        let payload = {
+            let rope = self.editor.buffer().rope();
+            let start = rope.byte_to_char(range.start);
+            let end = rope.byte_to_char(range.end);
+            rope.slice(start..end).to_string()
+        };
+        let clipboard = matches!(register, Register::System).then(|| payload.clone());
+        self.editor
+            .record_delete(payload, false, register.selector());
+        let (start_row, start_col) = self.position_for_byte_offset(range.start);
+        let (end_row, end_col) = self.position_for_byte_offset(range.end);
+        {
+            let _undo_group = self.editor.undo_group();
+            self.editor.push_undo();
+            self.editor.mutate_edit(hjkl_buffer::Edit::Replace {
+                start: hjkl_buffer::Position::new(start_row, start_col),
+                end: hjkl_buffer::Position::new(end_row, end_col),
+                with: String::new(),
+            });
+        }
+        let _ = self.editor.take_content_edits();
+        self.modified_since_save = true;
+        self.jump_to(start_row, start_col);
         let mut effects = vec![
             VimEffect::Edited {
                 edits: vec![TextEdit {
-                    range: 0..old_text.len(),
-                    new_text_len: new_text.len(),
-                    new_text,
+                    range,
+                    new_text_len: 0,
+                    new_text: String::new(),
                 }],
             },
             VimEffect::CursorMoved,
         ];
-        if matches!(register, Register::System) {
+        if let Some(payload) = clipboard {
             effects.push(VimEffect::ClipboardYank(payload));
         }
         if operator == RangeOperator::Change {
@@ -1579,6 +1742,157 @@ fn replacement_text_from_final_buffer<'a>(
 mod projected_selection_tests {
     use super::*;
 
+    impl VimCore {
+        fn prototype_contiguous_character_delete(&mut self, range: Range<usize>) -> Vec<VimEffect> {
+            assert_eq!(self.mode(), Mode::Normal);
+            let payload = {
+                let rope = self.editor.buffer().rope();
+                let start = rope.byte_to_char(range.start);
+                let end = rope.byte_to_char(range.end);
+                rope.slice(start..end).to_string()
+            };
+            self.editor
+                .record_delete(payload, false, Register::Unnamed.selector());
+            let (start_row, start_col) = self.position_for_byte_offset(range.start);
+            let (end_row, end_col) = self.position_for_byte_offset(range.end);
+            {
+                let _undo_group = self.editor.undo_group();
+                self.editor.push_undo();
+                self.editor.mutate_edit(hjkl_buffer::Edit::Replace {
+                    start: hjkl_buffer::Position::new(start_row, start_col),
+                    end: hjkl_buffer::Position::new(end_row, end_col),
+                    with: String::new(),
+                });
+            }
+            let _ = self.editor.take_content_edits();
+            self.modified_since_save = true;
+            self.jump_to(start_row, start_col);
+            vec![
+                VimEffect::Edited {
+                    edits: vec![TextEdit {
+                        range,
+                        new_text_len: 0,
+                        new_text: String::new(),
+                    }],
+                },
+                VimEffect::CursorMoved,
+            ]
+        }
+    }
+
+    #[test]
+    fn contiguous_character_delete_matches_reference_register_and_undo() {
+        for (text, range) in [
+            ("α café\nβ tea\nγ tail\n", 0..16),
+            ("first\nsecond\nthird\n", 6..13),
+        ] {
+            let mut reference = VimCore::new(text);
+            let mut prototype = VimCore::new(text);
+            let reference_effects = reference.apply_selection(
+                ProjectedSelection::Character {
+                    ranges: vec![range.clone()],
+                },
+                RangeOperator::Delete,
+                Register::Unnamed,
+            );
+            let prototype_effects = prototype.prototype_contiguous_character_delete(range);
+            assert_eq!(prototype.text(), reference.text());
+            assert_eq!(prototype.cursor(), reference.cursor());
+            assert_eq!(prototype_effects, reference_effects);
+            assert_eq!(
+                register_state(&prototype, '"'),
+                register_state(&reference, '"')
+            );
+            prototype.handle_key(VimCore::plain_key(KeyCodeKind::Char('u')));
+            reference.handle_key(VimCore::plain_key(KeyCodeKind::Char('u')));
+            assert_eq!(prototype.text(), text);
+            assert_eq!(reference.text(), text);
+        }
+    }
+
+    #[test]
+    fn contiguous_character_delete_and_change_avoid_full_text_replacement() {
+        let text = format!(
+            "{}fn selected() {{}}\n{}",
+            "fn before() {}\n".repeat(4000),
+            "fn after() {}\n".repeat(4000)
+        );
+        let start = text.find("fn selected").unwrap();
+        let range = start..start + "fn selected() {}\n".len();
+        for operator in [RangeOperator::Delete, RangeOperator::Change] {
+            let mut vim = VimCore::new(&text);
+            vim.reset_work_counters();
+            let effects = vim.apply_selection(
+                ProjectedSelection::Character {
+                    ranges: vec![range.clone()],
+                },
+                operator,
+                Register::Unnamed,
+            );
+            assert_eq!(
+                vim.work_counters().0,
+                0,
+                "{operator:?} materialized the document"
+            );
+            assert_eq!(
+                vim.text(),
+                format!("{}{}", &text[..range.start], &text[range.end..])
+            );
+            assert_eq!(register_state(&vim, '"').0, "fn selected() {}\n");
+            assert!(effects.iter().any(|effect| matches!(effect, VimEffect::Edited { edits } if edits.len() == 1 && edits[0].range == range)));
+            if operator == RangeOperator::Change {
+                vim.handle_key(VimCore::plain_key(KeyCodeKind::Esc));
+            }
+            vim.handle_key(VimCore::plain_key(KeyCodeKind::Char('u')));
+            assert_eq!(vim.text(), text);
+        }
+    }
+
+    #[test]
+    #[ignore = "exact 1 MiB contiguous Vim mutation diagnostic is run by its benchmark target"]
+    fn acceptance_1mb_contiguous_vim_delete_matches_reference() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/kitchen-sink-1mb.md");
+        let text = std::fs::read_to_string(path).unwrap();
+        for (language, first_line) in [("rust", 3000), ("go", 20000)] {
+            let start = text
+                .split_inclusive('\n')
+                .take(first_line)
+                .map(str::len)
+                .sum::<usize>();
+            let end = start
+                + text[start..]
+                    .split_inclusive('\n')
+                    .take(15)
+                    .map(str::len)
+                    .sum::<usize>();
+            let range = start..end;
+            let mut reference = VimCore::new(&text);
+            let mut prototype = VimCore::new(&text);
+            let started = std::time::Instant::now();
+            let fast_effects = prototype.prototype_contiguous_character_delete(range.clone());
+            let fast_ns = started.elapsed().as_nanos();
+            let started = std::time::Instant::now();
+            let reference_effects = reference.apply_selection(
+                ProjectedSelection::Character {
+                    ranges: vec![range],
+                },
+                RangeOperator::Delete,
+                Register::Unnamed,
+            );
+            let reference_ns = started.elapsed().as_nanos();
+            assert_eq!(fast_effects, reference_effects);
+            assert_eq!(prototype.text(), reference.text());
+            assert_eq!(
+                register_state(&prototype, '"'),
+                register_state(&reference, '"')
+            );
+            prototype.handle_key(VimCore::plain_key(KeyCodeKind::Char('u')));
+            assert_eq!(prototype.text(), text);
+            println!("VIM_DELETE\t{language}\t{fast_ns}\t{reference_ns}");
+        }
+    }
+
     fn clipboard_payloads(effects: &[VimEffect]) -> Vec<&str> {
         effects
             .iter()
@@ -1653,6 +1967,166 @@ mod projected_selection_tests {
         vim.handle_key(VimCore::plain_key(KeyCodeKind::Char('u')));
         assert_eq!(vim.text(), "é helo helo");
         assert!(vim.replace_range(1..2, "x").is_none());
+    }
+
+    #[test]
+    fn changed_envelope_replays_reset_with_unicode_and_repeated_text() {
+        let cases = [
+            ("alpha\nβeta\nomega\n", "alpha\nβeta changed\nomega\n"),
+            ("same\nsame\nsame\n", "same\nsame\n"),
+            ("é🙂tail", "éζtail"),
+            ("unchanged", "unchanged"),
+        ];
+        for (old, new) in cases {
+            let edits = changed_envelope(old, new);
+            let mut replay = old.to_string();
+            for edit in &edits {
+                assert!(replay.is_char_boundary(edit.range.start));
+                assert!(replay.is_char_boundary(edit.range.end));
+                assert_eq!(edit.new_text_len, edit.new_text.len());
+                replay.replace_range(edit.range.clone(), &edit.new_text);
+            }
+            assert_eq!(replay, new);
+            assert_eq!(edits.is_empty(), old == new);
+            if old != new {
+                assert!(edits[0].range.len() < old.len() || edits[0].new_text_len < new.len());
+            }
+        }
+    }
+
+    #[test]
+    fn projected_delete_reports_only_removed_ranges_in_replay_order() {
+        let mut vim = VimCore::new("first\nsecond\nthird\n");
+        let effects = vim.apply_selection(
+            ProjectedSelection::Character {
+                ranges: vec![0..6, 13..19],
+            },
+            RangeOperator::Delete,
+            Register::Unnamed,
+        );
+        let edits = effects
+            .into_iter()
+            .find_map(|effect| match effect {
+                VimEffect::Edited { edits } => Some(edits),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            edits
+                .iter()
+                .map(|edit| edit.range.clone())
+                .collect::<Vec<_>>(),
+            [13..19, 0..6]
+        );
+        let mut replay = "first\nsecond\nthird\n".to_string();
+        for edit in &edits {
+            replay.replace_range(edit.range.clone(), &edit.new_text);
+        }
+        assert_eq!(replay, vim.text());
+    }
+
+    #[test]
+    fn disjoint_character_delete_mutates_rope_without_materializing_document() {
+        let original = "α start\nkeep this\nβ end\n";
+        let first = 0.."α start\n".len();
+        let last_start = "α start\nkeep this\n".len();
+        let last = last_start..original.len();
+        let mut vim = VimCore::new(original);
+        vim.reset_work_counters();
+        let effects = vim.apply_selection(
+            ProjectedSelection::Character {
+                ranges: vec![first.clone(), last.clone()],
+            },
+            RangeOperator::Delete,
+            Register::Unnamed,
+        );
+        assert_eq!(vim.work_counters().0, 0);
+        assert_eq!(vim.text(), "keep this\n");
+        let edits = effects
+            .iter()
+            .find_map(|effect| match effect {
+                VimEffect::Edited { edits } => Some(edits),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            edits
+                .iter()
+                .map(|edit| edit.range.clone())
+                .collect::<Vec<_>>(),
+            [last, first]
+        );
+        vim.handle_key(VimCore::plain_key(KeyCodeKind::Char('u')));
+        assert_eq!(vim.text(), original);
+    }
+
+    #[test]
+    fn disjoint_change_keeps_unicode_crlf_payload_and_one_undo() {
+        let original = "α one\r\nkeep\r\nβ two\r\n";
+        let first = 0.."α one\r\n".len();
+        let last_start = "α one\r\nkeep\r\n".len();
+        let last = last_start..original.len();
+        let mut vim = VimCore::new(original);
+        vim.reset_work_counters();
+        let effects = vim.apply_selection(
+            ProjectedSelection::Character {
+                ranges: vec![first.clone(), last.clone()],
+            },
+            RangeOperator::Change,
+            Register::System,
+        );
+        assert_eq!(vim.work_counters().0, 0);
+        assert_eq!(vim.mode(), Mode::Insert);
+        assert_eq!(vim.text(), "keep\r\n");
+        assert_eq!(clipboard_payloads(&effects), ["α one\r\nβ two\r\n"]);
+        assert_eq!(register_state(&vim, '+').0, "α one\r\nβ two\r\n");
+        let edits = effects
+            .iter()
+            .find_map(|effect| match effect {
+                VimEffect::Edited { edits } => Some(edits),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            edits
+                .iter()
+                .map(|edit| edit.range.clone())
+                .collect::<Vec<_>>(),
+            [last, first]
+        );
+        vim.handle_key(VimCore::plain_key(KeyCodeKind::Esc));
+        vim.handle_key(VimCore::plain_key(KeyCodeKind::Char('u')));
+        assert_eq!(vim.text(), original);
+    }
+
+    #[test]
+    fn collapsed_descending_edits_replay_exact_final_text_without_widening_effects() {
+        let original = "α one\r\nkeep\r\nβ two\r\n";
+        let start = "α one\r\n".len();
+        let edits = vec![
+            TextEdit {
+                range: start + "keep\r\n".len()..original.len(),
+                new_text_len: 0,
+                new_text: String::new(),
+            },
+            TextEdit {
+                range: start..start + "keep".len(),
+                new_text_len: "stay".len(),
+                new_text: "stay".to_string(),
+            },
+        ];
+        let collapsed = collapsed_descending_edit(original, &edits).unwrap();
+        let mut sequential = original.to_string();
+        for edit in &edits {
+            sequential.replace_range(edit.range.clone(), &edit.new_text);
+        }
+        let mut aggregate = original.to_string();
+        aggregate.replace_range(collapsed.range, &collapsed.new_text);
+        assert_eq!(aggregate, sequential);
+        assert!(
+            collapsed_descending_edit(original, &edits.into_iter().rev().collect::<Vec<_>>())
+                .is_none()
+        );
     }
 
     #[test]

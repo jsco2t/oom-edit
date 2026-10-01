@@ -11,7 +11,7 @@ mod languages;
 
 use languages::LangDef;
 
-use std::{collections::HashMap, ops::Range, sync::Arc};
+use std::{cell::RefCell, collections::HashMap, ops::Range, sync::Arc};
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -19,7 +19,7 @@ use std::cell::Cell;
 use tree_sitter::{Parser, Point, Query, QueryCursor, StreamingIterator, Tree};
 
 use crate::style::{SemanticStyle, Span, StyledLine};
-use crate::vim::TextEdit;
+use crate::vim::{collapsed_descending_edit, TextEdit};
 
 // ── Markdown highlight query ────────────────────────────────────────────────
 
@@ -99,6 +99,30 @@ struct Injection {
     fence_lang: Option<String>,
 }
 
+/// A parsed source injection retained for repeat viewport reads.
+struct ParsedInjection {
+    start: usize,
+    end: usize,
+    language_name: &'static str,
+    tree: Tree,
+}
+
+/// Current source styling for one independently reparsed Markdown region.
+/// The complete tree remains a positional index for unchanged regions.
+struct SourcePatch {
+    bytes: Range<usize>,
+    root_kind: String,
+    first_line: usize,
+    lines: Vec<StyledLine>,
+    spell_exclusions: Vec<Range<usize>>,
+}
+
+const SOURCE_PARSE_CACHE_MAX_ENTRIES: usize = 8;
+// Source-byte budget bounds retained trees approximately; tree allocation is grammar-dependent.
+const SOURCE_PARSE_CACHE_MAX_SOURCE_BYTES: usize = 1024 * 1024;
+const BOUNDED_SOURCE_MIN_DOCUMENT_BYTES: usize = 64 * 1024;
+const BOUNDED_SOURCE_MAX_REGION_BYTES: usize = 8 * 1024;
+
 /// Immutable metadata collected from the markdown tree before injection
 /// queries are resolved through the mutable cache.
 struct InjectionMeta {
@@ -138,11 +162,20 @@ enum InjectionKind {
 enum ParsePath {
     Full,
     Incremental,
+    Bounded,
+    FenceInterior,
     BlockNeutral,
     Skipped,
 }
 
 // ── Highlighter ─────────────────────────────────────────────────────────────
+
+pub(crate) enum FenceEditStatus {
+    NotIncremental,
+    Incremental {
+        changed_source: Option<Range<usize>>,
+    },
+}
 
 /// Incremental tree-sitter highlighter for markdown documents.
 ///
@@ -165,6 +198,8 @@ pub struct Highlighter {
     md_inline_query: Query,
     /// Incremental parser for the markdown tree.
     md_parser: Parser,
+    /// Current replacements for regions whose root-tree syntax is stale.
+    patches: Vec<SourcePatch>,
     /// Injection regions (front matter, fenced code blocks).
     injections: Vec<Injection>,
     /// Cached complete front-matter byte span, including parser edge cases.
@@ -172,13 +207,35 @@ pub struct Highlighter {
     /// Normalized labels owned by retained link-reference definitions.
     spell_reference_labels: Vec<String>,
     /// Compiled injection queries, keyed by canonical registry language name.
-    query_cache: HashMap<&'static str, Arc<Query>>,
+    query_cache: RefCell<HashMap<&'static str, Arc<Query>>>,
+    /// Bounded, lazy source-injection parse cache. Edits invalidate affected entries.
+    source_parse_cache: RefCell<Vec<ParsedInjection>>,
+    fence_edit_status: FenceEditStatus,
+    #[cfg(test)]
+    query_compile_count: Cell<usize>,
+    #[cfg(test)]
+    source_injection_parse_count: Cell<usize>,
     /// Most recent parser route, exposed only to regression tests.
     #[cfg(test)]
     last_parse_path: ParsePath,
     /// Full Markdown block parses; ordinary inline edits must not increase it.
     #[cfg(test)]
     block_parse_count: Cell<usize>,
+    /// Structural byte range changed by the most recent Markdown reparse.
+    #[cfg(test)]
+    last_changed_bytes: usize,
+    #[cfg(test)]
+    last_changed_ranges: usize,
+    #[cfg(test)]
+    last_changed_lines: usize,
+    #[cfg(test)]
+    injection_scan_count: usize,
+    #[cfg(test)]
+    reference_scan_count: usize,
+    #[cfg(test)]
+    last_bounded_bytes: usize,
+    #[cfg(test)]
+    last_bounded_lines: usize,
 }
 
 impl Highlighter {
@@ -190,6 +247,10 @@ impl Highlighter {
     ///
     /// FR-4.1 / FR-4.2 / FR-4.3.
     pub fn new(text: &str) -> Self {
+        Self::new_with_queries(text, HashMap::new())
+    }
+
+    fn new_with_queries(text: &str, queries: HashMap<&'static str, Arc<Query>>) -> Self {
         let mut parser = Parser::new();
         parser
             .set_language(&tree_sitter_md::LANGUAGE.into())
@@ -213,14 +274,35 @@ impl Highlighter {
             md_query: query,
             md_inline_query: inline_query,
             md_parser: parser,
+            patches: Vec::new(),
             injections: Vec::new(),
             spell_front_matter_span: crate::frontmatter::front_matter_span(text),
             spell_reference_labels,
-            query_cache: HashMap::new(),
+            query_cache: RefCell::new(queries),
+            source_parse_cache: RefCell::new(Vec::new()),
+            fence_edit_status: FenceEditStatus::NotIncremental,
+            #[cfg(test)]
+            query_compile_count: Cell::new(0),
+            #[cfg(test)]
+            source_injection_parse_count: Cell::new(0),
             #[cfg(test)]
             last_parse_path: ParsePath::Full,
             #[cfg(test)]
             block_parse_count: Cell::new(1),
+            #[cfg(test)]
+            last_changed_bytes: 0,
+            #[cfg(test)]
+            last_changed_ranges: 0,
+            #[cfg(test)]
+            last_changed_lines: 0,
+            #[cfg(test)]
+            injection_scan_count: 0,
+            #[cfg(test)]
+            reference_scan_count: 1,
+            #[cfg(test)]
+            last_bounded_bytes: 0,
+            #[cfg(test)]
+            last_bounded_lines: 0,
         };
 
         // Discover injection regions
@@ -232,6 +314,49 @@ impl Highlighter {
     /// Return the current document text.
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    pub(crate) fn fence_changed_source_range(&self) -> Option<&Range<usize>> {
+        match &self.fence_edit_status {
+            FenceEditStatus::Incremental { changed_source } => changed_source.as_ref(),
+            FenceEditStatus::NotIncremental => None,
+        }
+    }
+
+    pub(crate) fn fence_edit_is_incremental(&self) -> bool {
+        matches!(self.fence_edit_status, FenceEditStatus::Incremental { .. })
+    }
+
+    /// Source line starts, kept in sync with every edit for indexed lookups.
+    pub(crate) fn line_starts(&self) -> &[usize] {
+        &self.line_starts
+    }
+
+    /// Test-only evidence for source reparse propagation and injection work.
+    #[cfg(test)]
+    pub(crate) fn work_snapshot(&self) -> (usize, usize, usize, usize, usize, usize) {
+        (
+            self.block_parse_count.get(),
+            self.last_changed_ranges,
+            self.last_changed_bytes,
+            self.injections.len(),
+            self.injection_scan_count,
+            self.reference_scan_count,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn changed_lines_snapshot(&self) -> usize {
+        self.last_changed_lines
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bounded_work_snapshot(&self) -> (usize, usize, usize) {
+        (
+            self.last_bounded_bytes,
+            self.last_bounded_lines,
+            self.patches.len(),
+        )
     }
 
     /// Return parser-owned block ranges that cannot contain checked prose.
@@ -249,7 +374,35 @@ impl Highlighter {
         }
 
         let mut ranges = Vec::new();
-        collect_spell_block_exclusions(self.md_tree.root_node(), &scan, &mut ranges);
+        let mut cursor = scan.start;
+        for patch in &self.patches {
+            if patch.bytes.end <= cursor || patch.bytes.start >= scan.end {
+                continue;
+            }
+            let unchanged_end = patch.bytes.start.min(scan.end);
+            if cursor < unchanged_end {
+                collect_spell_block_exclusions(
+                    self.md_tree.root_node(),
+                    &(cursor..unchanged_end),
+                    &mut ranges,
+                );
+            }
+            for exclusion in &patch.spell_exclusions {
+                let start = exclusion.start.max(scan.start);
+                let end = exclusion.end.min(scan.end);
+                if start < end {
+                    ranges.push(start..end);
+                }
+            }
+            cursor = patch.bytes.end.min(scan.end);
+        }
+        if cursor < scan.end {
+            collect_spell_block_exclusions(
+                self.md_tree.root_node(),
+                &(cursor..scan.end),
+                &mut ranges,
+            );
+        }
         if let Some(front_matter) = &self.spell_front_matter_span {
             let start = front_matter.start.max(scan.start);
             let end = front_matter.end.min(scan.end);
@@ -269,6 +422,484 @@ impl Highlighter {
         self.spell_reference_labels.clone()
     }
 
+    fn bounded_source_region(
+        &self,
+        edit: &TextEdit,
+        allow_local_markers: bool,
+    ) -> Option<(Range<usize>, String)> {
+        if self.text.len() < BOUNDED_SOURCE_MIN_DOCUMENT_BYTES {
+            return None;
+        }
+        if self.patches.is_empty() && edit_is_provably_block_neutral(&self.text, edit) {
+            return None;
+        }
+        let start = edit.range.start.min(edit.range.end);
+        let end = edit.range.start.max(edit.range.end);
+        if start < 4
+            || end > self.text.len()
+            || self
+                .spell_front_matter_span
+                .as_ref()
+                .is_some_and(|span| start <= span.end && end >= span.start)
+            || (!allow_local_markers && source_edit_may_change_global_semantics(&self.text, edit))
+        {
+            return None;
+        }
+        let root = self.md_tree.root_node();
+        let mut ancestor = root.descendant_for_byte_range(start, end)?;
+        while ancestor.id() != root.id() {
+            if ancestor.kind() == "link_reference_definition" {
+                return None;
+            }
+            ancestor = ancestor.parent()?;
+        }
+        let candidate = if allow_local_markers {
+            self.bounded_section_group(edit)?
+        } else if let Some(patch) = self
+            .patches
+            .iter()
+            .find(|patch| patch.bytes.start <= start && end <= patch.bytes.end)
+        {
+            (patch.bytes.clone(), patch.root_kind.clone())
+        } else {
+            let root = self.md_tree.root_node();
+            let node = root.named_children(&mut root.walk()).find(|node| {
+                node.start_byte() <= start && start < node.end_byte() && end <= node.end_byte()
+            })?;
+            if node.end_byte() - node.start_byte() <= BOUNDED_SOURCE_MAX_REGION_BYTES {
+                (node.start_byte()..node.end_byte(), node.kind().to_string())
+            } else {
+                let mut child = node.descendant_for_byte_range(start, end)?;
+                while !matches!(child.kind(), "paragraph" | "pipe_table") {
+                    child = child.parent()?;
+                    if child.id() == node.id() {
+                        return None;
+                    }
+                }
+                if child.start_byte() > start || end > child.end_byte() {
+                    return None;
+                }
+                let next_line = self
+                    .line_starts
+                    .partition_point(|line| *line < child.end_byte());
+                let span_end = self
+                    .line_starts
+                    .get(next_line)
+                    .copied()
+                    .unwrap_or(self.text.len());
+                (child.start_byte()..span_end, child.kind().to_string())
+            }
+        };
+        let span = &candidate.0;
+        if span.end - span.start > BOUNDED_SOURCE_MAX_REGION_BYTES
+            || self.line_starts.binary_search(&span.start).is_err()
+            || (span.end != self.text.len() && self.line_starts.binary_search(&span.end).is_err())
+            || self.patches.iter().any(|patch| {
+                patch.bytes != *span && patch.bytes.start < span.end && patch.bytes.end > span.start
+            })
+        {
+            return None;
+        }
+        Some(candidate)
+    }
+
+    fn bounded_section_group(&self, edit: &TextEdit) -> Option<(Range<usize>, String)> {
+        let start = edit.range.start;
+        let end = edit.range.end;
+        if let Some(patch) = self
+            .patches
+            .iter()
+            .find(|patch| patch.bytes.start <= start && end <= patch.bytes.end)
+        {
+            if patch.root_kind == "section_group" {
+                return Some((patch.bytes.clone(), patch.root_kind.clone()));
+            }
+        }
+        let root = self.md_tree.root_node();
+        let mut first = root.descendant_for_byte_range(start, start + 1)?;
+        while first.kind() != "section" {
+            first = first.parent()?;
+        }
+        let mut last = root.descendant_for_byte_range(end.saturating_sub(1), end)?;
+        while last.kind() != "section" {
+            last = last.parent()?;
+        }
+        let parent = first.parent()?;
+        if parent.kind() != "section" || last.parent()?.id() != parent.id() {
+            return None;
+        }
+        let span = first.start_byte()..last.end_byte();
+        (span.start <= start && end <= span.end).then_some((span, "section_group".to_string()))
+    }
+
+    fn edit_stays_inside_local_section(&self, edit: &TextEdit) -> bool {
+        let start = edit.range.start;
+        let end = edit.range.end;
+        if start > end || end > self.text.len() || (start == end && edit.new_text.is_empty()) {
+            return false;
+        }
+        let line_start = self.text[..start].rfind('\n').map_or(0, |at| at + 1);
+        let line_end = self.text[end..]
+            .find('\n')
+            .map_or(self.text.len(), |at| end + at);
+        let old = &self.text[line_start..line_end];
+        let mut new = String::with_capacity(old.len() - (end - start) + edit.new_text.len());
+        new.push_str(&self.text[line_start..start]);
+        new.push_str(&edit.new_text);
+        new.push_str(&self.text[end..line_end]);
+        old.lines().chain(new.lines()).all(|line| {
+            let line = line.trim_start_matches([' ', '\t']);
+            !(line.starts_with("# ") || line.starts_with("#\t"))
+                && !line.starts_with('<')
+                && !line.starts_with("===")
+                && !line.starts_with("```")
+                && !line.starts_with("~~~")
+                && !line.starts_with("+++")
+                && !line.contains("]:")
+                && !line.contains("[^")
+        })
+    }
+
+    pub(crate) fn local_section_window(&self, edit: &TextEdit) -> Option<Range<usize>> {
+        self.edit_stays_inside_local_section(edit)
+            .then(|| self.bounded_source_region(edit, true))
+            .flatten()
+            .and_then(|(span, kind)| (kind == "section_group").then_some(span))
+    }
+
+    fn apply_bounded_source_edit(&mut self, edit: &TextEdit, local_section: bool) -> bool {
+        let Some((old_span, root_kind)) = self.bounded_source_region(edit, local_section) else {
+            return false;
+        };
+        if local_section && root_kind != "section_group" {
+            return false;
+        }
+        let Some(tree_edit) = input_edit_indexed(&self.line_starts, edit) else {
+            return false;
+        };
+        let start = edit.range.start.min(edit.range.end);
+        let end = edit.range.start.max(edit.range.end);
+        let delta = edit.new_text_len as isize - (end - start) as isize;
+        let line_delta = edit.new_text.bytes().filter(|byte| *byte == b'\n').count() as isize
+            - self.text[start..end]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count() as isize;
+        let first_line = self.line_starts.binary_search(&old_span.start).unwrap();
+        self.md_tree.edit(&tree_edit);
+        apply_edit_to_line_starts(&mut self.line_starts, edit);
+        apply_edit_to_string(&mut self.text, edit);
+        let new_span = old_span.start..old_span.end.checked_add_signed(delta).unwrap();
+        let mut fragment = Self::new_with_queries(
+            &self.text[new_span.clone()],
+            self.query_cache.borrow().clone(),
+        );
+        let fragment_root = fragment.md_tree.root_node();
+        let mut fragment_cursor = fragment_root.walk();
+        let mut fragment_children = fragment_root.named_children(&mut fragment_cursor);
+        let only_root = fragment_children.next();
+        let same_root = if root_kind == "section_group" {
+            only_root.is_some_and(|node| node.kind() == "section")
+                && fragment_children.all(|node| node.kind() == "section")
+        } else if let Some(node) = only_root {
+            if fragment_children.next().is_some() {
+                false
+            } else if root_kind == "section" {
+                node.kind() == "section"
+            } else {
+                let mut nested_cursor = node.walk();
+                let mut nested = node.named_children(&mut nested_cursor);
+                nested.next().is_some_and(|child| child.kind() == root_kind)
+                    && nested.next().is_none()
+            }
+        } else {
+            false
+        };
+        if !same_root {
+            self.reparse_after_bounded_expansion();
+            return true;
+        }
+        let fragment_lines = fragment.highlight_lines(0..fragment.line_starts.len());
+        let spell_exclusions = fragment
+            .spell_block_exclusion_ranges(0..fragment.text.len())
+            .into_iter()
+            .map(|range| new_span.start + range.start..new_span.start + range.end)
+            .collect();
+        self.query_cache.get_mut().extend(
+            fragment
+                .query_cache
+                .borrow()
+                .iter()
+                .map(|(name, query)| (*name, Arc::clone(query))),
+        );
+        #[cfg(test)]
+        self.query_compile_count
+            .set(self.query_compile_count.get() + fragment.query_compile_count.get());
+        let mut injections = Vec::new();
+        for mut injection in std::mem::take(&mut self.injections) {
+            if injection.start < old_span.end && injection.end > old_span.start {
+                continue;
+            }
+            if injection.start >= old_span.end {
+                injection.start = injection.start.checked_add_signed(delta).unwrap();
+                injection.end = injection.end.checked_add_signed(delta).unwrap();
+            }
+            injections.push(injection);
+        }
+        for mut injection in std::mem::take(&mut fragment.injections) {
+            injection.start += new_span.start;
+            injection.end += new_span.start;
+            injections.push(injection);
+        }
+        injections.sort_by_key(|injection| injection.start);
+        self.injections = injections;
+        self.source_parse_cache.get_mut().retain_mut(|entry| {
+            if entry.start < old_span.end && entry.end > old_span.start {
+                return false;
+            }
+            if entry.start >= old_span.end {
+                entry.start = entry.start.checked_add_signed(delta).unwrap();
+                entry.end = entry.end.checked_add_signed(delta).unwrap();
+            }
+            true
+        });
+        let mut patches = Vec::with_capacity(self.patches.len() + 1);
+        for mut patch in std::mem::take(&mut self.patches) {
+            if patch.bytes == old_span {
+                continue;
+            }
+            if patch.bytes.start >= old_span.end {
+                patch.bytes.start = patch.bytes.start.checked_add_signed(delta).unwrap();
+                patch.bytes.end = patch.bytes.end.checked_add_signed(delta).unwrap();
+                patch.first_line = patch.first_line.checked_add_signed(line_delta).unwrap();
+                for exclusion in &mut patch.spell_exclusions {
+                    exclusion.start = exclusion.start.checked_add_signed(delta).unwrap();
+                    exclusion.end = exclusion.end.checked_add_signed(delta).unwrap();
+                }
+            }
+            patches.push(patch);
+        }
+        patches.push(SourcePatch {
+            bytes: new_span.clone(),
+            root_kind,
+            first_line,
+            lines: fragment_lines,
+            spell_exclusions,
+        });
+        patches.sort_by_key(|patch| patch.bytes.start);
+        self.patches = patches;
+        self.spell_front_matter_span = crate::frontmatter::front_matter_span(&self.text);
+        #[cfg(test)]
+        {
+            self.last_parse_path = ParsePath::Bounded;
+            self.last_bounded_bytes = new_span.end - new_span.start;
+            self.last_bounded_lines = self
+                .patches
+                .iter()
+                .find(|patch| patch.bytes == new_span)
+                .unwrap()
+                .lines
+                .len();
+            self.last_changed_ranges = 0;
+            self.last_changed_bytes = 0;
+            self.last_changed_lines = 0;
+        }
+        true
+    }
+
+    fn reparse_after_bounded_expansion(&mut self) {
+        self.md_tree = self
+            .md_parser
+            .parse(&self.text, Some(&self.md_tree))
+            .expect("re-parse should succeed");
+        self.patches.clear();
+        self.spell_front_matter_span = crate::frontmatter::front_matter_span(&self.text);
+        self.spell_reference_labels =
+            collect_spell_reference_labels(self.md_tree.root_node(), &self.text);
+        self.source_parse_cache.get_mut().clear();
+        self.discover_injections();
+        #[cfg(test)]
+        {
+            self.last_parse_path = ParsePath::Incremental;
+            self.block_parse_count.set(self.block_parse_count.get() + 1);
+            self.reference_scan_count += 1;
+            self.last_bounded_bytes = 0;
+            self.last_bounded_lines = 0;
+            self.last_changed_ranges = 1;
+            self.last_changed_bytes = self.text.len();
+            self.last_changed_lines = self.line_starts.len();
+        }
+    }
+
+    /// Preserve parsed injections outside a block-neutral edit and keep their
+    /// document coordinates current. An edit on an injection boundary needs
+    /// the Markdown tree to decide which side owns the inserted text.
+    fn rebase_unchanged_injections(&mut self, edit: &TextEdit) -> bool {
+        let start = edit.range.start.min(edit.range.end);
+        let end = edit.range.start.max(edit.range.end);
+        if self.injections.iter().any(|injection| {
+            (start <= injection.start && end > injection.start)
+                || (start < injection.end && end >= injection.end)
+                || (start == end && (start == injection.start || start == injection.end))
+        }) {
+            return false;
+        }
+        let delta = edit.new_text_len as isize - (end - start) as isize;
+        for injection in &mut self.injections {
+            if end <= injection.start {
+                injection.start = injection.start.checked_add_signed(delta).unwrap();
+                injection.end = injection.end.checked_add_signed(delta).unwrap();
+            } else if start < injection.end && end > injection.start {
+                injection.end = injection.end.checked_add_signed(delta).unwrap();
+            }
+        }
+        self.source_parse_cache.get_mut().retain_mut(|entry| {
+            if end <= entry.start {
+                entry.start = entry.start.checked_add_signed(delta).unwrap();
+                entry.end = entry.end.checked_add_signed(delta).unwrap();
+                true
+            } else {
+                start >= entry.end
+            }
+        });
+        true
+    }
+
+    fn edit_touches_reference_definition(&self, edit: &TextEdit) -> bool {
+        let start = edit.range.start.min(edit.range.end);
+        let end = edit.range.start.max(edit.range.end);
+        let Some(mut node) = self
+            .md_tree
+            .root_node()
+            .descendant_for_byte_range(start, end)
+        else {
+            return false;
+        };
+        loop {
+            if node.kind() == "link_reference_definition" {
+                return true;
+            }
+            let Some(parent) = node.parent() else {
+                return false;
+            };
+            node = parent;
+        }
+    }
+
+    /// Reparse only a known code injection when an edit cannot change its
+    /// surrounding Markdown fence structure.
+    fn apply_interior_fence_edit(&mut self, edit: &TextEdit) -> bool {
+        let start = edit.range.start;
+        let end = edit.range.end;
+        if start > end
+            || end > self.text.len()
+            || edit.new_text_len != edit.new_text.len()
+            || !self.patches.is_empty()
+            || !self.text.is_char_boundary(start)
+            || !self.text.is_char_boundary(end)
+        {
+            return false;
+        }
+        let affected_start = self.text[..start].rfind('\n').map_or(0, |at| at + 1);
+        let affected_end = self.text[end..]
+            .find('\n')
+            .map_or(self.text.len(), |at| end + at);
+        let replacement = format!(
+            "{}{}{}",
+            &self.text[affected_start..start],
+            edit.new_text,
+            &self.text[end..affected_end]
+        );
+        if self.text[affected_start..affected_end]
+            .lines()
+            .any(fence_delimiter_prefix)
+            || replacement.lines().any(fence_delimiter_prefix)
+        {
+            return false;
+        }
+        let Some(index) = self.injections.iter().position(|injection| {
+            injection.kind == InjectionKind::Fence
+                && injection.start <= start
+                && end < injection.end
+        }) else {
+            return false;
+        };
+        let injection = &self.injections[index];
+        let old_start = injection.start;
+        let old_end = injection.end;
+        let language = injection.language.clone();
+        let Some(entry_index) = self
+            .source_parse_cache
+            .borrow()
+            .iter()
+            .position(|entry| entry.start == old_start && entry.end == old_end)
+        else {
+            return false;
+        };
+        let old_code = &self.text[old_start..old_end];
+        let relative = TextEdit {
+            range: start - old_start..end - old_start,
+            new_text_len: edit.new_text_len,
+            new_text: edit.new_text.clone(),
+        };
+        let Some(code_input) = input_edit_indexed(&line_start_indices(old_code), &relative) else {
+            return false;
+        };
+        let Some(document_input) = input_edit_indexed(&self.line_starts, edit) else {
+            return false;
+        };
+        let delta = edit.new_text_len as isize - (end - start) as isize;
+        let Some(new_end) = old_end.checked_add_signed(delta) else {
+            return false;
+        };
+
+        let mut code_tree = self.source_parse_cache.get_mut()[entry_index].tree.clone();
+        code_tree.edit(&code_input);
+        self.md_tree.edit(&document_input);
+        apply_edit_to_line_starts(&mut self.line_starts, edit);
+        apply_edit_to_string(&mut self.text, edit);
+        let mut parser = Parser::new();
+        parser.set_language(&language).unwrap();
+        let updated_code_tree = parser
+            .parse(&self.text[old_start..new_end], Some(&code_tree))
+            .expect("the known code grammar parses after a local edit");
+        self.fence_edit_status = FenceEditStatus::Incremental {
+            changed_source: code_tree
+                .changed_ranges(&updated_code_tree)
+                .map(|range| old_start + range.start_byte..old_start + range.end_byte)
+                .reduce(|first, next| first.start.min(next.start)..first.end.max(next.end)),
+        };
+        self.injections[index].end = new_end;
+        for injection in &mut self.injections[index + 1..] {
+            injection.start = injection.start.checked_add_signed(delta).unwrap();
+            injection.end = injection.end.checked_add_signed(delta).unwrap();
+        }
+        for entry in self.source_parse_cache.get_mut() {
+            if entry.start == old_start && entry.end == old_end {
+                entry.end = new_end;
+                entry.tree = updated_code_tree.clone();
+            } else if entry.start >= old_end {
+                entry.start = entry.start.checked_add_signed(delta).unwrap();
+                entry.end = entry.end.checked_add_signed(delta).unwrap();
+            }
+        }
+        #[cfg(test)]
+        {
+            self.last_parse_path = ParsePath::FenceInterior;
+            self.last_changed_ranges = code_tree.changed_ranges(&updated_code_tree).count();
+            self.last_changed_bytes = edit.new_text_len + end - start;
+            self.last_changed_lines = code_input
+                .old_end_position
+                .row
+                .max(code_input.new_end_position.row)
+                .saturating_sub(code_input.start_position.row)
+                + 1;
+            self.last_bounded_bytes = 0;
+            self.last_bounded_lines = 0;
+        }
+        true
+    }
+
     /// Apply a batch of text edits and update the retained parse tree.
     ///
     /// This is the FR-4.4 incremental highlighting path: affected trees are
@@ -276,27 +907,56 @@ impl Highlighter {
     /// that cannot alter Markdown block structure. That narrow exception uses
     /// `Tree::edit` for coordinates and the live inline parse for styling.
     ///
-    /// Edits are applied in their incoming sequential order and injection
-    /// regions are re-resolved after the batch.
+    /// Edits are applied in their incoming sequential order. Injection
+    /// regions are retained for block-neutral edits and rediscovered when
+    /// Markdown structure may have changed.
     pub fn apply_edit(&mut self, edits: &[TextEdit]) {
         if edits.is_empty() {
             return;
         }
 
+        self.fence_edit_status = FenceEditStatus::NotIncremental;
+
+        if edits.len() == 1 && self.apply_interior_fence_edit(&edits[0]) {
+            return;
+        }
+        if edits.len() == 1 && self.apply_bounded_source_edit(&edits[0], false) {
+            return;
+        }
+        if let Some(collapsed) = collapsed_descending_edit(&self.text, edits) {
+            if self.local_section_window(&collapsed).is_some()
+                && self.apply_bounded_source_edit(&collapsed, true)
+            {
+                return;
+            }
+        }
+
         #[cfg(test)]
         {
             self.last_parse_path = ParsePath::Skipped;
+            self.last_changed_bytes = 0;
+            self.last_changed_ranges = 0;
+            self.last_changed_lines = 0;
+            self.last_bounded_bytes = 0;
+            self.last_bounded_lines = 0;
         }
 
-        let mut rediscover_injections = !self.injections.is_empty();
+        let mut rediscover_injections = false;
         let mut tree_was_edited = false;
-        let mut block_reparse_required = false;
+        let mut block_reparse_required = !self.patches.is_empty();
         for edit in edits {
             // Every coordinate is relative to the document produced by the
             // preceding entry, so compute and apply the tree edit before
             // applying the identical replacement to the working text.
-            rediscover_injections |= edit_may_create_injection(&self.text, edit);
-            block_reparse_required |= !edit_is_provably_block_neutral(&self.text, edit);
+            let block_neutral = edit_is_provably_block_neutral(&self.text, edit)
+                && !self.edit_touches_reference_definition(edit);
+            block_reparse_required |= !block_neutral;
+            if !block_neutral
+                || edit_may_create_injection(&self.text, edit)
+                || (!rediscover_injections && !self.rebase_unchanged_injections(edit))
+            {
+                rediscover_injections = true;
+            }
             if let Some(tree_edit) = input_edit_indexed(&self.line_starts, edit) {
                 self.md_tree.edit(&tree_edit);
                 tree_was_edited = true;
@@ -310,15 +970,30 @@ impl Highlighter {
             return;
         }
 
+        self.patches.clear();
+
         if block_reparse_required {
+            #[cfg(test)]
+            let edited_tree = self.md_tree.clone();
             let old_tree = Some(&self.md_tree);
             self.md_tree = self
                 .md_parser
                 .parse(&self.text, old_tree)
                 .expect("re-parse should succeed");
             #[cfg(test)]
-            self.block_parse_count
-                .set(self.block_parse_count.get().saturating_add(1));
+            {
+                self.block_parse_count
+                    .set(self.block_parse_count.get().saturating_add(1));
+                for changed in edited_tree.changed_ranges(&self.md_tree) {
+                    self.last_changed_ranges += 1;
+                    self.last_changed_bytes += changed.end_byte - changed.start_byte;
+                    self.last_changed_lines += changed
+                        .end_point
+                        .row
+                        .saturating_sub(changed.start_point.row)
+                        + 1;
+                }
+            }
             #[cfg(test)]
             {
                 self.last_parse_path = ParsePath::Incremental;
@@ -329,13 +1004,17 @@ impl Highlighter {
                 self.last_parse_path = ParsePath::BlockNeutral;
             }
         }
-
         if block_reparse_required {
             self.spell_reference_labels =
                 collect_spell_reference_labels(self.md_tree.root_node(), &self.text);
+            #[cfg(test)]
+            {
+                self.reference_scan_count += 1;
+            }
         }
 
         if rediscover_injections {
+            self.source_parse_cache.get_mut().clear();
             self.discover_injections();
         }
     }
@@ -348,6 +1027,43 @@ impl Highlighter {
     ///
     /// `lines` is a 0-based inclusive range of line indices.
     pub fn highlight_lines(&self, lines: Range<usize>) -> Vec<StyledLine> {
+        if self.patches.is_empty() {
+            return self.highlight_lines_tree(lines);
+        }
+        let line_count = if self.text.ends_with('\n') && !self.text.is_empty() {
+            self.line_starts.len().saturating_sub(1)
+        } else {
+            self.line_starts.len()
+        };
+        let end = lines.end.min(line_count);
+        if lines.start >= end {
+            return self.highlight_lines_tree(lines);
+        }
+        let mut result = Vec::with_capacity(end - lines.start);
+        let mut cursor = lines.start;
+        while cursor < end {
+            let index = self
+                .patches
+                .partition_point(|patch| patch.first_line + patch.lines.len() <= cursor);
+            match self.patches.get(index) {
+                Some(patch) if patch.first_line <= cursor => {
+                    let count = (end - cursor).min(patch.first_line + patch.lines.len() - cursor);
+                    result.extend_from_slice(
+                        &patch.lines[cursor - patch.first_line..cursor - patch.first_line + count],
+                    );
+                    cursor += count;
+                }
+                next => {
+                    let next_line = next.map_or(end, |patch| patch.first_line.min(end));
+                    result.extend(self.highlight_lines_tree(cursor..next_line));
+                    cursor = next_line;
+                }
+            }
+        }
+        result
+    }
+
+    fn highlight_lines_tree(&self, lines: Range<usize>) -> Vec<StyledLine> {
         if lines.start >= lines.end {
             return Vec::new();
         }
@@ -499,66 +1215,61 @@ impl Highlighter {
             }
 
             let mut inj_cursor = QueryCursor::new();
-            let mut inj_parser = Parser::new();
-            if inj_parser.set_language(&injection.language).is_ok() {
-                if let Some(inj_tree) = inj_parser.parse(&text[inj_start..inj_end], None) {
-                    let inj_root = inj_tree.root_node();
-                    let relative_start = range.start.saturating_sub(inj_start);
-                    let relative_end = range.end.saturating_sub(inj_start).min(inj_end - inj_start);
-                    inj_cursor.set_byte_range(relative_start..relative_end);
-                    let injection_bytes = &text.as_bytes()[inj_start..inj_end];
-                    let mut matches =
-                        inj_cursor.matches(&injection.query, inj_root, injection_bytes);
-                    let mut injection_spans = Vec::new();
+            if let Some(inj_tree) = self.source_injection_tree(injection) {
+                let inj_root = inj_tree.root_node();
+                let relative_start = range.start.saturating_sub(inj_start);
+                let relative_end = range.end.saturating_sub(inj_start).min(inj_end - inj_start);
+                inj_cursor.set_byte_range(relative_start..relative_end);
+                let injection_bytes = &text.as_bytes()[inj_start..inj_end];
+                let mut matches = inj_cursor.matches(&injection.query, inj_root, injection_bytes);
+                let mut injection_spans = Vec::new();
 
-                    while let Some(m) = matches.next() {
-                        for capture in m.captures {
-                            let capture_name =
-                                injection.query.capture_names()[capture.index as usize];
-                            let inj_node = capture.node;
-                            if injection.kind == InjectionKind::FrontMatter
-                                && injection.language_name == "toml"
-                                && capture_name
-                                    .strip_prefix('@')
-                                    .unwrap_or(capture_name)
-                                    .starts_with("property")
-                                && inj_node.kind() == "pair"
-                            {
-                                // tree-sitter-toml-ng captures the complete
-                                // pair as @property in addition to its key.
-                                // Keeping that broad capture would flatten the
-                                // value into FmKey after overlap resolution.
-                                continue;
-                            }
-                            let style = injection_capture_to_style(
-                                injection.kind,
-                                injection.language_name,
-                                capture_name,
-                                inj_node.kind(),
-                            );
+                while let Some(m) = matches.next() {
+                    for capture in m.captures {
+                        let capture_name = injection.query.capture_names()[capture.index as usize];
+                        let inj_node = capture.node;
+                        if injection.kind == InjectionKind::FrontMatter
+                            && injection.language_name == "toml"
+                            && capture_name
+                                .strip_prefix('@')
+                                .unwrap_or(capture_name)
+                                .starts_with("property")
+                            && inj_node.kind() == "pair"
+                        {
+                            // tree-sitter-toml-ng captures the complete
+                            // pair as @property in addition to its key.
+                            // Keeping that broad capture would flatten the
+                            // value into FmKey after overlap resolution.
+                            continue;
+                        }
+                        let style = injection_capture_to_style(
+                            injection.kind,
+                            injection.language_name,
+                            capture_name,
+                            inj_node.kind(),
+                        );
 
-                            let abs_start = inj_start + inj_node.start_byte();
-                            let abs_end = inj_start + inj_node.end_byte();
-                            let clipped_start = abs_start.max(range.start);
-                            let clipped_end = abs_end.min(range.end);
+                        let abs_start = inj_start + inj_node.start_byte();
+                        let abs_end = inj_start + inj_node.end_byte();
+                        let clipped_start = abs_start.max(range.start);
+                        let clipped_end = abs_end.min(range.end);
 
-                            if clipped_start < clipped_end {
-                                injection_spans.push(ByteSpan {
-                                    start_byte: clipped_start,
-                                    end_byte: clipped_end,
-                                    style,
-                                });
-                            }
+                        if clipped_start < clipped_end {
+                            injection_spans.push(ByteSpan {
+                                start_byte: clipped_start,
+                                end_byte: clipped_end,
+                                style,
+                            });
                         }
                     }
-                    injection_spans.sort_by_key(|span| {
-                        matches!(
-                            span.style,
-                            SemanticStyle::FmKey | SemanticStyle::FmDelimiter
-                        )
-                    });
-                    spans.extend(injection_spans);
                 }
+                injection_spans.sort_by_key(|span| {
+                    matches!(
+                        span.style,
+                        SemanticStyle::FmKey | SemanticStyle::FmDelimiter
+                    )
+                });
+                spans.extend(injection_spans);
             }
         }
 
@@ -660,6 +1371,10 @@ impl Highlighter {
 
     /// Discover all injection regions in the document.
     fn discover_injections(&mut self) {
+        #[cfg(test)]
+        {
+            self.injection_scan_count += 1;
+        }
         let metadata = self.collect_injection_metadata();
         self.build_injections(metadata);
     }
@@ -678,17 +1393,9 @@ impl Highlighter {
 
         for meta in metadata {
             let language = (meta.language.language_fn)();
-            let query = if let Some(cached) = self.query_cache.get(meta.language.name) {
-                Arc::clone(cached)
-            } else {
-                let compiled = Arc::new(
-                    Query::new(&language, meta.language.highlights_query)
-                        .expect("registered injection highlight query should compile"),
-                );
-                self.query_cache
-                    .insert(meta.language.name, Arc::clone(&compiled));
-                compiled
-            };
+            let query = self
+                .query_for(meta.language)
+                .expect("registered injection highlight query should compile");
 
             self.injections.push(Injection {
                 start: meta.start,
@@ -700,6 +1407,65 @@ impl Highlighter {
                 fence_lang: meta.fence_lang,
             });
         }
+    }
+
+    /// Return one query per canonical language for source and rendered fences.
+    fn query_for(&self, language: &'static LangDef) -> Option<Arc<Query>> {
+        if let Some(cached) = self.query_cache.borrow().get(language.name) {
+            return Some(Arc::clone(cached));
+        }
+        let compiled =
+            Arc::new(Query::new(&(language.language_fn)(), language.highlights_query).ok()?);
+        self.query_cache
+            .borrow_mut()
+            .insert(language.name, Arc::clone(&compiled));
+        #[cfg(test)]
+        self.query_compile_count
+            .set(self.query_compile_count.get() + 1);
+        Some(compiled)
+    }
+
+    /// Parse source injections on demand, retaining only a small bounded set.
+    fn source_injection_tree(&self, injection: &Injection) -> Option<Tree> {
+        let mut cache = self.source_parse_cache.borrow_mut();
+        if let Some(index) = cache.iter().position(|entry| {
+            entry.start == injection.start
+                && entry.end == injection.end
+                && entry.language_name == injection.language_name
+        }) {
+            let entry = cache.remove(index);
+            let tree = entry.tree.clone();
+            cache.push(entry);
+            return Some(tree);
+        }
+        drop(cache);
+
+        let mut parser = Parser::new();
+        parser.set_language(&injection.language).ok()?;
+        let tree = parser.parse(&self.text[injection.start..injection.end], None)?;
+        #[cfg(test)]
+        self.source_injection_parse_count
+            .set(self.source_injection_parse_count.get() + 1);
+
+        let source_bytes = injection.end - injection.start;
+        if source_bytes <= SOURCE_PARSE_CACHE_MAX_SOURCE_BYTES {
+            let mut cache = self.source_parse_cache.borrow_mut();
+            let mut cached_bytes: usize = cache.iter().map(|entry| entry.end - entry.start).sum();
+            while !cache.is_empty()
+                && (cache.len() >= SOURCE_PARSE_CACHE_MAX_ENTRIES
+                    || cached_bytes + source_bytes > SOURCE_PARSE_CACHE_MAX_SOURCE_BYTES)
+            {
+                let evicted = cache.remove(0);
+                cached_bytes -= evicted.end - evicted.start;
+            }
+            cache.push(ParsedInjection {
+                start: injection.start,
+                end: injection.end,
+                language_name: injection.language_name,
+                tree: tree.clone(),
+            });
+        }
+        Some(tree)
     }
 
     /// Walk the markdown tree and collect immutable injection metadata.
@@ -870,43 +1636,156 @@ fn collect_spell_reference_labels(root: tree_sitter::Node<'_>, text: &str) -> Ve
 
 // ── Standalone snippet highlighting ─────────────────────────────────────────
 
-/// Highlight a standalone code snippet with the given language.
-///
-/// This is used by the rendered layout renderer for fenced code blocks: each
-/// fence is highlighted as an independent snippet, not as part of the
-/// document's incremental tree (FR-3.5).
-///
-/// Unknown languages and uncaptured known-language text use `CodeBlock`;
-/// recognized language captures override that base style.
-pub fn highlight_snippet(lang: &str, text: &str) -> Vec<StyledLine> {
-    if text.is_empty() {
-        return vec![StyledLine {
-            text: String::new(),
-            spans: Vec::new(),
-        }];
+fn fence_delimiter_prefix(line: &str) -> bool {
+    let line = line.trim_start_matches([' ', '\t']);
+    line.starts_with("```") || line.starts_with("~~~")
+}
+
+impl Highlighter {
+    /// Reuse the source injection tree when its exact content span is also a
+    /// rendered code fence, keeping both views on the same parsed code.
+    pub(crate) fn highlight_fence_span(
+        &self,
+        lang: &str,
+        content_span: &Range<usize>,
+    ) -> Vec<StyledLine> {
+        let Some(text) = self.text.get(content_span.clone()) else {
+            return empty_snippet_line();
+        };
+        let injection = self.injections.iter().find(|injection| {
+            injection.kind == InjectionKind::Fence
+                && injection.start <= content_span.start
+                && content_span.end <= injection.end
+        });
+        if let Some(injection) = injection {
+            if let Some(tree) = self.source_injection_tree(injection) {
+                if injection.start == content_span.start
+                    && self.text[content_span.end..injection.end]
+                        .bytes()
+                        .all(|byte| byte == b'\n')
+                {
+                    if let Some(language) = languages::find_by_alias(lang) {
+                        if let Some(query) = self.query_for(language) {
+                            let injection_text = &self.text[injection.start..injection.end];
+                            let mut spans =
+                                collect_snippet_spans_from_tree(injection_text, &tree, &query);
+                            spans.retain(|span| span.start_byte < text.len());
+                            for span in &mut spans {
+                                span.end_byte = span.end_byte.min(text.len());
+                            }
+                            return highlight_snippet_with_spans(text, spans);
+                        }
+                    }
+                }
+            }
+        }
+        self.highlight_snippet(lang, text)
     }
 
+    /// Highlight a rendered fence with the same compiled query used by source injections.
+    pub(crate) fn highlight_snippet(&self, lang: &str, text: &str) -> Vec<StyledLine> {
+        if text.is_empty() {
+            return empty_snippet_line();
+        }
+        let Some(language) = languages::find_by_alias(lang) else {
+            return code_block_lines_for_text(text);
+        };
+        let Some(query) = self.query_for(language) else {
+            return code_block_lines_for_text(text);
+        };
+        highlight_snippet_with_query(text, &(language.language_fn)(), &query)
+    }
+}
+
+/// Uncached reference used to compare rendered output with the prior path.
+#[cfg(test)]
+fn highlight_snippet(lang: &str, text: &str) -> Vec<StyledLine> {
+    if text.is_empty() {
+        return empty_snippet_line();
+    }
     let Some(lang_def) = languages::find_by_alias(lang) else {
         return code_block_lines_for_text(text);
     };
     let lang_obj = (lang_def.language_fn)();
-
     let query = Query::new(&lang_obj, lang_def.highlights_query).ok();
     let Some(query) = query else {
         return code_block_lines_for_text(text);
     };
+    highlight_snippet_with_query(text, &lang_obj, &query)
+}
 
-    let mut parser = Parser::new();
-    if parser.set_language(&lang_obj).is_err() {
-        return code_block_lines_for_text(text);
-    }
+fn empty_snippet_line() -> Vec<StyledLine> {
+    vec![StyledLine {
+        text: String::new(),
+        spans: Vec::new(),
+    }]
+}
 
-    let tree = parser.parse(text, None);
-
-    let Some(tree) = tree else {
+/// Parse snippets independently even when their compiled query is shared.
+fn highlight_snippet_with_query(
+    text: &str,
+    lang_obj: &tree_sitter::Language,
+    query: &Query,
+) -> Vec<StyledLine> {
+    let Some(all_spans) = collect_snippet_spans(text, lang_obj, query) else {
         return code_block_lines_for_text(text);
     };
 
+    highlight_snippet_with_spans(text, all_spans)
+}
+
+fn highlight_snippet_with_spans(text: &str, all_spans: Vec<ByteSpan>) -> Vec<StyledLine> {
+    // Sweep each capture into only the physical lines it intersects.
+    let line_starts = line_start_indices(text);
+    let num_lines = if text.ends_with('\n') && !text.is_empty() {
+        line_starts.len().saturating_sub(1)
+    } else {
+        line_starts.len()
+    };
+    let (mut grouped_spans, _) = group_snippet_spans(text, &line_starts, num_lines, &all_spans);
+
+    let mut result = Vec::with_capacity(num_lines);
+    for line_idx in 0..num_lines {
+        let line_start = line_starts[line_idx];
+        let next_start = if line_idx + 1 < line_starts.len() {
+            line_starts[line_idx + 1]
+        } else {
+            text.len()
+        };
+        let line_end = if next_start > line_start && text.as_bytes()[next_start - 1] == b'\n' {
+            next_start - 1
+        } else {
+            next_start
+        };
+        let line_text = &text[line_start..line_end.min(text.len())];
+
+        let mut spans = merge_overlapping_spans(std::mem::take(&mut grouped_spans[line_idx]));
+        spans.sort_by_key(|span| span.start_col);
+
+        result.push(StyledLine {
+            text: line_text.to_string(),
+            spans,
+        });
+    }
+
+    result
+}
+
+fn collect_snippet_spans(
+    text: &str,
+    lang_obj: &tree_sitter::Language,
+    query: &Query,
+) -> Option<Vec<ByteSpan>> {
+    let mut parser = Parser::new();
+    if parser.set_language(lang_obj).is_err() {
+        return None;
+    }
+    let tree = parser.parse(text, None)?;
+
+    Some(collect_snippet_spans_from_tree(text, &tree, query))
+}
+
+fn collect_snippet_spans_from_tree(text: &str, tree: &Tree, query: &Query) -> Vec<ByteSpan> {
     let text_bytes = text.as_bytes();
     let root = tree.root_node();
     let mut cursor = QueryCursor::new();
@@ -917,7 +1796,7 @@ pub fn highlight_snippet(lang: &str, text: &str) -> Vec<StyledLine> {
         end_byte: text.len(),
         style: SemanticStyle::CodeBlock,
     }];
-    let mut matches = cursor.matches(&query, root, text_bytes);
+    let mut matches = cursor.matches(query, root, text_bytes);
 
     while let Some(m) = matches.next() {
         for capture in m.captures {
@@ -936,57 +1815,56 @@ pub fn highlight_snippet(lang: &str, text: &str) -> Vec<StyledLine> {
         }
     }
 
-    // Group spans by line and produce StyledLines
-    let line_starts = line_start_indices(text);
-    let num_lines = if text.ends_with('\n') && !text.is_empty() {
-        line_starts.len().saturating_sub(1)
-    } else {
-        line_starts.len()
-    };
+    all_spans
+}
 
-    let mut result = Vec::with_capacity(num_lines);
-    for line_idx in 0..num_lines {
-        let line_start = line_starts[line_idx];
-        let next_start = if line_idx + 1 < line_starts.len() {
-            line_starts[line_idx + 1]
-        } else {
-            text.len()
-        };
-        let line_end = if next_start > line_start && text.as_bytes()[next_start - 1] == b'\n' {
-            next_start - 1
-        } else {
-            next_start
-        };
-        let line_text = &text[line_start..line_end.min(text.len())];
-
-        let spans: Vec<RankedSpan> = all_spans
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| s.start_byte < line_end && s.end_byte > line_start)
-            .map(|(priority, s)| {
-                let relative_start = s.start_byte.max(line_start) - line_start;
-                let relative_end = s.end_byte.min(line_end) - line_start;
-                RankedSpan {
-                    span: Span {
-                        start_col: byte_offset_to_char_index(line_text, relative_start),
-                        end_col: byte_offset_to_char_index(line_text, relative_end),
-                        style: s.style,
-                    },
-                    priority,
-                }
-            })
-            .collect();
-
-        let mut spans = merge_overlapping_spans(spans);
-        spans.sort_by_key(|span| span.start_col);
-
-        result.push(StyledLine {
-            text: line_text.to_string(),
-            spans,
-        });
+/// Preserve capture priority while visiting only intersected lines.
+fn group_snippet_spans(
+    text: &str,
+    line_starts: &[usize],
+    num_lines: usize,
+    all_spans: &[ByteSpan],
+) -> (Vec<Vec<RankedSpan>>, usize) {
+    let mut grouped = vec![Vec::new(); num_lines];
+    let mut visits = 0;
+    for (priority, span) in all_spans.iter().enumerate() {
+        let first = line_starts
+            .partition_point(|start| *start <= span.start_byte)
+            .saturating_sub(1)
+            .min(num_lines);
+        let end = line_starts
+            .partition_point(|start| *start < span.end_byte)
+            .min(num_lines);
+        for line_idx in first..end {
+            visits += 1;
+            let line_start = line_starts[line_idx];
+            let next_start = line_starts.get(line_idx + 1).copied().unwrap_or(text.len());
+            let line_end = if next_start > line_start && text.as_bytes()[next_start - 1] == b'\n' {
+                next_start - 1
+            } else {
+                next_start
+            };
+            if span.start_byte >= line_end || span.end_byte <= line_start {
+                continue;
+            }
+            let line_text = &text[line_start..line_end];
+            grouped[line_idx].push(RankedSpan {
+                span: Span {
+                    start_col: byte_offset_to_char_index(
+                        line_text,
+                        span.start_byte.max(line_start) - line_start,
+                    ),
+                    end_col: byte_offset_to_char_index(
+                        line_text,
+                        span.end_byte.min(line_end) - line_start,
+                    ),
+                    style: span.style,
+                },
+                priority,
+            });
+        }
     }
-
-    result
+    (grouped, visits)
 }
 
 /// Split fallback text into lines with an explicit `CodeBlock` base style.
@@ -1293,6 +2171,44 @@ pub(crate) fn line_index_build_count() -> usize {
 
 /// A document with no existing injections only needs rediscovery when an
 /// edit can form a fenced-code or front-matter delimiter in its local lines.
+pub(crate) fn source_edit_may_change_global_semantics(text: &str, edit: &TextEdit) -> bool {
+    fn block_prefix(line: &str) -> Option<String> {
+        let trimmed = line.trim_start_matches([' ', '\t']);
+        let marker = trimmed
+            .bytes()
+            .next()
+            .filter(|byte| matches!(byte, b'`' | b'~' | b'#' | b'>' | b'-' | b'+' | b'*'))?;
+        let count = trimmed.bytes().take_while(|byte| *byte == marker).count();
+        if matches!(marker, b'`' | b'~') && count < 3 {
+            return None;
+        }
+        Some(trimmed[..count].to_string())
+    }
+
+    let start = edit.range.start.min(edit.range.end);
+    let end = edit.range.start.max(edit.range.end);
+    let line_start = text[..start].rfind('\n').map_or(0, |index| index + 1);
+    let line_end = text[end..]
+        .find('\n')
+        .map_or(text.len(), |index| end + index);
+    let old = &text[line_start..line_end];
+    let new = format!(
+        "{}{}{}",
+        &text[line_start..start],
+        edit.new_text,
+        &text[end..line_end]
+    );
+    if old.lines().chain(new.lines()).any(|line| {
+        let trimmed = line.trim_start_matches([' ', '\t']);
+        (trimmed.starts_with('[') && trimmed.contains("]:")) || trimmed.starts_with('<')
+    }) {
+        return true;
+    }
+    let old_markers = old.lines().filter_map(block_prefix).collect::<Vec<_>>();
+    let new_markers = new.lines().filter_map(block_prefix).collect::<Vec<_>>();
+    old_markers != new_markers
+}
+
 fn edit_may_create_injection(text: &str, edit: &TextEdit) -> bool {
     let start = edit.range.start.min(edit.range.end);
     let end = edit.range.start.max(edit.range.end);
@@ -1311,10 +2227,12 @@ fn edit_may_create_injection(text: &str, edit: &TextEdit) -> bool {
 }
 
 /// Prove the narrow case where a block reparse cannot change Markdown block
-/// structure: an ASCII word-character edit within a non-indented line that
-/// begins with an ASCII letter. Everything else takes the canonical
-/// Tree-sitter incremental parse path. `Tree::edit` keeps byte coordinates
-/// current, and inline syntax is parsed from live viewport text.
+/// structure: an ASCII word-character edit inside a non-indented line that
+/// begins with an ASCII letter. At a line start, only an explicit blank or
+/// metadata delimiter separates it from the preceding Markdown node;
+/// otherwise `Tree::edit` can assign inserted text to that node. Other edits
+/// take the canonical Tree-sitter incremental parse path. `Tree::edit` keeps byte
+/// coordinates current, and inline syntax is parsed from live viewport text.
 fn edit_is_provably_block_neutral(text: &str, edit: &TextEdit) -> bool {
     let start = edit.range.start.min(edit.range.end);
     let end = edit.range.start.max(edit.range.end);
@@ -1334,6 +2252,21 @@ fn edit_is_provably_block_neutral(text: &str, edit: &TextEdit) -> bool {
     let line_end = text[end..]
         .find('\n')
         .map_or(text.len(), |newline| end + newline);
+    if end == line_end && start == end {
+        return false;
+    }
+    if start == line_start {
+        let previous = text[..line_start]
+            .strip_suffix('\n')
+            .unwrap_or("")
+            .rsplit('\n')
+            .next()
+            .unwrap_or("")
+            .trim();
+        if !previous.is_empty() && !matches!(previous, "---" | "+++") {
+            return false;
+        }
+    }
     let old_line = &text[line_start..line_end];
     let mut new_line = text[line_start..start].to_string();
     new_line.push_str(&edit.new_text);
@@ -1448,13 +2381,1046 @@ fn merge_overlapping_spans(spans: Vec<RankedSpan>) -> Vec<Span> {
 mod tests {
     use super::*;
     use crate::input::{KeyCode, KeyCodeKind, KeyInput, Modifiers};
+    use crate::realistic_fixtures as fixtures;
+    use crate::rendered::BlockModel;
+    use crate::style::{LineKind, RenderedLayout, RenderedLineRole};
     use crate::vim::{VimCore, VimEffect};
 
     #[cfg(test)]
     use proptest::prelude::*;
 
+    #[test]
+    fn bounded_fence_source_prototype_handles_propagation_and_delimiter_fallback() {
+        let cases = [
+            (
+                "rust-raw-string",
+                "# Title\n\n```rust\nfn main() {\nlet s = r###\"opening\ncontinuation\n\"###;\nlet x = 1;\n}\n```\n\nTail\n",
+                "let s = r###\"opening\n",
+            ),
+            (
+                "go-comment",
+                "# Title\n\n```go\npackage main\n/* opening\ncomment content\n*/\nfunc main() {}\n```\n\nTail\n",
+                "/* opening\n",
+            ),
+            (
+                "unicode-crlf",
+                "# Café\r\n\r\n```rust\r\nfn café() {\r\nlet π = 3;\r\n}\r\n```\r\n\r\nTail\r\n",
+                "let π = 3;\r\n",
+            ),
+        ];
+        for (name, text, removed) in cases {
+            let start = text.find(removed).unwrap();
+            let end = start + removed.len();
+            let mut syntax = Highlighter::new(text);
+            let _ = syntax.highlight_lines(0..syntax.line_starts().len());
+            assert!(
+                syntax.apply_interior_fence_edit(&TextEdit {
+                    range: start..end,
+                    new_text_len: 0,
+                    new_text: String::new(),
+                }),
+                "{name}"
+            );
+            let edited = format!("{}{}", &text[..start], &text[end..]);
+            let fresh = Highlighter::new(&edited);
+            let all_lines = 0..fresh.line_starts().len();
+            assert_eq!(
+                syntax.highlight_lines(all_lines.clone()),
+                fresh.highlight_lines(all_lines),
+                "{name} did not propagate exact source styles"
+            );
+            let closing = edited.rfind("```").unwrap();
+            let delimiter_edit = TextEdit {
+                range: closing..closing + 3,
+                new_text_len: 0,
+                new_text: String::new(),
+            };
+            assert!(!syntax.apply_interior_fence_edit(&delimiter_edit));
+            syntax.apply_edit(&[delimiter_edit]);
+            let globally_edited = format!("{}{}", &edited[..closing], &edited[closing + 3..]);
+            let fresh = Highlighter::new(&globally_edited);
+            let all_lines = 0..fresh.line_starts().len();
+            assert_eq!(
+                syntax.highlight_lines(all_lines.clone()),
+                fresh.highlight_lines(all_lines),
+                "{name} global fallback after local edit differs"
+            );
+        }
+    }
+
+    #[test]
+    fn warmed_fence_edits_use_incremental_code_parse_through_public_gateway() {
+        for (language, code) in [
+            ("rust", "let s = r###\"open\ninside\n\"###;\nlet x = 1;\n"),
+            ("go", "/* open\ninside\n*/\nfunc main() {}\n"),
+        ] {
+            let original = format!("# Heading\n\n```{language}\n{code}```\n\nTail.\n");
+            let mut highlighter = Highlighter::new(&original);
+            let _ = highlighter.highlight_lines(0..highlighter.line_starts().len());
+            let start = original.find("inside\n").unwrap();
+            let edit = TextEdit {
+                range: start..start + "inside\n".len(),
+                new_text_len: 0,
+                new_text: String::new(),
+            };
+            highlighter.apply_edit(std::slice::from_ref(&edit));
+            assert_eq!(highlighter.last_parse_path, ParsePath::FenceInterior);
+            let edited = format!("{}{}", &original[..start], &original[edit.range.end..]);
+            let fresh = Highlighter::new(&edited);
+            assert_eq!(
+                highlighter.highlight_lines(0..highlighter.line_starts().len()),
+                fresh.highlight_lines(0..fresh.line_starts().len())
+            );
+            let restore = TextEdit {
+                range: start..start,
+                new_text_len: "inside\n".len(),
+                new_text: "inside\n".to_string(),
+            };
+            highlighter.apply_edit(&[restore]);
+            assert_eq!(highlighter.last_parse_path, ParsePath::FenceInterior);
+            let fresh = Highlighter::new(&original);
+            assert_eq!(
+                highlighter.highlight_lines(0..highlighter.line_starts().len()),
+                fresh.highlight_lines(0..fresh.line_starts().len())
+            );
+            let partial = TextEdit {
+                range: start..start + 3,
+                new_text_len: 2,
+                new_text: "IN".to_string(),
+            };
+            highlighter.apply_edit(std::slice::from_ref(&partial));
+            assert_eq!(highlighter.last_parse_path, ParsePath::FenceInterior);
+            let partially_edited = format!(
+                "{}{}{}",
+                &original[..partial.range.start],
+                partial.new_text,
+                &original[partial.range.end..]
+            );
+            let fresh = Highlighter::new(&partially_edited);
+            assert_eq!(
+                highlighter.highlight_lines(0..highlighter.line_starts().len()),
+                fresh.highlight_lines(0..fresh.line_starts().len())
+            );
+        }
+    }
+
+    #[test]
+    fn first_and_last_code_characters_keep_the_warmed_fence_parse() {
+        for (language, code) in [
+            ("rust", "fn alpha() {}\nlet tail = 1;\n"),
+            ("go", "func alpha() {}\nvar tail = 1;\n"),
+        ] {
+            let mut text = format!("# Heading\n\n```{language}\n{code}```\n\nTail.\n");
+            let mut highlighter = Highlighter::new(&text);
+            highlighter.highlight_lines(0..highlighter.line_starts().len());
+            let first = if language == "rust" {
+                "fn alpha()"
+            } else {
+                "func alpha()"
+            };
+            for (needle, replacement, at_end) in [(first, "x", false), ("tail = 1;", "!", true)] {
+                let at = text.find(needle).unwrap();
+                let range = if at_end {
+                    at + needle.len() - 1..at + needle.len()
+                } else {
+                    at..at + 1
+                };
+                let edit = TextEdit {
+                    range: range.clone(),
+                    new_text_len: replacement.len(),
+                    new_text: replacement.to_string(),
+                };
+                highlighter.apply_edit(std::slice::from_ref(&edit));
+                text.replace_range(range, replacement);
+                assert_eq!(highlighter.last_parse_path, ParsePath::FenceInterior);
+                let fresh = Highlighter::new(&text);
+                assert_eq!(
+                    highlighter.highlight_lines(0..highlighter.line_starts().len()),
+                    fresh.highlight_lines(0..fresh.line_starts().len())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rendered_fence_build_primes_the_matching_source_tree() {
+        let text = "# Heading\n\n```rust\nfn alpha() { let n = 1; }\n```\n\n```go\nfunc beta() { n := 2 }\n```\n";
+        let highlighter = Highlighter::new(text);
+        let model = BlockModel::build(text, crate::frontmatter::front_matter_span(text));
+        for block in &model.blocks {
+            if let crate::rendered::BlockKind::CodeFence {
+                content_span, lang, ..
+            } = &block.kind
+            {
+                assert!(highlighter.injections.iter().any(|injection| {
+                    injection.start == content_span.start
+                        && injection.end >= content_span.end
+                        && text[content_span.end..injection.end]
+                            .bytes()
+                            .all(|byte| byte == b'\n')
+                }));
+                assert_eq!(
+                    highlighter.highlight_fence_span(lang.as_deref().unwrap_or(""), content_span),
+                    highlighter.highlight_snippet(
+                        lang.as_deref().unwrap_or(""),
+                        &text[content_span.clone()]
+                    )
+                );
+            }
+        }
+        let layout = RenderedLayout::build(&model, 80, &highlighter);
+        assert!(!layout.lines.is_empty());
+        let cache = highlighter.source_parse_cache.borrow();
+        assert_eq!(cache.len(), 2);
+        for injection in &highlighter.injections {
+            assert!(cache
+                .iter()
+                .any(|entry| { entry.start == injection.start && entry.end == injection.end }));
+        }
+    }
+
     const VIEWPORT_MARKDOWN: &str =
         "# Heading\n\nIntro paragraph.\n\nMiddle paragraph.\n\n```rust\nfn main() {}\n```\nTail paragraph.\n";
+
+    #[test]
+    #[ignore = "exact 1 MiB incremental injection diagnostic is run by its benchmark target"]
+    fn acceptance_1mb_injection_incremental_profile() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/kitchen-sink-1mb.md");
+        let original = std::fs::read_to_string(path).unwrap();
+        for (language, first_line) in [("rust", 3000), ("go", 20000)] {
+            let start = original
+                .split_inclusive('\n')
+                .take(first_line)
+                .map(str::len)
+                .sum::<usize>();
+            let end = start
+                + original[start..]
+                    .split_inclusive('\n')
+                    .take(15)
+                    .map(str::len)
+                    .sum::<usize>();
+            let highlighter = Highlighter::new(&original);
+            let injection = highlighter
+                .injections
+                .iter()
+                .find(|injection| injection.start < start && end < injection.end)
+                .unwrap();
+            assert_eq!(injection.language_name, language);
+            let old_content = &original[injection.start..injection.end];
+            let local_start = start - injection.start;
+            let local_end = end - injection.start;
+            let relative_edit = TextEdit {
+                range: local_start..local_end,
+                new_text_len: 0,
+                new_text: String::new(),
+            };
+            let mut edited_tree = highlighter.source_injection_tree(injection).unwrap();
+            edited_tree.edit(
+                &input_edit_indexed(&line_start_indices(old_content), &relative_edit).unwrap(),
+            );
+            let new_content = format!(
+                "{}{}",
+                &old_content[..local_start],
+                &old_content[local_end..]
+            );
+            let mut parser = Parser::new();
+            parser.set_language(&injection.language).unwrap();
+            let started = std::time::Instant::now();
+            let incremental = parser.parse(&new_content, Some(&edited_tree)).unwrap();
+            let incremental_ns = started.elapsed().as_nanos();
+            let changed = edited_tree.changed_ranges(&incremental).collect::<Vec<_>>();
+            let started = std::time::Instant::now();
+            let complete = parser.parse(&new_content, None).unwrap();
+            let complete_ns = started.elapsed().as_nanos();
+            assert_eq!(
+                incremental.root_node().to_sexp(),
+                complete.root_node().to_sexp()
+            );
+            println!(
+                "INJECTION\t{language}\t{incremental_ns}\t{complete_ns}\t{}\t{}\t{}",
+                old_content.len(),
+                changed.len(),
+                changed
+                    .iter()
+                    .map(|range| range.end_byte - range.start_byte)
+                    .sum::<usize>(),
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "exact 1 MiB bounded source feasibility diagnostic is run by its benchmark target"]
+    fn acceptance_1mb_bounded_source_fence_matches_fresh() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/kitchen-sink-1mb.md");
+        let original = std::fs::read_to_string(path).unwrap();
+        for (language, first_line) in [("rust", 3000), ("go", 20000)] {
+            let start = original
+                .split_inclusive('\n')
+                .take(first_line)
+                .map(str::len)
+                .sum::<usize>();
+            let end = start
+                + original[start..]
+                    .split_inclusive('\n')
+                    .take(15)
+                    .map(str::len)
+                    .sum::<usize>();
+            let removed = original[start..end].to_string();
+            let edit = TextEdit {
+                range: start..end,
+                new_text_len: 0,
+                new_text: String::new(),
+            };
+            let mut syntax = Highlighter::new(&original);
+            let _ = syntax.highlight_lines(first_line..first_line + 15);
+            let started = std::time::Instant::now();
+            assert!(syntax.apply_interior_fence_edit(&edit));
+            let apply_ns = started.elapsed().as_nanos();
+            let expected = format!("{}{}", &original[..start], &original[end..]);
+            assert_eq!(syntax.text(), expected);
+            let started = std::time::Instant::now();
+            let affected = syntax.highlight_lines(first_line..first_line + 15);
+            let highlight_ns = started.elapsed().as_nanos();
+            let fresh = Highlighter::new(&expected);
+            assert_eq!(syntax.line_starts(), fresh.line_starts());
+            for window in [
+                0..10,
+                first_line.saturating_sub(5)..first_line + 20,
+                first_line + 200..first_line + 210,
+            ] {
+                assert_eq!(
+                    syntax.highlight_lines(window.clone()),
+                    fresh.highlight_lines(window),
+                    "{language} source styling differs"
+                );
+            }
+            assert_eq!(affected, fresh.highlight_lines(first_line..first_line + 15));
+            let restore = TextEdit {
+                range: start..start,
+                new_text_len: removed.len(),
+                new_text: removed,
+            };
+            assert!(syntax.apply_interior_fence_edit(&restore));
+            assert_eq!(syntax.text(), original);
+            println!("SOURCE_FENCE\t{language}\t{apply_ns}\t{highlight_ns}\t15");
+        }
+    }
+
+    const SOURCE_DIFFERENTIAL_CASES: &[(&str, &str)] = &[
+        (
+            "yaml",
+            "---\ntitle: λ\n---\n\n# Heading\n\nProse *emphasis*.\n",
+        ),
+        ("toml", "+++\ntitle = 'é'\n+++\n\nProse **strong**.\n"),
+        (
+            "list",
+            "- alpha\n  - nested *β*\n- second `code`\n\nTail.\n",
+        ),
+        ("table", "| A | B |\n|---|---|\n| λ | `é` |\n\nTail.\n"),
+        (
+            "rust-fence",
+            "```rust\nfn main() { println!(\"é\"); }\n```\n\nTail.\n",
+        ),
+        ("unknown-fence", "```unknown\nraw *text*\n```\n\nTail.\n"),
+        (
+            "reference",
+            "[ref]: /path\n\nA [link][ref] and ![image](url).\n",
+        ),
+        ("crlf", "# λ\r\n\r\n> Quoted &amp; escaped \\* text.\r\n"),
+        (
+            "html",
+            "<script>\nlet value = 1;\n</script>\n\nText ~~old~~.\n",
+        ),
+    ];
+
+    #[test]
+    fn source_differential_manifest_covers_every_construct() {
+        let names = SOURCE_DIFFERENTIAL_CASES
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "yaml",
+                "toml",
+                "list",
+                "table",
+                "rust-fence",
+                "unknown-fence",
+                "reference",
+                "crlf",
+                "html",
+            ]
+        );
+        assert!(SOURCE_DIFFERENTIAL_CASES
+            .iter()
+            .all(|(_, text)| !text.is_empty()));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 64,
+            rng_seed: proptest::test_runner::RngSeed::Fixed(0x0eed_5eed),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn source_edit_and_undo_match_fresh_for_all_constructs(
+            case in 0usize..SOURCE_DIFFERENTIAL_CASES.len(),
+            start_choice in any::<u8>(),
+            removed_chars in 0usize..3,
+            replacement in prop::sample::select(vec!["", "x", "\n", "`", "**", "é", "[ref]: /new\n"]),
+        ) {
+            let before = SOURCE_DIFFERENTIAL_CASES[case].1;
+            let boundaries = before
+                .char_indices()
+                .map(|(offset, _)| offset)
+                .chain([before.len()])
+                .collect::<Vec<_>>();
+            let index = start_choice as usize % boundaries.len();
+            let start = boundaries[index];
+            let end = boundaries[(index + removed_chars).min(boundaries.len() - 1)];
+            let replacement = if start == end && replacement.is_empty() { "x" } else { replacement };
+            let removed = before[start..end].to_string();
+            let mut highlighter = Highlighter::new(before);
+            highlighter.apply_edit(&[TextEdit {
+                range: start..end,
+                new_text_len: replacement.len(),
+                new_text: replacement.into(),
+            }]);
+            let mut current = before.to_string();
+            current.replace_range(start..end, replacement);
+            for reverse in [false, true] {
+                if reverse {
+                    highlighter.apply_edit(&[TextEdit {
+                        range: start..start + replacement.len(),
+                        new_text_len: removed.len(),
+                        new_text: removed.clone(),
+                    }]);
+                    current.replace_range(start..start + replacement.len(), &removed);
+                }
+                let fresh = Highlighter::new(&current);
+                prop_assert_eq!(highlighter.text(), current.as_str());
+                prop_assert_eq!(&highlighter.line_starts, &fresh.line_starts);
+                prop_assert_eq!(highlighter.highlight_lines(0..usize::MAX), fresh.highlight_lines(0..usize::MAX));
+                prop_assert_eq!(&highlighter.spell_reference_labels, &fresh.spell_reference_labels);
+                prop_assert_eq!(&highlighter.spell_front_matter_span, &fresh.spell_front_matter_span);
+                prop_assert_eq!(
+                    highlighter.spell_block_exclusion_ranges(0..current.len()),
+                    fresh.spell_block_exclusion_ranges(0..current.len())
+                );
+                let injection_key = |injection: &Injection| {
+                    (injection.start, injection.end, injection.language_name, injection.kind)
+                };
+                prop_assert_eq!(
+                    highlighter.injections.iter().map(injection_key).collect::<Vec<_>>(),
+                    fresh.injections.iter().map(injection_key).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn realistic_source_tree_exposes_bounded_root_children() {
+        for class in ["mixed", "prose", "lists", "tables"] {
+            let text = fixtures::generate(class, 1024 * 1024);
+            let highlighter = Highlighter::new(&text);
+            let root = highlighter.md_tree.root_node();
+            let children = root.named_children(&mut root.walk()).collect::<Vec<_>>();
+            let largest = children
+                .iter()
+                .max_by_key(|node| node.end_byte() - node.start_byte())
+                .unwrap();
+            let nested = largest
+                .named_children(&mut largest.walk())
+                .collect::<Vec<_>>();
+            let nested_largest = nested
+                .iter()
+                .max_by_key(|node| node.end_byte() - node.start_byte())
+                .unwrap();
+            if class == "lists" {
+                let items = nested_largest
+                    .named_children(&mut nested_largest.walk())
+                    .collect::<Vec<_>>();
+                let item = items
+                    .iter()
+                    .max_by_key(|node| node.end_byte() - node.start_byte())
+                    .unwrap();
+                assert_eq!(children.len(), 1);
+                assert_eq!(nested_largest.kind(), "list");
+                assert!(items.len() > 1000);
+                assert!(item.end_byte() - item.start_byte() <= 128);
+            } else if class == "mixed" {
+                assert!(children.len() > 100);
+                assert!(largest.end_byte() - largest.start_byte() <= 4096);
+            } else {
+                assert_eq!(children.len(), 1);
+                assert!(nested_largest.end_byte() - nested_largest.start_byte() <= 256);
+            }
+            assert!(!children.is_empty());
+        }
+    }
+
+    #[test]
+    fn exact_one_megabyte_prose_and_list_batches_match_fresh_source_after_undo() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/kitchen-sink-1mb.md");
+        let text = std::fs::read_to_string(path).unwrap();
+        assert_eq!(text.len(), 1_048_722);
+        for ranges in [
+            vec![18003..18518, 18524..18551, 18556..18557],
+            std::iter::once(3948..4243).collect(),
+        ] {
+            let edits = ranges
+                .into_iter()
+                .rev()
+                .map(|range| TextEdit {
+                    range,
+                    new_text_len: 0,
+                    new_text: String::new(),
+                })
+                .collect::<Vec<_>>();
+            let collapsed = collapsed_descending_edit(&text, &edits).unwrap();
+            let mut source = Highlighter::new(&text);
+            source.apply_edit(&edits);
+            assert_eq!(source.last_parse_path, ParsePath::Bounded);
+            let mut final_text = text.clone();
+            for edit in &edits {
+                final_text.replace_range(edit.range.clone(), &edit.new_text);
+            }
+            assert_eq!(source.text(), final_text);
+            let fresh = Highlighter::new(&final_text);
+            for lines in [0..8, 125..155, 590..625, 20_000..20_010, 24_350..24_370] {
+                assert_eq!(
+                    source.highlight_lines(lines.clone()),
+                    fresh.highlight_lines(lines)
+                );
+            }
+            assert_eq!(
+                source.spell_block_exclusion_ranges(
+                    collapsed.range.start..collapsed.range.start + collapsed.new_text_len
+                ),
+                fresh.spell_block_exclusion_ranges(
+                    collapsed.range.start..collapsed.range.start + collapsed.new_text_len
+                ),
+            );
+            let inverse = TextEdit {
+                range: collapsed.range.start..collapsed.range.start + collapsed.new_text_len,
+                new_text_len: collapsed.range.len(),
+                new_text: text[collapsed.range.clone()].to_string(),
+            };
+            source.apply_edit(&[inverse]);
+            assert_eq!(source.text(), text);
+            let fresh = Highlighter::new(&text);
+            for lines in [0..8, 125..155, 590..625, 20_000..20_010, 24_350..24_370] {
+                assert_eq!(
+                    source.highlight_lines(lines.clone()),
+                    fresh.highlight_lines(lines)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn realistic_changed_section_parses_with_exact_source_styling() {
+        let before = fixtures::generate("mixed", 1024 * 1024);
+        for midpoint in [false, true] {
+            let line = if midpoint {
+                before.lines().count() / 2
+            } else {
+                6
+            };
+            let start: usize = before.split_inclusive('\n').take(line).map(str::len).sum();
+            let end = start + before[start..].find('\n').unwrap() + 1;
+            let old = Highlighter::new(&before);
+            let root = old.md_tree.root_node();
+            let section = root
+                .named_children(&mut root.walk())
+                .find(|node| node.start_byte() <= start && end <= node.end_byte())
+                .unwrap();
+            let span = section.start_byte()..section.end_byte() - (end - start);
+            let after = format!("{}{}", &before[..start], &before[end..]);
+            let local = Highlighter::new(&after[span.clone()]);
+            let fresh = Highlighter::new(&after);
+            let first_line = after[..span.start]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count();
+            let count = local.text().lines().count();
+            assert_eq!(
+                local.highlight_lines(0..count),
+                fresh.highlight_lines(first_line..first_line + count),
+                "isolated section must retain exact source semantics",
+            );
+        }
+    }
+
+    #[test]
+    fn isolated_prose_and_table_children_match_fresh_source_styling() {
+        for (class, kind) in [("prose", "paragraph"), ("tables", "pipe_table")] {
+            let before = fixtures::generate(class, 1024 * 1024);
+            let source = Highlighter::new(&before);
+            let root = source.md_tree.root_node();
+            let section = root.named_child(0).unwrap();
+            let child = section
+                .named_children(&mut section.walk())
+                .find(|node| node.kind() == kind && node.start_byte() >= before.len() / 2)
+                .unwrap();
+            let span_start = child.start_byte();
+            let span_end = source
+                .line_starts
+                .iter()
+                .copied()
+                .find(|line| *line >= child.end_byte())
+                .unwrap_or(before.len());
+            let (edit_start, edit_end, inserted) = if class == "prose" {
+                let within = before[span_start..child.end_byte()]
+                    .char_indices()
+                    .nth(20)
+                    .unwrap()
+                    .0;
+                (span_start + within, span_start + within, "\n")
+            } else {
+                let rows = source
+                    .line_starts
+                    .iter()
+                    .copied()
+                    .filter(|line| span_start <= *line && *line < span_end)
+                    .collect::<Vec<_>>();
+                (rows[3], span_end, "")
+            };
+            let delta = inserted.len() as isize - (edit_end - edit_start) as isize;
+            let after = format!(
+                "{}{}{}",
+                &before[..edit_start],
+                inserted,
+                &before[edit_end..]
+            );
+            let new_span_end = span_end.checked_add_signed(delta).unwrap();
+            let local = Highlighter::new(&after[span_start..new_span_end]);
+            let fresh = Highlighter::new(&after);
+            let first_line = after[..span_start]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count();
+            let count = local.text().lines().count();
+            assert_eq!(
+                local.highlight_lines(0..count),
+                fresh.highlight_lines(first_line..first_line + count),
+                "{class} child must parse with complete source context",
+            );
+            let mut retained = Highlighter::new(&before);
+            retained.apply_edit(&[TextEdit {
+                range: edit_start..edit_end,
+                new_text_len: inserted.len(),
+                new_text: inserted.into(),
+            }]);
+            assert_eq!(retained.last_parse_path, ParsePath::Bounded, "{class}");
+            assert!(retained.bounded_work_snapshot().0 <= BOUNDED_SOURCE_MAX_REGION_BYTES);
+            assert_eq!(retained.line_starts, fresh.line_starts);
+            assert_eq!(
+                retained.highlight_lines(first_line.saturating_sub(4)..first_line + count + 4),
+                fresh.highlight_lines(first_line.saturating_sub(4)..first_line + count + 4),
+                "{class} retained source must remain exact",
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_source_line_delete_and_undo_match_fresh_analysis() {
+        let before = fixtures::generate("mixed", 1024 * 1024);
+        let midpoint = before
+            .lines()
+            .enumerate()
+            .skip(before.lines().count() / 2)
+            .find_map(|(line, content)| content.starts_with("## ").then_some(line + 2))
+            .unwrap();
+        for line in [6, midpoint] {
+            let start: usize = before.split_inclusive('\n').take(line).map(str::len).sum();
+            let end = start + before[start..].find('\n').unwrap() + 1;
+            let deleted = &before[start..end];
+            let mut highlighter = Highlighter::new(&before);
+            for (edit, current) in [
+                (
+                    TextEdit {
+                        range: start..end,
+                        new_text_len: 0,
+                        new_text: String::new(),
+                    },
+                    format!("{}{}", &before[..start], &before[end..]),
+                ),
+                (
+                    TextEdit {
+                        range: start..start,
+                        new_text_len: deleted.len(),
+                        new_text: deleted.to_string(),
+                    },
+                    before.clone(),
+                ),
+            ] {
+                highlighter.apply_edit(&[edit]);
+                assert_eq!(highlighter.text(), current);
+                assert_eq!(highlighter.last_parse_path, ParsePath::Bounded);
+                assert!(highlighter.last_bounded_bytes <= BOUNDED_SOURCE_MAX_REGION_BYTES);
+                assert_eq!(highlighter.changed_lines_snapshot(), 0);
+                let fresh = Highlighter::new(&current);
+                assert_eq!(highlighter.line_starts, fresh.line_starts);
+                assert_eq!(
+                    highlighter.spell_reference_labels,
+                    fresh.spell_reference_labels
+                );
+                let injection_key = |injection: &Injection| {
+                    (
+                        injection.start,
+                        injection.end,
+                        injection.language_name,
+                        injection.kind,
+                    )
+                };
+                assert_eq!(
+                    highlighter
+                        .injections
+                        .iter()
+                        .map(injection_key)
+                        .collect::<Vec<_>>(),
+                    fresh
+                        .injections
+                        .iter()
+                        .map(injection_key)
+                        .collect::<Vec<_>>(),
+                );
+                assert_eq!(
+                    highlighter.spell_block_exclusion_ranges(0..current.len()),
+                    fresh.spell_block_exclusion_ranges(0..current.len()),
+                );
+                let line_count = fresh.line_starts.len();
+                for first in [0, line.saturating_sub(20), line_count.saturating_sub(80)] {
+                    let end = (first + 80).min(line_count);
+                    assert_eq!(
+                        highlighter.highlight_lines(first..end),
+                        fresh.highlight_lines(first..end),
+                        "source viewport must match at line {first}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn two_distant_source_patches_remain_exact_through_reverse_edits() {
+        fn line_range(text: &str, line: usize) -> Range<usize> {
+            let start: usize = text.split_inclusive('\n').take(line).map(str::len).sum();
+            start..start + text[start..].find('\n').unwrap() + 1
+        }
+
+        fn verify(current: &str, highlighter: &Highlighter, anchors: &[usize]) {
+            let fresh = Highlighter::new(current);
+            assert_eq!(highlighter.line_starts, fresh.line_starts);
+            assert_eq!(
+                highlighter.spell_reference_labels,
+                fresh.spell_reference_labels
+            );
+            assert_eq!(
+                highlighter.spell_block_exclusion_ranges(0..current.len()),
+                fresh.spell_block_exclusion_ranges(0..current.len()),
+            );
+            let injection_key = |injection: &Injection| {
+                (
+                    injection.start,
+                    injection.end,
+                    injection.language_name,
+                    injection.kind,
+                )
+            };
+            assert_eq!(
+                highlighter
+                    .injections
+                    .iter()
+                    .map(injection_key)
+                    .collect::<Vec<_>>(),
+                fresh
+                    .injections
+                    .iter()
+                    .map(injection_key)
+                    .collect::<Vec<_>>(),
+            );
+            for &anchor in anchors {
+                let line = fresh.line_starts.partition_point(|start| *start <= anchor) - 1;
+                let range = line.saturating_sub(10)..line + 40;
+                assert_eq!(
+                    highlighter.highlight_lines(range.clone()),
+                    fresh.highlight_lines(range)
+                );
+            }
+        }
+
+        let mut current = fixtures::generate("mixed", 1024 * 1024);
+        let mut highlighter = Highlighter::new(&current);
+        let top = line_range(&current, 6);
+        let top_text = current[top.clone()].to_string();
+        highlighter.apply_edit(&[TextEdit {
+            range: top.clone(),
+            new_text_len: 0,
+            new_text: String::new(),
+        }]);
+        current.replace_range(top.clone(), "");
+        assert_eq!(highlighter.last_parse_path, ParsePath::Bounded);
+        verify(&current, &highlighter, &[top.start, current.len() - 1]);
+
+        let mid_heading = current
+            .lines()
+            .enumerate()
+            .skip(current.lines().count() / 2)
+            .find_map(|(line, content)| content.starts_with("## ").then_some(line + 2))
+            .unwrap();
+        let middle = line_range(&current, mid_heading);
+        let middle_text = current[middle.clone()].to_string();
+        highlighter.apply_edit(&[TextEdit {
+            range: middle.clone(),
+            new_text_len: 0,
+            new_text: String::new(),
+        }]);
+        current.replace_range(middle.clone(), "");
+        assert_eq!(highlighter.last_parse_path, ParsePath::Bounded);
+        assert_eq!(highlighter.patches.len(), 2);
+        verify(
+            &current,
+            &highlighter,
+            &[top.start, middle.start, current.len() - 1],
+        );
+
+        for (start, deleted) in [(middle.start, middle_text), (top.start, top_text)] {
+            highlighter.apply_edit(&[TextEdit {
+                range: start..start,
+                new_text_len: deleted.len(),
+                new_text: deleted.clone(),
+            }]);
+            current.insert_str(start, &deleted);
+            assert_eq!(highlighter.last_parse_path, ParsePath::Bounded);
+            verify(
+                &current,
+                &highlighter,
+                &[top.start, start, current.len() - 1],
+            );
+        }
+    }
+
+    #[test]
+    fn fence_language_rebuilds_local_injection_and_delimiter_expands_globally() {
+        let mut current = fixtures::generate("mixed", 1024 * 1024);
+        let mut highlighter = Highlighter::new(&current);
+        let label = current.find("```rust").unwrap() + 3;
+        highlighter.apply_edit(&[TextEdit {
+            range: label..label + 4,
+            new_text_len: 7,
+            new_text: "unknown".into(),
+        }]);
+        current.replace_range(label..label + 4, "unknown");
+        assert_eq!(highlighter.last_parse_path, ParsePath::Bounded);
+        let fresh = Highlighter::new(&current);
+        let first_line = highlighter
+            .line_starts
+            .partition_point(|start| *start <= label)
+            - 1;
+        assert_eq!(
+            highlighter.highlight_lines(first_line..first_line + 20),
+            fresh.highlight_lines(first_line..first_line + 20)
+        );
+        assert_eq!(highlighter.injections.len(), fresh.injections.len());
+        assert!(!highlighter
+            .injections
+            .iter()
+            .any(|injection| injection.start <= label && label < injection.end));
+
+        let delimiter = current.find("```unknown").unwrap();
+        highlighter.apply_edit(&[TextEdit {
+            range: delimiter..delimiter + 1,
+            new_text_len: 0,
+            new_text: String::new(),
+        }]);
+        current.remove(delimiter);
+        assert_eq!(highlighter.last_parse_path, ParsePath::Incremental);
+        assert!(highlighter.patches.is_empty());
+        let fresh = Highlighter::new(&current);
+        assert_eq!(
+            highlighter.highlight_lines(first_line..first_line + 50),
+            fresh.highlight_lines(first_line..first_line + 50)
+        );
+        assert_eq!(
+            highlighter.spell_reference_labels,
+            fresh.spell_reference_labels
+        );
+    }
+
+    #[test]
+    fn reference_definition_edit_invalidates_existing_source_patches() {
+        let mut current = fixtures::generate("mixed-reference", 1024 * 1024);
+        let mut highlighter = Highlighter::new(&current);
+        let start: usize = current.split_inclusive('\n').take(8).map(str::len).sum();
+        let end = start + current[start..].find('\n').unwrap() + 1;
+        highlighter.apply_edit(&[TextEdit {
+            range: start..end,
+            new_text_len: 0,
+            new_text: String::new(),
+        }]);
+        current.replace_range(start..end, "");
+        assert_eq!(highlighter.last_parse_path, ParsePath::Bounded);
+        assert_eq!(highlighter.patches.len(), 1);
+
+        let definition = current.find("[shared]:").unwrap();
+        highlighter.apply_edit(&[TextEdit {
+            range: definition..definition,
+            new_text_len: 1,
+            new_text: "#".into(),
+        }]);
+        current.insert(definition, '#');
+        assert_eq!(highlighter.last_parse_path, ParsePath::Incremental);
+        assert!(highlighter.patches.is_empty());
+        let fresh = Highlighter::new(&current);
+        assert_eq!(
+            highlighter.spell_reference_labels,
+            fresh.spell_reference_labels
+        );
+        assert_eq!(highlighter.injections.len(), fresh.injections.len());
+        for first in [0, 30, fresh.line_starts.len().saturating_sub(50)] {
+            assert_eq!(
+                highlighter.highlight_lines(first..first + 50),
+                fresh.highlight_lines(first..first + 50)
+            );
+        }
+    }
+
+    #[test]
+    fn seeded_large_source_edit_undo_sequence_matches_fresh_analysis() {
+        const SEED: u64 = 0x5eed_cafe_1234_5678;
+        let mut seed = SEED;
+        let mut current = fixtures::generate("mixed", 1024 * 1024);
+        let mut highlighter = Highlighter::new(&current);
+        for step in 0..16 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let prose_lines = current
+                .lines()
+                .enumerate()
+                .filter_map(|(line, content)| {
+                    content.starts_with("A paragraph with").then_some(line)
+                })
+                .collect::<Vec<_>>();
+            let line = prose_lines[(seed as usize) % prose_lines.len()];
+            let start: usize = current.split_inclusive('\n').take(line).map(str::len).sum();
+            let end = start + current[start..].find('\n').unwrap() + 1;
+            let (old_range, inserted) = if step % 2 == 0 {
+                (start..end, "")
+            } else {
+                (start..start, "\n")
+            };
+            let removed = current[old_range.clone()].to_string();
+            highlighter.apply_edit(&[TextEdit {
+                range: old_range.clone(),
+                new_text_len: inserted.len(),
+                new_text: inserted.into(),
+            }]);
+            current.replace_range(old_range, inserted);
+            for reverse in [false, true] {
+                if reverse {
+                    highlighter.apply_edit(&[TextEdit {
+                        range: start..start + inserted.len(),
+                        new_text_len: removed.len(),
+                        new_text: removed.clone(),
+                    }]);
+                    current.replace_range(start..start + inserted.len(), &removed);
+                }
+                assert_eq!(
+                    highlighter.last_parse_path,
+                    ParsePath::Bounded,
+                    "seed {SEED:x}, step {step}, reverse {reverse}"
+                );
+                assert!(highlighter.last_bounded_bytes <= BOUNDED_SOURCE_MAX_REGION_BYTES);
+                let fresh = Highlighter::new(&current);
+                assert_eq!(highlighter.line_starts, fresh.line_starts);
+                assert_eq!(
+                    highlighter.spell_reference_labels,
+                    fresh.spell_reference_labels
+                );
+                let injection_key = |injection: &Injection| {
+                    (
+                        injection.start,
+                        injection.end,
+                        injection.language_name,
+                        injection.kind,
+                    )
+                };
+                assert_eq!(
+                    highlighter
+                        .injections
+                        .iter()
+                        .map(injection_key)
+                        .collect::<Vec<_>>(),
+                    fresh
+                        .injections
+                        .iter()
+                        .map(injection_key)
+                        .collect::<Vec<_>>(),
+                );
+                assert_eq!(
+                    highlighter.spell_block_exclusion_ranges(0..current.len()),
+                    fresh.spell_block_exclusion_ranges(0..current.len()),
+                );
+                let edit_line = fresh.line_starts.partition_point(|offset| *offset <= start) - 1;
+                let last_line = fresh.line_starts.len().saturating_sub(80);
+                for first in [0, edit_line.saturating_sub(20), last_line] {
+                    assert_eq!(
+                        highlighter.highlight_lines(first..first + 80),
+                        fresh.highlight_lines(first..first + 80),
+                        "seed {SEED:x}, step {step}, reverse {reverse}, line {first}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn reference_snippet_groups(
+        text: &str,
+        line_starts: &[usize],
+        num_lines: usize,
+        spans: &[ByteSpan],
+    ) -> Vec<Vec<RankedSpan>> {
+        (0..num_lines)
+            .map(|line_idx| {
+                let line_start = line_starts[line_idx];
+                let next_start = line_starts.get(line_idx + 1).copied().unwrap_or(text.len());
+                let line_end =
+                    if next_start > line_start && text.as_bytes()[next_start - 1] == b'\n' {
+                        next_start - 1
+                    } else {
+                        next_start
+                    };
+                let line_text = &text[line_start..line_end];
+                spans
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, span)| span.start_byte < line_end && span.end_byte > line_start)
+                    .map(|(priority, span)| RankedSpan {
+                        span: Span {
+                            start_col: byte_offset_to_char_index(
+                                line_text,
+                                span.start_byte.max(line_start) - line_start,
+                            ),
+                            end_col: byte_offset_to_char_index(
+                                line_text,
+                                span.end_byte.min(line_end) - line_start,
+                            ),
+                            style: span.style,
+                        },
+                        priority,
+                    })
+                    .collect()
+            })
+            .collect()
+    }
 
     #[test]
     fn new_end_point_empty_text() {
@@ -2429,6 +4395,23 @@ mod tests {
     }
 
     #[test]
+    fn word_insertion_at_paragraph_boundary_reparses_source_ownership() {
+        let text = "#\nr<%(PW<w\nDEFG\nSBqs&\n";
+        let mut highlighter = Highlighter::new(text);
+        let edit = TextEdit {
+            range: 2..2,
+            new_text_len: 3,
+            new_text: "JKL".to_string(),
+        };
+        highlighter.apply_edit(&[edit]);
+        assert_eq!(highlighter.text(), "#\nJKLr<%(PW<w\nDEFG\nSBqs&\n");
+        assert_eq!(
+            highlighter.highlight_lines(0..5),
+            Highlighter::new(highlighter.text()).highlight_lines(0..5),
+        );
+    }
+
+    #[test]
     fn block_parser_reparses_same_marker_class_when_structure_can_change() {
         let mut highlighter = Highlighter::new("Title\n---\n");
         highlighter.apply_edit(&[TextEdit {
@@ -2626,7 +4609,7 @@ mod tests {
         let mut highlighter = Highlighter::new(text);
 
         assert_eq!(highlighter.injections.len(), 2);
-        assert_eq!(highlighter.query_cache.len(), 1);
+        assert_eq!(highlighter.query_cache.borrow().len(), 1);
         assert!(Arc::ptr_eq(
             &highlighter.injections[0].query,
             &highlighter.injections[1].query
@@ -2634,6 +4617,7 @@ mod tests {
         let cached_query = Arc::clone(
             highlighter
                 .query_cache
+                .borrow()
                 .get("rust")
                 .expect("Rust query should be cached"),
         );
@@ -2645,11 +4629,12 @@ mod tests {
             new_text: "x".to_string(),
         }]);
 
-        assert_eq!(highlighter.query_cache.len(), 1);
+        assert_eq!(highlighter.query_cache.borrow().len(), 1);
         assert!(Arc::ptr_eq(
             &cached_query,
             highlighter
                 .query_cache
+                .borrow()
                 .get("rust")
                 .expect("Rust query should remain cached")
         ));
@@ -2657,6 +4642,383 @@ mod tests {
             .injections
             .iter()
             .all(|injection| Arc::ptr_eq(&cached_query, &injection.query)));
+    }
+
+    #[test]
+    fn rendered_fences_share_canonical_queries_across_aliases_layouts_and_edits() {
+        let text = "```rust\nfn first() {}\n```\n\n```rust\nfn second() {}\n```\n\n```py\nprint('hi')\n```\n\n```unknown\nno grammar\n```\n";
+        let mut highlighter = Highlighter::new(text);
+        assert_eq!(highlighter.query_compile_count.get(), 2);
+
+        for (lang, snippet) in [
+            ("rust", "fn first() {}\n"),
+            ("py", "print('hi')\n"),
+            ("PYTHON", "print('hi')\n"),
+            ("unknown", "no grammar\n"),
+        ] {
+            assert_eq!(
+                highlighter.highlight_snippet(lang, snippet),
+                highlight_snippet(lang, snippet),
+                "cached and uncached styled lines differ for {lang}"
+            );
+        }
+        assert_eq!(highlighter.query_compile_count.get(), 2);
+
+        let model = BlockModel::build(text, None);
+        let wide = RenderedLayout::build(&model, 80, &highlighter);
+        let narrow = RenderedLayout::build(&model, 34, &highlighter);
+        assert_eq!(wide, RenderedLayout::build(&model, 80, &highlighter));
+        assert_eq!(narrow, RenderedLayout::build(&model, 34, &highlighter));
+        assert_eq!(highlighter.query_compile_count.get(), 2);
+
+        let offset = text.find("first").expect("first fence content");
+        highlighter.apply_edit(&[TextEdit {
+            range: offset..offset + 5,
+            new_text_len: 5,
+            new_text: "third".to_string(),
+        }]);
+        let edited = highlighter.text();
+        let edited_model = BlockModel::build(edited, None);
+        let edited_layout = RenderedLayout::build(&edited_model, 80, &highlighter);
+        assert_ne!(edited_layout, wide);
+        assert_eq!(highlighter.query_compile_count.get(), 2);
+
+        let reloaded = Highlighter::new(edited);
+        assert_eq!(reloaded.query_compile_count.get(), 2);
+        assert_eq!(
+            edited_layout,
+            RenderedLayout::build(&edited_model, 80, &reloaded)
+        );
+        assert_eq!(reloaded.query_compile_count.get(), 2);
+    }
+
+    #[test]
+    fn rendered_only_language_compiles_once_and_unknown_never_compiles() {
+        let highlighter = Highlighter::new("plain prose\n");
+        assert_eq!(highlighter.query_compile_count.get(), 0);
+        for _ in 0..3 {
+            assert_eq!(
+                highlighter.highlight_snippet("golang", "package main\n"),
+                highlight_snippet("go", "package main\n")
+            );
+            assert_eq!(
+                highlighter.highlight_snippet("unknown", "opaque\n"),
+                highlight_snippet("unknown", "opaque\n")
+            );
+        }
+        assert_eq!(highlighter.query_compile_count.get(), 1);
+        assert_eq!(highlighter.query_cache.borrow().len(), 1);
+    }
+
+    #[test]
+    fn long_valid_and_malformed_snippet_groups_match_quadratic_reference() {
+        let cases = [
+            (
+                "rust",
+                format!("fn main() {{\n{} }}\n", "let value = 123;\n".repeat(4096)),
+            ),
+            ("rust", "let = + ???;\n".repeat(4096)),
+            ("py", "print('café')\r\n".repeat(4096)),
+        ];
+        for (alias, snippet) in cases {
+            let language = languages::find_by_alias(alias).expect("known language");
+            let grammar = (language.language_fn)();
+            let query = Query::new(&grammar, language.highlights_query).expect("valid query");
+            let spans = collect_snippet_spans(&snippet, &grammar, &query).expect("parsed snippet");
+            let starts = line_start_indices(&snippet);
+            let lines = starts.len().saturating_sub(1);
+            let (grouped, _) = group_snippet_spans(&snippet, &starts, lines, &spans);
+            assert_eq!(
+                grouped,
+                reference_snippet_groups(&snippet, &starts, lines, &spans),
+                "span grouping changed for {alias}"
+            );
+            let highlighter = Highlighter::new("plain text\n");
+            let highlighted = highlighter.highlight_snippet(alias, &snippet);
+            assert_eq!(highlighted.len(), lines);
+            assert!(highlighted.iter().any(|line| !line.spans.is_empty()));
+        }
+    }
+
+    #[test]
+    fn long_unicode_fence_keeps_byte_exact_rendered_atoms() {
+        let text = format!("```rust\n{}```\n", "let café = \"界\";\n".repeat(1024));
+        let highlighter = Highlighter::new(&text);
+        let model = BlockModel::build(&text, None);
+        let layout = RenderedLayout::build(&model, 120, &highlighter);
+        let rows = layout
+            .lines
+            .iter()
+            .filter(|line| {
+                line.role == RenderedLineRole::CodeFence && line.kind == LineKind::Content
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1024);
+        for row in rows {
+            let mut ranges = row
+                .atoms
+                .iter()
+                .filter_map(|atom| atom.source.clone())
+                .collect::<Vec<_>>();
+            ranges.sort_by_key(|range| range.start);
+            assert_eq!(
+                ranges.first().map(|range| range.start),
+                Some(row.source.start),
+                "source={:?}, text={:?}, atoms={:?}",
+                row.source,
+                row.styled.text,
+                ranges
+            );
+            let visible_end = row.source.end
+                - usize::from(text.as_bytes().get(row.source.end - 1) == Some(&b'\n'));
+            assert_eq!(ranges.last().map(|range| range.end), Some(visible_end));
+            assert!(ranges.windows(2).all(|pair| pair[0].end == pair[1].start));
+            assert_eq!(&text[row.source.start..visible_end], "let café = \"界\";");
+        }
+    }
+
+    #[test]
+    fn snippet_grouping_visits_only_intersected_lines() {
+        let text = "value\n".repeat(4096);
+        let starts = line_start_indices(&text);
+        let mut spans = vec![ByteSpan {
+            start_byte: 0,
+            end_byte: text.len(),
+            style: SemanticStyle::CodeBlock,
+        }];
+        spans.extend((0..4096).map(|line| ByteSpan {
+            start_byte: starts[line],
+            end_byte: starts[line] + 5,
+            style: SemanticStyle::Keyword,
+        }));
+        let (grouped, visits) = group_snippet_spans(&text, &starts, 4096, &spans);
+        assert_eq!(
+            grouped,
+            reference_snippet_groups(&text, &starts, 4096, &spans)
+        );
+        assert!(visits <= 8192, "visited {visits} span/line pairs");
+    }
+
+    #[test]
+    fn source_injection_parse_is_reused_and_incrementally_updated_by_fence_edits() {
+        let mut text = format!(
+            "intro\n```rust\nfn main() {{\n{} }}\n```\noutro\n",
+            "let value = 123;\n".repeat(256)
+        );
+        let mut highlighter = Highlighter::new(&text);
+        assert_eq!(highlighter.source_injection_parse_count.get(), 0);
+        let first = highlighter.highlight_lines(2..12);
+        assert_eq!(highlighter.source_injection_parse_count.get(), 1);
+        assert_eq!(first, highlighter.highlight_lines(2..12));
+        assert_eq!(highlighter.source_injection_parse_count.get(), 1);
+        highlighter.highlight_lines(100..110);
+        assert_eq!(highlighter.source_injection_parse_count.get(), 1);
+
+        let offset = text.find("value").expect("inside fence");
+        highlighter.apply_edit(&[TextEdit {
+            range: offset..offset + 5,
+            new_text_len: 5,
+            new_text: "other".to_string(),
+        }]);
+        assert_eq!(highlighter.last_parse_path, ParsePath::FenceInterior);
+        text.replace_range(offset..offset + 5, "other");
+        assert_eq!(
+            highlighter.highlight_lines(2..12),
+            Highlighter::new(&text).highlight_lines(2..12)
+        );
+        assert_eq!(highlighter.source_injection_parse_count.get(), 1);
+
+        highlighter.apply_edit(&[TextEdit {
+            range: 0..0,
+            new_text_len: 2,
+            new_text: "x\n".to_string(),
+        }]);
+        text.insert_str(0, "x\n");
+        assert_eq!(
+            highlighter.highlight_lines(3..13),
+            Highlighter::new(&text).highlight_lines(3..13)
+        );
+        assert_eq!(highlighter.source_injection_parse_count.get(), 2);
+    }
+
+    #[test]
+    fn block_neutral_edits_rebase_injections_without_rediscovery() {
+        let mut text = concat!(
+            "---\ntitle: Performance fixture\n---\n",
+            "intro paragraph for the editor\n",
+            "```rust\nfn first() { let value = 123; }\n```\n",
+            "middle paragraph for the editor\n",
+            "```rust\nfn second() { let value = 456; }\n```\n",
+        )
+        .to_string();
+        let mut highlighter = Highlighter::new(&text);
+        let scan_count = highlighter.injection_scan_count;
+        highlighter.highlight_lines(0..highlighter.line_starts.len());
+        assert_eq!(highlighter.source_parse_cache.borrow().len(), 3);
+
+        for (old, new, path, affected_cache_entries) in [
+            ("intro", "opening", ParsePath::BlockNeutral, 3),
+            ("123", "12345", ParsePath::FenceInterior, 3),
+            ("fixture", "document", ParsePath::BlockNeutral, 2),
+        ] {
+            let start = text.find(old).unwrap();
+            highlighter.apply_edit(&[TextEdit {
+                range: start..start + old.len(),
+                new_text_len: new.len(),
+                new_text: new.to_string(),
+            }]);
+            text.replace_range(start..start + old.len(), new);
+            let fresh = Highlighter::new(&text);
+            assert_eq!(highlighter.last_parse_path, path, "edit {old:?} to {new:?}");
+            assert_eq!(highlighter.injection_scan_count, scan_count);
+            assert_eq!(
+                highlighter
+                    .injections
+                    .iter()
+                    .map(|injection| (injection.start, injection.end, injection.language_name))
+                    .collect::<Vec<_>>(),
+                fresh
+                    .injections
+                    .iter()
+                    .map(|injection| (injection.start, injection.end, injection.language_name))
+                    .collect::<Vec<_>>(),
+            );
+            assert_eq!(
+                highlighter.source_parse_cache.borrow().len(),
+                affected_cache_entries,
+            );
+            assert_eq!(
+                highlighter.highlight_lines(0..highlighter.line_starts.len()),
+                fresh.highlight_lines(0..fresh.line_starts.len()),
+            );
+        }
+    }
+
+    #[test]
+    fn html_block_boundary_edit_uses_wide_source_reparse() {
+        let mut text = "ordinary paragraph line for a large note\n".repeat(3500);
+        text.push_str("\n<div>\ninside html\n</div>\n\nfinal paragraph\n");
+        let mut highlighter = Highlighter::new(&text);
+        let start = text.find("<div>").unwrap();
+        highlighter.apply_edit(&[TextEdit {
+            range: start..start + 5,
+            new_text_len: 5,
+            new_text: "plain".to_string(),
+        }]);
+        text.replace_range(start..start + 5, "plain");
+        let fresh = Highlighter::new(&text);
+        assert_eq!(highlighter.last_parse_path, ParsePath::Incremental);
+        assert_eq!(highlighter.bounded_work_snapshot().2, 0);
+        assert_eq!(highlighter.line_starts, fresh.line_starts);
+        assert_eq!(
+            highlighter.spell_block_exclusion_ranges(0..text.len()),
+            fresh.spell_block_exclusion_ranges(0..text.len()),
+        );
+        let first = highlighter
+            .line_starts
+            .partition_point(|line| *line < start);
+        assert_eq!(
+            highlighter.highlight_lines(first.saturating_sub(2)..first + 7),
+            fresh.highlight_lines(first.saturating_sub(2)..first + 7),
+        );
+    }
+
+    #[test]
+    fn source_injection_cache_stays_bounded_after_many_fences() {
+        let text = (0..20)
+            .map(|number| format!("```rust\nlet value = {number};\n```\n"))
+            .collect::<String>();
+        let highlighter = Highlighter::new(&text);
+        for line in (1..60).step_by(3) {
+            highlighter.highlight_lines(line..line + 1);
+        }
+        assert_eq!(highlighter.source_injection_parse_count.get(), 20);
+        assert_eq!(
+            highlighter.source_parse_cache.borrow().len(),
+            SOURCE_PARSE_CACHE_MAX_ENTRIES
+        );
+        assert!(
+            highlighter
+                .source_parse_cache
+                .borrow()
+                .iter()
+                .map(|entry| entry.end - entry.start)
+                .sum::<usize>()
+                <= SOURCE_PARSE_CACHE_MAX_SOURCE_BYTES
+        );
+    }
+
+    #[test]
+    fn source_injection_cache_releases_stale_entries_across_edits_and_languages() {
+        fn replace(highlighter: &mut Highlighter, text: &mut String, old: &str, new: &str) {
+            let start = text.find(old).expect("fixture token exists");
+            highlighter.apply_edit(&[TextEdit {
+                range: start..start + old.len(),
+                new_text_len: new.len(),
+                new_text: new.to_string(),
+            }]);
+            text.replace_range(start..start + old.len(), new);
+            assert_eq!(highlighter.text(), text.as_str());
+            let fresh = Highlighter::new(text);
+            assert_eq!(
+                highlighter.highlight_lines(0..highlighter.line_starts.len()),
+                fresh.highlight_lines(0..fresh.line_starts.len()),
+            );
+            let cache = highlighter.source_parse_cache.borrow();
+            assert!(cache.len() <= SOURCE_PARSE_CACHE_MAX_ENTRIES);
+            assert!(
+                cache
+                    .iter()
+                    .map(|entry| entry.end - entry.start)
+                    .sum::<usize>()
+                    <= SOURCE_PARSE_CACHE_MAX_SOURCE_BYTES
+            );
+            assert!(cache.iter().all(|entry| {
+                entry.start < entry.end
+                    && entry.end <= text.len()
+                    && highlighter.injections.iter().any(|injection| {
+                        injection.start == entry.start
+                            && injection.end == entry.end
+                            && injection.language_name == entry.language_name
+                    })
+            }));
+        }
+
+        let mut text = format!(
+            "---\ntitle: cache ownership\n---\n```rust\n{}\n```\n```go\n{}\n```\n",
+            "let rust_value = 123;\n".repeat(64),
+            "goValue := 456\n".repeat(64),
+        );
+        let mut highlighter = Highlighter::new(&text);
+        highlighter.highlight_lines(0..highlighter.line_starts.len());
+        for _ in 0..12 {
+            replace(
+                &mut highlighter,
+                &mut text,
+                "rust_value = 123",
+                "rust_value = 789",
+            );
+            replace(
+                &mut highlighter,
+                &mut text,
+                "rust_value = 789",
+                "rust_value = 123",
+            );
+            replace(&mut highlighter, &mut text, "```rust", "```go  ");
+            replace(&mut highlighter, &mut text, "```go  ", "```rust");
+            replace(
+                &mut highlighter,
+                &mut text,
+                "goValue := 456",
+                "goValue := 012",
+            );
+            replace(
+                &mut highlighter,
+                &mut text,
+                "goValue := 012",
+                "goValue := 456",
+            );
+        }
     }
 
     #[test]
@@ -3148,8 +5510,13 @@ mod tests {
                         prop_assert_eq!(
                             incremental[i].spans.len(),
                             fresh[i].spans.len(),
-                            "line {} span count mismatch after edit",
-                            i
+                            "line {} span count mismatch after byte {}, range {:?}, insert {:?}, current text {:?}, parse path {:?}",
+                            i,
+                            byte,
+                            edit.range,
+                            edit.new_text,
+                            current_text,
+                            highlighter.last_parse_path,
                         );
 
                         for j in 0..incremental[i].spans.len().min(fresh[i].spans.len()) {

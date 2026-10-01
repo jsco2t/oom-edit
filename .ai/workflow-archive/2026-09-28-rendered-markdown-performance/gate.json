@@ -1,0 +1,17 @@
+{
+  "standard_commands": [
+    "make check"
+  ],
+  "final_commands": [
+    "make check",
+    "make bench",
+    "make bench-realistic",
+    "make bench-rss-stability",
+    "make bench-interactions",
+    "make bench-acceptance-1mb",
+    "make test-public-api",
+    "make test-embedding-example",
+    "make test-standalone-host",
+    "make bench-acceptance-1mb-prose-cycles"
+  ]
+}

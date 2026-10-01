@@ -65,6 +65,11 @@ mod style;
 mod syntax;
 mod vim;
 
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../oom-edit/perf/realistic_fixtures.rs"]
+mod realistic_fixtures;
+
 // ── Public re-exports ──────────────────────────────────────────────────────
 
 // Complete public API surface.
@@ -90,8 +95,9 @@ pub use spell::{
 };
 pub use style::{
     JumpTarget, LineKind, RenderedLayout, RenderedLine, RenderedLineRole, RenderedPoint,
-    RenderedSearch, RenderedSelection, RenderedSelectionRow, RenderedSourceAtom, SearchDirection,
-    SelectionShape, SemanticStyle, SourceDecoration, SourceFrame, Span, StyledLine, TargetKind,
+    RenderedSearch, RenderedSelection, RenderedSelectionRow, RenderedSourceAtom,
+    RenderedViewportFrame, SearchDirection, SelectionShape, SemanticStyle, SourceDecoration,
+    SourceFrame, Span, StyledLine, TargetKind,
 };
 
 #[cfg(test)]

@@ -140,6 +140,34 @@ fn edit_save_reload_preserves_exact_lf_and_crlf_bytes() {
 }
 
 #[test]
+fn full_line_character_mutation_preserves_crlf_serialization_policy() {
+    let directory = tempfile::tempdir().unwrap();
+    for (name, original, expected) in [
+        ("terminated.md", "alpha\r\nbeta\r\n", "alpha\r\n"),
+        ("unterminated.md", "alpha\r\nbeta", "alpha"),
+    ] {
+        for operation in ['d', 'c'] {
+            let path = directory.path().join(format!("{operation}-{name}"));
+            write(&path, original);
+            let mut session = EditorSession::open(&path).unwrap();
+            let normalized = session.document();
+            let start = normalized.find("beta").unwrap();
+            session.select_source_offsets(start, start + 3, 40).unwrap();
+            session.handle_key(key(operation));
+            if operation == 'c' {
+                session.handle_key(esc());
+            }
+            session.save(None, false).unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+            assert_eq!(
+                EditorSession::open_existing(&path).unwrap().document(),
+                expected.replace("\r\n", "\n")
+            );
+        }
+    }
+}
+
+#[test]
 fn session_front_matter_is_live_and_parser_neutral() {
     let session = EditorSession::from_text("---\ntitle: Hello\nauthor: World\n---\n\nBody\n");
     match session.front_matter() {

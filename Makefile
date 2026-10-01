@@ -19,7 +19,7 @@ PERF_ROOT ?= $(CURDIR)
 
 .PHONY: help
 help: ## Show this help (default)
-	@grep -E '^[a-zA-Z_-]+:.*##' $(MAKEFILE_LIST) \
+	@grep -E '^[a-zA-Z0-9_-]+:.*##' $(MAKEFILE_LIST) \
 		| awk 'BEGIN {FS = ":.*## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
 # ---------------------------------------------------------------------------
@@ -58,7 +58,7 @@ sync-notices: ## Refresh the byte-identical crate-local copy of canonical third-
 # Test
 # ---------------------------------------------------------------------------
 .PHONY: test
-test: feature-workflow-test tui-perf-test ci-workflow-test drd-coverage-test grammar-generation-test downstream-tool-test terminal-guard-tool-test ## Run the full test suite
+test: feature-workflow-test tui-perf-test realistic-perf-test acceptance-1mb-perf-test rss-stability-test ci-workflow-test drd-coverage-test grammar-generation-test downstream-tool-test terminal-guard-tool-test ## Run the full test suite
 	bash scripts/with-isolated-config.sh cargo test --workspace --offline --locked
 
 .PHONY: downstream-tool-test
@@ -163,6 +163,30 @@ feature-workflow-test: ## Test feature-workflow helper scripts
 .PHONY: tui-perf-test
 tui-perf-test: ## Test TUI performance evidence tooling
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_tui_performance.py'
+
+.PHONY: realistic-perf-test
+realistic-perf-test: ## Test realistic fixture and measurement contracts
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_realistic_performance.py'
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_interaction_performance.py'
+	cargo test --package oom-edit --test realistic_fixtures --offline --locked
+
+.PHONY: test-realistic-performance
+test-realistic-performance: realistic-perf-test ## Verify realistic fixture and runner shape
+
+.PHONY: acceptance-1mb-perf-test
+acceptance-1mb-perf-test: ## Test exact large-note acceptance runner contracts
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_acceptance_1mb.py'
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_acceptance_1mb_prose_cycles.py'
+
+.PHONY: rss-stability-test
+rss-stability-test: ## Test current-RSS stability runner contracts
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_rss_stability.py'
+
+.PHONY: test-incremental
+test-incremental: ## Run bounded-update differential and propagation tests
+	cargo test -p oom-edit-core --lib syntax::tests --offline --locked
+	cargo test -p oom-edit-core --lib rendered::retained::tests --offline --locked
+	cargo test -p oom-edit-core --lib rendered::rows::tests --offline --locked
 
 .PHONY: ci-workflow-test
 ci-workflow-test: ## Test the GitHub Actions workflow contract
@@ -273,6 +297,11 @@ check: ## Run fmt-check + lint + build + test + deny + audit + data-license-chec
 	echo "test"; \
 	if PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .agents/skills/feature-workflow/tests -p 'test_*.py' 2>&1 \
 		&& PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_tui_performance.py' 2>&1 \
+		&& PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_realistic_performance.py' 2>&1 \
+		&& PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_interaction_performance.py' 2>&1 \
+		&& PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_acceptance_1mb.py' 2>&1 \
+		&& PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_acceptance_1mb_prose_cycles.py' 2>&1 \
+		&& PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_rss_stability.py' 2>&1 \
 		&& PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_ci_workflow.py' 2>&1 \
 		&& PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_drd_coverage.py' 2>&1 \
 		&& PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_regenerate_markdown.py' 2>&1 \
@@ -402,6 +431,160 @@ bench-check: ## Run asserting debug performance smoke gates
 	cargo test -p oom-spell --offline --locked --test perf_smoke
 	cargo test -p oom-edit-core --offline --locked --test perf_smoke
 	cargo test -p oom-edit --offline --locked --lib perf_tests::tui_gutter_debug_performance_smoke -- --exact --ignored --test-threads=1
+
+.PHONY: bench-realistic
+bench-realistic: ## Assert cold public-pane performance across realistic Markdown classes (OUTPUT=optional raw path)
+	cargo build --release --package oom-edit --example performance_realistic --offline --locked
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/realistic_performance.py gate --binary target/release/examples/performance_realistic --trials 5 $(if $(OUTPUT),--output $(OUTPUT),)
+
+.PHONY: bench-realistic-record
+bench-realistic-record: ## Record realistic baseline (TRIALS=1 OUTPUT=/tmp/file.jsonl PERF_SKIP_LAYOUT=1)
+	cargo build --release --package oom-edit --example performance_realistic --offline --locked
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/realistic_performance.py record --binary target/release/examples/performance_realistic --trials $(or $(TRIALS),1) $(if $(PERF_SKIP_LAYOUT),--skip-layout,) $(if $(OUTPUT),--output $(OUTPUT),)
+
+.PHONY: bench-rss-stability
+bench-rss-stability: ## Assert 400-cycle current-RSS stability for exact Rust/Go edits, mode transitions and reloads (OUTPUT=raw path)
+	cargo build --release --package oom-edit --example performance_rss_stability --offline --locked
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/rss_stability.py --gate --binary target/release/examples/performance_rss_stability --fixture examples/kitchen-sink-1mb.md --source-root . --trials 3 --count 400 $(if $(OUTPUT),--output $(OUTPUT),)
+
+.PHONY: bench-rss-stability-record
+bench-rss-stability-record: ## Record exact current-RSS cycles without gate (COUNT=100/200/300/400 TRIALS=1 SCENARIO=rust-reload OUTPUT=raw path)
+	cargo build --release --package oom-edit --example performance_rss_stability --offline --locked
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/rss_stability.py --binary target/release/examples/performance_rss_stability --fixture examples/kitchen-sink-1mb.md --source-root . --trials $(or $(TRIALS),1) --count $(or $(COUNT),100) $(if $(SCENARIO),--scenario $(SCENARIO),) $(if $(OUTPUT),--output $(OUTPUT),)
+
+.PHONY: bench-interactions-record
+bench-interactions-record: ## Record public-pane interactions (TRIALS=5 ITERATIONS=21 CASE=source-line SIZE=1048576 OUTPUT=/tmp/file.jsonl)
+	cargo build --release --package oom-edit --example performance_realistic --offline --locked
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/interaction_performance.py --binary target/release/examples/performance_realistic --trials $(or $(TRIALS),5) --iterations $(or $(ITERATIONS),21) $(if $(CASE),--case $(CASE),) $(if $(SIZE),--size $(SIZE),) $(if $(OUTPUT),--output $(OUTPUT),)
+
+.PHONY: bench-interactions
+bench-interactions: ## Assert 1 MiB public-pane local edits, scrolling, and cold/warmed mode returns
+	cargo build --release --package oom-edit --example performance_realistic --offline --locked
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/interaction_performance.py --gate --binary target/release/examples/performance_realistic --trials 5 --iterations 21 $(if $(OUTPUT),--output $(OUTPUT),)
+
+.PHONY: bench-acceptance-1mb-record
+bench-acceptance-1mb-record: ## Record exact kitchen-sink keyboard and Select latency (TRIALS, OUTPUT, SCENARIO)
+	cargo build --release --package oom-edit --example performance_acceptance_1mb --offline --locked
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/acceptance_1mb.py --binary target/release/examples/performance_acceptance_1mb --fixture examples/kitchen-sink-1mb.md --source-root . --role candidate --trials $(or $(TRIALS),5) $(if $(SCENARIO),--scenario $(SCENARIO),) $(if $(OUTPUT),--output $(OUTPUT),)
+
+.PHONY: bench-acceptance-1mb
+bench-acceptance-1mb: ## Assert exact kitchen-sink keyboard, Select and edit latency
+	cargo build --release --package oom-edit --example performance_acceptance_1mb --offline --locked
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/acceptance_1mb.py --gate --binary target/release/examples/performance_acceptance_1mb --fixture examples/kitchen-sink-1mb.md --source-root . --role candidate --trials 5 $(if $(OUTPUT),--output $(OUTPUT),)
+	cargo build --release --package oom-edit --bin oom-edit --offline --locked
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/acceptance_1mb_pty.py --gate --binary target/release/oom-edit --fixture examples/kitchen-sink-1mb.md --source-root . --role candidate --trials 5 --keys 1000
+
+.PHONY: bench-acceptance-1mb-navigation
+bench-acceptance-1mb-navigation: ## Assert sustained 1 MiB navigation through the public pane and 63x229 standalone PTY
+	cargo build --release --package oom-edit --example performance_acceptance_1mb --bin oom-edit --offline --locked
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/acceptance_1mb.py --gate --navigation-only --binary target/release/examples/performance_acceptance_1mb --fixture examples/kitchen-sink-1mb.md --source-root . --role candidate --trials 5
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/acceptance_1mb_pty.py --gate --binary target/release/oom-edit --fixture examples/kitchen-sink-1mb.md --source-root . --role candidate --trials 5 --keys 1000 --rows 63 --cols 229 --term xterm-kitty
+
+.PHONY: bench-acceptance-1mb-select-motion
+bench-acceptance-1mb-select-motion: ## Assert 1 MiB Select motion latency in flat and retained views (OUTPUT=optional raw path)
+	cargo build --release --package oom-edit --example performance_acceptance_1mb --offline --locked
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/acceptance_1mb.py --select-motion-gate --binary target/release/examples/performance_acceptance_1mb --fixture examples/kitchen-sink-1mb.md --source-root . --role candidate --trials 7 $(if $(OUTPUT),--output $(OUTPUT),)
+
+.PHONY: bench-acceptance-1mb-edit-cycles
+bench-acceptance-1mb-edit-cycles: ## Assert 100 exact Rust/Go fence delete/change/undo cycles through the public pane (OUTPUT=optional raw path)
+	cargo build --release --package oom-edit --example performance_acceptance_1mb --offline --locked
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/acceptance_1mb_edit_cycles.py --gate --binary target/release/examples/performance_acceptance_1mb --fixture examples/kitchen-sink-1mb.md --source-root . --count 100 $(if $(OUTPUT),--output $(OUTPUT),)
+
+.PHONY: bench-acceptance-1mb-prose-cycles-record
+bench-acceptance-1mb-prose-cycles-record: ## Record exact 1 MiB prose/list Select delete/change/undo cycles (COUNT, OUTPUT)
+	cargo build --release --package oom-edit --example performance_acceptance_1mb --offline --locked
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/acceptance_1mb_prose_cycles.py --binary target/release/examples/performance_acceptance_1mb --fixture examples/kitchen-sink-1mb.md --source-root . --count $(or $(COUNT),1) $(if $(OUTPUT),--output $(OUTPUT),)
+
+.PHONY: bench-acceptance-1mb-prose-cycles
+bench-acceptance-1mb-prose-cycles: ## Assert 100 exact 1 MiB prose/list Select delete/change/undo cycles each (OUTPUT)
+	cargo build --release --package oom-edit --example performance_acceptance_1mb --offline --locked
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/acceptance_1mb_prose_cycles.py --gate --binary target/release/examples/performance_acceptance_1mb --fixture examples/kitchen-sink-1mb.md --source-root . --count 100 $(if $(OUTPUT),--output $(OUTPUT),)
+
+.PHONY: bench-acceptance-1mb-pty-record
+bench-acceptance-1mb-pty-record: ## Record standalone PTY output timing (TRIALS, OUTPUT, REGION, ROWS, COLS, SERIAL_DELAY_MS, BURST_CADENCE_MS, TERM_NAME, POST_EDIT, FIRST_FRAME_TIMEOUT_S)
+	cargo build --release --package oom-edit --bin oom-edit --offline --locked
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/acceptance_1mb_pty.py --binary target/release/oom-edit --fixture examples/kitchen-sink-1mb.md --source-root . --role candidate --trials $(or $(TRIALS),5) --keys $(or $(KEYS),1000) --rows $(or $(ROWS),41) --cols $(or $(COLS),100) --serial-delay-ms $(or $(SERIAL_DELAY_MS),2) --burst-cadence-ms $(or $(BURST_CADENCE_MS),2) --term $(or $(TERM_NAME),xterm-256color) --first-frame-timeout-s $(or $(FIRST_FRAME_TIMEOUT_S),15) $(if $(POST_EDIT),--post-edit,) $(if $(REGION),--region $(REGION),) $(if $(OUTPUT),--output $(OUTPUT),)
+
+.PHONY: bench-acceptance-1mb-core-phases
+bench-acceptance-1mb-core-phases: ## Record exact-note core construction and Select projection phases (TRIALS, OUTPUT)
+	cargo build --release --package oom-edit-core --example performance_acceptance_1mb_core --offline --locked
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/acceptance_1mb_core.py --binary target/release/examples/performance_acceptance_1mb_core --fixture examples/kitchen-sink-1mb.md --source-root . --role candidate --trials $(or $(TRIALS),5) $(if $(OUTPUT),--output $(OUTPUT),)
+
+.PHONY: bench-acceptance-1mb-mutation-phases
+bench-acceptance-1mb-mutation-phases: ## Trace exact-note mutation parser and model work
+	cargo test -p oom-edit-core --lib --offline --locked acceptance_1mb_mutation_work_profile -- --ignored --nocapture
+
+.PHONY: bench-acceptance-1mb-prose-batch-profile
+bench-acceptance-1mb-prose-batch-profile: ## Compare exact-note multi-range source batching and full-model costs
+	cargo test -p oom-edit-core --release --lib --offline --locked acceptance_1mb_prose_batch_profile -- --ignored --nocapture
+
+.PHONY: bench-acceptance-1mb-prose-model-window
+bench-acceptance-1mb-prose-model-window: ## Compare affected 1 MiB Markdown block windows to the complete builder
+	cargo test -p oom-edit-core --release --lib --offline --locked acceptance_1mb_local_model_windows_match_full_builder -- --ignored --nocapture
+
+.PHONY: bench-acceptance-1mb-prose-row-window
+bench-acceptance-1mb-prose-row-window: ## Compare affected 1 MiB block rows to the complete rendered builder
+	cargo test -p oom-edit-core --release --lib --offline --locked acceptance_1mb_local_block_rows_match_complete_builder -- --ignored --nocapture
+
+.PHONY: bench-acceptance-1mb-feasibility
+bench-acceptance-1mb-feasibility: ## Trace contiguous large-fence Vim and source-update cost
+	cargo test -p oom-edit-core --release --lib --offline --locked acceptance_1mb_contiguous_fence_edit_profile -- --ignored --nocapture
+
+.PHONY: bench-acceptance-1mb-injection-parse
+bench-acceptance-1mb-injection-parse: ## Compare incremental and full code-injection parse on exact note
+	cargo test -p oom-edit-core --release --lib --offline --locked acceptance_1mb_injection_incremental_profile -- --ignored --nocapture
+
+.PHONY: bench-acceptance-1mb-fence-model
+bench-acceptance-1mb-fence-model: ## Compare local large-fence model splice to complete builder
+	cargo test -p oom-edit-core --release --lib --offline --locked acceptance_1mb_fence_model_splice_matches_full_builder -- --ignored --nocapture
+
+.PHONY: bench-acceptance-1mb-selection-prototype
+bench-acceptance-1mb-selection-prototype: ## Compare indexed short Select projection to full-layout oracle
+	cargo test -p oom-edit-core --release --lib --offline --locked acceptance_1mb_bounded_character_projection_matches_complete -- --ignored --nocapture
+
+.PHONY: bench-acceptance-1mb-code-rows
+bench-acceptance-1mb-code-rows: ## Compare local source-highlight code rows to complete renderer
+	cargo test -p oom-edit-core --release --lib --offline --locked acceptance_1mb_source_highlight_builds_exact_code_rows -- --ignored --nocapture
+
+.PHONY: bench-acceptance-1mb-source-prototype
+bench-acceptance-1mb-source-prototype: ## Compare bounded source-fence edits and highlighting to fresh analysis
+	cargo test -p oom-edit-core --release --lib --offline --locked acceptance_1mb_bounded_source_fence_matches_fresh -- --ignored --nocapture
+
+.PHONY: bench-acceptance-1mb-row-splice
+bench-acceptance-1mb-row-splice: ## Compare lazy-offset large-fence rows to full layout
+	cargo test -p oom-edit-core --release --lib --offline --locked acceptance_1mb_fence_row_splice_matches_complete_layout -- --ignored --nocapture
+
+.PHONY: bench-acceptance-1mb-vim-splice
+bench-acceptance-1mb-vim-splice: ## Compare one-undo rope delete with the projected full-replace reference
+	cargo test -p oom-edit-core --release --lib --offline --locked acceptance_1mb_contiguous_vim_delete_matches_reference -- --ignored --nocapture
+
+.PHONY: bench-acceptance-1mb-baseline-prepare
+bench-acceptance-1mb-baseline-prepare: tui-perf-baseline-prepare ## Build clean main probe without changing the active worktree (BASELINE_DIR, BASELINE_REV)
+	cp crates/oom-edit/examples/performance_acceptance_1mb.rs "$(BASELINE_DIR)/crates/oom-edit/examples/performance_acceptance_1mb.rs"
+	cp crates/oom-edit-core/examples/performance_acceptance_1mb_core.rs "$(BASELINE_DIR)/crates/oom-edit-core/examples/performance_acceptance_1mb_core.rs"
+	cp examples/kitchen-sink-1mb.md "$(BASELINE_DIR)/examples/kitchen-sink-1mb.md"
+	cargo build --manifest-path "$(BASELINE_DIR)/Cargo.toml" --release --package oom-edit --example performance_acceptance_1mb --offline --locked
+	cargo build --manifest-path "$(BASELINE_DIR)/Cargo.toml" --release --package oom-edit-core --example performance_acceptance_1mb_core --offline --locked
+	cargo build --manifest-path "$(BASELINE_DIR)/Cargo.toml" --release --package oom-edit --bin oom-edit --offline --locked
+
+.PHONY: bench-acceptance-1mb-baseline-record
+bench-acceptance-1mb-baseline-record: ## Record clean main against exact fixture (BASELINE_DIR, TRIALS, OUTPUT, SCENARIO)
+	test -n "$(BASELINE_DIR)"
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/acceptance_1mb.py --binary "$(BASELINE_DIR)/target/release/examples/performance_acceptance_1mb" --fixture "$(BASELINE_DIR)/examples/kitchen-sink-1mb.md" --source-root "$(BASELINE_DIR)" --role main --trials $(or $(TRIALS),5) $(if $(SCENARIO),--scenario $(SCENARIO),) $(if $(OUTPUT),--output $(OUTPUT),)
+
+.PHONY: bench-acceptance-1mb-baseline-pty-record
+bench-acceptance-1mb-baseline-pty-record: ## Record clean main terminal output (BASELINE_DIR, TRIALS, OUTPUT, REGION, ROWS, COLS, SERIAL_DELAY_MS, BURST_CADENCE_MS, TERM_NAME, POST_EDIT)
+	test -n "$(BASELINE_DIR)"
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/acceptance_1mb_pty.py --binary "$(BASELINE_DIR)/target/release/oom-edit" --fixture "$(BASELINE_DIR)/examples/kitchen-sink-1mb.md" --source-root "$(BASELINE_DIR)" --role main --trials $(or $(TRIALS),5) --keys $(or $(KEYS),1000) --rows $(or $(ROWS),41) --cols $(or $(COLS),100) --serial-delay-ms $(or $(SERIAL_DELAY_MS),2) --burst-cadence-ms $(or $(BURST_CADENCE_MS),2) --term $(or $(TERM_NAME),xterm-256color) $(if $(POST_EDIT),--post-edit,) $(if $(REGION),--region $(REGION),) $(if $(OUTPUT),--output $(OUTPUT),)
+
+.PHONY: bench-acceptance-1mb-baseline-core-phases
+bench-acceptance-1mb-baseline-core-phases: ## Record clean main core phases (BASELINE_DIR, TRIALS, OUTPUT)
+	test -n "$(BASELINE_DIR)"
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/acceptance_1mb_core.py --binary "$(BASELINE_DIR)/target/release/examples/performance_acceptance_1mb_core" --fixture "$(BASELINE_DIR)/examples/kitchen-sink-1mb.md" --source-root "$(BASELINE_DIR)" --role main --trials $(or $(TRIALS),5) $(if $(OUTPUT),--output $(OUTPUT),)
+
+.PHONY: bench-acceptance-1mb-compare
+bench-acceptance-1mb-compare: ## Compare pane/PTY/core raw profiles (PANE_MAIN, PANE_CANDIDATE, PTY_MAIN, PTY_CANDIDATE, CORE_MAIN, CORE_CANDIDATE)
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/acceptance_1mb_compare.py --pane-main "$(PANE_MAIN)" --pane-candidate "$(PANE_CANDIDATE)" --pty-main "$(PTY_MAIN)" --pty-candidate "$(PTY_CANDIDATE)" --core-main "$(CORE_MAIN)" --core-candidate "$(CORE_CANDIDATE)"
 
 .PHONY: tui-perf-record
 tui-perf-record: ## Record TUI performance TSV (BRANCH_ROLE, OUTPUT, TRIALS)

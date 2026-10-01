@@ -231,6 +231,26 @@ pub struct RenderedLayout {
     pub link_index: Vec<(usize, String)>,
 }
 
+/// Owned, current-text rows for one rendered viewport.
+///
+/// This is the bounded presentation counterpart to [`RenderedLayout`], which
+/// remains available to hosts that explicitly need the complete document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedViewportFrame {
+    /// First row represented in `lines`.
+    pub first_row: usize,
+    /// Total rendered row count, including rows outside this viewport.
+    pub total_rows: usize,
+    /// Styled rows with exact source-byte atoms.
+    pub lines: Vec<RenderedLine>,
+    /// Optional 1-based source line number for each row in `lines`.
+    pub line_numbers: Vec<Option<usize>>,
+    /// Source line for gutter continuation rows, aligned with `lines`.
+    pub gutter_continuations: Vec<Option<usize>>,
+    /// Current rendered cursor in document-wide coordinates.
+    pub cursor: RenderedPoint,
+}
+
 /// A point in final rendered display-cell coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, PartialOrd, Ord)]
 pub struct RenderedPoint {

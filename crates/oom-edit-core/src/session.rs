@@ -118,6 +118,1063 @@ mod tests {
         }
     }
 
+    fn assert_complete_reference(session: &mut EditorSession, width: u16) {
+        let text = session.document();
+        let fresh_highlighter = crate::syntax::Highlighter::new(&text);
+        let fresh_model = BlockModel::build(&text, crate::frontmatter::front_matter_span(&text));
+        let (expected, expected_fences) = RenderedLayout::build_with_fence_regions(
+            &fresh_model,
+            width,
+            &fresh_highlighter,
+            session.rendered_state.fm_collapsed,
+        );
+        let actual = session.render_layout(width).clone();
+        assert_eq!(
+            actual, expected,
+            "rendered cells, styles, atoms and indices drifted"
+        );
+        if let SessionMode::Select(active) = &session.session_mode {
+            let mut expected_selection = nav::project_selection_from_source_positions(
+                active.anchor.point,
+                active.active.point,
+                active.kind.shape(),
+                active.anchor.source,
+                active.active.source,
+                &expected,
+                &text,
+            );
+            if let SelectionKind::Character { ranges } = &active.kind {
+                expected_selection.source_ranges = ranges.clone();
+                expected_selection.rows = nav::character_selection_rows(ranges, &expected);
+            }
+            assert_eq!(session.rendered_selection(), Some(expected_selection));
+        }
+        assert_eq!(session.rendered_state.code_fence_regions, expected_fences);
+        let work = &session.rendered_state.last_work;
+        assert_eq!(
+            work.rebuilt_blocks + work.reused_blocks,
+            fresh_model.blocks.len()
+        );
+        assert_eq!(work.rebuilt_rows, actual.lines.len());
+        assert_eq!(work.reused_rows, 0);
+        let visible_lines = session.line_count().min(48);
+        assert_eq!(
+            session.live.highlighter().highlight_lines(0..visible_lines),
+            fresh_highlighter.highlight_lines(0..visible_lines),
+            "source highlighting drifted"
+        );
+        assert_eq!(
+            session.live.front_matter(),
+            &crate::frontmatter::parse_front_matter(&text)
+        );
+        let (
+            parse_count,
+            changed_ranges,
+            changed_bytes,
+            injection_count,
+            injection_scans,
+            reference_scans,
+        ) = session.live.highlighter().work_snapshot();
+        assert!(parse_count >= 1);
+        assert!(changed_bytes <= text.len());
+        assert!(changed_ranges <= session.line_count());
+        assert!(injection_count <= session.line_count());
+        assert!(injection_scans >= 1);
+        assert!(reference_scans >= 1);
+        assert!(session.rendered_cursor().row < actual.lines.len().max(1));
+    }
+
+    #[test]
+    fn complete_reference_covers_current_text_after_local_and_global_edits() {
+        let documents = [
+            "---\r\ntitle: Café\r\n---\r\n\r\n# Heading &amp; \\*literal\\*\r\n\r\n[ref]: https://example.invalid\r\n\r\nA [link][ref] and duplicate duplicate.\r\n\r\n| A | B |\r\n|---|---|\r\n| α | `β` |\r\n\r\n```rust\r\nlet value = 42;\r\n```\r\n\r\n[^note]: footnote\r\n",
+            "+++\ntitle = 'Demo'\n+++\n\n> - nested *item*\n> - another item\n\n```unknown\nplain code\n```\n\nA [link](https://example.invalid) and &amp;.\n",
+        ];
+        for initial in documents {
+            let mut session = EditorSession::from_text(initial);
+            let baseline = session.document();
+            for width in [22, 80] {
+                assert_complete_reference(&mut session, width);
+            }
+            let body_offset = baseline
+                .find("Heading")
+                .or_else(|| baseline.find("nested"))
+                .unwrap();
+            session.jump_to_offset(body_offset).unwrap();
+            session.render_layout(80);
+            session.handle_key(key('V'));
+            assert_eq!(session.mode(), Mode::Select);
+            for width in [22, 80] {
+                assert_complete_reference(&mut session, width);
+            }
+            session.handle_key(key('d'));
+            assert_ne!(session.document(), baseline);
+            for width in [22, 80] {
+                assert_complete_reference(&mut session, width);
+            }
+            session.handle_key(key('u'));
+            assert_eq!(session.document(), baseline);
+            session.handle_key(key('i'));
+            session.handle_key(key('x'));
+            for width in [22, 80] {
+                assert_complete_reference(&mut session, width);
+            }
+            session.handle_key(esc());
+            let text = session.document();
+            let source_anchor = session.live.cursor();
+            let line_starts = session.live.highlighter().line_starts().to_vec();
+            let layout = session.render_layout(80).clone();
+            let expected_cursor = nav::enter_rendered_indexed(
+                source_anchor.0,
+                source_anchor.1,
+                &layout,
+                &text,
+                &line_starts,
+            );
+            assert_eq!(session.rendered_cursor(), expected_cursor.point());
+            session.handle_key(key('u'));
+            assert_eq!(session.document(), baseline);
+            for width in [22, 80] {
+                assert_complete_reference(&mut session, width);
+            }
+        }
+    }
+
+    #[test]
+    fn session_publishes_one_local_edit_into_retained_rows_before_full_materialization() {
+        let text = "# Heading\n\nA [link](https://example.invalid) and a body line.\nSecond line.\n\nTail.\n";
+        let mut session = EditorSession::from_text(text);
+        session.render_layout(24);
+        session
+            .jump_to_offset(text.find("body line").unwrap())
+            .unwrap();
+        session.ensure_rendered_rows(24);
+        assert!(session.rendered_state.layout_cache.is_none());
+        assert!(session.rendered_state.row_cache.is_some());
+
+        session.handle_key(key('i'));
+        session.handle_key(key('x'));
+        session.handle_key(esc());
+        assert!(session.rendered_state.row_cache.is_some());
+        assert!(session.rendered_state.layout_cache.is_none());
+        let viewport = session.rendered_viewport(24, 0, 12);
+        let current = session.document();
+        let fresh_model =
+            BlockModel::build(&current, crate::frontmatter::front_matter_span(&current));
+        let fresh_highlighter = crate::syntax::Highlighter::new(&current);
+        let expected =
+            RenderedLayout::build_with_fence_regions(&fresh_model, 24, &fresh_highlighter, false).0;
+        assert_eq!(viewport.first_row, 0);
+        assert_eq!(viewport.total_rows, expected.lines.len());
+        assert_eq!(viewport.lines, expected.lines[..viewport.lines.len()]);
+        assert_eq!(
+            viewport.line_numbers,
+            expected.line_numbers[..viewport.line_numbers.len()]
+        );
+        assert_complete_reference(&mut session, 24);
+    }
+
+    #[test]
+    fn rendered_line_delete_and_undo_keep_indexed_rows_current() {
+        let text = crate::realistic_fixtures::generate("mixed", 1024 * 1024);
+        let mut session = EditorSession::from_text(&text);
+        let source = session.live.highlighter().line_starts()[6];
+        session.jump_to_offset(source).unwrap();
+        session.rendered_viewport(100, 0, 41);
+        session.ensure_rendered_rows(100);
+        assert!(session.rendered_state.row_cache.is_some());
+        session.handle_key(key('V'));
+        assert!(session.rendered_state.row_cache.is_some());
+        session.handle_key(key('d'));
+        assert!(session.rendered_state.row_cache.is_some());
+        let (rebuilt, _, retained) = session.rendered_state.row_cache.as_ref().unwrap().work();
+        assert!(rebuilt < 500, "local delete rebuilt {rebuilt} rows");
+        assert!(retained > 10_000, "local delete retained {retained} rows");
+        let current = session.document();
+        let fresh = EditorSession::from_text(&current)
+            .render_layout(100)
+            .clone();
+        for top in [
+            0,
+            fresh.lines.len() / 2,
+            fresh.lines.len().saturating_sub(41),
+        ] {
+            let viewport = session.rendered_viewport(100, top, 41);
+            let first = viewport.first_row;
+            let end = first + viewport.lines.len();
+            assert_eq!(viewport.lines, fresh.lines[first..end]);
+            assert_eq!(viewport.line_numbers, fresh.line_numbers[first..end]);
+        }
+        let (_, reads, _) = session.rendered_state.row_cache.as_ref().unwrap().work();
+        assert!(reads < 150, "three viewports read {reads} rows");
+        session.handle_key(key('u'));
+        assert!(session.rendered_state.row_cache.is_some());
+        assert_eq!(session.document(), text);
+        let viewport = session.rendered_viewport(100, 0, 41);
+        let restored = EditorSession::from_text(&text).render_layout(100).clone();
+        assert_eq!(viewport.lines, restored.lines[..viewport.lines.len()]);
+        assert_eq!(
+            viewport.line_numbers,
+            restored.line_numbers[..viewport.line_numbers.len()]
+        );
+    }
+
+    #[test]
+    fn indexed_viewports_match_complete_rows_and_gutters_at_every_scroll_offset() {
+        let documents = [
+            "# Café\r\n\r\nA repeated repeated [link](https://example.invalid) and é🙂.\r\n\r\nTail.\r\n",
+            "---\ntitle: Note\n---\n\nA [^one] reference and [link](https://example.invalid).\n\n[^one]: footnote body.\n",
+            "| A | B |\n|---|---|\n| `x` | α |\n\n```rust\nfn main() {}\n```\n",
+        ];
+        for text in documents {
+            for width in [12, 40] {
+                let mut session = EditorSession::from_text(text);
+                let expected = session.render_layout(width).clone();
+                session.ensure_rendered_rows(width);
+                let mut expected_continuations = Vec::new();
+                let mut source_line = None;
+                for (row, line) in expected.lines.iter().enumerate() {
+                    let continuation = if let Some(number) = expected.line_numbers[row] {
+                        source_line = Some(number - 1);
+                        None
+                    } else if row > 0
+                        && line.kind == LineKind::Content
+                        && line.source == expected.lines[row - 1].source
+                    {
+                        source_line
+                    } else {
+                        None
+                    };
+                    expected_continuations.push(continuation);
+                }
+                for top in 0..expected.lines.len() {
+                    let viewport = session.rendered_viewport(width, top, 4);
+                    let end = viewport.first_row + viewport.lines.len();
+                    assert_eq!(viewport.total_rows, expected.lines.len());
+                    assert_eq!(
+                        viewport.lines,
+                        expected.lines[top..end],
+                        "width {width}, top {top}"
+                    );
+                    assert_eq!(viewport.line_numbers, expected.line_numbers[top..end]);
+                    assert_eq!(
+                        viewport.gutter_continuations,
+                        expected_continuations[top..end]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_vertical_motions_match_complete_navigation_without_materializing_rows() {
+        let text = "# Heading\n\nA [link](https://example.invalid) with text long enough to wrap at narrow width.\n\n## Second\n\nTail.\n";
+        let mut complete = EditorSession::from_text(text);
+        let mut indexed = EditorSession::from_text(text);
+        complete.render_layout(18);
+        indexed.render_layout(18);
+        indexed.ensure_rendered_rows(18);
+        let ctrl = |character| KeyInput {
+            code: KeyCode {
+                kind: KeyCodeKind::Char(character),
+            },
+            mods: Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            },
+        };
+        let motions = [
+            key('j'),
+            special(KeyCodeKind::Down),
+            key('l'),
+            special(KeyCodeKind::Right),
+            key('h'),
+            key('w'),
+            key('W'),
+            key('e'),
+            key('E'),
+            key('b'),
+            key('B'),
+            key('0'),
+            key('$'),
+            key('{'),
+            key('}'),
+            special(KeyCodeKind::Home),
+            special(KeyCodeKind::End),
+            special(KeyCodeKind::Tab),
+            special(KeyCodeKind::BackTab),
+            key('['),
+            key('['),
+            key(']'),
+            key(']'),
+            key('2'),
+            key('l'),
+            key('k'),
+            key('3'),
+            key('j'),
+            key('G'),
+            key('g'),
+            key('g'),
+            key('2'),
+            key('g'),
+            key('g'),
+            ctrl('d'),
+            ctrl('u'),
+            ctrl('f'),
+            ctrl('b'),
+            special(KeyCodeKind::Enter),
+            esc(),
+            key('~'),
+        ];
+        for motion in motions {
+            assert_eq!(indexed.handle_key(motion), complete.handle_key(motion));
+            assert_eq!(indexed.rendered_cursor(), complete.rendered_cursor());
+            assert_eq!(indexed.cursor(), complete.cursor());
+            assert!(indexed.rendered_state.row_cache.is_some());
+            assert!(indexed.rendered_state.layout_cache.is_none());
+        }
+    }
+
+    #[test]
+    fn indexed_line_selection_matches_complete_projection_after_local_edit() {
+        let text = "# Café\r\n\r\nA paragraph with a wrapped line and more words.\r\n\r\nTail [link](https://example.invalid).\r\n";
+        let mut indexed = EditorSession::from_text(text);
+        indexed.render_layout(18);
+        indexed
+            .jump_to_offset(text.find("wrapped").unwrap())
+            .unwrap();
+        indexed.ensure_rendered_rows(18);
+        indexed.handle_key(key('V'));
+        let mut complete = EditorSession::from_text(text);
+        complete.render_layout(18);
+        complete
+            .jump_to_offset(text.find("wrapped").unwrap())
+            .unwrap();
+        complete.handle_key(key('V'));
+        for motion in [key('j'), key('j'), key('k')] {
+            assert_eq!(indexed.handle_key(motion), complete.handle_key(motion));
+            assert_eq!(indexed.rendered_selection(), complete.rendered_selection());
+            assert!(indexed.rendered_state.layout_cache.is_none());
+        }
+        for edit in [esc(), key('i'), key('x'), esc()] {
+            indexed.handle_key(edit);
+            complete.handle_key(edit);
+        }
+        assert_eq!(indexed.document(), complete.document());
+        indexed.handle_key(key('V'));
+        complete.render_layout(18);
+        complete.handle_key(key('V'));
+        assert_eq!(indexed.rendered_selection(), complete.rendered_selection());
+        let point = RenderedPoint {
+            row: complete.rendered_cursor().row + 1,
+            column: 3,
+        };
+        assert_eq!(
+            indexed.move_to_rendered_point(point),
+            complete.move_to_rendered_point(point)
+        );
+        assert_eq!(indexed.rendered_selection(), complete.rendered_selection());
+        assert!(indexed.rendered_state.layout_cache.is_none());
+    }
+
+    #[test]
+    fn short_retained_select_shapes_match_complete_without_materializing_layout() {
+        let text = "# Café\n\nA long paragraph that wraps across several display rows with **strong** text and a [link](https://example.invalid).\n\n- one `code` item\n- two items\n\n| Key | Value |\n|---|---|\n| α | beta |\n\n```rust\nfn alpha() {\n    let value = 1;\n}\n```\n\nA [^note] reference.\n\n[^note]: footnote body.\n";
+        for marker in [
+            "long paragraph",
+            "two items",
+            "| α |",
+            "let value",
+            "footnote body",
+        ] {
+            for shape in [key('v'), key('V'), ctrl('v')] {
+                let mut indexed = EditorSession::from_text(text);
+                let mut complete = EditorSession::from_text(text);
+                indexed.render_layout(24);
+                complete.render_layout(24);
+                let offset = text.find(marker).unwrap();
+                indexed.jump_to_offset(offset).unwrap();
+                complete.jump_to_offset(offset).unwrap();
+                indexed.ensure_rendered_rows(24);
+                assert_eq!(indexed.handle_key(shape), complete.handle_key(shape));
+                assert_eq!(indexed.rendered_selection(), complete.rendered_selection());
+                assert!(indexed.rendered_state.layout_cache.is_none(), "{marker}");
+                for motion in [key('j'), key('j'), key('k')] {
+                    assert_eq!(indexed.handle_key(motion), complete.handle_key(motion));
+                    assert_eq!(indexed.rendered_selection(), complete.rendered_selection());
+                    assert!(indexed.rendered_state.layout_cache.is_none(), "{marker}");
+                }
+                let reads = indexed
+                    .rendered_state
+                    .row_cache
+                    .as_ref()
+                    .unwrap()
+                    .selection_reads();
+                assert!(
+                    reads > 0 && reads < 100,
+                    "{marker}: {reads} selection rows read"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn large_select_motions_and_undo_scale_with_selected_rows() {
+        let mixed = crate::realistic_fixtures::generate("mixed", 128 * 1024);
+        let mut fence = String::from("# Large fence\n\n```rust\n");
+        while fence.len() < 1024 * 1024 {
+            fence.push_str("fn example() { let value = 42; }\n");
+        }
+        fence.push_str("```\n");
+        for (text, marker) in [(&mixed, "paragraph"), (&fence, "fn example")] {
+            let offset = text.find(marker).unwrap();
+            for shape in [key('v'), key('V'), ctrl('v')] {
+                let mut indexed = EditorSession::from_text(text);
+                let mut complete = EditorSession::from_text(text);
+                indexed.render_layout(80);
+                complete.render_layout(80);
+                indexed.jump_to_offset(offset).unwrap();
+                complete.jump_to_offset(offset).unwrap();
+                indexed.ensure_rendered_rows(80);
+                for input in [shape, key('j'), key('j'), key('k')] {
+                    assert_eq!(indexed.handle_key(input), complete.handle_key(input));
+                    assert_eq!(indexed.rendered_selection(), complete.rendered_selection());
+                    let top = indexed.rendered_cursor().row.saturating_sub(4);
+                    let indexed_view = indexed.rendered_viewport(80, top, 12);
+                    let complete_view = complete.rendered_viewport(80, top, 12);
+                    assert_eq!(indexed_view, complete_view);
+                    assert!(indexed.rendered_state.layout_cache.is_none());
+                }
+                let reads = indexed
+                    .rendered_state
+                    .row_cache
+                    .as_ref()
+                    .unwrap()
+                    .selection_reads();
+                assert!(
+                    reads > 0 && reads < 120,
+                    "{marker}: {reads} selection row reads"
+                );
+                assert_eq!(indexed.handle_key(key('d')), complete.handle_key(key('d')));
+                assert_eq!(indexed.document(), complete.document());
+                assert_eq!(indexed.handle_key(key('u')), complete.handle_key(key('u')));
+                assert_eq!(indexed.document(), text.as_str());
+                assert_eq!(indexed.rendered_selection(), complete.rendered_selection());
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_character_operators_match_complete_projection_across_markdown_constructs() {
+        let cases = [
+            ("wrapped", "## A\n\nLong words with é and λ that wrap over several display rows.\nSecond source line remains.\n\n## B\nTail.\n", "Long"),
+            ("heading", "## A\n\nFirst text.\n\n---\n\n## B\n> Quoted text.\n\n## C\nTail.\n", "First"),
+            ("list", "## A\n\n- one\n- two with **bold**\n  - nested\n- three\n\n## B\nTail.\n", "one"),
+            ("table", "## A\n\n| Name | Value |\n| --- | --- |\n| é | `λ` |\n| two | three |\n\n## B\nTail.\n", "Name"),
+            ("crlf-unicode", "## Café\r\n\r\nα line one\r\nβ line two\r\nγ line three\r\n\r\n## Tail\r\nDone.\r\n", "α line"),
+            ("reference", "[id]: /target\n\n## A\n\nA [link][id] and text.\nNext source line.\n\n## B\nTail.\n", "A [link]"),
+            ("footnote", "## A\n\nA [^n] and body.\nNext source line.\n\n[^n]: Footnote body.\n\n## B\nTail.\n", "A [^n]"),
+            ("fence-boundary", "## A\n\n```rust\nfn main() {}\n```\n\n## B\nTail.\n", "fn main"),
+        ];
+        for (name, original, marker) in cases {
+            for operator in ['d', 'c'] {
+                for retained in [false, true] {
+                    let mut session = EditorSession::from_text(original);
+                    let source = session.document();
+                    let width = 18;
+                    session.render_layout(width);
+                    session
+                        .jump_to_offset(source.find(marker).unwrap())
+                        .unwrap();
+                    if retained {
+                        session.ensure_rendered_rows(width);
+                    }
+                    session.handle_key(key('v'));
+                    session.handle_key(key('j'));
+                    session.handle_key(key('j'));
+                    let selection = session.rendered_selection().unwrap();
+                    let layout = session.render_layout(width).clone();
+                    let ranges =
+                        nav::character_mutation_ranges(&selection.source_ranges, &layout, &source);
+                    assert!(!ranges.is_empty(), "{name}");
+                    let mut expected = source.clone();
+                    for range in ranges.iter().rev() {
+                        expected.replace_range(range.clone(), "");
+                    }
+                    if retained {
+                        session.ensure_rendered_rows(width);
+                    }
+                    session.handle_key(key(operator));
+                    assert_eq!(
+                        session.document(),
+                        expected,
+                        "{name} {operator} retained={retained}"
+                    );
+                    assert_complete_reference(&mut session, width);
+                    if operator == 'c' {
+                        session.handle_key(esc());
+                    }
+                    session.handle_key(key('u'));
+                    assert_eq!(session.document(), source, "{name} undo");
+                    assert_complete_reference(&mut session, width);
+                    session.handle_key(ctrl('r'));
+                    assert_eq!(session.document(), expected, "{name} redo");
+                    assert_complete_reference(&mut session, width);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exact_prose_select_edits_publish_bounded_current_rows() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/kitchen-sink-1mb.md");
+        let original = fs::read_to_string(path).unwrap();
+        for line in [600, 130] {
+            for operator in ['d', 'c'] {
+                let mut session = EditorSession::from_text(&original);
+                session.render_layout(100);
+                let offset = original
+                    .split_inclusive('\n')
+                    .take(line)
+                    .map(str::len)
+                    .sum();
+                session.jump_to_offset(offset).unwrap();
+                session.ensure_rendered_rows(100);
+                session.handle_key(key('v'));
+                for _ in 0..15 {
+                    session.handle_key(key('j'));
+                }
+                let before_builds = session.rendered_state.layout_builds;
+                session.handle_key(key(operator));
+                assert_eq!(session.rendered_state.layout_builds, before_builds);
+                assert!(session.rendered_state.layout_cache.is_none());
+                let rows = session.rendered_state.row_cache.as_ref().unwrap();
+                let (rebuilt_rows, _, retained_rows) = rows.work();
+                assert!(rebuilt_rows < 100, "{line} {operator}: {rebuilt_rows} rows");
+                assert!(
+                    retained_rows > 20_000,
+                    "{line} {operator}: {retained_rows} retained rows"
+                );
+                let model_work = session.live.rendered_model_work();
+                assert!(!model_work.full_rebuild);
+                assert!(model_work.parsed_bytes < 4096);
+                assert!(model_work.rebuilt_blocks < 20);
+                let top = session.rendered_cursor().row.saturating_sub(8);
+                let frame = session.rendered_viewport(100, top, 41);
+                assert_eq!(frame.lines.len(), 41);
+                assert_eq!(session.rendered_state.layout_builds, before_builds);
+                assert_complete_reference(&mut session, 100);
+                if operator == 'c' {
+                    session.handle_key(esc());
+                }
+                session.ensure_rendered_rows(100);
+                let before_undo_builds = session.rendered_state.layout_builds;
+                session.handle_key(key('u'));
+                assert_eq!(session.document(), original, "{line} {operator} undo");
+                assert!(
+                    session.rendered_state.row_cache.is_some(),
+                    "{line} {operator} undo discarded retained rows"
+                );
+                let undo_work = session.live.rendered_model_work();
+                assert!(
+                    !undo_work.full_rebuild,
+                    "{line} {operator} undo rebuilt model"
+                );
+                assert!(
+                    undo_work.parsed_bytes < 4096,
+                    "{line} {operator} undo parsed {} bytes",
+                    undo_work.parsed_bytes
+                );
+                let top = session.rendered_cursor().row.saturating_sub(8);
+                let frame = session.rendered_viewport(100, top, 41);
+                assert_eq!(frame.lines.len(), 41);
+                assert_eq!(session.rendered_state.layout_builds, before_undo_builds);
+                assert_complete_reference(&mut session, 100);
+            }
+        }
+    }
+
+    #[test]
+    fn retained_selection_endpoint_keeps_source_less_line_identity() {
+        let text = "# Heading\n\n---\n\nA [paragraph](https://example.invalid) that wraps across two or three rows.\n\n[^a]: Footnote body.\n";
+        let mut session = EditorSession::from_text(text);
+        let layout = session.render_layout(14).clone();
+        session.ensure_rendered_rows(14);
+        let mut checked = 0;
+        for (row, line) in layout.lines.iter().enumerate() {
+            if line.atoms.iter().any(|atom| atom.source.is_some()) {
+                continue;
+            }
+            let point = RenderedPoint { row, column: 0 };
+            let expected = nav::line_identity_for_point(point, &layout);
+            let endpoint = session.selection_endpoint_at(point);
+            assert!(endpoint.atom.is_none());
+            assert_eq!(endpoint.line, expected, "row {row}");
+            checked += 1;
+        }
+        assert!(checked > 0);
+        assert!(session.rendered_state.layout_cache.is_none());
+    }
+
+    #[test]
+    fn large_fence_character_delete_keeps_bounded_model_and_rows() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/kitchen-sink-1mb.md");
+        let original = std::fs::read_to_string(path).unwrap();
+        let mut session = EditorSession::from_text(&original);
+        session.render_layout(100);
+        let start = original.find("fn summarize_batch_0200").unwrap();
+        session.jump_to_offset(start).unwrap();
+        session.ensure_rendered_rows(100);
+        session.rendered_state.last_work = ProjectionWork::default();
+        session.handle_key(key('v'));
+        for _ in 0..15 {
+            session.handle_key(key('j'));
+        }
+        let selected_before = session.rendered_selection().unwrap().source_ranges;
+        assert!(session.rendered_state.row_cache.is_some());
+        session.handle_key(key('d'));
+        assert!(session.rendered_state.layout_cache.is_none());
+        assert!(
+            session.rendered_state.row_cache.is_some(),
+            "selected {selected_before:?}, model {:?}, rebuilt rows {}",
+            session.live.rendered_model_work(),
+            session.rendered_state.last_work.rebuilt_rows
+        );
+        let reads = session.rendered_state.row_cache.as_ref().unwrap().work().1;
+        assert!(reads < 100, "cursor remap read {reads} retained rows");
+        assert!(session.rendered_state.row_cache.as_ref().unwrap().work().0 <= 20);
+        assert_eq!(session.rendered_state.last_work.rebuilt_rows, 0);
+        assert!(!session.live.rendered_model_work().full_rebuild);
+        assert_eq!(session.live.rendered_model_work().parsed_bytes, 0);
+        let current = session.document();
+        let fresh = EditorSession::from_text(&current)
+            .render_layout(100)
+            .clone();
+        let top = session.rendered_cursor().row.saturating_sub(3);
+        let actual = session.rendered_viewport(100, top, 12);
+        assert_eq!(actual.lines, fresh.lines[top..top + actual.lines.len()]);
+        session.handle_key(key('u'));
+        assert_eq!(session.document(), original);
+    }
+
+    #[test]
+    fn large_go_fence_change_matches_complete_source_and_rendered_views() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/kitchen-sink-1mb.md");
+        let original = std::fs::read_to_string(path).unwrap();
+        let mut session = EditorSession::from_text(&original);
+        session.render_layout(100);
+        let start = original.find("func summarizeBatch0200").unwrap();
+        session.jump_to_offset(start).unwrap();
+        session.ensure_rendered_rows(100);
+        session.handle_key(key('v'));
+        for _ in 0..15 {
+            session.handle_key(key('j'));
+        }
+        session.handle_key(key('c'));
+        assert_eq!(session.mode(), Mode::Insert);
+        assert!(session.rendered_state.row_cache.is_some());
+        assert!(!session.live.rendered_model_work().full_rebuild);
+        assert_eq!(session.live.rendered_model_work().parsed_bytes, 0);
+        let changed = session.document();
+        assert_ne!(changed, original);
+        let mut fresh = EditorSession::from_text(&changed);
+        let expected_layout = fresh.render_layout(100).clone();
+        assert_eq!(session.live.rendered_model(), fresh.live.rendered_model());
+        let actual_layout = session.render_layout(100);
+        assert_eq!(actual_layout.lines.len(), expected_layout.lines.len());
+        for (row, (actual, expected)) in actual_layout
+            .lines
+            .iter()
+            .zip(&expected_layout.lines)
+            .enumerate()
+        {
+            assert!(
+                actual == expected,
+                "row {row}: text {:?} vs {:?}, spans {:?} vs {:?}, source {:?} vs {:?}",
+                actual.styled.text,
+                expected.styled.text,
+                actual.styled.spans,
+                expected.styled.spans,
+                actual.source,
+                expected.source,
+            );
+        }
+        assert_eq!(actual_layout.line_numbers, expected_layout.line_numbers);
+        assert_eq!(actual_layout.jump_targets, expected_layout.jump_targets);
+        assert_eq!(actual_layout.link_index, expected_layout.link_index);
+        let source_top = session.cursor().0.saturating_sub(3);
+        let viewport = Viewport {
+            top_line: source_top,
+            height: 12,
+            width: 100,
+            wrap: true,
+            left_col: 0,
+            skip_rows: 0,
+        };
+        assert_eq!(
+            session.render_source(viewport).lines,
+            fresh.render_source(viewport).lines,
+        );
+        session.handle_key(esc());
+        session.handle_key(key('u'));
+        assert_eq!(session.document(), original);
+    }
+
+    #[test]
+    fn inserted_fence_delimiter_rebuilds_before_publishing_rendered_rows() {
+        let original = "# Heading\n\n```rust\nfn alpha() {}\nfn beta() {}\n```\n\nTail.\n";
+        let mut session = EditorSession::from_text(original);
+        session.render_layout(80);
+        session.ensure_rendered_rows(80);
+        let at = original.find("fn beta").unwrap();
+        let mutation = session.live.replace_range(at..at, "```\n").unwrap();
+        session.translate_vim_effects(mutation.effects);
+        assert!(session.rendered_state.row_cache.is_none());
+        assert!(session.live.rendered_model_work().full_rebuild);
+        let changed = session.document();
+        let mut fresh = EditorSession::from_text(&changed);
+        assert_eq!(session.render_layout(80), fresh.render_layout(80));
+        assert_eq!(
+            session
+                .live
+                .highlighter()
+                .highlight_lines(0..session.line_count()),
+            fresh
+                .live
+                .highlighter()
+                .highlight_lines(0..fresh.line_count()),
+        );
+    }
+
+    #[test]
+    fn indexed_source_jumps_match_complete_mapping_without_materializing_rows() {
+        let text = "# Café\r\n\r\nA wrapped paragraph with α and [link](https://example.invalid).\r\n\r\nTail.\r\n";
+        let mut indexed = EditorSession::from_text(text);
+        let mut complete = EditorSession::from_text(text);
+        indexed.render_layout(16);
+        complete.render_layout(16);
+        indexed.ensure_rendered_rows(16);
+        let edit_at = indexed.document().find("wrapped").unwrap();
+        indexed.jump_to_offset(edit_at).unwrap();
+        complete.jump_to_offset(edit_at).unwrap();
+        for edit in [key('i'), key('x'), esc()] {
+            indexed.handle_key(edit);
+            complete.handle_key(edit);
+        }
+        complete.render_layout(16);
+        assert!(indexed.rendered_state.row_cache.is_some());
+        let current = indexed.document();
+        assert_eq!(current, complete.document());
+        for offset in [
+            current.find("Café").unwrap(),
+            current.find("wrapped").unwrap(),
+            current.find('α').unwrap(),
+            current.find("Tail").unwrap(),
+            current.find("\n\n").unwrap() + 1,
+            current.len(),
+        ] {
+            assert_eq!(
+                indexed.jump_to_offset(offset),
+                complete.jump_to_offset(offset)
+            );
+            assert_eq!(indexed.rendered_cursor(), complete.rendered_cursor());
+            assert_eq!(indexed.cursor(), complete.cursor());
+            assert!(
+                indexed.rendered_state.row_cache.is_some(),
+                "offset {offset} of {}",
+                current.len()
+            );
+            assert!(indexed.rendered_state.layout_cache.is_none());
+        }
+    }
+
+    #[test]
+    fn indexed_search_matches_complete_prompt_and_repeat_after_local_edit() {
+        let text = "# Heading\n\nalpha text\n\nbeta alpha\n\nTail.\n";
+        let mut indexed = EditorSession::from_text(text);
+        let mut complete = EditorSession::from_text(text);
+        indexed.render_layout(20);
+        complete.render_layout(20);
+        indexed.jump_to_offset(text.find("alpha").unwrap()).unwrap();
+        complete
+            .jump_to_offset(text.find("alpha").unwrap())
+            .unwrap();
+        indexed.ensure_rendered_rows(20);
+        for edit in [key('i'), key('x'), esc()] {
+            indexed.handle_key(edit);
+            complete.handle_key(edit);
+        }
+        complete.render_layout(20);
+        for input in [
+            key('/'),
+            key('b'),
+            key('e'),
+            key('t'),
+            key('a'),
+            special(KeyCodeKind::Enter),
+            key('n'),
+            key('N'),
+        ] {
+            assert_eq!(indexed.handle_key(input), complete.handle_key(input));
+            assert_eq!(indexed.rendered_cursor(), complete.rendered_cursor());
+            assert_eq!(indexed.rendered_search(), complete.rendered_search());
+            assert!(indexed.rendered_state.row_cache.is_some());
+            assert!(indexed.rendered_state.layout_cache.is_none());
+        }
+    }
+
+    #[test]
+    fn work_counters_expose_current_full_rebuild_and_source_propagation() {
+        let text = format!(
+            "---\ntitle: Work\n---\n\n{}",
+            "## Heading\n\nA paragraph with [link](https://example.invalid).\n\n```rust\nlet n = 42;\n```\n\n"
+                .repeat(512)
+        );
+        let mut session = EditorSession::from_text(&text);
+        let before = session.render_layout(76).lines.len();
+        assert!(before > 2_000);
+        let prior_parses = session.live.highlighter().work_snapshot().0;
+        let offset = text.find("A paragraph").unwrap();
+        session.jump_to_offset(offset).unwrap();
+        session.handle_key(key('i'));
+        session.handle_key(key('#'));
+        let (
+            parse_count,
+            changed_ranges,
+            changed_bytes,
+            injections,
+            injection_scans,
+            reference_scans,
+        ) = session.live.highlighter().work_snapshot();
+        assert!(
+            parse_count > prior_parses,
+            "structural edit must invoke the parser"
+        );
+        assert!(changed_ranges <= session.line_count());
+        assert!(changed_bytes <= session.document().len());
+        assert!(injections > 0);
+        assert!(injection_scans > 1);
+        assert!(reference_scans > 1);
+        let rebuilt_rows = session.render_layout(76).lines.len();
+        let work = &session.rendered_state.last_work;
+        assert_eq!(work.rebuilt_rows, rebuilt_rows);
+        assert_eq!(work.reused_rows, 0);
+        assert!(work.rebuilt_blocks > 512);
+        assert_eq!(work.reused_blocks, 0);
+    }
+
+    #[test]
+    #[ignore = "exact 1 MiB diagnostic is run by the acceptance benchmark target"]
+    fn acceptance_1mb_mutation_work_profile() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/kitchen-sink-1mb.md");
+        let text = fs::read_to_string(path).unwrap();
+        assert_eq!(text.len(), 1_048_722);
+        for (language, source_line) in [("rust", 3000), ("go", 20000)] {
+            let mut session = EditorSession::from_text(&text);
+            session.render_layout(100);
+            let offset = text
+                .split_inclusive('\n')
+                .take(source_line)
+                .map(str::len)
+                .sum();
+            session.jump_to_offset(offset).unwrap();
+            session.handle_key(key('v'));
+            for _ in 0..15 {
+                session.handle_key(key('j'));
+            }
+            let before = session.live.highlighter().work_snapshot();
+            let started = std::time::Instant::now();
+            session.handle_key(key('d'));
+            let input_ns = started.elapsed().as_nanos();
+            assert_eq!(session.mode(), Mode::Normal);
+            let after = session.live.highlighter().work_snapshot();
+            let model = session.live.rendered_model_work();
+            let started = std::time::Instant::now();
+            session.render_layout(100);
+            let render_ns = started.elapsed().as_nanos();
+            println!(
+                "MUTATION\t{language}\t{input_ns}\t{render_ns}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                after.0 - before.0,
+                after.1,
+                after.2,
+                after.3,
+                after.4,
+                after.5,
+                model.rebuilt_blocks,
+                model.parsed_bytes,
+                model.full_rebuild
+            );
+            session.handle_key(key('u'));
+            assert_eq!(session.live.text(), text);
+        }
+    }
+
+    #[test]
+    #[ignore = "exact 1 MiB multi-range feasibility diagnostic"]
+    fn acceptance_1mb_prose_batch_profile() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/kitchen-sink-1mb.md");
+        let original = fs::read_to_string(path).unwrap();
+        assert_eq!(original.len(), 1_048_722);
+        for first_line in [600, 130] {
+            let mut session = EditorSession::from_text(&original);
+            session.render_layout(100);
+            session.ensure_rendered_rows(100);
+            let offset = original
+                .split_inclusive('\n')
+                .take(first_line)
+                .map(str::len)
+                .sum();
+            session.jump_to_offset(offset).unwrap();
+            session.handle_key(key('v'));
+            for _ in 0..15 {
+                session.handle_key(key('j'));
+            }
+            let selection = session.rendered_selection().unwrap();
+            let ranges = nav::character_mutation_ranges(
+                &selection.source_ranges,
+                session.render_layout(100),
+                &original,
+            );
+            let edits = ranges
+                .iter()
+                .rev()
+                .map(|range| crate::vim::TextEdit {
+                    range: range.clone(),
+                    new_text_len: 0,
+                    new_text: String::new(),
+                })
+                .collect::<Vec<_>>();
+            let mut expected = original.clone();
+            for edit in &edits {
+                expected.replace_range(edit.range.clone(), "");
+            }
+            let mut source = crate::syntax::Highlighter::new(&original);
+            let start = std::time::Instant::now();
+            source.apply_edit(&edits);
+            let source_ns = start.elapsed().as_nanos();
+            assert_eq!(source.text(), expected);
+            let fresh = crate::syntax::Highlighter::new(&expected);
+            let changed_lines = first_line.saturating_sub(2)..first_line + 18;
+            assert_eq!(
+                source.highlight_lines(changed_lines.clone()),
+                fresh.highlight_lines(changed_lines)
+            );
+            let old_window_start = original[..ranges[0].start]
+                .rfind("\n## ")
+                .map_or(0, |at| at + 1);
+            let old_window_end = original[ranges.last().unwrap().end..]
+                .find("\n## ")
+                .map_or(original.len(), |at| ranges.last().unwrap().end + at + 1);
+            let removed_bytes = edits
+                .iter()
+                .map(|edit| edit.range.end - edit.range.start)
+                .sum::<usize>();
+            let new_window = old_window_start..old_window_end - removed_bytes;
+            let fragment_started = std::time::Instant::now();
+            let fragment = crate::syntax::Highlighter::new(&expected[new_window.clone()]);
+            let fragment_ns = fragment_started.elapsed().as_nanos();
+            let first_window_line = expected[..new_window.start]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count();
+            let window_lines = expected[new_window.clone()]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count();
+            assert_eq!(
+                fragment.highlight_lines(0..window_lines),
+                fresh.highlight_lines(first_window_line..first_window_line + window_lines),
+            );
+            let start = std::time::Instant::now();
+            let full_model =
+                BlockModel::build(&expected, crate::frontmatter::front_matter_span(&expected));
+            let full_model_ns = start.elapsed().as_nanos();
+            session.ensure_rendered_rows(100);
+            let start = std::time::Instant::now();
+            session.handle_key(key('d'));
+            let current_handler_ns = start.elapsed().as_nanos();
+            let [vim_ns, prepare_ns, source_refresh_ns, model_refresh_ns] =
+                session.live.selection_profile_ns();
+            let publish_profile = session.rendered_state.last_publish_profile_ns;
+            let retained_published = session.rendered_state.last_publish_used_retained;
+            let select_profile = session.rendered_state.last_select_operator_profile_ns;
+            assert_eq!(session.document(), expected);
+            assert_eq!(session.live.rendered_model(), &full_model);
+            let model_work = session.live.rendered_model_work();
+            let start = std::time::Instant::now();
+            assert_complete_reference(&mut session, 100);
+            let full_frame_oracle_ns = start.elapsed().as_nanos();
+            session.ensure_rendered_rows(100);
+            let start = std::time::Instant::now();
+            session.handle_key(key('u'));
+            let undo_handler_ns = start.elapsed().as_nanos();
+            let start = std::time::Instant::now();
+            let top = session.rendered_cursor().row.saturating_sub(8);
+            let _ = session.rendered_viewport(100, top, 41);
+            let undo_frame_ns = start.elapsed().as_nanos();
+            println!(
+                "PROSE-BATCH\t{first_line}\t{}\t{source_ns}\t{full_model_ns}\t{fragment_ns}\t{}\t{current_handler_ns}\t{vim_ns}\t{prepare_ns}\t{source_refresh_ns}\t{model_refresh_ns}\t{full_frame_oracle_ns}\t{undo_handler_ns}\t{undo_frame_ns}\t{}\t{}\t{}\t{publish_profile:?}\t{retained_published}\t{select_profile:?}\t{ranges:?}",
+                edits.len(),
+                new_window.end - new_window.start,
+                model_work.rebuilt_blocks,
+                model_work.parsed_bytes,
+                model_work.full_rebuild,
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "exact 1 MiB feasibility diagnostic is run by its benchmark target"]
+    fn acceptance_1mb_contiguous_fence_edit_profile() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/kitchen-sink-1mb.md");
+        let original = fs::read_to_string(path).unwrap();
+        assert_eq!(original.len(), 1_048_722);
+        for (language, first_line) in [("rust", 3000), ("go", 20000)] {
+            let start = original
+                .split_inclusive('\n')
+                .take(first_line)
+                .map(str::len)
+                .sum::<usize>();
+            let end = start
+                + original[start..]
+                    .split_inclusive('\n')
+                    .take(15)
+                    .map(str::len)
+                    .sum::<usize>();
+            let mut vim = crate::vim::VimCore::new(&original);
+            let mut syntax = crate::syntax::Highlighter::new(&original);
+            let prehighlight_started = std::time::Instant::now();
+            let _ = syntax.highlight_lines(first_line..first_line + 15);
+            let prehighlight_ns = prehighlight_started.elapsed().as_nanos();
+            let started = std::time::Instant::now();
+            let edits = vim.replace_range(start..end, "").unwrap();
+            let vim_ns = started.elapsed().as_nanos();
+            assert_eq!(edits.len(), 1);
+            let expected = format!("{}{}", &original[..start], &original[end..]);
+            assert_eq!(vim.text(), expected);
+            let before = syntax.work_snapshot();
+            let started = std::time::Instant::now();
+            syntax.apply_edit(&edits);
+            let source_ns = started.elapsed().as_nanos();
+            let after = syntax.work_snapshot();
+            let started = std::time::Instant::now();
+            let actual = syntax.highlight_lines(first_line..first_line + 15);
+            let highlight_ns = started.elapsed().as_nanos();
+            let fresh = crate::syntax::Highlighter::new(&expected);
+            assert_eq!(actual, fresh.highlight_lines(first_line..first_line + 15));
+            vim.handle_key(key('u'));
+            assert_eq!(vim.text(), original);
+            println!(
+                "CONTIGUOUS\t{language}\t{vim_ns}\t{source_ns}\t{highlight_ns}\t{prehighlight_ns}\t{}\t{}\t{}",
+                after.0 - before.0,
+                after.2,
+                after.4 - before.4,
+            );
+        }
+    }
+
     #[test]
     fn save_faults_preserve_live_text_and_undo_and_distinguish_commit() {
         for (after_commit, expected_bytes) in [(false, "original\n"), (true, "Xoriginal\n")] {
@@ -129,6 +1186,8 @@ mod tests {
             session.handle_key(key('X'));
             session.handle_key(esc());
             let cursor = session.cursor();
+            session.render_layout(40);
+            let layout_builds = session.rendered_state.layout_builds;
             let mut operations = FaultSave {
                 delegate: FileSystemAtomicSave,
                 fail_parent_sync: after_commit,
@@ -144,12 +1203,97 @@ mod tests {
             assert_eq!(session.document(), "Xoriginal\n");
             assert_eq!(session.cursor(), cursor);
             assert!(session.is_dirty());
+            session.render_layout(40);
+            assert_eq!(session.rendered_state.layout_builds, layout_builds);
             session.handle_key(key('u'));
             assert_eq!(session.document(), "original\n");
             if after_commit {
                 assert!(session.is_dirty(), "durability uncertainty survives undo");
             }
         }
+    }
+
+    #[test]
+    fn saves_preserve_layout_while_text_and_geometry_changes_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.md");
+        fs::write(&path, "# heading\n\noriginal\n").unwrap();
+        let mut session = EditorSession::open(&path).unwrap();
+        let original = session.render_layout(40).clone();
+        assert_eq!(session.rendered_state.layout_builds, 1);
+
+        session.save(None, false).unwrap();
+        assert!(!session.is_dirty());
+        assert_eq!(session.render_layout(40), &original);
+        assert_eq!(session.rendered_state.layout_builds, 1);
+
+        session.handle_key(key('i'));
+        session.handle_key(key('X'));
+        session.handle_key(esc());
+        assert!(session.is_dirty());
+        let edited = session.render_layout(40).clone();
+        assert_ne!(edited, original);
+        assert_eq!(session.rendered_state.layout_builds, 2);
+        session.save(None, false).unwrap();
+        assert!(!session.is_dirty());
+        assert_eq!(session.render_layout(40), &edited);
+        assert_eq!(session.rendered_state.layout_builds, 2);
+
+        session.handle_key(key('i'));
+        session.handle_key(key('Y'));
+        session.handle_key(esc());
+        let version_checked_layout = session.render_layout(40).clone();
+        assert!(session.is_dirty());
+        assert_eq!(session.rendered_state.layout_builds, 3);
+        let version = crate::DiskVersion::observe(&path).unwrap();
+        session.save_if_version(None, &version).unwrap();
+        assert!(!session.is_dirty());
+        assert_eq!(session.render_layout(40), &version_checked_layout);
+        assert_eq!(session.rendered_state.layout_builds, 3);
+
+        let retarget = dir.path().join("retarget.md");
+        session.save(Some(&retarget), false).unwrap();
+        assert_eq!(session.path(), Some(retarget.as_path()));
+        assert_eq!(session.render_layout(40), &version_checked_layout);
+        assert_eq!(session.rendered_state.layout_builds, 3);
+
+        let copy = dir.path().join("copy.md");
+        session.save_copy(&copy).unwrap();
+        assert_eq!(session.render_layout(40), &version_checked_layout);
+        assert_eq!(session.rendered_state.layout_builds, 3);
+
+        session.render_layout(24);
+        assert_eq!(session.rendered_state.layout_builds, 4);
+        let external = "# changed externally\n\nreplacement\n";
+        fs::write(&retarget, external).unwrap();
+        let version = match session.disk_state() {
+            crate::DiskState::Modified { version } => version,
+            state => panic!("expected modified disk state, got {state:?}"),
+        };
+        assert!(session.save(None, false).is_err());
+        assert_eq!(session.rendered_state.layout_builds, 4);
+        session.reload_from_disk(&version).unwrap();
+        assert_eq!(session.document(), external);
+        assert_ne!(session.render_layout(24), &edited);
+        assert_eq!(session.rendered_state.layout_builds, 1);
+    }
+
+    #[test]
+    fn stale_version_save_preserves_dirty_state_and_rendered_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.md");
+        fs::write(&path, "original\n").unwrap();
+        let mut session = EditorSession::open(&path).unwrap();
+        session.handle_key(key('i'));
+        session.handle_key(key('X'));
+        session.handle_key(esc());
+        let layout = session.render_layout(40).clone();
+        let stale = crate::DiskVersion::observe(&path).unwrap();
+        fs::write(&path, "other contents\n").unwrap();
+        assert!(session.save_if_version(None, &stale).is_err());
+        assert!(session.is_dirty());
+        assert_eq!(session.render_layout(40), &layout);
+        assert_eq!(session.rendered_state.layout_builds, 1);
     }
 
     #[test]
@@ -1019,7 +2163,9 @@ use crate::document::{Document, LineEnding};
 use crate::error::{OpenError, SaveError};
 use crate::frontmatter::FrontMatter;
 use crate::rendered::nav;
-use crate::rendered::{BlockModel, RenderedCodeFenceRegion};
+#[cfg(test)]
+use crate::rendered::BlockModel;
+use crate::rendered::{LayoutBoundary, ModelChange, RenderedCodeFenceRegion, RetainedRows};
 use crate::spell::{
     DecorationKind, Diagnostic, DiagnosticDecorationRow, DiagnosticProvider, PositionError,
     TextPosition,
@@ -1029,7 +2175,7 @@ use crate::style::{
     RenderedSelection, RenderedSourceAtom, SearchDirection, SelectionShape, SourceDecoration,
     TargetKind,
 };
-use live_document::LiveDocument;
+use live_document::{LiveDocument, PendingProjectionChange};
 use std::ops::Range;
 use unicode_width::UnicodeWidthChar;
 
@@ -1505,9 +2651,22 @@ impl RenderedSearchState {
 ///
 /// Holds a cached layout, cursor position, search state, and front-matter
 /// panel collapse state. The layout is invalidated on edits.
+#[cfg(test)]
+#[derive(Default)]
+struct ProjectionWork {
+    rebuilt_blocks: usize,
+    reused_blocks: usize,
+    rebuilt_rows: usize,
+    reused_rows: usize,
+}
+
 struct RenderedState {
     /// Cached rendered layout (None = needs rebuild).
     layout_cache: Option<RenderedLayout>,
+    /// One retained row store for bounded viewport drawing.
+    row_cache: Option<RetainedRows>,
+    /// Ownership boundaries for moving a flat build into retained rows.
+    layout_boundaries: Vec<LayoutBoundary>,
     /// Full source spans paired with rendered fenced-code row intervals.
     code_fence_regions: Vec<RenderedCodeFenceRegion>,
     /// The width used when the layout was last built.
@@ -1531,12 +2690,22 @@ struct RenderedState {
     /// Actual rendered layout builds, exposed only to regression tests.
     #[cfg(test)]
     layout_builds: usize,
+    #[cfg(test)]
+    last_work: ProjectionWork,
+    #[cfg(test)]
+    last_publish_profile_ns: [u128; 3],
+    #[cfg(test)]
+    last_publish_used_retained: bool,
+    #[cfg(test)]
+    last_select_operator_profile_ns: [u128; 6],
 }
 
 impl RenderedState {
     fn new() -> Self {
         Self {
             layout_cache: None,
+            row_cache: None,
+            layout_boundaries: Vec::new(),
             code_fence_regions: Vec::new(),
             last_width: 0,
             cursor: RenderedCursor::new(0),
@@ -1548,6 +2717,14 @@ impl RenderedState {
             pending_heading_bracket: None,
             #[cfg(test)]
             layout_builds: 0,
+            #[cfg(test)]
+            last_work: ProjectionWork::default(),
+            #[cfg(test)]
+            last_publish_profile_ns: [0; 3],
+            #[cfg(test)]
+            last_publish_used_retained: false,
+            #[cfg(test)]
+            last_select_operator_profile_ns: [0; 6],
         }
     }
 
@@ -1558,6 +2735,8 @@ impl RenderedState {
     /// Invalidate the layout cache.
     fn invalidate(&mut self) {
         self.layout_cache = None;
+        self.row_cache = None;
+        self.layout_boundaries.clear();
         self.code_fence_regions.clear();
     }
 }
@@ -1698,7 +2877,6 @@ impl EditorSession {
             return Err(error);
         }
         self.save_point = SaveBaseline::Confirmed(self.live.save_point());
-        self.rendered_state.invalidate();
         Ok(())
     }
 
@@ -1727,7 +2905,6 @@ impl EditorSession {
         // once after the save succeeds.
         let mark = self.live.save_point();
         self.save_point = SaveBaseline::Confirmed(mark);
-        self.rendered_state.invalidate();
         Ok(())
     }
 
@@ -1787,9 +2964,11 @@ impl EditorSession {
         let candidate = self.document.prepare_reload(expected)?;
         if candidate.text != self.live.text_ref() {
             let cursor = self.live.cursor();
+            // Release rows for the obsolete text before allocating replacement
+            // source analysis; reload will rebuild the rendered view on demand.
+            self.rendered_state = RenderedState::new();
             let _outcome = self.live.reload(&candidate.text, cursor);
             self.session_mode = SessionMode::CoreDriven;
-            self.rendered_state = RenderedState::new();
         }
         self.document.commit_reload(&candidate);
         self.save_point = SaveBaseline::Confirmed(self.live.save_point());
@@ -1964,26 +3143,39 @@ impl EditorSession {
 
     /// Project visible diagnostics into rendered display-cell intervals.
     ///
-    /// Call [`Self::render_layout`] first to establish the host width. Rows
-    /// outside `visible` are clipped, and source-less presentation atoms are
-    /// never included.
+    /// Establish the host width with [`Self::render_layout`] or
+    /// [`Self::rendered_viewport`] first. Rows outside `visible` are clipped,
+    /// and source-less presentation atoms are never included.
     pub fn diagnostic_decoration_rows(
         &mut self,
         visible: Range<usize>,
     ) -> Vec<DiagnosticDecorationRow> {
-        let Some(layout) = self.rendered_state.layout_cache.as_ref() else {
+        let lines = if let Some(layout) = self.rendered_state.layout_cache.as_ref() {
+            let start = visible.start.min(layout.lines.len());
+            let end = visible.end.min(layout.lines.len()).max(start);
+            layout.lines[start..end].to_vec()
+        } else if let Some(rows) = self.rendered_state.row_cache.as_mut() {
+            (visible.start..visible.end.min(rows.row_count()))
+                .filter_map(|row| {
+                    rows.row_current(
+                        row,
+                        self.live.rendered_model(),
+                        self.live.text_ref(),
+                        self.live.highlighter(),
+                        self.rendered_state.last_width,
+                    )
+                })
+                .collect::<Vec<_>>()
+        } else {
             return Vec::new();
         };
-        let start = visible.start.min(layout.lines.len());
-        let end = visible.end.min(layout.lines.len());
+        let start = visible.start;
+        let end = start + lines.len();
         if start >= end {
             return Vec::new();
         }
-        let source_intervals = Self::visible_source_intervals(
-            layout.lines[start..end]
-                .iter()
-                .map(|line| line.atoms.as_slice()),
-        );
+        let source_intervals =
+            Self::visible_source_intervals(lines.iter().map(|line| line.atoms.as_slice()));
         let diagnostics = self.diagnostics();
         Self::visible_diagnostic_indices(diagnostics, &source_intervals)
             .into_iter()
@@ -1993,9 +3185,15 @@ impl EditorSession {
                     provider: diagnostic.provider,
                     severity: diagnostic.severity,
                 };
-                nav::project_source_range(&diagnostic.range, visible.clone(), layout)
-                    .into_iter()
-                    .map(move |(row, columns)| DiagnosticDecorationRow { row, columns, kind })
+                lines.iter().enumerate().flat_map(move |(offset, line)| {
+                    nav::project_atom_intervals(&diagnostic.range, &line.atoms)
+                        .into_iter()
+                        .map(move |columns| DiagnosticDecorationRow {
+                            row: start + offset,
+                            columns,
+                            kind,
+                        })
+                })
             })
             .collect()
     }
@@ -2104,15 +3302,25 @@ impl EditorSession {
 
     /// Move the cursor to the closest source-backed rendered atom.
     pub fn move_to_rendered_point(&mut self, point: RenderedPoint) -> Vec<Effect> {
-        let Some(layout) = self.rendered_state.layout_cache.as_ref() else {
+        let candidate = if let Some(layout) = self.rendered_state.layout_cache.as_ref() {
+            nav::source_backed_point(point, layout).and_then(|point| {
+                nav::source_for_point(point, layout).map(|source| (point, source))
+            })
+        } else if let Some(rows) = self.rendered_state.row_cache.as_mut() {
+            rows.source_backed_point(
+                point,
+                self.live.rendered_model(),
+                self.live.text_ref(),
+                self.live.highlighter(),
+                self.rendered_state.last_width,
+            )
+        } else {
+            None
+        };
+        let Some((point, source)) = candidate else {
             return Vec::new();
         };
-        let Some(point) = nav::source_backed_point(point, layout) else {
-            return Vec::new();
-        };
-        let offset = nav::source_for_point(point, layout)
-            .expect("source-backed point has source")
-            .start;
+        let offset = source.start;
         let position = self.live.position_for_byte_offset(offset);
         self.live.jump_to(position.0, position.1);
         self.rendered_state.cursor = RenderedCursor::at(point);
@@ -2126,7 +3334,7 @@ impl EditorSession {
         anchor: RenderedPoint,
         active: RenderedPoint,
     ) -> Vec<Effect> {
-        if self.rendered_state.layout_cache.is_none()
+        if (self.rendered_state.layout_cache.is_none() && self.rendered_state.row_cache.is_none())
             || matches!(self.mode(), Mode::Insert | Mode::Command)
         {
             return Vec::new();
@@ -2303,21 +3511,150 @@ impl EditorSession {
         let SessionMode::Select(active) = &self.session_mode else {
             return None;
         };
-        let layout = self.rendered_state.layout_cache.as_ref()?;
-        let mut selection = nav::project_selection_from_source_positions(
+        let lines = if matches!(active.kind, SelectionKind::Line) {
+            self.line_selection_lines(active)
+        } else {
+            self.selection_lines(active.anchor.point, active.active.point)
+        };
+        Some(nav::project_selection_from_rows(
             active.anchor.point,
             active.active.point,
             active.kind.shape(),
+            (active.anchor.source, active.active.source),
+            &lines,
+            match &active.kind {
+                SelectionKind::Character { ranges } => Some(ranges),
+                SelectionKind::Line | SelectionKind::Block => None,
+            },
+            self.live.text_ref(),
+        ))
+    }
+
+    fn selection_lines(
+        &self,
+        anchor: RenderedPoint,
+        active: RenderedPoint,
+    ) -> Vec<(usize, crate::style::RenderedLine)> {
+        let first = anchor.row.min(active.row);
+        let end = anchor.row.max(active.row).saturating_add(1);
+        if let Some(layout) = self.rendered_state.layout_cache.as_ref() {
+            return (first..end)
+                .filter_map(|row| layout.lines.get(row).cloned().map(|line| (row, line)))
+                .collect();
+        }
+        self.rendered_state
+            .row_cache
+            .as_ref()
+            .map_or_else(Vec::new, |rows| {
+                rows.rows_current_range(
+                    first..end,
+                    self.live.rendered_model(),
+                    self.live.highlighter(),
+                    self.rendered_state.last_width,
+                )
+            })
+    }
+
+    fn line_selection_lines(
+        &self,
+        active: &ActiveSelection,
+    ) -> Vec<(usize, crate::style::RenderedLine)> {
+        let text = self.live.text_ref();
+        let selected = nav::physical_lines_for_source_positions(
             active.anchor.source,
             active.active.source,
-            layout,
-            &self.live.text(),
+            text,
         );
-        if let SelectionKind::Character { ranges } = &active.kind {
-            selection.source_ranges = ranges.clone();
-            selection.rows = nav::character_selection_rows(ranges, layout);
+        if let Some(layout) = self.rendered_state.layout_cache.as_ref() {
+            let mut first = active.anchor.point.row.min(active.active.point.row);
+            let mut last = active.anchor.point.row.max(active.active.point.row);
+            while first > 0
+                && nav::line_row_intersects_source(&layout.lines[first - 1], &selected, text)
+            {
+                first -= 1;
+            }
+            while last + 1 < layout.lines.len()
+                && nav::line_row_intersects_source(&layout.lines[last + 1], &selected, text)
+            {
+                last += 1;
+            }
+            return (first..=last)
+                .filter_map(|row| layout.lines.get(row).cloned().map(|line| (row, line)))
+                .collect();
         }
-        Some(selection)
+        self.rendered_state
+            .row_cache
+            .as_ref()
+            .map_or_else(Vec::new, |rows| {
+                let model = self.live.rendered_model();
+                let highlighter = self.live.highlighter();
+                let width = self.rendered_state.last_width;
+                let mut first = active.anchor.point.row.min(active.active.point.row);
+                let mut last = active.anchor.point.row.max(active.active.point.row);
+                while first > 0 {
+                    let previous =
+                        rows.rows_current_range(first - 1..first, model, highlighter, width);
+                    if !previous.first().is_some_and(|(_, line)| {
+                        nav::line_row_intersects_source(line, &selected, text)
+                    }) {
+                        break;
+                    }
+                    first -= 1;
+                }
+                while last + 1 < rows.row_count() {
+                    let next =
+                        rows.rows_current_range(last + 1..last + 2, model, highlighter, width);
+                    if !next.first().is_some_and(|(_, line)| {
+                        nav::line_row_intersects_source(line, &selected, text)
+                    }) {
+                        break;
+                    }
+                    last += 1;
+                }
+                rows.rows_current_range(first..last + 1, model, highlighter, width)
+            })
+    }
+
+    fn selection_endpoint_at(&self, point: RenderedPoint) -> SelectionEndpoint {
+        let (atom, line) = if let Some(layout) = self.rendered_state.layout_cache.as_ref() {
+            (
+                nav::source_for_point(point, layout),
+                nav::line_identity_for_point(point, layout),
+            )
+        } else {
+            let line = self
+                .selection_lines(point, point)
+                .pop()
+                .map(|(_, line)| line);
+            let atom = line.as_ref().and_then(|line| {
+                line.atoms
+                    .iter()
+                    .find(|atom| {
+                        atom.columns.contains(&point.column) || atom.columns.start == point.column
+                    })
+                    .and_then(|atom| atom.source.clone())
+            });
+            let identity = atom
+                .is_none()
+                .then(|| {
+                    self.rendered_state.row_cache.as_ref().and_then(|rows| {
+                        rows.line_identity_at(
+                            point.row,
+                            self.live.rendered_model(),
+                            self.live.highlighter(),
+                            self.rendered_state.last_width,
+                        )
+                    })
+                })
+                .flatten();
+            (atom, identity)
+        };
+        SelectionEndpoint {
+            point,
+            source: self.live.cursor(),
+            atom,
+            line,
+        }
     }
 
     /// Check if the buffer is dirty (modified since last save).
@@ -3091,14 +4428,38 @@ impl EditorSession {
                 selection.anchor.atom.is_none() && selection.anchor.line.is_some()
             });
             let text = self.live.text();
-            let fm_span = crate::frontmatter::front_matter_span(&text);
-            let model = BlockModel::build(&text, fm_span);
-            let (layout, code_fence_regions) = RenderedLayout::build_with_fence_regions(
-                &model,
-                width,
-                self.live.highlighter(),
-                self.rendered_state.fm_collapsed,
-            );
+            self.live.ensure_rendered_model();
+            let model = self.live.rendered_model();
+            let (layout, code_fence_regions, boundaries) = if let Some(rows) =
+                self.rendered_state.row_cache.take()
+            {
+                if self.rendered_state.last_width == width {
+                    let (layout, fences, boundaries) =
+                        rows.into_complete_current(model, &text, self.live.highlighter(), width);
+                    (layout, fences, boundaries)
+                } else {
+                    RenderedLayout::build_with_boundaries(
+                        model,
+                        width,
+                        self.live.highlighter(),
+                        self.rendered_state.fm_collapsed,
+                    )
+                }
+            } else {
+                RenderedLayout::build_with_boundaries(
+                    model,
+                    width,
+                    self.live.highlighter(),
+                    self.rendered_state.fm_collapsed,
+                )
+            };
+            #[cfg(test)]
+            let last_work = ProjectionWork {
+                rebuilt_blocks: self.live.rendered_model_work().rebuilt_blocks,
+                reused_blocks: self.live.rendered_model_work().reused_blocks,
+                rebuilt_rows: layout.lines.len(),
+                reused_rows: 0,
+            };
             let cursor = active_atom_remap
                 .then(|| {
                     selection
@@ -3126,7 +4487,13 @@ impl EditorSession {
                 })
                 .map(RenderedCursor::at)
                 .unwrap_or_else(|| {
-                    nav::enter_rendered(source_anchor.0, source_anchor.1, &layout, &text)
+                    nav::enter_rendered_indexed(
+                        source_anchor.0,
+                        source_anchor.1,
+                        &layout,
+                        &text,
+                        self.live.highlighter().line_starts(),
+                    )
                 });
             let select_anchor = anchor_atom_remap
                 .then(|| {
@@ -3158,10 +4525,18 @@ impl EditorSession {
                 .or_else(|| {
                     selection.as_ref().map(|selection| {
                         let (line, col) = selection.anchor.source;
-                        nav::enter_rendered(line, col, &layout, &text).point()
+                        nav::enter_rendered_indexed(
+                            line,
+                            col,
+                            &layout,
+                            &text,
+                            self.live.highlighter().line_starts(),
+                        )
+                        .point()
                     })
                 });
             self.rendered_state.layout_cache = Some(layout);
+            self.rendered_state.layout_boundaries = boundaries;
             self.rendered_state.code_fence_regions = code_fence_regions;
             self.rendered_state.last_width = width;
             self.rendered_state.cursor = cursor;
@@ -3174,12 +4549,165 @@ impl EditorSession {
             #[cfg(test)]
             {
                 self.rendered_state.layout_builds += 1;
+                self.rendered_state.last_work = last_work;
             }
         }
         self.rendered_state
             .layout_cache
             .as_ref()
             .expect("rendered layout must be cached after building")
+    }
+
+    fn ensure_rendered_rows(&mut self, width: u16) {
+        if width == 0
+            || (self.rendered_state.row_cache.is_some() && self.rendered_state.last_width == width)
+        {
+            return;
+        }
+        self.render_layout(width);
+        let layout = self
+            .rendered_state
+            .layout_cache
+            .take()
+            .expect("flat layout was built before partitioning");
+        let fences = std::mem::take(&mut self.rendered_state.code_fence_regions);
+        let boundaries = std::mem::take(&mut self.rendered_state.layout_boundaries);
+        let rows = if boundaries.is_empty() {
+            self.live.ensure_rendered_model();
+            RetainedRows::build(
+                self.live.rendered_model(),
+                width,
+                self.live.highlighter(),
+                self.rendered_state.fm_collapsed,
+            )
+        } else {
+            RetainedRows::from_complete(layout, fences, &boundaries)
+        };
+        self.rendered_state.code_fence_regions = rows.fence_regions();
+        self.rendered_state.row_cache = Some(rows);
+    }
+
+    /// Return only the current rendered rows needed by a host viewport.
+    ///
+    /// Unlike [`Self::render_layout`], a local edit can retain unaffected
+    /// mapped rows and read only the requested window. The cursor and row
+    /// count still use document-wide coordinates.
+    pub fn rendered_viewport(
+        &mut self,
+        width: u16,
+        top: usize,
+        height: usize,
+    ) -> crate::style::RenderedViewportFrame {
+        if self.rendered_state.row_cache.is_none() || self.rendered_state.last_width != width {
+            self.render_layout(width);
+        }
+        if let Some(layout) = self.rendered_state.layout_cache.as_ref() {
+            let total = layout.lines.len();
+            let first = top.min(total.saturating_sub(1));
+            let end = first.saturating_add(height).min(total);
+            let lines = layout.lines[first..end].to_vec();
+            let numbers = layout.line_numbers[first..end].to_vec();
+            let mut source_line = layout.line_numbers[..first]
+                .iter()
+                .rev()
+                .find_map(|number| *number)
+                .map(|number| number - 1);
+            let mut previous = first.checked_sub(1).and_then(|row| layout.lines.get(row));
+            let mut continuations = Vec::with_capacity(lines.len());
+            for (line, number) in lines.iter().zip(&numbers) {
+                let continuation = if let Some(number) = number {
+                    source_line = Some(number - 1);
+                    None
+                } else if previous.is_some_and(|prior| {
+                    line.kind == LineKind::Content && line.source == prior.source
+                }) {
+                    source_line
+                } else {
+                    None
+                };
+                continuations.push(continuation);
+                previous = Some(line);
+            }
+            return crate::style::RenderedViewportFrame {
+                first_row: first,
+                total_rows: total,
+                lines,
+                line_numbers: numbers,
+                gutter_continuations: continuations,
+                cursor: self.rendered_cursor(),
+            };
+        }
+        self.ensure_rendered_rows(width);
+        let Some(rows) = self.rendered_state.row_cache.as_mut() else {
+            return crate::style::RenderedViewportFrame {
+                first_row: 0,
+                total_rows: 0,
+                lines: Vec::new(),
+                line_numbers: Vec::new(),
+                gutter_continuations: Vec::new(),
+                cursor: self.rendered_cursor(),
+            };
+        };
+        let total = rows.row_count();
+        let first = top.min(total.saturating_sub(1));
+        let end = first.saturating_add(height).min(total);
+        let mut prior_source_line = None;
+        let mut prior_line = None;
+        if first > 0 {
+            prior_line = rows.row_current(
+                first - 1,
+                self.live.rendered_model(),
+                self.live.text_ref(),
+                self.live.highlighter(),
+                width,
+            );
+            for previous in (0..first).rev() {
+                if let Some(number) = rows.line_number(previous) {
+                    prior_source_line = Some(number - 1);
+                    break;
+                }
+            }
+        }
+        let mut lines = Vec::with_capacity(end - first);
+        let mut numbers = Vec::with_capacity(end - first);
+        let mut continuations = Vec::with_capacity(end - first);
+        for row in first..end {
+            let line = rows
+                .row_current(
+                    row,
+                    self.live.rendered_model(),
+                    self.live.text_ref(),
+                    self.live.highlighter(),
+                    width,
+                )
+                .expect("indexed viewport row is within the current geometry");
+            let number = rows.line_number(row);
+            let continuation = if let Some(number) = number {
+                prior_source_line = Some(number - 1);
+                None
+            } else if prior_line
+                .as_ref()
+                .is_some_and(|previous: &crate::style::RenderedLine| {
+                    line.kind == LineKind::Content && line.source == previous.source
+                })
+            {
+                prior_source_line
+            } else {
+                None
+            };
+            prior_line = Some(line.clone());
+            lines.push(line);
+            numbers.push(number);
+            continuations.push(continuation);
+        }
+        crate::style::RenderedViewportFrame {
+            first_row: first,
+            total_rows: total,
+            lines,
+            line_numbers: numbers,
+            gutter_continuations: continuations,
+            cursor: self.rendered_cursor(),
+        }
     }
 
     /// Return the rendered cursor row.
@@ -3196,11 +4724,19 @@ impl EditorSession {
     /// indices shift. This remaps the rendered cursor to the same content
     /// line using the core's `enter_rendered` pure function.
     pub fn remap_rendered_cursor(&mut self, edit_line: usize, edit_col: usize) {
+        if self.rendered_state.layout_cache.is_none() && self.rendered_state.row_cache.is_some() {
+            self.render_layout(self.rendered_state.last_width);
+        }
         let Some(layout) = self.rendered_state.layout_cache.as_ref() else {
             return;
         };
-        let text = self.live.text();
-        self.rendered_state.cursor = nav::enter_rendered(edit_line, edit_col, layout, &text);
+        self.rendered_state.cursor = nav::enter_rendered_indexed(
+            edit_line,
+            edit_col,
+            layout,
+            self.live.text_ref(),
+            self.live.highlighter().line_starts(),
+        );
     }
 
     // ── Internal helpers ─────────────────────────────────────────────
@@ -3491,8 +5027,11 @@ impl EditorSession {
     }
 
     fn focused_synthetic_link_destination(&self) -> Option<String> {
-        let layout = self.rendered_state.layout_cache.as_ref()?;
         let line = self.rendered_state.cursor.line;
+        if let Some(rows) = self.rendered_state.row_cache.as_ref() {
+            return rows.link_destination_at_row(line).map(ToOwned::to_owned);
+        }
+        let layout = self.rendered_state.layout_cache.as_ref()?;
         if layout.lines.get(line)?.kind != LineKind::Synthetic {
             return None;
         }
@@ -3694,13 +5233,215 @@ impl EditorSession {
             }
         }
 
+        let cursor = self.rendered_state.cursor;
+        let search = self.rendered_state.search.current().cloned();
+        let count = std::mem::take(&mut self.rendered_state.count);
+        if self.rendered_state.layout_cache.is_none() {
+            if let Some(rows) = self.rendered_state.row_cache.as_mut() {
+                if let Some(row) = nav::vertical_target(key, &cursor, rows.row_count(), count) {
+                    self.rendered_state.cursor = rows.cursor_for_row(
+                        row,
+                        cursor.desired_column,
+                        self.live.rendered_model(),
+                        self.live.text_ref(),
+                        self.live.highlighter(),
+                        self.rendered_state.last_width,
+                    );
+                    self.commit_rendered_cursor();
+                    self.refresh_character_selection();
+                    return vec![Effect::CursorMoved];
+                }
+                if let Some(forward) = nav::horizontal_direction(key) {
+                    let point = nav::horizontal_point_with(
+                        &cursor,
+                        rows.row_count(),
+                        forward,
+                        count.max(1),
+                        |row| {
+                            rows.row_current(
+                                row,
+                                self.live.rendered_model(),
+                                self.live.text_ref(),
+                                self.live.highlighter(),
+                                self.rendered_state.last_width,
+                            )
+                        },
+                    );
+                    if let Some(point) = point {
+                        self.rendered_state.cursor = RenderedCursor::at(point);
+                        self.commit_rendered_cursor();
+                        self.refresh_character_selection();
+                        return vec![Effect::CursorMoved];
+                    }
+                    return Vec::new();
+                }
+                if let Some(motion) = nav::word_motion(key) {
+                    let point = nav::word_point_with(
+                        &cursor,
+                        rows.row_count(),
+                        self.live.text_ref(),
+                        motion,
+                        count.max(1),
+                        |row| {
+                            rows.row_current(
+                                row,
+                                self.live.rendered_model(),
+                                self.live.text_ref(),
+                                self.live.highlighter(),
+                                self.rendered_state.last_width,
+                            )
+                        },
+                    );
+                    if let Some(point) = point {
+                        self.rendered_state.cursor = RenderedCursor::at(point);
+                        self.commit_rendered_cursor();
+                        self.refresh_character_selection();
+                        return vec![Effect::CursorMoved];
+                    }
+                    return Vec::new();
+                }
+                if let Some(target) =
+                    nav::jump_row_for_key(key, &cursor, count, &rows.jump_targets())
+                {
+                    if let Some(row) = target {
+                        self.rendered_state.cursor = rows.cursor_for_row(
+                            row,
+                            cursor.desired_column,
+                            self.live.rendered_model(),
+                            self.live.text_ref(),
+                            self.live.highlighter(),
+                            self.rendered_state.last_width,
+                        );
+                        self.commit_rendered_cursor();
+                        self.refresh_character_selection();
+                        return vec![Effect::CursorMoved];
+                    }
+                    return Vec::new();
+                }
+                if key.mods == Modifiers::default() {
+                    if let KeyCodeKind::Char(direction @ ('/' | '?')) = key.code.kind {
+                        let mut draft = RenderedSearch::new("");
+                        draft.set_direction(if direction == '/' {
+                            SearchDirection::Forward
+                        } else {
+                            SearchDirection::Backward
+                        });
+                        self.rendered_state.search.begin(draft, cursor);
+                        return Vec::new();
+                    }
+                    if let KeyCodeKind::Char('n' | 'N') = key.code.kind {
+                        let Some(search) = search.filter(|search| !search.pattern.is_empty())
+                        else {
+                            return Vec::new();
+                        };
+                        let direction = if key.code.kind == KeyCodeKind::Char('n') {
+                            search.direction()
+                        } else if search.direction() == SearchDirection::Forward {
+                            SearchDirection::Backward
+                        } else {
+                            SearchDirection::Forward
+                        };
+                        let target = rows.find_next_match(
+                            &search,
+                            &cursor,
+                            direction,
+                            self.live.rendered_model(),
+                            self.live.highlighter(),
+                            self.rendered_state.last_width,
+                        );
+                        self.rendered_state.search.replace_last(search);
+                        if let Some(row) = target {
+                            let wrapped = if direction == SearchDirection::Forward {
+                                row <= cursor.line
+                            } else {
+                                row >= cursor.line
+                            };
+                            self.rendered_state.cursor = rows.cursor_for_row(
+                                row,
+                                cursor.desired_column,
+                                self.live.rendered_model(),
+                                self.live.text_ref(),
+                                self.live.highlighter(),
+                                self.rendered_state.last_width,
+                            );
+                            self.commit_rendered_cursor();
+                            self.refresh_character_selection();
+                            let mut effects = vec![Effect::CursorMoved];
+                            if wrapped {
+                                effects.push(Effect::Message {
+                                    text: " (wrapped)".to_string(),
+                                    severity: Severity::Info,
+                                });
+                            }
+                            return effects;
+                        }
+                        return Vec::new();
+                    }
+                    if let KeyCodeKind::Char('0' | '^' | '$') = key.code.kind {
+                        let line = rows.row_current(
+                            cursor.line,
+                            self.live.rendered_model(),
+                            self.live.text_ref(),
+                            self.live.highlighter(),
+                            self.rendered_state.last_width,
+                        );
+                        if let Some(point) = line.as_ref().and_then(|line| {
+                            nav::edge_point_with(
+                                cursor.line,
+                                key.code.kind == KeyCodeKind::Char('$'),
+                                line,
+                            )
+                        }) {
+                            self.rendered_state.cursor = RenderedCursor::at(point);
+                            self.commit_rendered_cursor();
+                            self.refresh_character_selection();
+                            return vec![Effect::CursorMoved];
+                        }
+                        return Vec::new();
+                    }
+                    let target_row = match key.code.kind {
+                        KeyCodeKind::Char('{') => rows.boundary_row(cursor.line, false),
+                        KeyCodeKind::Char('}') => rows.boundary_row(cursor.line, true),
+                        KeyCodeKind::Home => rows.edge_content_row(false),
+                        KeyCodeKind::End => rows.edge_content_row(true),
+                        _ => None,
+                    };
+                    if let Some(row) = target_row {
+                        self.rendered_state.cursor = rows.cursor_for_row(
+                            row,
+                            cursor.desired_column,
+                            self.live.rendered_model(),
+                            self.live.text_ref(),
+                            self.live.highlighter(),
+                            self.rendered_state.last_width,
+                        );
+                        self.commit_rendered_cursor();
+                        self.refresh_character_selection();
+                        return vec![Effect::CursorMoved];
+                    }
+                    if matches!(key.code.kind, KeyCodeKind::Enter) {
+                        return rows.target_message_at_row(cursor.line).map_or_else(
+                            Vec::new,
+                            |text| {
+                                vec![Effect::Message {
+                                    text,
+                                    severity: Severity::Info,
+                                }]
+                            },
+                        );
+                    }
+                }
+                if key.mods == Modifiers::default() && key.code.kind == KeyCodeKind::Char('z') {
+                    self.render_layout(self.rendered_state.last_width);
+                } else {
+                    return Vec::new();
+                }
+            }
+        }
         let Some(layout) = self.rendered_state.layout_cache.as_ref() else {
             return Vec::new();
         };
         let text = nav::key_inspects_source(key).then(|| self.live.text());
-        let cursor = self.rendered_state.cursor;
-        let search = self.rendered_state.search.current().cloned();
-        let count = std::mem::take(&mut self.rendered_state.count);
         let result = nav::handle_key(
             key,
             &cursor,
@@ -3782,31 +5523,56 @@ impl EditorSession {
                     return Vec::new();
                 };
                 let cursor = *cursor;
-                let text = self.live.text();
-                let Some(layout) = self.rendered_state.layout_cache.as_ref() else {
-                    return Vec::new();
-                };
                 let Some((search_state, _)) = self.rendered_state.search.prompt() else {
                     return Vec::new();
                 };
                 let mut search_state = search_state.clone();
                 search_state.pattern.push(c);
-                let match_line = nav::find_next_match(
-                    &search_state,
-                    &cursor,
-                    layout,
-                    &text,
-                    search_state.direction(),
-                );
+                let match_line = if let Some(layout) = self.rendered_state.layout_cache.as_ref() {
+                    nav::find_next_match(
+                        &search_state,
+                        &cursor,
+                        layout,
+                        self.live.text_ref(),
+                        search_state.direction(),
+                    )
+                } else if let Some(rows) = self.rendered_state.row_cache.as_mut() {
+                    rows.find_next_match(
+                        &search_state,
+                        &cursor,
+                        search_state.direction(),
+                        self.live.rendered_model(),
+                        self.live.highlighter(),
+                        self.rendered_state.last_width,
+                    )
+                } else {
+                    None
+                };
                 self.rendered_state
                     .search
                     .update_draft(|draft| *draft = search_state);
                 if let Some(match_line) = match_line {
-                    self.rendered_state.cursor = nav::cursor_for_row(
-                        match_line,
-                        self.rendered_state.cursor.desired_column,
-                        layout,
-                    );
+                    self.rendered_state.cursor =
+                        if let Some(layout) = self.rendered_state.layout_cache.as_ref() {
+                            nav::cursor_for_row(
+                                match_line,
+                                self.rendered_state.cursor.desired_column,
+                                layout,
+                            )
+                        } else {
+                            self.rendered_state
+                                .row_cache
+                                .as_mut()
+                                .unwrap()
+                                .cursor_for_row(
+                                    match_line,
+                                    self.rendered_state.cursor.desired_column,
+                                    self.live.rendered_model(),
+                                    self.live.text_ref(),
+                                    self.live.highlighter(),
+                                    self.rendered_state.last_width,
+                                )
+                        };
                     self.commit_rendered_cursor();
                     self.refresh_character_selection();
                     vec![Effect::CursorMoved]
@@ -3820,6 +5586,9 @@ impl EditorSession {
 
     fn enter_insert_from_rendered(&mut self, action: RenderedExitAction) -> Vec<Effect> {
         self.commit_rendered_cursor();
+        if self.rendered_state.layout_cache.is_some() {
+            self.ensure_rendered_rows(self.rendered_state.last_width);
+        }
         self.rendered_state.search.cancel();
         self.rendered_state.count = 0;
         let vim_effects = self.live.handle_key(action.key());
@@ -3828,23 +5597,7 @@ impl EditorSession {
 
     fn enter_select(&mut self, shape: SelectionShape) -> Vec<Effect> {
         let point = self.rendered_state.cursor.point();
-        let source = self.live.cursor();
-        let atom = self
-            .rendered_state
-            .layout_cache
-            .as_ref()
-            .and_then(|layout| nav::source_for_point(point, layout));
-        let line = self
-            .rendered_state
-            .layout_cache
-            .as_ref()
-            .and_then(|layout| nav::line_identity_for_point(point, layout));
-        let endpoint = SelectionEndpoint {
-            point,
-            source,
-            atom,
-            line,
-        };
+        let endpoint = self.selection_endpoint_at(point);
         self.rendered_state.register_input = RegisterInput::Default;
         self.session_mode = SessionMode::Select(ActiveSelection {
             anchor: endpoint.clone(),
@@ -3876,12 +5629,24 @@ impl EditorSession {
         operator: RangeOperator,
         publication: YankPublication,
     ) -> Vec<Effect> {
+        if operator != RangeOperator::Yank
+            && matches!(&self.session_mode, SessionMode::Select(active) if active.kind.shape() == SelectionShape::Line)
+        {
+            return self.apply_rendered_line_operator(operator, publication);
+        }
+        if let Some(effects) = self.try_apply_bounded_character_operator(operator, publication) {
+            return effects;
+        }
+        if self.rendered_state.layout_cache.is_none() && self.rendered_state.row_cache.is_some() {
+            self.render_layout(self.rendered_state.last_width);
+        }
         let Some(layout) = self.rendered_state.layout_cache.as_ref() else {
             return Vec::new();
         };
         let SessionMode::Select(active) = &self.session_mode else {
             return Vec::new();
         };
+        let text = self.live.text();
         let mut selection = nav::project_selection_from_source_positions(
             active.anchor.point,
             active.active.point,
@@ -3889,7 +5654,7 @@ impl EditorSession {
             active.anchor.source,
             active.active.source,
             layout,
-            &self.live.text(),
+            &text,
         );
         if let SelectionKind::Character { ranges } = &active.kind {
             selection.source_ranges = ranges.clone();
@@ -3902,14 +5667,227 @@ impl EditorSession {
                 self.live.highlighter().text(),
                 &self.rendered_state.code_fence_regions,
             );
+        } else if matches!(operator, RangeOperator::Delete | RangeOperator::Change)
+            && selection.shape == SelectionShape::Character
+        {
+            selection.source_ranges =
+                nav::character_mutation_ranges(&selection.source_ranges, layout, &text);
         }
         if selection.source_ranges.is_empty() {
             return Vec::new();
         }
-        let clipboard_content =
-            crate::clipboard::rendered_selection_content(&selection, layout, &self.live.text());
+        let clipboard_content = if matches!(operator, RangeOperator::Delete | RangeOperator::Change)
+            && selection.shape == SelectionShape::Character
+        {
+            crate::clipboard::ClipboardContent::from_markdown(
+                selection
+                    .source_ranges
+                    .iter()
+                    .filter_map(|range| text.get(range.clone()))
+                    .collect(),
+            )
+        } else {
+            crate::clipboard::rendered_selection_content(&selection, layout, &text)
+        };
         let register = self.rendered_state.register_input.take();
         let projected = project_selection_for_vim(selection);
+        self.ensure_rendered_rows(self.rendered_state.last_width);
+        let vim_effects = if operator == RangeOperator::Yank {
+            self.live.apply_yank(
+                ProjectedYank {
+                    selection: projected,
+                    payload: clipboard_content.markdown().to_string(),
+                },
+                register,
+            )
+        } else {
+            self.live.apply_selection(projected, operator, register)
+        };
+        let clipboard_output = match publication {
+            YankPublication::Configured => clipboard_content.clone(),
+            YankPublication::PlainText => crate::clipboard::ClipboardContent::invariant(
+                clipboard_content.plain_text().to_string(),
+            ),
+        };
+        let effects =
+            self.translate_vim_effects_with_clipboard(vim_effects, Some(&clipboard_output));
+        self.remap_active_cursor_from_canonical();
+        let target_mode = if operator == RangeOperator::Change {
+            Mode::Insert
+        } else {
+            Mode::Normal
+        };
+        self.finish_select(target_mode, effects)
+    }
+
+    fn try_apply_bounded_character_operator(
+        &mut self,
+        operator: RangeOperator,
+        publication: YankPublication,
+    ) -> Option<Vec<Effect>> {
+        if !matches!(operator, RangeOperator::Delete | RangeOperator::Change)
+            || (self.rendered_state.row_cache.is_none()
+                && self.rendered_state.layout_cache.is_none())
+        {
+            return None;
+        }
+        let SessionMode::Select(active) = &self.session_mode else {
+            return None;
+        };
+        if !matches!(active.kind, SelectionKind::Character { .. }) {
+            return None;
+        }
+        #[cfg(test)]
+        let mut stage = std::time::Instant::now();
+        let lines = self.selection_lines(active.anchor.point, active.active.point);
+        let selection = self.rendered_selection()?;
+        let first = selection.source_ranges.first()?;
+        let last = selection.source_ranges.last()?;
+        let in_fence = self.live.rendered_model().blocks.iter().any(|block| {
+            matches!(&block.kind, crate::rendered::BlockKind::CodeFence {
+                content_span,
+                indented: false,
+                ..
+            } if content_span.start < first.start && last.end < content_span.end)
+        });
+        #[cfg(test)]
+        {
+            self.rendered_state.last_select_operator_profile_ns[0] = stage.elapsed().as_nanos();
+            stage = std::time::Instant::now();
+        }
+        let coverage = if in_fence {
+            lines
+        } else if let Some(rows) = self.rendered_state.row_cache.as_ref() {
+            rows.rows_near_source_range(
+                &(first.start..last.end),
+                self.live.rendered_model(),
+                self.live.highlighter(),
+                self.rendered_state.last_width,
+            )
+        } else {
+            let layout = self.rendered_state.layout_cache.as_ref()?;
+            let model = self.live.rendered_model();
+            let first_block = model
+                .blocks
+                .partition_point(|block| block.span.end <= first.start);
+            let after_block = model
+                .blocks
+                .partition_point(|block| block.span.start < last.end);
+            let start_block = first_block.saturating_sub(1);
+            let end_block = after_block.saturating_add(1).min(model.blocks.len());
+            let start_row = self
+                .rendered_state
+                .layout_boundaries
+                .get(start_block)?
+                .rows
+                .start;
+            let end_row = self
+                .rendered_state
+                .layout_boundaries
+                .get(end_block.saturating_sub(1))?
+                .rows
+                .end;
+            (start_row..end_row)
+                .filter_map(|row| layout.lines.get(row).cloned().map(|line| (row, line)))
+                .collect()
+        };
+        if coverage.len() > 512 {
+            return None;
+        }
+        #[cfg(test)]
+        {
+            self.rendered_state.last_select_operator_profile_ns[1] = stage.elapsed().as_nanos();
+            stage = std::time::Instant::now();
+        }
+        let text = self.live.text_ref();
+        let ranges = nav::character_mutation_ranges_with_lines(
+            &selection.source_ranges,
+            coverage.iter().map(|(_, line)| line),
+            text,
+        );
+        if ranges.is_empty() {
+            return None;
+        }
+        let clipboard_content = crate::clipboard::ClipboardContent::from_markdown(
+            ranges
+                .iter()
+                .filter_map(|range| text.get(range.clone()))
+                .collect(),
+        );
+        let register = self.rendered_state.register_input.take();
+        self.ensure_rendered_rows(self.rendered_state.last_width);
+        #[cfg(test)]
+        {
+            self.rendered_state.last_select_operator_profile_ns[2] = stage.elapsed().as_nanos();
+            stage = std::time::Instant::now();
+        }
+        let vim_effects =
+            self.live
+                .apply_selection(ProjectedSelection::Character { ranges }, operator, register);
+        #[cfg(test)]
+        {
+            self.rendered_state.last_select_operator_profile_ns[3] = stage.elapsed().as_nanos();
+            stage = std::time::Instant::now();
+        }
+        let clipboard_output = match publication {
+            YankPublication::Configured => clipboard_content.clone(),
+            YankPublication::PlainText => crate::clipboard::ClipboardContent::invariant(
+                clipboard_content.plain_text().to_string(),
+            ),
+        };
+        let effects =
+            self.translate_vim_effects_with_clipboard(vim_effects, Some(&clipboard_output));
+        #[cfg(test)]
+        {
+            self.rendered_state.last_select_operator_profile_ns[4] = stage.elapsed().as_nanos();
+            stage = std::time::Instant::now();
+        }
+        if self.rendered_state.row_cache.is_none() {
+            self.remap_active_cursor_from_canonical();
+        }
+        let target_mode = if operator == RangeOperator::Change {
+            Mode::Insert
+        } else {
+            Mode::Normal
+        };
+        let result = self.finish_select(target_mode, effects);
+        #[cfg(test)]
+        {
+            self.rendered_state.last_select_operator_profile_ns[5] = stage.elapsed().as_nanos();
+        }
+        Some(result)
+    }
+
+    fn apply_rendered_line_operator(
+        &mut self,
+        operator: RangeOperator,
+        publication: YankPublication,
+    ) -> Vec<Effect> {
+        let SessionMode::Select(active) = &self.session_mode else {
+            return Vec::new();
+        };
+        let first = active.anchor.source.0.min(active.active.source.0);
+        let last = active.anchor.source.0.max(active.active.source.0);
+        let line_starts = self.live.highlighter().line_starts();
+        let start = line_starts
+            .get(first)
+            .copied()
+            .unwrap_or(self.live.text_ref().len());
+        let end = line_starts
+            .get(last + 1)
+            .copied()
+            .unwrap_or(self.live.text_ref().len());
+        if start >= end {
+            return Vec::new();
+        }
+        let clipboard_content = crate::clipboard::ClipboardContent::from_markdown(
+            self.live.text_ref()[start..end].to_string(),
+        );
+        let register = self.rendered_state.register_input.take();
+        self.ensure_rendered_rows(self.rendered_state.last_width);
+        let projected = ProjectedSelection::Line {
+            ranges: std::iter::once(start..end).collect(),
+        };
         let vim_effects = if operator == RangeOperator::Yank {
             self.live.apply_yank(
                 ProjectedYank {
@@ -3953,6 +5931,44 @@ impl EditorSession {
     /// document is unchanged (notably yank), so the cached rendered endpoint
     /// must be updated before returning to Normal.
     fn remap_active_cursor_from_canonical(&mut self) {
+        if self.rendered_state.layout_cache.is_none() {
+            let offset = self.live.cursor_byte_offset();
+            let indexed = if let Some(rows) = self.rendered_state.row_cache.as_mut() {
+                let model = self.live.rendered_model();
+                let candidate = model
+                    .blocks
+                    .partition_point(|block| block.span.start <= offset)
+                    .saturating_sub(1);
+                [candidate, candidate.saturating_add(1)]
+                    .into_iter()
+                    .find_map(|index| {
+                        rows.point_for_offset_in_block(
+                            index,
+                            offset,
+                            model,
+                            self.live.text_ref(),
+                            self.live.highlighter(),
+                            self.rendered_state.last_width,
+                        )
+                    })
+            } else {
+                None
+            };
+            if let Some(cursor) = indexed {
+                self.rendered_state.cursor = cursor;
+                return;
+            }
+            if offset == self.live.text_ref().len() {
+                if let Some(rows) = self.rendered_state.row_cache.as_ref() {
+                    self.rendered_state.cursor =
+                        RenderedCursor::new(rows.row_count().saturating_sub(1));
+                    return;
+                }
+            }
+            if self.rendered_state.row_cache.is_some() {
+                self.render_layout(self.rendered_state.last_width);
+            }
+        }
         let Some(layout) = self.rendered_state.layout_cache.as_ref() else {
             return;
         };
@@ -3961,47 +5977,67 @@ impl EditorSession {
             source.0,
             self.live.cursor_byte_offset(),
             layout,
-            |offset| self.live.position_for_byte_offset(offset).0,
+            |offset| nav::source_line_for_offset(self.live.highlighter().line_starts(), offset),
             |offset| self.live.byte_before_is_newline(offset),
         );
     }
 
     fn commit_rendered_cursor(&mut self) {
-        let Some(layout) = self.rendered_state.layout_cache.as_ref() else {
+        let source_offset = if let Some(layout) = self.rendered_state.layout_cache.as_ref() {
+            nav::canonical_source_offset_for_row(
+                &self.rendered_state.cursor,
+                self.live.cursor_byte_offset(),
+                layout,
+            )
+        } else if let Some(rows) = self.rendered_state.row_cache.as_mut() {
+            let Some(line) = rows.row_current(
+                self.rendered_state.cursor.line,
+                self.live.rendered_model(),
+                self.live.text_ref(),
+                self.live.highlighter(),
+                self.rendered_state.last_width,
+            ) else {
+                return;
+            };
+            nav::canonical_source_offset_for_line(
+                &self.rendered_state.cursor,
+                self.live.cursor_byte_offset(),
+                &line,
+            )
+        } else {
             return;
         };
-        let source_offset = nav::canonical_source_offset_for_row(
-            &self.rendered_state.cursor,
-            self.live.cursor_byte_offset(),
-            layout,
-        );
         let source = self.live.position_for_byte_offset(source_offset);
         self.live.jump_to(source.0, source.1);
     }
 
     fn refresh_character_selection(&mut self) {
-        let SessionMode::Select(selection) = &mut self.session_mode else {
-            return;
-        };
-        let Some(layout) = self.rendered_state.layout_cache.as_ref() else {
+        let SessionMode::Select(selection) = &self.session_mode else {
             return;
         };
         let point = self.rendered_state.cursor.point();
-        selection.active = SelectionEndpoint {
-            point,
-            source: self.live.cursor(),
-            atom: nav::source_for_point(point, layout),
-            line: nav::line_identity_for_point(point, layout),
-        };
-        if let SelectionKind::Character { ranges } = &mut selection.kind {
-            *ranges = nav::project_selection(
-                selection.anchor.point,
-                selection.active.point,
+        let anchor = selection.anchor.clone();
+        let shape = selection.kind.shape();
+        let active = self.selection_endpoint_at(point);
+        let ranges = (shape == SelectionShape::Character).then(|| {
+            nav::project_selection_from_rows(
+                anchor.point,
+                active.point,
                 SelectionShape::Character,
-                layout,
-                &self.live.text(),
+                (anchor.source, active.source),
+                &self.selection_lines(anchor.point, active.point),
+                None,
+                self.live.text_ref(),
             )
-            .source_ranges;
+            .source_ranges
+        });
+        if let SessionMode::Select(selection) = &mut self.session_mode {
+            selection.active = active;
+            if let (SelectionKind::Character { ranges: selected }, Some(ranges)) =
+                (&mut selection.kind, ranges)
+            {
+                *selected = ranges;
+            }
         }
     }
 
@@ -4019,6 +6055,7 @@ impl EditorSession {
     ) -> Vec<Effect> {
         let mut effects = Vec::new();
         let mut left_insert = false;
+        let mut edited = false;
         for effect in vim_effects {
             match effect {
                 VimEffect::ModeChanged(vim_mode) => {
@@ -4031,7 +6068,7 @@ impl EditorSession {
                     effects.push(Effect::ModeChanged(mode));
                 }
                 VimEffect::Edited { .. } => {
-                    self.rendered_state.invalidate();
+                    edited = true;
                     effects.push(Effect::Edited);
                 }
                 VimEffect::CursorMoved => effects.push(Effect::CursorMoved),
@@ -4051,14 +6088,155 @@ impl EditorSession {
                 VimEffect::Bell => {}
             }
         }
-        if left_insert {
+        if edited {
+            self.publish_rendered_text_change();
+        }
+        if left_insert && !edited {
             // Insert-mode motions are owned by the canonical Vim cursor.
-            // Re-enter rendered coordinates before the next rendered motion;
-            // when an edit invalidated the cache, render_layout performs this
-            // same remap from the canonical source anchor after rebuilding.
+            // Re-enter rendered coordinates from the retained rows before
+            // the next rendered motion.
             self.remap_active_cursor_from_canonical();
         }
         effects
+    }
+
+    fn publish_rendered_text_change(&mut self) {
+        #[cfg(test)]
+        {
+            self.rendered_state.last_publish_profile_ns = [0; 3];
+            self.rendered_state.last_publish_used_retained = false;
+        }
+        let change = self.live.take_projection_change();
+        self.rendered_state.layout_cache = None;
+        self.rendered_state.layout_boundaries.clear();
+        let Some(rows) = &mut self.rendered_state.row_cache else {
+            self.rendered_state.row_cache = None;
+            self.rendered_state.code_fence_regions.clear();
+            return;
+        };
+        #[cfg(test)]
+        let started = std::time::Instant::now();
+        let (index, updated) = match change {
+            PendingProjectionChange::One(ModelChange::Local {
+                index,
+                source_delta,
+                line_delta,
+                old_links,
+                new_links,
+            }) => {
+                let updated = rows.block_link_count(index) == Some(old_links)
+                    && rows.replace_local_block(
+                        index,
+                        self.live.rendered_model(),
+                        self.live.text_ref(),
+                        self.live.highlighter(),
+                        self.rendered_state.last_width,
+                        crate::rendered::RowShift {
+                            source: source_delta,
+                            lines: line_delta,
+                        },
+                    )
+                    && rows.block_link_count(index) == Some(new_links);
+                (index, updated)
+            }
+            PendingProjectionChange::One(ModelChange::Window {
+                old_blocks,
+                new_blocks,
+                old_source_end,
+                source_delta,
+                line_delta,
+                old_links,
+                new_links,
+            }) => {
+                let updated = rows.replace_window(
+                    crate::rendered::RowWindowChange {
+                        old_blocks,
+                        new_blocks: new_blocks.clone(),
+                        old_source_end,
+                        shift: crate::rendered::RowShift {
+                            source: source_delta,
+                            lines: line_delta,
+                        },
+                        old_links,
+                        new_links,
+                    },
+                    self.live.rendered_model(),
+                    self.live.highlighter(),
+                    self.rendered_state.last_width,
+                );
+                let cursor = self.live.cursor_byte_offset();
+                let first_candidate = self
+                    .live
+                    .rendered_model()
+                    .blocks
+                    .partition_point(|block| block.span.end <= cursor);
+                let index = first_candidate.clamp(new_blocks.start, new_blocks.end - 1);
+                (index, updated)
+            }
+            PendingProjectionChange::One(ModelChange::FenceInterior {
+                index,
+                edit_range,
+                new_text,
+                source_delta,
+                line_delta,
+            }) => {
+                let edit = crate::vim::TextEdit {
+                    range: edit_range,
+                    new_text_len: new_text.len(),
+                    new_text,
+                };
+                let updated = rows.splice_fence_interior(
+                    index,
+                    &edit,
+                    self.live.rendered_model(),
+                    self.live.highlighter(),
+                    crate::rendered::RowShift {
+                        source: source_delta,
+                        lines: line_delta,
+                    },
+                );
+                (index, updated)
+            }
+            PendingProjectionChange::None
+            | PendingProjectionChange::Multiple
+            | PendingProjectionChange::One(ModelChange::Wide) => (0, false),
+        };
+        #[cfg(test)]
+        {
+            self.rendered_state.last_publish_profile_ns[0] = started.elapsed().as_nanos();
+        }
+        if !updated {
+            self.rendered_state.row_cache = None;
+            self.rendered_state.code_fence_regions.clear();
+            return;
+        }
+        #[cfg(test)]
+        let started = std::time::Instant::now();
+        let Some(cursor) = rows.point_for_offset_in_block(
+            index,
+            self.live.cursor_byte_offset(),
+            self.live.rendered_model(),
+            self.live.text_ref(),
+            self.live.highlighter(),
+            self.rendered_state.last_width,
+        ) else {
+            self.rendered_state.row_cache = None;
+            self.rendered_state.code_fence_regions.clear();
+            return;
+        };
+        #[cfg(test)]
+        {
+            self.rendered_state.last_publish_profile_ns[1] = started.elapsed().as_nanos();
+        }
+        self.rendered_state.cursor = cursor;
+        #[cfg(test)]
+        let started = std::time::Instant::now();
+        self.rendered_state.code_fence_regions = rows.fence_regions();
+        #[cfg(test)]
+        {
+            self.rendered_state.last_publish_profile_ns[2] = started.elapsed().as_nanos();
+            self.rendered_state.last_publish_used_retained = true;
+        }
     }
 
     /// Process an ex command text and produce effects.

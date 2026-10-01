@@ -203,7 +203,14 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    const MARKDOWN: &str = "---\ntitle: Same\n---\n\n# Heading\n\nSame λ e\u{301} 👩\u{200d}💻 repeated same words.\n\n| A | B |\n| - | - |\n| same | `code` |\n\n```rust\nfn main() {}\n```\n";
+    mod incremental_host_vector {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/incremental_host_vector.rs"
+        ));
+    }
+
+    const MARKDOWN: &str = incremental_host_vector::MARKDOWN;
 
     fn reference(now: Instant) -> App {
         App::new(
@@ -350,6 +357,50 @@ mod tests {
                 .into_iter()
                 .collect()
         );
+    }
+
+    #[test]
+    fn shared_incremental_vector_preserves_standalone_cells_modes_and_cursor() {
+        let initial = Instant::now();
+        let mut baseline = reference(initial);
+        let mut host = StandaloneHost::from_app_for_test(reference(initial), initial);
+        let mut terminal = Terminal::new(TestBackend::new(96, 24)).unwrap();
+        let mut baseline_terminal = Terminal::new(TestBackend::new(96, 24)).unwrap();
+        for (index, step) in incremental_host_vector::steps().into_iter().enumerate() {
+            let now = initial + Duration::from_millis(index as u64 * 10);
+            match step {
+                incremental_host_vector::Step::Event(event) => {
+                    baseline.handle_event_at(&event, now);
+                    host.handle_event_at(&event, now);
+                }
+                incremental_host_vector::Step::PaneSize(width, height) => {
+                    let event = Event::Resize(width, height);
+                    baseline.handle_event_at(&event, now);
+                    host.handle_event_at(&event, now);
+                    terminal.backend_mut().resize(width, height);
+                    baseline_terminal.backend_mut().resize(width, height);
+                }
+            }
+            baseline.tick(now);
+            host.tick(now);
+            baseline_terminal
+                .draw(|frame| baseline.render(frame))
+                .unwrap();
+            terminal.draw(|frame| host.render(frame, now)).unwrap();
+            assert_eq!(
+                terminal.backend().buffer().content,
+                baseline_terminal.backend().buffer().content,
+                "standalone cells after shared step {index}"
+            );
+            let expected_session = baseline.active_mut().unwrap().session_mut();
+            let tab = host.pane.active_tab().unwrap();
+            assert_eq!(host.pane.text(&tab).unwrap(), expected_session.document());
+            assert_eq!(
+                host.pane.source_cursor(&tab).unwrap(),
+                expected_session.cursor()
+            );
+            assert_eq!(host.mode(), expected_session.mode());
+        }
     }
 
     #[test]

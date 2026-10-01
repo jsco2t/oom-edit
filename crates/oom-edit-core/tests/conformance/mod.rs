@@ -1002,6 +1002,41 @@ fn select_delete_x_change_indent_and_outdent_conform() {
 }
 
 #[test]
+fn characterwise_full_visible_line_delete_and_change_remove_line_breaks() {
+    for operator in ['d', 'c'] {
+        let source = "# café\n# next\n";
+        let mut session = EditorSession::from_text(source);
+        session.render_layout(40);
+        session
+            .jump_to_offset(source.find("café").unwrap())
+            .unwrap();
+        session.handle_key(key('v'));
+        session.handle_key(key('$'));
+        let before = session.rendered_selection().unwrap();
+        assert_eq!(before.shape, SelectionShape::Character);
+        assert_eq!(before.source_ranges, vec![2..7]);
+        session.handle_key(key(operator));
+        assert_eq!(session.document(), "# next\n", "{operator}");
+        assert_eq!(
+            session.mode(),
+            if operator == 'c' {
+                Mode::Insert
+            } else {
+                Mode::Normal
+            }
+        );
+    }
+
+    for operator in ['d', 'c'] {
+        let mut linewise = EditorSession::from_text("# café\n# next\n");
+        linewise.render_layout(40);
+        linewise.handle_key(key('V'));
+        linewise.handle_key(key(operator));
+        assert_eq!(linewise.document(), "# next\n", "V/{operator}");
+    }
+}
+
+#[test]
 fn select_shape_operator_matrix_conforms() {
     for shape in [
         SelectionShape::Character,
@@ -1126,38 +1161,93 @@ fn select_shape_operator_matrix_conforms() {
 }
 
 #[test]
-fn rendered_character_operators_preserve_unselected_markdown_syntax() {
+fn rendered_character_operators_keep_yank_bytes_but_delete_full_visible_lines() {
     let cases = [
-        ("\\*escaped\\*\n", 8, "\\*escaped\\*", "*escaped*", "\n"),
-        ("*emphasis*\n", 7, "*emphasis*", "emphasis", "**\n"),
-        ("**strong**\n", 5, "**strong**", "strong", "****\n"),
-        ("~~strike~~\n", 5, "~~strike~~", "strike", "~~~~\n"),
-        ("`code`\n", 3, "`code`", "code", "``\n"),
+        (
+            "\\*escaped\\*\n",
+            8,
+            "\\*escaped\\*",
+            "*escaped*",
+            "\\*escaped\\*\n",
+            "*escaped*\n",
+            "",
+        ),
+        (
+            "*emphasis*\n",
+            7,
+            "*emphasis*",
+            "emphasis",
+            "*emphasis*\n",
+            "emphasis\n",
+            "",
+        ),
+        (
+            "**strong**\n",
+            5,
+            "**strong**",
+            "strong",
+            "**strong**\n",
+            "strong\n",
+            "",
+        ),
+        (
+            "~~strike~~\n",
+            5,
+            "~~strike~~",
+            "strike",
+            "~~strike~~\n",
+            "strike\n",
+            "",
+        ),
+        ("`code`\n", 3, "`code`", "code", "`code`\n", "code\n", ""),
         (
             "[label](https://example.test)\n",
             4,
             "[label](https://example.test)",
             "label",
-            "[](https://example.test)\n",
+            "[label](https://example.test)\n",
+            "label\n",
+            "",
         ),
         (
             "![alt](image.png)\n",
             2,
             "![alt](image.png)",
             "alt",
-            "![](image.png)\n",
+            "![alt](image.png)\n",
+            "alt\n",
+            "",
         ),
         (
             "**[nested](target)**\n",
             5,
             "**[nested](target)**",
             "nested",
-            "**[](target)**\n",
+            "**[nested](target)**\n",
+            "nested\n",
+            "",
         ),
-        ("A &amp; B\n", 4, "A &amp; B", "A & B", "\n"),
+        (
+            "A &amp; B\n",
+            4,
+            "A &amp; B",
+            "A & B",
+            "A &amp; B\n",
+            "A & B\n",
+            "",
+        ),
     ];
 
-    for (source, right_moves, markdown, plain_text, deleted) in cases {
+    for (
+        source,
+        right_moves,
+        yank_markdown,
+        yank_plain,
+        mutation_markdown,
+        mutation_plain,
+        deleted,
+    ) in cases
+    {
         for operator in ['y', 'd', 'c'] {
             let mut session = EditorSession::from_text(source);
             session.render_layout(80);
@@ -1172,10 +1262,22 @@ fn rendered_character_operators_preserve_unselected_markdown_syntax() {
             let effects = session.handle_key(key(operator));
             let contents = clipboard_contents(&effects);
             assert_eq!(contents.len(), 1, "{source:?}/{operator}");
-            assert_eq!(contents[0].markdown(), markdown, "{source:?}/{operator}");
+            assert_eq!(
+                contents[0].markdown(),
+                if operator == 'y' {
+                    yank_markdown
+                } else {
+                    mutation_markdown
+                },
+                "{source:?}/{operator}"
+            );
             assert_eq!(
                 contents[0].plain_text(),
-                plain_text,
+                if operator == 'y' {
+                    yank_plain
+                } else {
+                    mutation_plain
+                },
                 "{source:?}/{operator}"
             );
             assert_eq!(
