@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "work_id": "2026-10-08-editor-pane-minimal-status-bar",
+  "title": "EditorPane minimal status bar",
+  "created_at": "2026-10-08T19:10:32Z",
+  "approved_at": "2026-10-08T19:13:54Z",
+  "completed_at": "2026-10-08T19:23:31Z",
+  "archived_at": "2026-10-08T19:52:19Z",
+  "baseline_sha": "04b37e53d1d3355f8fd0bd35946dca124d66bca4",
+  "final_sha": "04b37e53d1d3355f8fd0bd35946dca124d66bca4",
+  "approved_plan_sha256": "cc6d8d42d73acd6ff269a069955b17402749835f57e796673d2a213fc7856393",
+  "acceptance_rounds": 1,
+  "prior_completed_rounds": 0,
+  "task_count": 1,
+  "tasks_completed": 1,
+  "result": "DONE",
+  "final_evidence": "evidence/final.md"
+}

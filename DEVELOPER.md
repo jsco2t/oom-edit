@@ -209,6 +209,14 @@ competing hint rows. The pane still owns its editor line. Query catalog styles
 for your host surfaces and preserve non-color state signals. Cursor shape and
 terminal escape output are the host's responsibilities.
 
+Set `PaneOptions::minimal_status_bar=true` to leave only the mode badge and
+right-side spelling/ruler indicators in the pane's editor line. This option
+also suppresses inline hints and which-key, even when `inline_hints=true`.
+Active ex and search prompts remain visible while typing. File details,
+dirty markers and transient notices are hidden in the pane row. File state
+remains available through `status()` and lifecycle events, but ordinary
+transient notices are not exported for separate host rendering.
+
 The [living split host](crates/oom-edit/examples/embedded.rs) and its
 [consumer-owned adapter](crates/oom-edit/examples/support/embedded_host.rs)
 demonstrate complete drawing, styles, mouse translation, global interception,

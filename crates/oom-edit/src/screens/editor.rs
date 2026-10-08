@@ -403,6 +403,7 @@ pub fn render_status_row(
         StatusRowOptions {
             text: overlay_hints,
             inline: true,
+            minimal: false,
             disk_marker: None,
         },
         area,
@@ -415,6 +416,7 @@ pub fn render_status_row(
 pub struct StatusRowOptions<'a> {
     pub text: &'a str,
     pub inline: bool,
+    pub minimal: bool,
     pub disk_marker: Option<&'a str>,
 }
 
@@ -465,11 +467,14 @@ pub fn render_status_row_with_options(
         command_line: command_line.clone(),
     };
 
-    let status_text = status.build(transient, theme, tier);
+    let mut status_text = status.build(transient, theme, tier);
+    if hints.minimal {
+        status_text.content.clear();
+    }
 
     let has_transient = transient.is_some() && command_line.is_none();
     let cmdline_active = command_line.is_some();
-    let middle = if cmdline_active || has_transient {
+    let middle = if hints.minimal || cmdline_active || has_transient {
         String::new()
     } else {
         let mut indicators = Vec::new();
@@ -513,7 +518,7 @@ pub fn render_status_row_with_options(
         area,
         &status_text,
         &middle,
-        !inline_hints || overlay_hints.is_empty(),
+        hints.minimal || !inline_hints || overlay_hints.is_empty(),
         theme,
         tier,
     );

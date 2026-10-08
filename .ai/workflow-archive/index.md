@@ -14,3 +14,4 @@
 - 2026-09-24-rendered-line-numbering-and-soft-break-fidelity — Rendered Line Numbering and Soft-Break Fidelity — completed 2026-09-24T17:40:09Z — 5cf7981417db4bbc68bb13a1bd0e7e94170080fd..5cf7981417db4bbc68bb13a1bd0e7e94170080fd
 - 2026-09-25-embeddable-editor-pane — Embeddable Editor Pane and Standalone Parity — completed 2026-09-27T18:01:30Z — eafaa6afa796d0258b72a6e5ab6ca5a3699d600a..87d5b48f766eb35f30c2136e23d2a4448329713b
 - 2026-09-28-rendered-markdown-performance — Rendered Markdown performance — completed 2026-10-01T22:08:26Z — 0e26684733551691a49a2ff7111cec9404fdd2d3..0e26684733551691a49a2ff7111cec9404fdd2d3
+- 2026-10-08-editor-pane-minimal-status-bar — EditorPane minimal status bar — completed 2026-10-08T19:23:31Z — 04b37e53d1d3355f8fd0bd35946dca124d66bca4..04b37e53d1d3355f8fd0bd35946dca124d66bca4

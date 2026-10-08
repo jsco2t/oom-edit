@@ -43,6 +43,7 @@ fn construct_with_policy(
         PaneOptions {
             command_policy: CommandPolicy::Embedded,
             inline_hints: false,
+            minimal_status_bar: false,
             always_tab_bar: true,
             empty_state_lines: vec!["Choose a note".to_string()],
         },
@@ -96,6 +97,103 @@ fn key(ch: char) -> KeyInput {
         },
         mods: Modifiers::default(),
     }
+}
+
+fn status_row(pane: &mut EditorPane, now: Instant) -> String {
+    let frame = pane.render(80, 24, now);
+    (0..frame.width)
+        .map(|column| {
+            frame
+                .cell(column, frame.height - 1)
+                .unwrap()
+                .symbol
+                .as_str()
+        })
+        .collect()
+}
+
+#[test]
+fn embedded_minimal_status_row_preserves_badge_right_indicators_and_prompts() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("minimal-status.md");
+    std::fs::write(&path, "hello world\n").unwrap();
+    assert!(!PaneOptions::default().minimal_status_bar);
+
+    for inline_hints in [false, true] {
+        let mut pane = construct_with_options(
+            directory.path(),
+            vec![path.clone()],
+            Box::new(AllowAllFileAccess),
+            PaneOptions {
+                minimal_status_bar: true,
+                inline_hints,
+                ..PaneOptions::default()
+            },
+        )
+        .pane;
+        let now = Instant::now();
+        let status = pane.status().unwrap();
+        assert_eq!(status.mode, Mode::Normal);
+        assert_eq!(status.path.as_deref(), Some(path.as_path()));
+        assert!(status.spell.is_some());
+        assert!(!pane.hints().is_empty());
+
+        let assert_minimal = |pane: &mut EditorPane, badge: &str, render_at: Instant| {
+            let row = status_row(pane, render_at);
+            assert!(row.starts_with(badge), "{row:?}");
+            assert!(row.contains("🅂 0"), "{row:?}");
+            assert!(row.contains(&pane.status().unwrap().ruler.text), "{row:?}");
+            let right_start = row.find('🅂').unwrap();
+            assert!(row[9..right_start].trim().is_empty(), "{row:?}");
+        };
+        assert_minimal(&mut pane, " NORMAL ", now);
+
+        pane.handle_input(PaneInput::Key(key('i')), now);
+        assert_minimal(&mut pane, " INSERT ", now);
+        pane.handle_input(PaneInput::Key(key('x')), now);
+        pane.handle_input(PaneInput::Key(special(KeyCodeKind::Esc)), now);
+        assert!(pane.status().unwrap().dirty);
+        assert_minimal(&mut pane, " NORMAL ", now);
+        pane.handle_input(PaneInput::Key(key('v')), now);
+        assert_minimal(&mut pane, " SELECT ", now);
+        pane.handle_input(PaneInput::Key(special(KeyCodeKind::Esc)), now);
+
+        pane.handle_input(PaneInput::Key(key(' ')), now);
+        let which_key_time = now + std::time::Duration::from_millis(150);
+        pane.tick(which_key_time);
+        assert!(pane.which_key().is_some());
+        assert_minimal(&mut pane, " NORMAL ", which_key_time);
+        pane.handle_input(PaneInput::Key(special(KeyCodeKind::Esc)), now);
+
+        pane.handle_input(PaneInput::Key(key(':')), now);
+        pane.handle_input(PaneInput::Key(key('w')), now);
+        let command_row = status_row(&mut pane, now);
+        assert!(command_row.starts_with(" :CMD "), "{command_row:?}");
+        assert!(command_row.contains(":w"), "{command_row:?}");
+        assert_eq!(pane.render(80, 24, now).cursor.unwrap().row, 23);
+        pane.handle_input(PaneInput::Key(special(KeyCodeKind::Esc)), now);
+
+        pane.handle_input(PaneInput::Key(key('/')), now);
+        pane.handle_input(PaneInput::Key(key('h')), now);
+        let search_row = status_row(&mut pane, now);
+        assert!(search_row.contains("/h"), "{search_row:?}");
+        assert_eq!(pane.render(80, 24, now).cursor.unwrap().row, 23);
+        pane.handle_input(PaneInput::Key(special(KeyCodeKind::Esc)), now);
+        ex(&mut pane, "unknown_status_command", now);
+        assert_minimal(&mut pane, " NORMAL ", now);
+    }
+
+    let mut default = construct_with_options(
+        directory.path(),
+        vec![path],
+        Box::new(AllowAllFileAccess),
+        PaneOptions::default(),
+    )
+    .pane;
+    assert!(status_row(&mut default, Instant::now()).contains("minimal-status.md"));
+    let now = Instant::now();
+    ex(&mut default, "unknown_status_command", now);
+    assert!(status_row(&mut default, now).contains("Unknown command"));
 }
 
 #[test]

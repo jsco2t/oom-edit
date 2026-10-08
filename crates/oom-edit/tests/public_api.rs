@@ -42,6 +42,11 @@ fn oom_edit_facade_exports_only_the_curated_host_api() {
     let _: fn(&EditorPane, KeyInput) -> KeyOwnership = EditorPane::key_ownership;
     let _: fn(KeyInput) -> Option<HostReservation> = EditorPane::host_reservation;
     let _: fn(&EditorPane) -> Option<EditorStatus> = EditorPane::status;
+    let minimal = PaneOptions {
+        minimal_status_bar: true,
+        ..PaneOptions::default()
+    };
+    assert!(minimal.minimal_status_bar);
     let _: fn() -> ThemeCatalog = ThemeCatalog::builtins;
     let _: fn(&std::path::Path) -> ThemeLoadReport = ThemeCatalog::load_from_base;
     let _: fn(&ThemeCatalog) -> Vec<String> = ThemeCatalog::names;
