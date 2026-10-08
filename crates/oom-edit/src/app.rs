@@ -245,6 +245,7 @@ pub(crate) struct AppStartupOptions {
 #[derive(Clone, Copy)]
 pub(crate) struct AppRenderOptions<'a> {
     pub(crate) inline_hints: bool,
+    pub(crate) minimal_status_bar: bool,
     pub(crate) always_tab_bar: bool,
     pub(crate) empty_state_lines: &'a [String],
 }
@@ -254,6 +255,7 @@ impl AppRenderOptions<'_> {
     pub(crate) const fn standalone() -> Self {
         Self {
             inline_hints: true,
+            minimal_status_bar: false,
             always_tab_bar: false,
             empty_state_lines: &[],
         }
@@ -1506,6 +1508,7 @@ impl App {
                 StatusRowOptions {
                     text: self.overlay.hints(),
                     inline: options.inline_hints,
+                    minimal: options.minimal_status_bar,
                     disk_marker: entry.disk_change.marker(),
                 },
                 status_area,
@@ -1515,7 +1518,7 @@ impl App {
         }
 
         // Render which-key hint bar if conditions are met.
-        if options.inline_hints && self.is_focused() {
+        if options.inline_hints && !options.minimal_status_bar && self.is_focused() {
             self.render_which_key(frame, status_area);
         }
 
@@ -4086,6 +4089,7 @@ mod tests {
             now,
             AppRenderOptions {
                 inline_hints: false,
+                minimal_status_bar: false,
                 always_tab_bar: true,
                 empty_state_lines: &empty_lines,
             },
@@ -4110,6 +4114,7 @@ mod tests {
                 now,
                 AppRenderOptions {
                     inline_hints,
+                    minimal_status_bar: false,
                     always_tab_bar: false,
                     empty_state_lines: &[],
                 },

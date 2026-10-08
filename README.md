@@ -241,6 +241,9 @@ host panel or editor to change focus. The host owns its bottom status row,
 shows exported hints/which-key, drains typed events and handles unnamed-save
 paths. This demonstration deliberately uses monochrome and disables clipboard
 and theme persistence; the editor's ordinary file writes remain enabled.
+Embedded hosts can set `PaneOptions::minimal_status_bar=true` to keep the
+pane's mode badge and right-side status indicators while hiding its ordinary
+middle content; active command and search prompts remain visible.
 
 `make build-examples` builds it; `make test-embedding-example` exercises the
 same host logic headlessly. See [independent consumer verification](docs/downstream-consumer.md)

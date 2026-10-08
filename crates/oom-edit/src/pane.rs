@@ -73,6 +73,9 @@ pub struct PaneOptions {
     pub command_policy: CommandPolicy,
     /// Render hints and which-key inside the editor, instead of host-owned chrome.
     pub inline_hints: bool,
+    /// Show only the mode badge and right-side indicators outside active prompts.
+    /// This suppresses inline hints, file details, and transient notices.
+    pub minimal_status_bar: bool,
     /// Show the tab bar even when only one tab is open.
     pub always_tab_bar: bool,
     /// Host-supplied lines shown while no tabs are open.
@@ -84,6 +87,7 @@ impl Default for PaneOptions {
         Self {
             command_policy: CommandPolicy::Embedded,
             inline_hints: false,
+            minimal_status_bar: false,
             always_tab_bar: false,
             empty_state_lines: Vec::new(),
         }
@@ -811,6 +815,7 @@ impl EditorPane {
             now,
             AppRenderOptions {
                 inline_hints: self.options.inline_hints,
+                minimal_status_bar: self.options.minimal_status_bar,
                 always_tab_bar: self.options.always_tab_bar,
                 empty_state_lines: &self.options.empty_state_lines,
             },
