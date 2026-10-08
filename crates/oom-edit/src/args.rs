@@ -211,11 +211,11 @@ mod tests {
     #[test]
     fn version_is_message() {
         match parse(&["--version"]) {
-            Ok(ParseOutcome::Message(m)) => assert_eq!(m, "oom-edit 0.6.5\n"),
+            Ok(ParseOutcome::Message(m)) => assert_eq!(m, "oom-edit 0.6.6\n"),
             other => panic!("expected version message, got {other:?}"),
         }
         match parse(&["-V"]) {
-            Ok(ParseOutcome::Message(m)) => assert_eq!(m, "oom-edit 0.6.5\n"),
+            Ok(ParseOutcome::Message(m)) => assert_eq!(m, "oom-edit 0.6.6\n"),
             other => panic!("expected version message, got {other:?}"),
         }
     }

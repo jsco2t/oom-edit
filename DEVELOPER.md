@@ -16,10 +16,10 @@ The canonical origin is `https://github.com/jsco2t/oom-edit`. The editor and
 **all four downstream patches** must select one immutable revision. A
 dependency's Cargo patches do not propagate into its consumer's workspace.
 
-The example below pins the published `v0.6.0` commit. To consume the untagged
-0.6.5 candidate, replace all five revisions with its same full commit SHA and
-use the [make-owned source verification](docs/downstream-consumer.md). Do not
-substitute a `v0.6.5` tag before it exists.
+The example below pins the published `v0.6.0` commit. To consume a newer
+release, replace all five revisions with its same full commit SHA and use the
+[make-owned source verification](docs/downstream-consumer.md). Verify any tag
+against the gated SHA after publication.
 
 ```toml
 [dependencies]

@@ -295,26 +295,26 @@ fn spell_release_versions_and_exact_path_edges_are_reconciled() {
     let changelog =
         std::fs::read_to_string(root.join("CHANGELOG.md")).expect("changelog should be readable");
 
-    assert_eq!(env!("CARGO_PKG_VERSION"), "0.6.5");
-    assert!(tui_manifest.contains("version = \"0.6.5\""));
-    assert!(core_manifest.contains("version = \"0.6.5\""));
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.6.6");
+    assert!(tui_manifest.contains("version = \"0.6.6\""));
+    assert!(core_manifest.contains("version = \"0.6.6\""));
     assert!(spell_manifest.contains("version = \"0.1.0\""));
     assert!(tui_manifest
-        .contains("oom-edit-core = { path = \"../oom-edit-core\", version = \"=0.6.5\" }"));
+        .contains("oom-edit-core = { path = \"../oom-edit-core\", version = \"=0.6.6\" }"));
     assert_eq!(
         lockfile
-            .matches("name = \"oom-edit\"\nversion = \"0.6.5\"")
+            .matches("name = \"oom-edit\"\nversion = \"0.6.6\"")
             .count(),
         1
     );
     assert_eq!(
         lockfile
-            .matches("name = \"oom-edit-core\"\nversion = \"0.6.5\"")
+            .matches("name = \"oom-edit-core\"\nversion = \"0.6.6\"")
             .count(),
         1
     );
     assert!(changelog.contains("## [0.5.0] - 2026-08-15"));
-    assert!(changelog.contains("0.6.5 release candidate"));
+    assert!(changelog.contains("## [0.6.6] - 2026-10-08"));
     assert!(changelog.contains("`oom-spell` 0.1.0"));
 }
 

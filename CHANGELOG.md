@@ -7,7 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-The 0.6.5 release candidate is not yet tagged or published.
+## [0.6.6] - 2026-10-08
+
+### Added
+
+- Added an embedded `EditorPane` option for a minimal status row that keeps the
+  mode badge and right-side spelling/ruler indicators while hiding ordinary
+  middle content. Active command and search prompts remain visible.
+
+## [0.6.5] - 2026-10-01
 
 ### Changed
 

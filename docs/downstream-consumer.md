@@ -5,8 +5,8 @@ Cargo patches belong to the consuming workspace: a dependency's root patches
 do not propagate. Pin the editor and all four patches to one full immutable
 commit, not a branch or an unapproved future tag.
 
-The example below uses the published `v0.6.0` commit. For an untagged 0.6.5
-candidate, use its full committed SHA for all five sources. A local candidate
+The example below uses the published `v0.6.0` commit. For a newer candidate or
+release, use its full committed SHA for all five sources. A local candidate
 can be prepared through an isolated Git URL rewrite without changing the
 working repository or its Git history. Verify the exact tag only after that
 tag has been separately created and published.
@@ -78,7 +78,7 @@ actual checkout SHA after `make ci`, using the same preparation and offline
 validation targets; it does not depend on a tag that does not yet exist.
 
 After separate publication authorization and a successful release push, prepare
-a **new** consumer with `DOWNSTREAM_TAG=v0.6.5` and the gated SHA still supplied
+a **new** consumer with `DOWNSTREAM_TAG=v0.6.6` and the gated SHA still supplied
 as `DOWNSTREAM_REV`. Then run `make downstream-tag-check` with those same
 variables. This selects the actual tag for all five Git sources and asserts
 that their resolved commit equals the gated SHA. The tag target is never part
