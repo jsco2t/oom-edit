@@ -28,3 +28,5 @@
 .ai/workflow/state.json
 .ai/workflow/status.md
 .ai/workflow/evidence/
+
+scripts/__pycache__/
