@@ -113,6 +113,7 @@ impl EmbeddedHost {
     }
 
     pub fn handle_event(&mut self, event: Event, area: Rect, now: Instant) {
+        self.pane.tick(now);
         match event {
             Event::Key(event) => {
                 if let Some(key) = translate_key(&event) {

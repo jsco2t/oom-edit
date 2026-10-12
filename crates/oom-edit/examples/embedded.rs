@@ -33,6 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let _guard = TerminalGuard::with_options(TerminalGuardOptions {
         keyboard_enhancement: enhancement,
+        focus_change: true,
         ..TerminalGuardOptions::default()
     })?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;

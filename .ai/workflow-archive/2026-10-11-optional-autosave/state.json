@@ -1,0 +1,96 @@
+{
+  "schema_version": 2,
+  "work_id": "2026-10-11-optional-autosave",
+  "title": "Optional autosave",
+  "phase": "DONE",
+  "created_at": "2026-10-11T21:21:12Z",
+  "updated_at": "2026-10-12T13:41:03.777917+00:00",
+  "approved_at": "2026-10-12T03:59:21.201841+00:00",
+  "completed_at": "2026-10-12T04:50:06.131675+00:00",
+  "archived_at": "2026-10-12T13:41:03.777917+00:00",
+  "baseline_sha": "1960ade52a394a7c23fe400fdbb395283834ab72",
+  "final_sha": "1960ade52a394a7c23fe400fdbb395283834ab72",
+  "plan_revision": 3,
+  "acceptance_round": 2,
+  "completed_rounds": [
+    {
+      "round": 1,
+      "plan_revision": 2,
+      "approved_at": "2026-10-12T00:31:18.448270+00:00",
+      "completed_at": "2026-10-12T00:46:11.125234+00:00",
+      "approved_plan_sha256": "a20b4c9e5ea36bdc52e22c26f6092cb7d8432568e76d1dc266f9c583d796a976",
+      "final_sha": "1960ade52a394a7c23fe400fdbb395283834ab72",
+      "task_ids": [
+        "001",
+        "002",
+        "003"
+      ],
+      "final_evidence": "evidence/final-round-001.md"
+    }
+  ],
+  "approved_plan_sha256": "98f83a0787d0b73a9222af3cce4d269bb1c77ec8d2406448b63839e52cee9088",
+  "current_task": null,
+  "tasks": [
+    {
+      "id": "001",
+      "path": "tasks/001-implement-optional-autosave.md",
+      "round": 1,
+      "status": "COMPLETE",
+      "attempts": 2,
+      "implementation": "main",
+      "evidence": "evidence/001.md"
+    },
+    {
+      "id": "002",
+      "path": "tasks/002-verify-and-document-autosave.md",
+      "round": 1,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/002.md"
+    },
+    {
+      "id": "003",
+      "path": "tasks/003-fix-incremental-highlighting.md",
+      "round": 1,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/003.md"
+    },
+    {
+      "id": "004",
+      "path": "tasks/004-restore-line-start-performance.md",
+      "round": 2,
+      "status": "COMPLETE",
+      "attempts": 2,
+      "implementation": "main",
+      "evidence": "evidence/004.md"
+    },
+    {
+      "id": "005",
+      "path": "tasks/005-enforce-performance-acceptance.md",
+      "round": 2,
+      "status": "COMPLETE",
+      "attempts": 1,
+      "implementation": "main",
+      "evidence": "evidence/005.md"
+    }
+  ],
+  "task_retry_limit": 3,
+  "final_retry_limit": 2,
+  "final_attempts": 1,
+  "stop_continuations": 0,
+  "max_stop_continuations": 50,
+  "block_reason": null,
+  "approved_extensions": [
+    {
+      "previous_plan_revision": 1,
+      "previous_plan_sha256": "147ae2c1e83c719f090bd76305ef24bcfbede3fc30af8a7cb59c0a84e1e4a643",
+      "previous_approved_at": "2026-10-11T21:27:22.439255+00:00",
+      "approval_text": "extension is approved.",
+      "scope": "Fix persisted incremental-highlighting defect and rerun final validation",
+      "approved_at": "2026-10-12T00:31:18.412322+00:00"
+    }
+  ]
+}

@@ -163,3 +163,53 @@ number = 42
     ));
     assert_eq!(fs::read(&path).unwrap(), wrong_type);
 }
+
+#[test]
+fn autosave_defaults_partial_tables_and_all_switch_combinations_roundtrip() {
+    use oom_edit::{AutosaveConfig, ConfigApplyReport, ConfigField};
+    for old in ["", "[editor]\nwrap = false\n", "[autosave]\n"] {
+        let config: Config = toml::from_str(old).unwrap();
+        assert_eq!(config.autosave, AutosaveConfig::default());
+    }
+    for interval in [false, true] {
+        for focus in [false, true] {
+            let config: Config = toml::from_str(&format!(
+                "[autosave]\nevery_five_minutes = {interval}\non_focus_loss = {focus}\n"
+            ))
+            .unwrap();
+            assert_eq!(
+                config.autosave,
+                AutosaveConfig {
+                    every_five_minutes: interval,
+                    on_focus_loss: focus
+                }
+            );
+            let roundtrip: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+            assert_eq!(roundtrip, config);
+            let report = ConfigApplyReport::between(&Config::default(), &config);
+            let mut expected = Vec::new();
+            if interval {
+                expected.push(ConfigField::AutosaveEveryFiveMinutes);
+            }
+            if focus {
+                expected.push(ConfigField::AutosaveOnFocusLoss);
+            }
+            assert_eq!(report.applied_now, expected);
+            assert!(report.requires_new_pane.is_empty());
+        }
+    }
+    let config: Config = toml::from_str("[autosave]\non_focus_loss = true\n").unwrap();
+    assert_eq!(
+        config.autosave,
+        AutosaveConfig {
+            every_five_minutes: false,
+            on_focus_loss: true
+        }
+    );
+    for invalid in [
+        "[autosave]\nevery_five_minutes = 300\n",
+        "[autosave]\non_focus_loss = 'true'\n",
+    ] {
+        assert!(toml::from_str::<Config>(invalid).is_err());
+    }
+}

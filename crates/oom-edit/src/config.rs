@@ -1,7 +1,7 @@
 //! Configuration — `$XDG_CONFIG_HOME/oom-edit/config.toml` (fallback
 //! `~/.config/oom-edit/config.toml`).
 //!
-//! `[theme]`, `[editor]`, `[clipboard]`, and `[spell]` sections.
+//! `[theme]`, `[editor]`, `[autosave]`, `[clipboard]`, and `[spell]` sections.
 //! Load-with-defaults on missing/partial config. Atomic write on change.
 //! Never fail startup on malformed config (warn to stderr, use defaults).
 
@@ -182,6 +182,20 @@ pub struct Config {
     #[serde(default)]
     /// Spelling resource and runtime configuration.
     pub spell: SpellConfig,
+    /// Optional automatic document-saving triggers. Both default to disabled.
+    #[serde(default)]
+    pub autosave: AutosaveConfig,
+}
+
+/// The `[autosave]` section of the config.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutosaveConfig {
+    /// Save modified named tabs every five minutes of host time.
+    #[serde(default)]
+    pub every_five_minutes: bool,
+    /// Save modified named tabs when the editor pane loses focus.
+    #[serde(default)]
+    pub on_focus_loss: bool,
 }
 
 /// Clipboard representation written to the host system clipboard.
@@ -541,6 +555,10 @@ pub enum ConfigField {
     SpellLanguage,
     /// Construction-time additional dictionary paths.
     AdditionalDictionaries,
+    /// Whether automatic saving runs every five minutes.
+    AutosaveEveryFiveMinutes,
+    /// Whether automatic saving runs when pane focus is lost.
+    AutosaveOnFocusLoss,
 }
 
 /// Exact changes that can apply now and those that need a new pane.
@@ -583,6 +601,14 @@ impl ConfigApplyReport {
         }
         if old.spell.enabled != new.spell.enabled {
             report.applied_now.push(ConfigField::SpellEnabled);
+        }
+        if old.autosave.every_five_minutes != new.autosave.every_five_minutes {
+            report
+                .applied_now
+                .push(ConfigField::AutosaveEveryFiveMinutes);
+        }
+        if old.autosave.on_focus_loss != new.autosave.on_focus_loss {
+            report.applied_now.push(ConfigField::AutosaveOnFocusLoss);
         }
         if old.editor.wrap_width != new.editor.wrap_width {
             report.requires_new_pane.push(ConfigField::WrapWidth);
@@ -1037,6 +1063,7 @@ additional_dictionaries = ["team.txt", "/opt/shared.txt"]
                 language: "en_AU".to_string(),
                 additional_dictionaries: vec![PathBuf::from("project.words")],
             },
+            autosave: AutosaveConfig::default(),
         };
 
         let temp_dir = tempfile::tempdir().unwrap();

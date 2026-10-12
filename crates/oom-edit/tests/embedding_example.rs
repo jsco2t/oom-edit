@@ -648,3 +648,57 @@ fn fr_111_failed_save_path_releases_host_prompt() {
         .next()
         .is_none());
 }
+
+#[test]
+fn split_host_focus_and_mouse_transitions_autosave_through_the_public_pane() {
+    for mouse in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("note.md");
+        std::fs::write(&path, "original\n").unwrap();
+        let now = Instant::now();
+        let mut host = EmbeddedHost::new(directory.path(), vec![path.clone()], now);
+        let mut config = oom_edit::Config::default();
+        config.autosave.on_focus_loss = true;
+        host.pane.apply_config(config);
+        let area = Rect::new(24, 0, 96, 19);
+        host.pane.render(area.width, area.height, now);
+        host.handle_event(key(KeyCode::Char('i'), KeyModifiers::NONE), area, now);
+        host.handle_event(Event::Paste("changed ".into()), area, now);
+        let lost_at = now + Duration::from_secs(100);
+        let event = if mouse {
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            })
+        } else {
+            Event::FocusLost
+        };
+        host.events.clear();
+        host.handle_event(event, area, lost_at);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "changed original\n"
+        );
+        assert_eq!(
+            host.events
+                .iter()
+                .filter(|e| matches!(e, PaneEvent::Saved { .. }))
+                .count(),
+            1
+        );
+        let frame = host.pane.render(100, 24, lost_at + Duration::from_secs(1));
+        let text: String = frame.cells.iter().map(|c| c.symbol.as_str()).collect();
+        assert!(text.contains("Autosaved 1 file(s)"));
+        assert!(frame.cursor.is_none());
+        host.events.clear();
+        host.handle_event(Event::FocusLost, area, lost_at);
+        assert!(!host
+            .events
+            .iter()
+            .any(|e| matches!(e, PaneEvent::Saved { .. })));
+        host.handle_event(Event::FocusGained, area, lost_at);
+        assert_eq!(host.pane.tabs()[0].mode, oom_edit::Mode::Insert);
+    }
+}

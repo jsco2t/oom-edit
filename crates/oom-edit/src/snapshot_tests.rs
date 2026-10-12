@@ -130,6 +130,7 @@ fn confirm_overwrite_overlay() -> crate::overlay::Overlay {
     std::fs::write(&path, "fixture\n").unwrap();
     crate::overlay::Overlay::open_confirm_overwrite(
         crate::lifecycle::SaveRequest {
+            origin: crate::lifecycle::SaveOrigin::Manual,
             target: 0,
             path: None,
             force: false,

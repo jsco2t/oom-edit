@@ -1,16 +1,17 @@
 use oom_edit::{
-    AllowAllFileAccess, Args, ClipboardConfig, ClipboardCopyFormat, ClipboardError, ClipboardSink,
-    ColorValue, CommandPolicy, Config, ConfigApplyReport, ConfigField, ConfigPersistError,
-    ConfigValidation, ConfigWarning, DisplayMode, EditorConfig, EditorPane, FileAccessPolicy,
-    FileOperation, FilePolicyError, FileThemeSink, InputDisposition, KeyCode, KeyCodeKind,
-    KeyInput, Mode, Modifiers, OpenCursor, OpenOptions, OpenOutcome, Osc52Clipboard, OwnedStyle,
-    PaletteKind, PaneCell, PaneConstruction, PaneConstructionReport, PaneCursor, PaneCursorShape,
-    PaneError, PaneErrorKind, PaneEvent, PaneFrame, PaneIdleResult, PaneInit, PaneInput,
-    PaneInputState, PaneMouse, PaneMouseKind, PaneOptions, PaneServices, PaneTick, PaneWarning,
-    ParseOutcome, RequestId, ResolvedTheme, SemanticStyle, SpellConfig, StyleModifiers, TabId,
-    TabSnapshot, TerminalError, TerminalGuard, TerminalGuardOptions, ThemeCatalog, ThemeConfig,
-    ThemeEnvironment, ThemeLoadReport, ThemeLoadWarning, ThemeLoadWarningKind,
-    ThemePersistenceSink, ThemeRole, ThemeSelection, ThemeSlot, ThemeSource, Tier, UiSlot,
+    AllowAllFileAccess, Args, AutosaveConfig, ClipboardConfig, ClipboardCopyFormat, ClipboardError,
+    ClipboardSink, ColorValue, CommandPolicy, Config, ConfigApplyReport, ConfigField,
+    ConfigPersistError, ConfigValidation, ConfigWarning, DisplayMode, EditorConfig, EditorPane,
+    FileAccessPolicy, FileOperation, FilePolicyError, FileThemeSink, InputDisposition, KeyCode,
+    KeyCodeKind, KeyInput, Mode, Modifiers, OpenCursor, OpenOptions, OpenOutcome, Osc52Clipboard,
+    OwnedStyle, PaletteKind, PaneCell, PaneConstruction, PaneConstructionReport, PaneCursor,
+    PaneCursorShape, PaneError, PaneErrorKind, PaneEvent, PaneFrame, PaneIdleResult, PaneInit,
+    PaneInput, PaneInputState, PaneMouse, PaneMouseKind, PaneOptions, PaneServices, PaneTick,
+    PaneWarning, ParseOutcome, RequestId, ResolvedTheme, SemanticStyle, SpellConfig,
+    StyleModifiers, TabId, TabSnapshot, TerminalError, TerminalGuard, TerminalGuardOptions,
+    ThemeCatalog, ThemeConfig, ThemeEnvironment, ThemeLoadReport, ThemeLoadWarning,
+    ThemeLoadWarningKind, ThemePersistenceSink, ThemeRole, ThemeSelection, ThemeSlot, ThemeSource,
+    Tier, UiSlot,
 };
 use oom_edit::{
     BindingExecution, BindingId, BindingSequence, EditorBinding, EditorRuler, EditorStatus,
@@ -127,6 +128,13 @@ fn oom_edit_facade_exports_only_the_curated_host_api() {
     let _: fn(std::path::PathBuf) -> FileThemeSink = FileThemeSink::new;
     let _: fn(&mut FileThemeSink, ThemeSlot, &str) -> Result<(), ConfigPersistError> =
         FileThemeSink::persist_theme;
+    let _ = AutosaveConfig {
+        every_five_minutes: true,
+        on_focus_loss: true,
+    };
+    let _ = ConfigField::AutosaveEveryFiveMinutes;
+    let _ = ConfigField::AutosaveOnFocusLoss;
+    let _ = TerminalError::FocusChange(std::io::ErrorKind::Other);
     let _ = std::any::TypeId::of::<ClipboardConfig>();
     let _ = std::any::TypeId::of::<ClipboardCopyFormat>();
     let _ = std::any::TypeId::of::<ConfigWarning>();
@@ -247,7 +255,7 @@ fn oom_edit_facade_exports_only_the_curated_host_api() {
     assert_eq!(declarations, [
         "pub use args::{Args, ParseOutcome};",
         "pub use clipboard::Osc52Clipboard;",
-        "pub use config::{ ClipboardConfig, ClipboardCopyFormat, Config, ConfigApplyReport, ConfigField, ConfigPersistError, ConfigValidation, ConfigWarning, EditorConfig, FileThemeSink, SpellConfig, ThemeConfig, ThemePersistenceSink, ThemeSlot, };",
+        "pub use config::{ AutosaveConfig, ClipboardConfig, ClipboardCopyFormat, Config, ConfigApplyReport, ConfigField, ConfigPersistError, ConfigValidation, ConfigWarning, EditorConfig, FileThemeSink, SpellConfig, ThemeConfig, ThemePersistenceSink, ThemeSlot, };",
         "pub use oom_edit_core::{ ClipboardError, ClipboardSink, DiagnosticSeverity, KeyCode, KeyCodeKind, KeyInput, Mode, Modifiers, SemanticStyle, };",
         "pub use owned_style::{ColorValue, OwnedStyle, StyleModifiers};",
         "pub use pane::{ AllowAllFileAccess, CommandPolicy, DiskChange, EditorPane, ExternalChangeToken, FileAccessPolicy, FileOperation, FilePolicyError, InputDisposition, OpenCursor, OpenOptions, OpenOutcome, PaneConstruction, PaneConstructionReport, PaneError, PaneErrorKind, PaneEvent, PaneIdleResult, PaneInit, PaneInput, PaneInputState, PaneMouse, PaneMouseKind, PaneOptions, PaneServices, PaneTick, PaneWarning, PreparedClose, PreparedRetarget, RequestId, Retarget, TabId, TabSnapshot, };",

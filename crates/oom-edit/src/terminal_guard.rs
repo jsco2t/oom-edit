@@ -9,8 +9,9 @@ use std::sync::Once;
 
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -23,6 +24,7 @@ const ALTERNATE: u8 = 1 << 1;
 const MOUSE: u8 = 1 << 2;
 const PASTE: u8 = 1 << 3;
 const KEYBOARD: u8 = 1 << 4;
+const FOCUS: u8 = 1 << 5;
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Bits are published before each terminal command, so a signal during setup
@@ -39,6 +41,8 @@ pub struct TerminalGuardOptions {
     pub bracketed_paste: bool,
     /// Acquire supported keyboard disambiguation; standalone defaults to false.
     pub keyboard_enhancement: bool,
+    /// Acquire terminal focus-loss and focus-gain reports. Defaults to false.
+    pub focus_change: bool,
 }
 
 impl Default for TerminalGuardOptions {
@@ -47,6 +51,7 @@ impl Default for TerminalGuardOptions {
             mouse_capture: true,
             bracketed_paste: true,
             keyboard_enhancement: false,
+            focus_change: false,
         }
     }
 }
@@ -71,6 +76,8 @@ pub enum TerminalError {
     BracketedPaste(std::io::ErrorKind),
     /// Supported keyboard enhancement could not be pushed.
     KeyboardEnhancement(std::io::ErrorKind),
+    /// Focus reporting could not be enabled.
+    FocusChange(std::io::ErrorKind),
     /// A panic already restored the terminal owned by this guard.
     Inactive,
 }
@@ -92,6 +99,9 @@ impl std::fmt::Display for TerminalError {
             TerminalError::KeyboardEnhancement(kind) => {
                 write!(f, "failed to enable keyboard enhancement: {kind}")
             }
+            TerminalError::FocusChange(kind) => {
+                write!(f, "failed to enable focus reporting: {kind}")
+            }
             TerminalError::Inactive => f.write_str("terminal guard is no longer active"),
         }
     }
@@ -106,6 +116,7 @@ enum SetupStep {
     Mouse,
     Paste,
     Keyboard,
+    Focus,
 }
 
 impl SetupStep {
@@ -116,6 +127,7 @@ impl SetupStep {
             Self::Mouse => MOUSE,
             Self::Paste => PASTE,
             Self::Keyboard => KEYBOARD,
+            Self::Focus => FOCUS,
         }
     }
 
@@ -126,6 +138,7 @@ impl SetupStep {
             Self::Mouse => TerminalError::MouseCapture(kind),
             Self::Paste => TerminalError::BracketedPaste(kind),
             Self::Keyboard => TerminalError::KeyboardEnhancement(kind),
+            Self::Focus => TerminalError::FocusChange(kind),
         }
     }
 }
@@ -144,12 +157,14 @@ fn setup_steps(
         SetupStep::Mouse,
         SetupStep::Paste,
         SetupStep::Keyboard,
+        SetupStep::Focus,
     ] {
         let requested = match step {
             SetupStep::Raw | SetupStep::Alternate => true,
             SetupStep::Mouse => options.mouse_capture,
             SetupStep::Paste => options.bracketed_paste,
             SetupStep::Keyboard => options.keyboard_enhancement && keyboard_supported(),
+            SetupStep::Focus => options.focus_change,
         };
         if !requested {
             continue;
@@ -193,6 +208,7 @@ impl TerminalGuard {
                 SetupStep::Alternate => execute!(stdout(), EnterAlternateScreen),
                 SetupStep::Mouse => execute!(stdout(), EnableMouseCapture),
                 SetupStep::Paste => execute!(stdout(), EnableBracketedPaste),
+                SetupStep::Focus => execute!(stdout(), EnableFocusChange),
                 SetupStep::Keyboard => execute!(
                     stdout(),
                     PushKeyboardEnhancementFlags(
@@ -265,6 +281,9 @@ fn restore_active() {
 
 /// Restore only features this guard acquired, in reverse setup order.
 fn restore_terminal(out: &mut impl Write, acquired: u8) {
+    if acquired & FOCUS != 0 {
+        let _ = execute!(out, DisableFocusChange);
+    }
     if acquired & KEYBOARD != 0 {
         let _ = execute!(out, PopKeyboardEnhancementFlags);
     }
@@ -325,7 +344,7 @@ fn restore_then_default(restore: impl FnOnce(), default: impl FnOnce()) {
 #[cfg(unix)]
 #[allow(unsafe_code)]
 mod signals {
-    use super::{ACQUIRED, ALTERNATE, KEYBOARD, MOUSE, PASTE, RAW};
+    use super::{ACQUIRED, ALTERNATE, FOCUS, KEYBOARD, MOUSE, PASTE, RAW};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Cooked-mode termios captured before raw mode, restored by the handler.
@@ -333,6 +352,7 @@ mod signals {
     static TERMIOS_SAVED: AtomicBool = AtomicBool::new(false);
     static INSTALLED: AtomicBool = AtomicBool::new(false);
 
+    pub(super) const DISABLE_FOCUS: &[u8] = b"\x1b[?1004l";
     pub(super) const POP_KEYBOARD: &[u8] = b"\x1b[<1u";
     pub(super) const DISABLE_PASTE: &[u8] = b"\x1b[?2004l";
     pub(super) const DISABLE_MOUSE: &[u8] =
@@ -375,6 +395,13 @@ mod signals {
                         std::ptr::addr_of!(termios),
                     );
                 }
+            }
+            if acquired & FOCUS != 0 {
+                libc::write(
+                    libc::STDOUT_FILENO,
+                    DISABLE_FOCUS.as_ptr().cast(),
+                    DISABLE_FOCUS.len(),
+                );
             }
             if acquired & KEYBOARD != 0 {
                 libc::write(
@@ -442,10 +469,13 @@ mod tests {
     /// Every optional feature is restored exactly when it was acquired.
     #[test]
     fn restore_terminal_writes_only_acquired_feature_escapes() {
-        for bits in 0..=(RAW | ALTERNATE | MOUSE | PASTE | KEYBOARD) {
+        for bits in 0..=(RAW | ALTERNATE | MOUSE | PASTE | KEYBOARD | FOCUS) {
             let mut sink = Vec::new();
             restore_terminal(&mut sink, bits);
             let mut expected = Vec::new();
+            if bits & FOCUS != 0 {
+                expected.extend_from_slice(b"\x1b[?1004l");
+            }
             if bits & KEYBOARD != 0 {
                 expected.extend_from_slice(b"\x1b[<1u");
             }
@@ -470,6 +500,7 @@ mod tests {
             mouse_capture: true,
             bracketed_paste: true,
             keyboard_enhancement: true,
+            focus_change: true,
         };
         for failed in [
             SetupStep::Raw,
@@ -477,6 +508,7 @@ mod tests {
             SetupStep::Mouse,
             SetupStep::Paste,
             SetupStep::Keyboard,
+            SetupStep::Focus,
         ] {
             let published = Cell::new(0_u8);
             let reached = RefCell::new(Vec::new());
@@ -542,16 +574,19 @@ mod tests {
                 mouse_capture: false,
                 bracketed_paste: false,
                 keyboard_enhancement: false,
+                focus_change: false,
             },
             TerminalGuardOptions {
                 mouse_capture: true,
                 bracketed_paste: false,
                 keyboard_enhancement: true,
+                focus_change: true,
             },
             TerminalGuardOptions {
                 mouse_capture: false,
                 bracketed_paste: true,
                 keyboard_enhancement: true,
+                focus_change: true,
             },
         ] {
             let published = Cell::new(0_u8);
@@ -571,6 +606,7 @@ mod tests {
             assert_eq!(published.get() & MOUSE != 0, options.mouse_capture);
             assert_eq!(published.get() & PASTE != 0, options.bracketed_paste);
             assert_eq!(published.get() & KEYBOARD, 0);
+            assert_eq!(published.get() & FOCUS != 0, options.focus_change);
         }
     }
 
@@ -606,12 +642,14 @@ mod tests {
     #[test]
     fn signal_restore_uses_the_exact_acquired_feature_bytes() {
         let bytes = [
+            signals::DISABLE_FOCUS,
             signals::POP_KEYBOARD,
             signals::DISABLE_PASTE,
             signals::DISABLE_MOUSE,
             signals::LEAVE_ALTERNATE,
         ]
         .concat();
+        assert_eq!(signals::DISABLE_FOCUS, b"\x1b[?1004l");
         assert_eq!(signals::POP_KEYBOARD, b"\x1b[<1u");
         assert_eq!(signals::DISABLE_PASTE, DISABLE_BRACKETED_PASTE);
         assert_eq!(signals::DISABLE_MOUSE, DISABLE_MOUSE);

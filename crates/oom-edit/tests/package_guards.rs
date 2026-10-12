@@ -57,6 +57,31 @@ fn developer_guide_uses_the_exercised_public_consumer() {
 }
 
 #[test]
+fn readme_autosave_examples_parse_with_the_documented_switches() {
+    let readme = std::fs::read_to_string(root().join("README.md")).unwrap();
+    let configurations: Vec<oom_edit::Config> = readme
+        .split("```toml\n")
+        .skip(1)
+        .map(|block| block.split("```").next().unwrap())
+        .filter(|toml| toml.contains("[autosave]"))
+        .map(|toml| toml::from_str(toml).expect("README config must be usable verbatim"))
+        .collect();
+    let switches: Vec<_> = configurations
+        .iter()
+        .map(|config| {
+            (
+                config.autosave.every_five_minutes,
+                config.autosave.on_focus_loss,
+            )
+        })
+        .collect();
+    assert_eq!(
+        switches,
+        [(false, false), (true, false), (false, true), (true, true)]
+    );
+}
+
+#[test]
 fn integrated_ci_owns_coverage_docs_examples_and_performance() {
     let makefile = include_str!("../../../Makefile");
     let recipes = makefile

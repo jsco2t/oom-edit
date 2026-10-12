@@ -547,6 +547,7 @@ impl App {
         });
         let progress = self.execute_save_version(
             SaveRequest {
+                origin: crate::lifecycle::SaveOrigin::Manual,
                 target: index,
                 path,
                 force,

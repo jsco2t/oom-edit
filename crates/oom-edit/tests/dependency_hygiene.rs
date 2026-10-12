@@ -343,3 +343,36 @@ fn tui_never_substitutes_rendered_remap_for_a_canonical_jump() {
         "TUI jumps must call EditorSession::jump_to_offset, not remap only: {offenders:?}"
     );
 }
+
+#[test]
+fn autosave_uses_one_lifecycle_writer_and_hosts_own_terminal_focus() {
+    let autosave = include_str!("../src/app/autosave.rs");
+    assert!(autosave.contains("self.execute_lifecycle(LifecycleAction::Save("));
+    assert!(autosave.contains("origin: SaveOrigin::Automatic(trigger)"));
+    for bypass in [
+        ".session.save(",
+        ".save_with_observer(",
+        "std::fs::write",
+        "Instant::now()",
+    ] {
+        assert!(!autosave.contains(bypass), "autosave bypass: {bypass}");
+    }
+    let app = include_str!("../src/app.rs");
+    let writer = app
+        .split("fn execute_save_version(")
+        .nth(1)
+        .unwrap()
+        .split("fn replace_tab_from_disk(")
+        .next()
+        .unwrap();
+    assert!(writer.contains("SaveOrigin::Automatic(_)"));
+    let standalone = include_str!("../src/standalone.rs")
+        .split("#[cfg(test)]\nmod tests")
+        .next()
+        .unwrap();
+    assert!(standalone.contains("self.pane.set_focused("));
+    assert!(!standalone.contains("EnableFocusChange"));
+    let pane = include_str!("../src/pane.rs");
+    assert!(!pane.contains("EnableFocusChange"));
+    assert!(!pane.contains("Instant::now()"));
+}

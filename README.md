@@ -115,6 +115,11 @@ wrap_width = 100
 # steady underscore in Select. Set false for a steady block in every mode.
 cursor_shapes = true
 
+[autosave]
+# Each trigger is optional; enable either or both.
+every_five_minutes = false
+on_focus_loss = false
+
 [clipboard]
 # Preserve Markdown source by default. Use "plain-text" to copy rendered text
 # without Markdown syntax.
@@ -132,6 +137,61 @@ language = "en_US" # "en_US", "en_CA", or "en_AU"
 additional_dictionaries = []
 # Example: ["project.words", "/opt/shared/company.words"]
 ```
+
+### Autosave
+
+Autosave is off by default. Enable either trigger or both in `config.toml`.
+
+Every five minutes:
+
+```toml
+[autosave]
+every_five_minutes = true
+on_focus_loss = false
+```
+
+On focus loss:
+
+```toml
+[autosave]
+every_five_minutes = false
+on_focus_loss = true
+```
+
+Both triggers:
+
+```toml
+[autosave]
+every_five_minutes = true
+on_focus_loss = true
+```
+
+`every_five_minutes` saves 300 seconds after startup or enabling the setting,
+then every five minutes. Manual and focus-triggered saves do not reset that
+schedule. A delayed timer performs one save cycle and starts the next interval
+from that time. `on_focus_loss` saves when the terminal loses focus, or when an
+embedding host moves focus away from the editor. Repeated unfocused reports,
+regaining focus, and switching editor tabs do not trigger saves. Terminal focus
+saves require the terminal or multiplexer to forward focus reports; periodic
+saving works without those reports.
+
+Each cycle saves all modified tabs with file paths, including background tabs.
+Unnamed buffers need an explicit save and filename. A named new-file buffer can
+be created by autosave. Clean files are not rewritten. Autosave preserves the
+current mode, cursor, selection, and undo history, including during Insert.
+
+Automatic saves use the ordinary atomic save protocol and never force an
+overwrite or silently recreate a previously opened file that disappeared.
+Conflicts, denied writes, and I/O failures retain dirty work and show a notice;
+other eligible tabs can still save. A write whose durability cannot be confirmed
+also remains dirty. Use `Space w` or `:w` to retry and resolve a conflict explicitly.
+Autosave writes the document itself; it does not provide crash-recovery files.
+
+A prompt, overlay, pending key sequence, or host file transaction skips that
+cycle and shows an autosave notice when modified named work exists. There is no
+queued save: periodic saving retries at the next five-minute interval; focus
+saving retries on the next actual focus-loss transition. The two triggers may
+be combined to provide both opportunities.
 
 ### Themes
 

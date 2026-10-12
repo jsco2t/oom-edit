@@ -62,6 +62,16 @@ language to en_US, and an unreadable additional dictionary disables spelling
 for the run. Use `ThemeConfig::set_dark/set_light` when constructing explicit
 theme slots so presence has the same meaning as a written TOML slot.
 
+`Config::autosave` is an owned `AutosaveConfig` with independent
+`every_five_minutes` and `on_focus_loss` booleans, both false by default.
+`apply_config` applies both immediately and reports
+`ConfigField::AutosaveEveryFiveMinutes` / `ConfigField::AutosaveOnFocusLoss`.
+Call `tick(now)` before applying a time-sensitive config change. Enabling the
+periodic setting schedules its first expiry 300 seconds after the most recently
+supplied time; unrelated config updates leave its deadline intact. Changes do
+not persist host configuration. See [autosave semantics](README.md#autosave)
+for scope, skipped cycles, and noninteractive failure handling.
+
 Load user themes through `ThemeCatalog::load_from_base`, or use built-ins only.
 Pass a `ThemeSelection` with an explicit name/appearance/tier; selection does
 not read the environment. A host may deliberately capture `ThemeEnvironment`
@@ -186,11 +196,29 @@ cancels App Space chords/drag state on focus loss; native grammar and modal
 state suspend rather than being fabricated with an Escape. Remove the pane's
 screen origin once from mouse coordinates before dispatch.
 
+Call `tick(now)` with the post-read event timestamp **before** `set_focused`.
+When enabled, focus autosave runs on an actual focused-to-unfocused transition;
+it also applies when your surrounding UI takes editor focus. All modified named
+tabs are considered. Ordinary Insert/Select state is retained; prompts, overlays,
+pending grammar and file transactions skip the trigger. A repeated unfocused
+call or active-tab change does not save. Translate delivered terminal focus
+reports into this same focus authority. Reporting support and forwarding are
+host/terminal responsibilities; the pane never acquires a terminal feature.
+
 Sample an event timestamp **after** reading the event and before dispatch.
 Call `tick(now)` even while the pane is hidden, honoring `next_deadline` and
 redraw requests. When `idle_due` allows spelling work, call bounded
 `idle_unit(max_bytes)` units and measure actual runtime in the host; do not
 make one unbounded idle call or use a fresh wall clock inside pure layout.
+
+Periodic autosave uses the host's monotonic clock and continues while the pane
+is unfocused or hidden. Honor the existing `PaneTick::next_deadline`; a late tick
+runs at most one cycle and schedules the next for 300 seconds later. Drain
+events after `tick` and `set_focused` as well as input/lifecycle calls: autosaves
+emit existing correlated `Saved`/`Completed`, `Failed`, or
+`DiskWriteCommitted` events with captured `TabId` values. A failed or uncertain
+write must not be treated as a confirmed save. No editor command or mutable
+session escape is needed to execute autosave.
 
 ## Owned frames and host chrome
 
@@ -273,8 +301,12 @@ are crate-local for independently vendored consumers and byte-identical to
 the canonical root document.
 
 The host decides whether to use `TerminalGuard`. One guard may be active per
-process; a second acquisition returns a typed error. Choose mouse, paste and
-supported keyboard-enhancement options explicitly. Acquired features are
+process; a second acquisition returns a typed error. Choose mouse, paste,
+supported keyboard-enhancement and focus-reporting options explicitly.
+`TerminalGuardOptions::focus_change` defaults to false for library hosts;
+standalone and the split example enable it for their terminal session. Set it
+to true to request focus reports through an owned guard, and handle the owned
+`TerminalError::FocusChange` setup failure. Acquired features are
 restored on drop, panic, partial failure and handled fatal signals; prior panic
 hooks are chained. Mouse capture may be toggled while active. The core has no
 terminal dependency. The pane itself neither acquires a terminal nor writes
@@ -288,6 +320,7 @@ make build-examples
 make run-embedded ARGS=path/to/note.md
 make run-embedded ARGS="--legacy-keys path/to/note.md"
 make test-embedding-example
+make test-pane-autosave
 make test-package-guards
 make coverage-check
 make doc

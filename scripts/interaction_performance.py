@@ -45,6 +45,8 @@ GATE_CASES = (
 LOCAL_LIMIT_NS = 50_000_000
 SCROLL_LIMIT_NS = 25_000_000
 FIRST_RENDER_LIMIT_NS = 500_000_000
+GATE_TRIALS = 5
+GATE_ITERATIONS = 21
 SIZES = (144 * KIB, 1024 * KIB)
 CASE_CLASSES = {"source-reference": "mixed-reference"}
 FIXTURE_IDENTITIES = {
@@ -144,7 +146,7 @@ def verify_cycles(rows: list[dict[str, object]], case: str,
 def gate_failures(rows: list[dict[str, object]], case: str,
                   trials: int, iterations: int) -> list[str]:
     verify_cycles(rows, case, trials, iterations)
-    if trials < 5 or iterations < 21:
+    if trials < GATE_TRIALS or iterations < GATE_ITERATIONS:
         raise ValueError("interaction gate requires five trials and 21 cycles")
     failures = []
     for step in CASES[case]:
@@ -167,6 +169,13 @@ def gate_failures(rows: list[dict[str, object]], case: str,
     return failures
 
 
+def sample_phase(case: str, cycle: int) -> str:
+    """Classify the first-ever rendered return separately from later returns."""
+    if case.startswith("exit-insert"):
+        return "first-render" if cycle == 0 else "warmed"
+    return "ordinary"
+
+
 def format_phases(rows: list[dict[str, object]]) -> str:
     parts = []
     for name in ("input_ns", "render_ns", "total_ns"):
@@ -187,15 +196,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--gate", action="store_true")
-    parser.add_argument("--trials", type=int, default=5)
-    parser.add_argument("--iterations", type=int, default=21)
+    parser.add_argument("--trials", type=int, default=GATE_TRIALS)
+    parser.add_argument("--iterations", type=int, default=GATE_ITERATIONS)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--case", choices=CASES.keys(), action="append")
     parser.add_argument("--size", type=int, action="append")
     args = parser.parse_args()
     if args.trials < 1 or args.iterations < 1:
         parser.error("trials and iterations must be positive")
-    if args.gate and (args.trials < 5 or args.iterations < 21 or args.case or args.size):
+    if args.gate and (args.trials < GATE_TRIALS or args.iterations < GATE_ITERATIONS
+                      or args.case or args.size):
         parser.error("gate requires five trials, 21 cycles and the fixed case/size inventory")
     chosen_cases = list(GATE_CASES) if args.gate else args.case or list(CASES)
     chosen_sizes = (1024 * KIB,) if args.gate else args.size or list(SIZES)
@@ -210,9 +220,7 @@ def main() -> int:
                 for index, row in enumerate(run):
                     row["trial"] = trial
                     row["cycle"] = index // len(CASES[case])
-                    row["phase"] = (
-                        "first-render" if row["cycle"] == 0 else "warmed"
-                    ) if case.startswith("exit-insert") else "ordinary"
+                    row["phase"] = sample_phase(case, row["cycle"])
                 rows.extend(run)
             verify_cycles(rows, case, args.trials, args.iterations)
             observations.extend(rows)

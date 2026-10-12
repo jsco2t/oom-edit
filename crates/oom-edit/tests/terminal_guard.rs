@@ -11,6 +11,7 @@ fn fr_091_guard_options_keep_standalone_keyboard_enhancement_off() {
             mouse_capture: true,
             bracketed_paste: true,
             keyboard_enhancement: false,
+            focus_change: false,
         }
     );
     let _: fn() -> Result<TerminalGuard, TerminalError> = TerminalGuard::new;
@@ -43,7 +44,10 @@ fn terminal_guard_probe_child() {
         return;
     };
     let before = stty_state();
-    let options = TerminalGuardOptions::default();
+    let options = TerminalGuardOptions {
+        focus_change: true,
+        ..TerminalGuardOptions::default()
+    };
     match scenario.as_str() {
         "normal" => {
             let guard = TerminalGuard::with_options(options).unwrap();
@@ -62,6 +66,7 @@ fn terminal_guard_probe_child() {
                 mouse_capture: false,
                 bracketed_paste: false,
                 keyboard_enhancement: false,
+                focus_change: false,
             })
             .unwrap();
             drop(guard);
@@ -73,6 +78,7 @@ fn terminal_guard_probe_child() {
                 mouse_capture: false,
                 bracketed_paste: false,
                 keyboard_enhancement: false,
+                focus_change: false,
             })
             .unwrap();
             guard.set_mouse_capture(true).unwrap();
@@ -89,6 +95,7 @@ fn terminal_guard_probe_child() {
                 mouse_capture: false,
                 bracketed_paste: false,
                 keyboard_enhancement: true,
+                focus_change: false,
             };
             if scenario == "enhanced-panic" {
                 assert!(std::panic::catch_unwind(|| {
@@ -268,6 +275,8 @@ fn fr_090_exclusive_guard_and_sequential_reuse_restore_termios() {
     assert_eq!(count(&output, b"\x1b[?2004h"), 2);
     assert_eq!(count(&output, b"\x1b[?2004l"), 2);
     assert_eq!(count(&output, b"\x1b[<1u"), 0);
+    assert_eq!(count(&output, b"\x1b[?1004h"), 2);
+    assert_eq!(count(&output, b"\x1b[?1004l"), 2);
 }
 
 #[cfg(unix)]
@@ -280,6 +289,8 @@ fn fr_090_panic_and_signal_restore_once_without_stale_hook_writes() {
     assert_eq!(count(&panic_output, b"\x1b[?1049l"), 1);
     assert_eq!(count(&panic_output, b"\x1b[?1000l"), 1);
     assert_eq!(count(&panic_output, b"\x1b[?2004l"), 1);
+    assert_eq!(count(&panic_output, b"\x1b[?1004h"), 1);
+    assert_eq!(count(&panic_output, b"\x1b[?1004l"), 1);
 
     for signal in ["signal", "hup"] {
         let signal_output = probe(signal);
@@ -289,11 +300,14 @@ fn fr_090_panic_and_signal_restore_once_without_stale_hook_writes() {
         assert_eq!(count(&signal_output, b"\x1b[?1049l"), 1);
         assert_eq!(count(&signal_output, b"\x1b[?1000l"), 1);
         assert_eq!(count(&signal_output, b"\x1b[?2004l"), 1);
+        assert_eq!(count(&signal_output, b"\x1b[?1004h"), 1);
+        assert_eq!(count(&signal_output, b"\x1b[?1004l"), 1);
     }
     let dropped = probe("post-drop-signal");
     assert_eq!(count(&dropped, b"\x1b[?1049l"), 1);
     assert_eq!(count(&dropped, b"\x1b[?1000l"), 1);
     assert_eq!(count(&dropped, b"\x1b[?2004l"), 1);
+    assert_eq!(count(&dropped, b"\x1b[?1004l"), 1);
 }
 
 #[cfg(unix)]
@@ -304,6 +318,8 @@ fn fr_092_runtime_mouse_and_minimal_options_emit_exact_captures() {
     assert_eq!(count(&minimal, b"\x1b[?1000l"), 0);
     assert_eq!(count(&minimal, b"\x1b[?2004h"), 0);
     assert_eq!(count(&minimal, b"\x1b[?2004l"), 0);
+    assert_eq!(count(&minimal, b"\x1b[?1004h"), 0);
+    assert_eq!(count(&minimal, b"\x1b[?1004l"), 0);
 
     let mouse = probe("mouse");
     assert_eq!(count(&mouse, b"\x1b[?1000h"), 2);

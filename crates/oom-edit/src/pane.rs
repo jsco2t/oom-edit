@@ -1201,8 +1201,11 @@ impl EditorPane {
 
     /// Set the one focus authority for input, cursor, hints and safe reload.
     /// Call `tick(now)` before a focus transition to supply its timestamp.
+    /// Enabled focus-loss autosave may write modified named tabs and emit events.
+    /// Exclusive interactions and file transactions skip automatic saves.
     pub fn set_focused(&mut self, focused: bool) {
         self.app.set_focused(focused);
+        self.flush_lifecycle_events();
     }
 
     /// Content-validate tabs matching these paths or directories, even when
@@ -1224,8 +1227,11 @@ impl EditorPane {
     }
 
     /// Advance timers even when the host does not draw this pane.
+    /// Enabled periodic autosave may write modified named tabs, including while
+    /// unfocused. Drain events to receive correlated save results.
     pub fn tick(&mut self, now: Instant) -> PaneTick {
         let result = self.app.tick(now);
+        self.flush_lifecycle_events();
         if result.redraw {
             self.idle_complete = false;
         }

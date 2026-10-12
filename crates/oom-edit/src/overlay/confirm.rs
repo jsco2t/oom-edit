@@ -389,6 +389,7 @@ impl ConfirmOverwrite {
         let version = oom_edit_core::DiskVersion::observe(&path).unwrap();
         Self::for_request(
             SaveRequest {
+                origin: crate::lifecycle::SaveOrigin::Manual,
                 target: 0,
                 path: None,
                 force: false,

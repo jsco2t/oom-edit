@@ -68,6 +68,7 @@ use crate::theme::{ResolvedTheme, Theme, ThemeCatalog, Tier};
 use crate::widgets::status_bar;
 use crate::widgets::which_key;
 
+mod autosave;
 mod disk_watch;
 mod lifecycle_protocol;
 #[cfg(test)]
@@ -239,6 +240,7 @@ pub(crate) struct AppStartupOptions {
     clipboard_copy_format: ClipboardCopyFormat,
     spell_enabled: bool,
     cursor_shapes: bool,
+    autosave: crate::config::AutosaveConfig,
 }
 
 /// Presentation choices supplied by a host without changing editor state.
@@ -264,14 +266,16 @@ impl AppRenderOptions<'_> {
 
 impl AppStartupOptions {
     pub(crate) fn from_config(config: &crate::config::Config) -> Self {
-        Self::new(
+        let mut options = Self::new(
             config.editor.wrap,
             config.relative_line_numbers,
             config.clipboard.copy_format,
             config.spell.enabled,
         )
         .with_wrap_width(config.editor.wrap_width)
-        .with_cursor_shapes(config.editor.cursor_shapes)
+        .with_cursor_shapes(config.editor.cursor_shapes);
+        options.autosave = config.autosave;
+        options
     }
 
     pub(crate) fn new(
@@ -287,6 +291,7 @@ impl AppStartupOptions {
             clipboard_copy_format,
             spell_enabled,
             cursor_shapes: true,
+            autosave: crate::config::AutosaveConfig::default(),
         }
     }
 
@@ -427,6 +432,7 @@ pub struct App {
     /// Reusable presentation buffers; never owns editor text or session state.
     offscreen: Option<Terminal<TestBackend>>,
     presentation_revision: u64,
+    autosave: autosave::AutosaveState,
     next_disk_poll: Instant,
     disk_probe: Box<dyn disk_watch::DiskProbe>,
     /// Follow requested by a state transition that returns before the normal
@@ -594,6 +600,7 @@ impl App {
             clipboard_copy_format,
             spell_enabled: spell_enabled_default,
             cursor_shapes,
+            autosave,
         } = options;
         let is_light = resolved_theme.is_light();
         let tier = resolved_theme.capability;
@@ -632,6 +639,7 @@ impl App {
             frame_generation: 0,
             offscreen: None,
             presentation_revision: 0,
+            autosave: autosave::AutosaveState::new(autosave, initial_time),
             next_disk_poll: initial_time + disk_watch::POLL_INTERVAL,
             disk_probe: Box::new(disk_watch::FilesystemProbe),
             pending_scroll_follow: true,
@@ -988,6 +996,7 @@ impl App {
             }
             self.pending_scroll_follow = true;
         }
+        self.autosave.configure(config.autosave, self.now);
         self.relative_line_numbers = config.relative_line_numbers;
         self.cursor_shapes = config.editor.cursor_shapes;
         self.clipboard_copy_format = config.clipboard.copy_format;
@@ -1052,10 +1061,8 @@ impl App {
         self.active_mut().map(|t| &mut t.session)
     }
 
-    /// Advance internal timers and report their presentation effect.
-    ///
-    /// Advances `self.now`, expires any TTL'd transient messages, and
-    /// computes the minimum of transient expiry and which-key pending+150ms.
+    /// Advance timers, reconcile disk observations and run due autosaves.
+    /// Report presentation changes and the next host wake deadline.
     pub(crate) fn tick(&mut self, now: Instant) -> TickResult {
         let abandoned = self.sync_abandoned_transaction();
         let which_key_was_visible = match self.pending_input {
@@ -1078,9 +1085,12 @@ impl App {
         let revision = self.presentation_revision;
         self.poll_disk(now);
         self.reconcile_safe_disk_change();
+        if self.autosave.take_due(now) {
+            self.run_autosave(crate::lifecycle::AutosaveTrigger::Interval);
+        }
         let disk_redraw = revision != self.presentation_revision;
 
-        // Compute next deadline: min(transient.expires_at, which_key_pending+150ms).
+        // Wake for the earliest presentation, disk or autosave timer.
         let transient_deadline = self.transient.as_ref().map(|t| t.expires_at);
         let which_key_deadline = match self.pending_input {
             PendingAppInput::Space { since } => Some(since + std::time::Duration::from_millis(150)),
@@ -1091,6 +1101,7 @@ impl App {
             .into_iter()
             .chain(which_key_deadline)
             .chain(self.disk_poll_deadline())
+            .chain(self.autosave.deadline())
             .min()
             .filter(|deadline| *deadline >= now);
         let which_key_is_visible = match self.pending_input {
@@ -1297,6 +1308,9 @@ impl App {
         self.invalidate_presentation();
         if self.is_focused() == focused {
             return;
+        }
+        if !focused && self.autosave.on_focus_loss() {
+            self.run_autosave(crate::lifecycle::AutosaveTrigger::FocusLoss);
         }
         let elapsed = self.focus.elapsed(self.now);
         self.focus = if focused {
@@ -1993,6 +2007,7 @@ impl App {
             crate::overlay::ConfirmationResolution::DirtyClose { action, choice } => match choice {
                 DirtyCloseChoice::SaveAndClose => {
                     self.execute_lifecycle(LifecycleAction::Save(SaveRequest {
+                        origin: crate::lifecycle::SaveOrigin::Manual,
                         target: action.target,
                         path: None,
                         force: false,
@@ -2048,6 +2063,7 @@ impl App {
             }
             AppCommand::Save => {
                 self.execute_lifecycle(LifecycleAction::Save(SaveRequest {
+                    origin: crate::lifecycle::SaveOrigin::Manual,
                     target: self.active_tab,
                     path: None,
                     force: false,
@@ -2877,6 +2893,14 @@ impl App {
                     format!("File modified on disk: {}", path.display()),
                     oom_edit_core::Severity::Warning,
                 );
+                if matches!(request.origin, crate::lifecycle::SaveOrigin::Automatic(_)) {
+                    self.lifecycle_failure(PaneError {
+                        kind: PaneErrorKind::Io,
+                        path: Some(path),
+                        detail: "autosave refused: file changed or disappeared on disk; save explicitly to resolve".into(),
+                    });
+                    return SaveProgress::Failed;
+                }
                 match oom_edit_core::DiskVersion::observe(&path) {
                     Ok(version) => {
                         self.overlay = Overlay::open_confirm_overwrite(request, path, version);
@@ -3150,6 +3174,7 @@ impl App {
                 then_quit,
             } => {
                 self.execute_lifecycle(LifecycleAction::Save(SaveRequest {
+                    origin: crate::lifecycle::SaveOrigin::Manual,
                     target: self.active_tab,
                     path,
                     force,
@@ -5750,7 +5775,7 @@ mod tests {
         app
     }
 
-    fn file_backed_app(dir: &std::path::Path, files: &[(&str, &str)]) -> App {
+    pub(super) fn file_backed_app(dir: &std::path::Path, files: &[(&str, &str)]) -> App {
         assert!(!files.is_empty());
         let paths: Vec<_> = files
             .iter()
@@ -5872,6 +5897,7 @@ mod tests {
                 app.lifecycle_events.clear();
                 app.save_observer = Some(Box::new(Reject(boundary)));
                 app.execute_lifecycle(LifecycleAction::Save(SaveRequest {
+                    origin: crate::lifecycle::SaveOrigin::Manual,
                     target: 0,
                     path: copy.then_some(copy_path),
                     force: false,
@@ -5925,7 +5951,7 @@ mod tests {
         }
     }
 
-    fn dirty_tab(app: &mut App, index: usize, inserted: &str) {
+    pub(super) fn dirty_tab(app: &mut App, index: usize, inserted: &str) {
         let session = &mut app.tabs[index].session;
         session.render_layout(74);
         session.handle_key(KeyInput {
@@ -9358,6 +9384,7 @@ mod tests {
         app.tabs[0].rendered_left_col = 6;
         std::fs::write(&target, "external replacement that is longer\n").unwrap();
         app.execute_lifecycle(LifecycleAction::Save(SaveRequest {
+            origin: crate::lifecycle::SaveOrigin::Manual,
             target: 0,
             path: None,
             force: false,
@@ -9500,6 +9527,7 @@ mod tests {
         let mut app = test_app(EditorSession::from_text("one\n"));
         dirty_tab(&mut app, 0, "dirty ");
         app.execute_lifecycle(LifecycleAction::Save(SaveRequest {
+            origin: crate::lifecycle::SaveOrigin::Manual,
             target: 0,
             path: None,
             force: false,

@@ -1,0 +1,20 @@
+{
+  "standard_commands": [
+    "make check"
+  ],
+  "final_commands": [
+    "make check",
+    "make test-public-api",
+    "make build-examples",
+    "make doc",
+    "make coverage-check",
+    "make terminal-guard-pty-test",
+    "make bench",
+    "make tui-perf-record BRANCH_ROLE=candidate TRIALS=5 OUTPUT=.ai/workflow/evidence/round-002-tui-candidate.tsv",
+    "make tui-perf-record PERF_ROOT=/tmp/oom-autosave-perf-baseline-20261012 BRANCH_ROLE=baseline TRIALS=5 OUTPUT=.ai/workflow/evidence/round-002-tui-baseline.tsv",
+    "make tui-perf-compare BASELINE=.ai/workflow/evidence/round-002-tui-baseline.tsv CANDIDATE=.ai/workflow/evidence/round-002-tui-candidate.tsv OUTPUT=.ai/workflow/evidence/round-002-tui-comparison.tsv",
+    "make bench-interactions OUTPUT=.ai/workflow/evidence/round-002-interactions-candidate.jsonl",
+    "make -C /tmp/oom-autosave-perf-baseline-20261012 bench-interactions OUTPUT=/tmp/oom-autosave-round-002-interactions-baseline.jsonl",
+    "make interaction-perf-compare BASELINE=/tmp/oom-autosave-round-002-interactions-baseline.jsonl CANDIDATE=.ai/workflow/evidence/round-002-interactions-candidate.jsonl OUTPUT=.ai/workflow/evidence/round-002-interactions-comparison.tsv"
+  ]
+}

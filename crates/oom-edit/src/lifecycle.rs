@@ -25,8 +25,21 @@ pub(crate) enum SaveContinuation {
     CloseSavedTab,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AutosaveTrigger {
+    Interval,
+    FocusLoss,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SaveOrigin {
+    Manual,
+    Automatic(AutosaveTrigger),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SaveRequest {
+    pub origin: SaveOrigin,
     pub target: usize,
     pub path: Option<PathBuf>,
     pub force: bool,
@@ -137,6 +150,7 @@ mod tests {
     #[test]
     fn save_continuation_is_relative_to_its_only_target() {
         let request = SaveRequest {
+            origin: crate::lifecycle::SaveOrigin::Manual,
             target: 2,
             path: None,
             force: false,

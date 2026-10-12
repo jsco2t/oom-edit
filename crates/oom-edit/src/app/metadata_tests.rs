@@ -26,6 +26,7 @@ fn every_overlay_exports_exact_hints_and_owns_modified_and_noop_input() {
         }),
         Overlay::open_confirm_overwrite(
             SaveRequest {
+                origin: crate::lifecycle::SaveOrigin::Manual,
                 target: 0,
                 path: None,
                 force: false,

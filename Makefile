@@ -58,7 +58,7 @@ sync-notices: ## Refresh the byte-identical crate-local copy of canonical third-
 # Test
 # ---------------------------------------------------------------------------
 .PHONY: test
-test: feature-workflow-test tui-perf-test realistic-perf-test acceptance-1mb-perf-test rss-stability-test ci-workflow-test drd-coverage-test grammar-generation-test downstream-tool-test terminal-guard-tool-test ## Run the full test suite
+test: feature-workflow-test tui-perf-test realistic-perf-test interaction-perf-compare-test acceptance-1mb-perf-test rss-stability-test ci-workflow-test drd-coverage-test grammar-generation-test downstream-tool-test terminal-guard-tool-test ## Run the full test suite
 	bash scripts/with-isolated-config.sh cargo test --workspace --offline --locked
 
 .PHONY: downstream-tool-test
@@ -123,6 +123,11 @@ test-embedding-example: ## Drive the public-API split host and shared key vector
 	cargo test --package oom-edit --test embedding_example --offline --locked
 	cargo test -p oom-edit --offline --locked --lib terminal_key_vectors_cover_legacy_and_enhanced_equivalence
 
+.PHONY: test-pane-autosave
+test-pane-autosave: ## Verify optional autosave timing, focus, file safety and lifecycle isolation
+	cargo test --package oom-edit --test pane_autosave --offline --locked
+	cargo test --package oom-edit --lib app::autosave::tests --offline --locked
+
 .PHONY: test-pane-public
 test-pane-public: ## Run external-consumer pane API and behavior tests
 	cargo test --package oom-edit --test pane_public --offline --locked
@@ -173,6 +178,10 @@ realistic-perf-test: ## Test realistic fixture and measurement contracts
 .PHONY: test-realistic-performance
 test-realistic-performance: realistic-perf-test ## Verify realistic fixture and runner shape
 
+.PHONY: interaction-perf-compare-test
+interaction-perf-compare-test: ## Test public-pane comparison thresholds, inventory integrity and failed evidence retention
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_interaction_performance_compare.py'
+
 .PHONY: acceptance-1mb-perf-test
 acceptance-1mb-perf-test: ## Test exact large-note acceptance runner contracts
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_acceptance_1mb.py'
@@ -181,6 +190,11 @@ acceptance-1mb-perf-test: ## Test exact large-note acceptance runner contracts
 .PHONY: rss-stability-test
 rss-stability-test: ## Test current-RSS stability runner contracts
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_rss_stability.py'
+
+.PHONY: test-syntax-incremental-regression
+test-syntax-incremental-regression: ## Verify syntax incremental/fresh equivalence and its saved regressions
+	cargo test -p oom-edit-core --lib syntax::incremental_regression --offline --locked
+	cargo test -p oom-edit-core --lib syntax::tests::proptest_with_backward_and_newlines --offline --locked
 
 .PHONY: test-incremental
 test-incremental: ## Run bounded-update differential and propagation tests
@@ -299,6 +313,7 @@ check: ## Run fmt-check + lint + build + test + deny + audit + data-license-chec
 		&& PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_tui_performance.py' 2>&1 \
 		&& PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_realistic_performance.py' 2>&1 \
 		&& PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_interaction_performance.py' 2>&1 \
+		&& PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_interaction_performance_compare.py' 2>&1 \
 		&& PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_acceptance_1mb.py' 2>&1 \
 		&& PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_acceptance_1mb_prose_cycles.py' 2>&1 \
 		&& PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_rss_stability.py' 2>&1 \
@@ -461,6 +476,10 @@ bench-interactions-record: ## Record public-pane interactions (TRIALS=5 ITERATIO
 bench-interactions: ## Assert 1 MiB public-pane local edits, scrolling, and cold/warmed mode returns
 	cargo build --release --package oom-edit --example performance_realistic --offline --locked
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/interaction_performance.py --gate --binary target/release/examples/performance_realistic --trials 5 --iterations 21 $(if $(OUTPUT),--output $(OUTPUT),)
+
+.PHONY: interaction-perf-compare
+interaction-perf-compare: ## Compare complete 1 MiB public-pane gates (BASELINE, CANDIDATE, OUTPUT)
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/interaction_performance_compare.py --baseline "$(BASELINE)" --candidate "$(CANDIDATE)" --output "$(OUTPUT)"
 
 .PHONY: bench-acceptance-1mb-record
 bench-acceptance-1mb-record: ## Record exact kitchen-sink keyboard and Select latency (TRIALS, OUTPUT, SCENARIO)

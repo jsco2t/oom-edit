@@ -79,6 +79,10 @@ impl StandaloneHost {
                     .handle_input(PaneInput::Mouse(crossterm_mouse_to_pane(*mouse)), now);
             }
             Event::Resize(width, height) => self.pane.resize(*width, *height, now),
+            Event::FocusLost | Event::FocusGained => {
+                self.pane.tick(now);
+                self.pane.set_focused(matches!(event, Event::FocusGained));
+            }
             _ => {}
         }
         self.consume_events();
@@ -231,6 +235,55 @@ mod tests {
     fn keys(text: &str) -> impl Iterator<Item = Event> + '_ {
         text.chars()
             .map(|character| key(KeyCode::Char(character), KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn terminal_focus_events_autosave_with_the_sampled_time_and_suspend_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "original\n").unwrap();
+        let now = Instant::now();
+        let mut host = StandaloneHost::from_app_for_test(reference(now), now);
+        host.pane
+            .open_existing(&path, crate::OpenOptions::default())
+            .unwrap();
+        let mut config = crate::Config::default();
+        config.autosave.on_focus_loss = true;
+        host.pane.apply_config(config);
+        crate::event::dispatch_event_at(&mut host, Event::Resize(80, 24), now);
+        crate::event::dispatch_event_at(
+            &mut host,
+            key(KeyCode::Char('i'), KeyModifiers::NONE),
+            now,
+        );
+        crate::event::dispatch_event_at(&mut host, Event::Paste("changed ".into()), now);
+        let lost_at = now + Duration::from_secs(100);
+        assert!(crate::event::dispatch_event_at(
+            &mut host,
+            Event::FocusLost,
+            lost_at
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "changed original\n"
+        );
+        let frame = host.pane.render(100, 24, lost_at + Duration::from_secs(1));
+        assert!(frame.cursor.is_none());
+        let text: String = frame.cells.iter().map(|c| c.symbol.as_str()).collect();
+        assert!(text.contains("Autosaved 1 file(s)"));
+        crate::event::dispatch_event_at(&mut host, Event::Paste("ignored ".into()), lost_at);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "changed original\n"
+        );
+        assert!(crate::event::dispatch_event_at(
+            &mut host,
+            Event::FocusGained,
+            lost_at
+        ));
+        crate::event::dispatch_event_at(&mut host, Event::Paste("more ".into()), lost_at);
+        assert!(host.pane.tabs().iter().find(|t| t.active).unwrap().dirty);
+        assert!(!host.should_quit);
     }
 
     #[test]

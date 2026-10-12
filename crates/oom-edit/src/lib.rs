@@ -92,7 +92,7 @@ pub(crate) mod widgets;
 pub use args::{Args, ParseOutcome};
 pub use clipboard::Osc52Clipboard;
 pub use config::{
-    ClipboardConfig, ClipboardCopyFormat, Config, ConfigApplyReport, ConfigField,
+    AutosaveConfig, ClipboardConfig, ClipboardCopyFormat, Config, ConfigApplyReport, ConfigField,
     ConfigPersistError, ConfigValidation, ConfigWarning, EditorConfig, FileThemeSink, SpellConfig,
     ThemeConfig, ThemePersistenceSink, ThemeSlot,
 };
@@ -233,7 +233,10 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let host = StandaloneHost::new(pane, cursor_shapes, std::time::Instant::now());
 
     // Enter raw mode + alternate screen + install panic/signal hooks.
-    let _guard = TerminalGuard::new()?;
+    let _guard = TerminalGuard::with_options(TerminalGuardOptions {
+        focus_change: true,
+        ..TerminalGuardOptions::default()
+    })?;
 
     let terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
@@ -327,7 +330,7 @@ mod startup_tests {
         let warnings = startup_source
             .find("for warning in &theme_report.warnings")
             .unwrap();
-        let terminal = startup_source.find("TerminalGuard::new()").unwrap();
+        let terminal = startup_source.find("TerminalGuard::with_options(").unwrap();
         assert!(load < warnings && warnings < terminal);
     }
 }

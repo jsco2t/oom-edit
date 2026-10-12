@@ -15,3 +15,4 @@
 - 2026-09-25-embeddable-editor-pane — Embeddable Editor Pane and Standalone Parity — completed 2026-09-27T18:01:30Z — eafaa6afa796d0258b72a6e5ab6ca5a3699d600a..87d5b48f766eb35f30c2136e23d2a4448329713b
 - 2026-09-28-rendered-markdown-performance — Rendered Markdown performance — completed 2026-10-01T22:08:26Z — 0e26684733551691a49a2ff7111cec9404fdd2d3..0e26684733551691a49a2ff7111cec9404fdd2d3
 - 2026-10-08-editor-pane-minimal-status-bar — EditorPane minimal status bar — completed 2026-10-08T19:23:31Z — 04b37e53d1d3355f8fd0bd35946dca124d66bca4..04b37e53d1d3355f8fd0bd35946dca124d66bca4
+- 2026-10-11-optional-autosave — Optional autosave — completed 2026-10-12T04:50:06.131675+00:00 — 1960ade52a394a7c23fe400fdbb395283834ab72..1960ade52a394a7c23fe400fdbb395283834ab72

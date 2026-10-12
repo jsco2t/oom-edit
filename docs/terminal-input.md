@@ -1,12 +1,24 @@
 # Terminal input and guard
 
-`TerminalGuard` is process-exclusive. `TerminalGuard::new()` uses the standalone
+`TerminalGuard` is process-exclusive. `TerminalGuard::new()` uses library
 defaults: raw mode, alternate screen, mouse capture and bracketed paste, with
-keyboard enhancement off. An embedding host may call `with_options` to choose
-mouse, paste and keyboard enhancement, and may change mouse capture through
-`set_mouse_capture` while its guard remains active. A second live guard returns
+keyboard enhancement and focus reporting off. Standalone and the split example
+enable `TerminalGuardOptions::focus_change` with `with_options`, acquiring
+focus-loss/focus-gain reports for their terminal session. An embedding host may
+choose mouse, paste, keyboard enhancement and focus reporting, and may change
+mouse capture through `set_mouse_capture` while its guard remains active. A second live guard returns
 `TerminalError::Busy`. Dropping the guard restores only acquired features;
 partial setup, panic, SIGHUP and SIGTERM use the same acquisition record.
+
+Focus reporting uses the terminal's focus protocol and requires terminal or
+multiplexer support. Hosts route delivered reports through the existing pane
+focus API: sample the timestamp after reading an event, call `tick(now)`, then
+`set_focused(false)` or `set_focused(true)`, and drain typed pane events. Enabled
+focus autosave considers modified named tabs only on a true focus-loss
+transition. Periodic autosave uses the same pane timer independently of focus
+reports; hosts continue ticking hidden panes. See [autosave configuration and
+safety behavior](../README.md#autosave).
+
 After a panic restores the terminal, that guard cannot toggle mouse capture.
 
 Keyboard enhancement requests the kitty protocol's escape disambiguation and

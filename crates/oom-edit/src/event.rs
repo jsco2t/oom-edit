@@ -1,7 +1,7 @@
 //! Event-loop driver: tick → conditional draw → poll-with-deadline → dispatch.
 //!
-//! The poll deadline is `min(FRAME_BUDGET, deadline)` where `deadline` is
-//! computed from transient TTL expiry and which-key pending+150ms.
+//! The poll deadline is `min(FRAME_BUDGET, deadline)` where `deadline`
+//! includes presentation, disk polling, and enabled autosave timers.
 //! Key events with `kind == Press` only are dispatched; resize events are
 //! coalesced in bounded batches before rendered layout and cursor remapping.
 
@@ -281,8 +281,8 @@ pub(crate) fn dispatch_event_at(app: &mut StandaloneHost, ev: Event, now: Instan
             app.handle_event_at(&ev, now);
             true
         }
-        // Resize: forward the coalesced final dimensions for rendered remap.
-        Event::Resize(_, _) => {
+        // Forward coalesced resize dimensions and host focus transitions.
+        Event::Resize(_, _) | Event::FocusLost | Event::FocusGained => {
             app.handle_event_at(&ev, now);
             true
         }

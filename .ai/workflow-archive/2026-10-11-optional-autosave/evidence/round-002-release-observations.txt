@@ -1,0 +1,51 @@
+NFR-1 open_to_first_frame: 1048576 bytes, 9893 lines, 7 iterations, avg 40.41ms, worst 40.75ms, target <150.00ms
+NFR-2 insert_cursor: 1048576 bytes, 9893 lines, 5488 iterations, avg 45.56µs, worst 70.09µs, target <16.00ms
+NFR-2 source_scroll_frame: 1048576 bytes, 9893 lines, 77 iterations, avg 3.26ms, worst 3.32ms, target <50.00ms
+NFR-3 edit_beginning: 1048576 bytes, 9893 lines, 848 iterations, avg 295.09µs, worst 440.93µs, target <10.00ms
+NFR-3 edit_middle: 1048576 bytes, 9893 lines, 1636 iterations, avg 152.85µs, worst 263.75µs, target <10.00ms
+NFR-3 edit_end: 1048576 bytes, 9893 lines, 2255 iterations, avg 110.90µs, worst 171.06µs, target <10.00ms
+NFR-2 insert_edit_to_frame: 1048576 bytes, 9893 lines, 70 iterations, avg 3.62ms, worst 3.70ms, target <50.00ms
+NFR-3 injection_heavy_edit: 1340 bytes, 201 lines, 461 iterations, avg 542.33µs, worst 584.47µs, target <10.00ms
+NFR-4 rendered_cold_build: 100111 bytes, 5000 lines, 1 iterations, avg 15.94ms, worst 15.94ms, target <100.00ms
+NFR-4 rendered_resize_rebuild: 100111 bytes, 5000 lines, 1 iterations, avg 10.20ms, worst 10.20ms, target <100.00ms
+NFR-2 rendered_mid_file_navigation: 100111 bytes, 5000 lines, 196388 iterations, avg 1.27µs, worst 12.57µs, target <16.00ms
+NFR-4 large_rendered_layout: 262144 bytes, 4946 rendered lines, avg 23.06ms, worst 23.26ms, heap 11717520 bytes
+NFR-4 large_rendered_layout: 524288 bytes, 9893 rendered lines, avg 49.62ms, worst 51.22ms, heap 23434792 bytes
+NFR-4 large_rendered_layout: 1048576 bytes, 19785 rendered lines, avg 94.90ms, worst 96.49ms, heap 46869472 bytes
+NFR-10 spell_tick_4k: 1048576 bytes, 24386 lines, 20 iterations, avg 145.39µs, worst 157.17µs, target <2.00ms
+NFR-10 spell_full_scan_1mb: 1048576 bytes, 24386 lines, 5 iterations, avg 44.44ms, worst 45.26ms, target <300.00ms
+NFR-10 pathological_single_line_tick_4k: 1048572 bytes, 1 lines, 20 iterations, avg 31.03µs, worst 35.58µs, target <2.00ms
+NFR-10 timed_edit_pair: baseline 30.507728ms, with diagnostics 29.017794ms, 16 edits each
+NFR-10 timed_edit_pair: baseline 30.250444ms, with diagnostics 28.422897ms, 16 edits each
+NFR-10 timed_edit_pair: baseline 31.665008ms, with diagnostics 28.916035ms, 16 edits each
+NFR-10 timed_edit_pair: baseline 28.802649ms, with diagnostics 28.196392ms, 16 edits each
+NFR-10 timed_edit_pair: baseline 29.344803ms, with diagnostics 28.943466ms, 16 edits each
+NFR-10 timed_edit_pair: baseline 28.952514ms, with diagnostics 28.227585ms, 16 edits each
+NFR-10 timed_edit_pair: baseline 28.645943ms, with diagnostics 27.97273ms, 16 edits each
+NFR-10 timed_edit_pair: baseline 28.535727ms, with diagnostics 28.429767ms, 16 edits each
+NFR-10 timed_edit_pair: baseline 29.132761ms, with diagnostics 28.663036ms, 16 edits each
+NFR-10 spell_dirty_mark_and_shift: 1048576 bytes, 47983 lines, 8 iterations, avg 0.00µs, worst 0.00µs, target <100.00µs
+4 KiB build step: 1.55425ms, target <2ms
+three-list synthetic build: 110.45879ms, target <150ms
+engine peak live heap: 12987210 bytes, target <=26214400
+single-length finalization step: 226.104µs, target <2ms
+check average: 126ns, target <1µs
+common suggestion: 2.805997ms, target <10ms
+64-byte suggestion: 3.738µs, target <10ms
+dense suggestion incremental heap: 296 bytes, target <=16384
+candidate source-render-empty trial 1/1: pass
+candidate rendered-render-empty trial 1/1: pass
+candidate source-first-frame trial 1/1: pass
+candidate rendered-first-frame trial 1/1: pass
+candidate edit-frame trial 1/1: pass
+candidate source-scroll-frame trial 1/1: pass
+candidate idle-quiescent trial 1/1: pass
+candidate source-gutter-sparse trial 1/1: pass
+candidate rendered-gutter-sparse trial 1/1: pass
+candidate source-gutter-dense-5000 trial 1/1: pass
+candidate source-gutter-dense-50000 trial 1/1: pass
+candidate rendered-gutter-dense-5000 trial 1/1: pass
+candidate rendered-gutter-dense-50000 trial 1/1: pass
+candidate idle-gutter-project trial 1/1: pass
+candidate idle-gutter-cancel trial 1/1: pass
+test perf_tests::pane_frame_conversion_release_limit ... 200x60 owned frame conversion p95 514.229µs

@@ -232,6 +232,31 @@ included in that transition number; the complete cold open-to-rendered frame
 is the independent `make bench-realistic` measurement above. Neither path
 uses a loading frame or stale editable layout.
 
+Compare complete same-host public-pane gate records with:
+
+```sh
+make bench-interactions OUTPUT=/path/to/candidate.jsonl
+make -C /path/to/clean-baseline bench-interactions OUTPUT=/path/to/baseline.jsonl
+make interaction-perf-compare BASELINE=/path/to/baseline.jsonl CANDIDATE=/path/to/candidate.jsonl OUTPUT=/path/to/comparison.tsv
+```
+
+The comparator requires the unchanged 1 MiB fixture, 100x41 geometry, all 12
+gate cases, five trials and 21 cycles: 2,310 observations per version. It
+validates every fixture, mode, step, phase and trial/cycle tuple, and requires
+both versions to pass the existing absolute budgets. First-ever and warmed
+returns stay separate. Record source revision, local changes and host/toolchain
+provenance alongside the raw files; run both versions serially on the same host.
+
+For each case/step/phase, median input, render and total time must not grow by
+**both more than 10% and more than 100 microseconds**. Median process peak RSS
+must not grow by **both more than 5% and more than 1 MiB**. Equality at either
+allowance passes. These are the existing TUI comparison allowances. The TSV
+reports all 96 metric comparisons, including medians, p99, worst values and
+absolute-gate failures, before returning nonzero for a measured regression.
+Raw observations and cold/tail samples are retained. Integrity failures reject
+the comparison. `make interaction-perf-compare-test` exercises these contracts
+and runs through both `make test` and `make check`.
+
 `make bench-interactions-record` retains the wider observational inventory
 at both 144 KiB and 1 MiB: front matter, references, fence-language changes,
 structural edits, resize, reload and save in addition to the gated cases.

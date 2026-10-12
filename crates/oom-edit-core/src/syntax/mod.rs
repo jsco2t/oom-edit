@@ -7,6 +7,8 @@
 //! See architecture §6.3, plan §6.4 (FR-4.1–4.6), and task T06.
 
 mod captures;
+#[cfg(test)]
+mod incremental_regression;
 mod languages;
 
 use languages::LangDef;
@@ -946,8 +948,8 @@ impl Highlighter {
         let mut block_reparse_required = !self.patches.is_empty();
         for edit in edits {
             // Every coordinate is relative to the document produced by the
-            // preceding entry, so compute and apply the tree edit before
-            // applying the identical replacement to the working text.
+            // preceding entry. Update the tree coordinates before applying
+            // the logical replacement to the working text.
             let block_neutral = edit_is_provably_block_neutral(&self.text, edit)
                 && !self.edit_touches_reference_definition(edit);
             block_reparse_required |= !block_neutral;
@@ -957,7 +959,7 @@ impl Highlighter {
             {
                 rediscover_injections = true;
             }
-            if let Some(tree_edit) = input_edit_indexed(&self.line_starts, edit) {
+            if let Some(tree_edit) = block_edit_indexed(&self.line_starts, edit, block_neutral) {
                 self.md_tree.edit(&tree_edit);
                 tree_was_edited = true;
             }
@@ -2110,6 +2112,28 @@ fn input_edit_indexed(line_starts: &[usize], edit: &TextEdit) -> Option<tree_sit
     })
 }
 
+/// Keep the block owner at a proven word-only prefix insertion. Including the
+/// following unchanged ASCII letter makes the tree edit overlap its content,
+/// rather than shifting the whole node past an insertion at its boundary.
+/// Text and line indexes still receive only the original logical insertion.
+fn block_edit_indexed(
+    line_starts: &[usize],
+    edit: &TextEdit,
+    block_neutral: bool,
+) -> Option<tree_sitter::InputEdit> {
+    let mut tree_edit = input_edit_indexed(line_starts, edit)?;
+    if block_neutral
+        && tree_edit.start_byte == tree_edit.old_end_byte
+        && tree_edit.start_position.column == 0
+    {
+        tree_edit.old_end_byte += 1;
+        tree_edit.new_end_byte += 1;
+        tree_edit.old_end_position.column += 1;
+        tree_edit.new_end_position.column += 1;
+    }
+    Some(tree_edit)
+}
+
 #[cfg(test)]
 fn input_edit(old_text: &str, edit: &TextEdit) -> Option<tree_sitter::InputEdit> {
     input_edit_indexed(&line_start_indices(old_text), edit)
@@ -2228,11 +2252,10 @@ fn edit_may_create_injection(text: &str, edit: &TextEdit) -> bool {
 
 /// Prove the narrow case where a block reparse cannot change Markdown block
 /// structure: an ASCII word-character edit inside a non-indented line that
-/// begins with an ASCII letter. At a line start, only an explicit blank or
-/// metadata delimiter separates it from the preceding Markdown node;
-/// otherwise `Tree::edit` can assign inserted text to that node. Other edits
-/// take the canonical Tree-sitter incremental parse path. `Tree::edit` keeps byte
-/// coordinates current, and inline syntax is parsed from live viewport text.
+/// begins with an ASCII letter. Prefix edits need a blank or metadata delimiter
+/// separating the preceding Markdown node. Other edits take the canonical
+/// Tree-sitter incremental parse path. Proven prefix insertions use an anchored tree edit
+/// to retain source ownership; inline syntax is parsed from live viewport text.
 fn edit_is_provably_block_neutral(text: &str, edit: &TextEdit) -> bool {
     let start = edit.range.start.min(edit.range.end);
     let end = edit.range.start.max(edit.range.end);
