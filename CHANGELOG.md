@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-12
+
+### Added
+
+- Added independently optional autosave every five minutes and on focus loss,
+  disabled by default, with public configuration for embedded editor hosts.
+- Added optional terminal focus reporting and restoration, including the
+  standalone editor and embedded example.
+- Added baseline-relative public-pane performance checks that reject editing
+  regressions while retaining the existing absolute performance budgets.
+
+### Fixed
+
+- Preserved incremental Markdown highlighting correctness for line-start edits
+  without triggering document-wide work for ordinary prose edits.
+
 ## [0.6.6] - 2026-10-08
 
 ### Added

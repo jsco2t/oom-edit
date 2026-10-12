@@ -78,7 +78,7 @@ actual checkout SHA after `make ci`, using the same preparation and offline
 validation targets; it does not depend on a tag that does not yet exist.
 
 After separate publication authorization and a successful release push, prepare
-a **new** consumer with `DOWNSTREAM_TAG=v0.6.6` and the gated SHA still supplied
+a **new** consumer with `DOWNSTREAM_TAG=v0.7.0` and the gated SHA still supplied
 as `DOWNSTREAM_REV`. Then run `make downstream-tag-check` with those same
 variables. This selects the actual tag for all five Git sources and asserts
 that their resolved commit equals the gated SHA. The tag target is never part
