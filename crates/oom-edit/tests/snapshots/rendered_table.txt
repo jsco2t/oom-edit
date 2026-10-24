@@ -21,4 +21,4 @@
 
 
 
- NORMAL  v=select               🅂 0 1:83  20% Top
+ NORMAL  v=select           🅂 0 1:83  20% [5] Top

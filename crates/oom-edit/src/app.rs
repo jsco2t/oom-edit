@@ -7606,7 +7606,7 @@ mod tests {
                 .unwrap()
                 .rendered_search_prompt()
                 .as_deref(),
-            Some("/")
+            Some("/?")
         );
         assert!(!search.overlay.is_some());
 

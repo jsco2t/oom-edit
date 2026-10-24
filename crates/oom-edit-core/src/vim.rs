@@ -516,6 +516,8 @@ impl VimCore {
             // that same pending state here so Visual yanks can target `+`/`*`.
             self.hjkl_state_mut().pending = HjklPending::SelectRegister;
             true
+        } else if let Some(consumed) = self.try_empty_linewise_put(key, hjkl_input.clone()) {
+            consumed
         } else {
             feed_input(&mut self.editor, hjkl_input)
         };
@@ -705,6 +707,65 @@ impl VimCore {
 
     fn system_clipboard_register_selected(&self) -> bool {
         matches!(self.hjkl_state().pending_register, Some('+') | Some('*'))
+    }
+
+    /// An empty buffer has no existing line to separate from a linewise put.
+    fn try_empty_linewise_put(&mut self, key: KeyInput, input: PlannedInput) -> Option<bool> {
+        if self.mode != Mode::Normal
+            || key.mods.ctrl
+            || key.mods.alt
+            || !matches!(key.code.kind, KeyCodeKind::Char('p' | 'P'))
+            || self.hjkl_state().pending != HjklPending::None
+            || self.editor.buffer().rope().len_bytes() != 0
+        {
+            return None;
+        }
+        let selector = self.hjkl_state().pending_register;
+        let count = self.hjkl_state().count.max(1);
+        let previous_input_at = self.editor.last_input_host_at();
+        // Keep engine bookkeeping (repeat, macros and one-shot Normal) on the
+        // ordinary dispatch path, then replace the placeholder-line result in
+        // the same undo step with the exact register payload.
+        let consumed = feed_input(&mut self.editor, input);
+        // Use the engine's sampled input time to resolve the same register and
+        // count it used after expiring a stale prefix.
+        let prefix_expired = previous_input_at
+            .zip(self.editor.last_input_host_at())
+            .is_some_and(|(previous, now)| {
+                now.saturating_sub(previous) > self.editor.settings().timeout_len
+            });
+        let selector = selector.filter(|_| !prefix_expired);
+        let count = if prefix_expired { 1 } else { count };
+        let slot = self.editor.with_registers(|registers| {
+            selector
+                .and_then(|register| registers.read(register))
+                .unwrap_or(&registers.unnamed)
+                .clone()
+        });
+        if !slot.linewise || slot.blockwise || slot.text.is_empty() {
+            return Some(consumed);
+        }
+        let mut text = slot.text.clone();
+        for _ in 1..count {
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(&slot.text);
+        }
+        let _ = self.editor.take_content_edits();
+        self.editor.buffer_mut().replace_all(&text);
+        self.editor.mark_content_dirty();
+        self.editor.jump_cursor(0, 0);
+        hjkl_engine::motions::move_first_non_blank(self.editor.buffer_mut());
+        self.editor.set_sticky_col(Some(self.cursor().1));
+        self.editor.set_mark('[', (0, 0));
+        let rope = self.editor.buffer().rope();
+        let end = rope.byte_to_line(rope.len_bytes().saturating_sub(1));
+        let line = rope.line(end);
+        let newline = usize::from(line.char(line.len_chars().saturating_sub(1)) == '\n');
+        let col = line.len_chars().saturating_sub(1 + newline);
+        self.editor.set_mark(']', (end, col));
+        Some(consumed)
     }
 
     /// Paste renderer-created block registers using display-cell geometry.
@@ -2167,6 +2228,75 @@ mod projected_selection_tests {
         assert_eq!(register_state(&vim, '0'), expected);
         assert_eq!(register_state(&vim, '+'), expected);
         assert_eq!(vim.text(), "alpha\nbeta\n");
+    }
+
+    #[test]
+    fn empty_linewise_put_preserves_payload_counts_marks_and_undo() {
+        for payload in ["  café\nlast", "  café\nlast\n"] {
+            for put in ['p', 'P'] {
+                for count in [1, 2] {
+                    let mut vim = VimCore::new("");
+                    vim.editor.record_yank(payload.into(), true, Some('a'));
+                    feed_plain(&mut vim, &format!("\"a{count}{put}"));
+                    let expected = if count == 1 {
+                        payload.to_string()
+                    } else {
+                        format!("{}\n{payload}", payload.trim_end_matches('\n'))
+                    };
+                    assert_eq!(vim.text(), expected);
+                    assert_eq!(vim.cursor(), (0, 2));
+                    assert!(!vim.has_pending_input());
+                    assert_eq!(register_state(&vim, 'a').0, payload);
+                    assert_eq!(vim.editor.mark('['), Some((0, 0)));
+                    assert_eq!(vim.editor.mark(']'), Some((2 * count - 1, 3)));
+                    feed_plain(&mut vim, "u");
+                    assert_eq!(vim.text(), "");
+                    vim.handle_key(KeyInput {
+                        code: KeyCode {
+                            kind: KeyCodeKind::Char('r'),
+                        },
+                        mods: Modifiers {
+                            ctrl: true,
+                            ..Modifiers::default()
+                        },
+                    });
+                    assert_eq!(vim.text(), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_linewise_put_records_the_change_for_dot_repeat() {
+        for put in ['p', 'P'] {
+            let mut vim = VimCore::new("");
+            vim.editor.record_yank("alpha".into(), true, None);
+            feed_plain(&mut vim, &format!("{put}."));
+            assert_eq!(vim.text(), "alpha\nalpha", "{put}");
+        }
+    }
+
+    #[test]
+    fn empty_linewise_put_is_recorded_in_macros() {
+        let mut vim = VimCore::new("");
+        vim.editor.record_yank("alpha".into(), true, None);
+        feed_plain(&mut vim, "qapq");
+        assert_eq!(register_state(&vim, 'a').0, "p");
+        feed_plain(&mut vim, "@a");
+        assert_eq!(vim.text(), "alpha\nalpha");
+    }
+
+    #[test]
+    fn empty_linewise_put_drops_expired_register_and_count_prefixes() {
+        let mut vim = VimCore::new("");
+        vim.editor.record_yank("named".into(), true, Some('a'));
+        vim.editor.record_yank("unnamed".into(), true, None);
+        vim.set_host_time(Some(core::time::Duration::ZERO));
+        feed_plain(&mut vim, "\"a2");
+        vim.set_host_time(Some(core::time::Duration::from_secs(2)));
+        feed_plain(&mut vim, "p");
+        assert_eq!(vim.text(), "unnamed");
+        assert!(!vim.has_pending_input());
     }
 
     #[test]

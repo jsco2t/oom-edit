@@ -2364,7 +2364,24 @@ fn prepare_fenced_code_yank_selection(
     let covered: Vec<_> = fence_regions
         .iter()
         .filter(|region| {
-            selected_rows.start <= region.rows.start && region.rows.end <= selected_rows.end
+            selected_rows.start <= region.rows.start
+                && (region.rows.end <= selected_rows.end
+                    || (region.rows.start < selected_rows.end
+                        && layout.lines[region.rows.clone()]
+                            .iter()
+                            .flat_map(|line| &line.atoms)
+                            .filter_map(|atom| atom.source.as_ref())
+                            .all(|source| {
+                                let after = selection
+                                    .source_ranges
+                                    .partition_point(|selected| selected.start <= source.start);
+                                selection
+                                    .source_ranges
+                                    .get(after.saturating_sub(1))
+                                    .is_some_and(|selected| {
+                                        selected.start <= source.start && source.end <= selected.end
+                                    })
+                            })))
         })
         .cloned()
         .collect();
@@ -2580,6 +2597,7 @@ enum RenderedSearchState {
     },
     Prompt {
         draft: RenderedSearch,
+        cursor: usize,
         origin: RenderedCursor,
         last: Option<RenderedSearch>,
     },
@@ -2611,16 +2629,49 @@ impl RenderedSearchState {
             Self::Inactive { last } | Self::Prompt { last, .. } => last,
         };
         *self = Self::Prompt {
+            cursor: draft.pattern.len(),
             draft,
             origin,
             last,
         };
     }
 
-    fn update_draft(&mut self, update: impl FnOnce(&mut RenderedSearch)) {
-        if let Self::Prompt { draft, .. } = self {
-            update(draft);
+    /// Edit the prompt, returning whether its pattern changed.
+    fn edit(&mut self, key: KeyInput) -> bool {
+        let Self::Prompt { draft, cursor, .. } = self else {
+            return false;
+        };
+        if key.mods.ctrl || key.mods.alt {
+            return false;
         }
+        let pattern = &mut draft.pattern;
+        match key.code.kind {
+            KeyCodeKind::Char(c) if !c.is_control() => {
+                pattern.insert(*cursor, c);
+                *cursor += c.len_utf8();
+                return true;
+            }
+            KeyCodeKind::Backspace if *cursor > 0 => {
+                let previous = pattern[..*cursor].chars().next_back().unwrap().len_utf8();
+                pattern.drain(*cursor - previous..*cursor);
+                *cursor -= previous;
+                return true;
+            }
+            KeyCodeKind::Delete if *cursor < pattern.len() => {
+                pattern.remove(*cursor);
+                return true;
+            }
+            KeyCodeKind::Left if *cursor > 0 => {
+                *cursor -= pattern[..*cursor].chars().next_back().unwrap().len_utf8();
+            }
+            KeyCodeKind::Right if *cursor < pattern.len() => {
+                *cursor += pattern[*cursor..].chars().next().unwrap().len_utf8();
+            }
+            KeyCodeKind::Home => *cursor = 0,
+            KeyCodeKind::End => *cursor = pattern.len(),
+            _ => {}
+        }
+        false
     }
 
     fn submit(&mut self) {
@@ -3484,6 +3535,18 @@ impl EditorSession {
             SearchDirection::Backward => '?',
         };
         Some(format!("{prefix}{}", search.pattern))
+    }
+
+    /// Return the active search prompt's UTF-8 byte cursor, including its prefix.
+    ///
+    /// The offset is a character boundary in [`Self::rendered_search_prompt`].
+    /// Hosts convert the preceding text to display cells when drawing a cursor.
+    /// Submitted or cancelled searches return `None`.
+    pub fn rendered_search_prompt_cursor(&self) -> Option<usize> {
+        match &self.rendered_state.search {
+            RenderedSearchState::Prompt { cursor, .. } => Some(1 + cursor),
+            RenderedSearchState::Inactive { .. } => None,
+        }
     }
 
     /// Return the rendered cursor position.
@@ -5513,21 +5576,13 @@ impl EditorSession {
                 self.rendered_state.search.submit();
                 Vec::new()
             }
-            KeyCodeKind::Char(c)
-                if !key.mods.ctrl
-                    && !key.mods.alt
-                    && !key.mods.shift
-                    && (c.is_ascii_alphanumeric() || c == ' ' || c == '.' || c == '_') =>
-            {
-                let Some((_, cursor)) = self.rendered_state.search.prompt() else {
+            _ => {
+                if !self.rendered_state.search.edit(key) {
                     return Vec::new();
-                };
+                }
+                let (search_state, cursor) = self.rendered_state.search.prompt().unwrap();
                 let cursor = *cursor;
-                let Some((search_state, _)) = self.rendered_state.search.prompt() else {
-                    return Vec::new();
-                };
-                let mut search_state = search_state.clone();
-                search_state.pattern.push(c);
+                let search_state = search_state.clone();
                 let match_line = if let Some(layout) = self.rendered_state.layout_cache.as_ref() {
                     nav::find_next_match(
                         &search_state,
@@ -5548,9 +5603,6 @@ impl EditorSession {
                 } else {
                     None
                 };
-                self.rendered_state
-                    .search
-                    .update_draft(|draft| *draft = search_state);
                 if let Some(match_line) = match_line {
                     self.rendered_state.cursor =
                         if let Some(layout) = self.rendered_state.layout_cache.as_ref() {
@@ -5580,7 +5632,6 @@ impl EditorSession {
                     Vec::new()
                 }
             }
-            _ => Vec::new(),
         }
     }
 

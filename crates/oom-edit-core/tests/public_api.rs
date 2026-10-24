@@ -58,6 +58,33 @@ fn assert_no_exported_macros(path: &Path) {
 }
 
 #[test]
+fn search_prompt_cursor_is_a_prefixed_utf8_byte_boundary() {
+    let mut session = EditorSession::from_text("plain");
+    session.render_layout(40);
+    let send = |session: &mut EditorSession, kind| {
+        session.handle_key(KeyInput {
+            code: KeyCode { kind },
+            mods: Modifiers::default(),
+        });
+    };
+    assert_eq!(session.rendered_search_prompt_cursor(), None);
+    for c in "/a界é".chars() {
+        send(&mut session, KeyCodeKind::Char(c));
+        let prompt = session.rendered_search_prompt().unwrap();
+        assert_eq!(session.rendered_search_prompt_cursor(), Some(prompt.len()));
+    }
+    send(&mut session, KeyCodeKind::Left);
+    assert_eq!(session.rendered_search_prompt_cursor(), Some(5));
+    send(&mut session, KeyCodeKind::Left);
+    assert_eq!(session.rendered_search_prompt_cursor(), Some(2));
+    send(&mut session, KeyCodeKind::Enter);
+    assert_eq!(session.rendered_search_prompt_cursor(), None);
+    send(&mut session, KeyCodeKind::Char('/'));
+    send(&mut session, KeyCodeKind::Esc);
+    assert_eq!(session.rendered_search_prompt_cursor(), None);
+}
+
+#[test]
 fn public_facade_types_are_available_at_crate_root() {
     let mut session = EditorSession::from_text("# root\n");
     let _: Vec<Effect> = session.open_command_prompt("wq");
@@ -67,6 +94,7 @@ fn public_facade_types_are_available_at_crate_root() {
     let _: Effect = Effect::ReloadCurrentRequested { force: true };
     let _: Effect = Effect::ReloadAllRequested;
     let _: Mode = session.mode();
+    let _: fn(&EditorSession) -> Option<usize> = EditorSession::rendered_search_prompt_cursor;
     let _: fn(&EditorSession) -> bool = EditorSession::has_pending_input;
     let _: fn(&mut EditorSession) = EditorSession::clear_pending_input;
     let _: fn(&mut EditorSession, KeyInput, std::time::Duration) -> Vec<Effect> =

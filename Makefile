@@ -90,6 +90,25 @@ downstream-negative-check: ## Reject bad resolved sources and corrupted vendored
 test-package-guards: ## Verify integrated facade documentation, consumer snippet and CI ownership
 	cargo test --package oom-edit --test package_guards --offline --locked
 
+.PHONY: test-clipboard-boundaries
+test-clipboard-boundaries: ## Verify byte-exact rendered selection copy and paste boundaries
+	cargo test --package oom-edit-core --test clipboard_boundaries --offline --locked
+
+.PHONY: test-search-editing-core
+test-search-editing-core: ## Verify editable rendered search drafts through the core session
+	cargo test --package oom-edit-core --test search_editing --offline --locked
+
+.PHONY: test-search-editing-pane
+test-search-editing-pane: ## Verify search editing and prompt cursor through the public pane
+	cargo test --package oom-edit --test search_editing --offline --locked
+
+.PHONY: test-search-editing
+test-search-editing: test-search-editing-core test-search-editing-pane ## Verify core and pane search editing
+
+.PHONY: test-status-line-count
+test-status-line-count: ## Verify total source-line counts in pane metadata and status rows
+	cargo test --package oom-edit --test status_line_count --offline --locked
+
 .PHONY: test-config-public
 test-config-public: ## Verify public config roundtrip, exact fallbacks, presence and safe persistence
 	cargo test --package oom-edit --test config_public --offline --locked

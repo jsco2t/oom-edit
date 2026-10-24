@@ -21,4 +21,4 @@
 
     ─ links ─
     [0] https://example.com
- NORMAL  v=select  /=search  :=command  ?=commands                🅂 0 22:1  95%
+ NORMAL  v=select  /=search  :=command  ?=commands           🅂 0 22:1  95% [23]

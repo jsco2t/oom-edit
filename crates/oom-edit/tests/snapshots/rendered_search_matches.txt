@@ -21,4 +21,4 @@
  21
  22 More text here.
 
- NORMAL  v=select  /=search  :=command  ?=commands                 🅂 0 6:3  26%
+ NORMAL  v=select  /=search  :=command  ?=commands            🅂 0 6:3  26% [23]

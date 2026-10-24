@@ -399,7 +399,7 @@ fn fr_085_status_data() {
     assert_eq!(status.ruler.line, 3);
     assert_eq!(status.ruler.column, 6);
     assert_eq!(status.ruler.line_count, 3);
-    assert_eq!(status.ruler.text, "3:6  100% Bot");
+    assert_eq!(status.ruler.text, "3:6  100% [3] Bot");
     assert!(row(&mut pane, now).contains(&status.ruler.text));
 }
 
@@ -807,7 +807,7 @@ fn status_tracks_named_paths_active_tabs_prompts_spell_and_disk_markers() {
     assert_eq!(status.ruler.line, 1);
     assert_eq!(status.ruler.column, 1);
     assert_eq!(status.ruler.line_count, 3);
-    assert_eq!(status.ruler.text, "1:1  33% Top");
+    assert_eq!(status.ruler.text, "1:1  33% [3] Top");
     assert_eq!(status.spell.unwrap().count, 0);
     assert!(status.spell.unwrap().highest_severity.is_none());
     feed(&mut pane, " z", now);
