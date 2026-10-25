@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-10-25
+
+### Fixed
+
+- Added active-search match counts and clearing, editable search prompts, and
+  clearer command help.
+- Fixed wrapped Insert navigation, blank-line handling, and undo boundaries.
+- Started spelling checks after two idle seconds, canceled interrupted scans,
+  and refreshed spelling-correction counts immediately.
+- Preserved rendered copy and paste boundaries, displayed total source lines,
+  and improved default fence-marker contrast.
+- Restored responsive large-note editing with an active search by retaining
+  cached match offsets instead of copying the complete rendered document.
+
 ## [0.7.0] - 2026-10-12
 
 ### Added
