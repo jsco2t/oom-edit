@@ -7,10 +7,17 @@ use super::{Diagnostic, DiagnosticProvider, DiagnosticSeverity};
 use crate::syntax::Highlighter;
 use crate::vim::TextEdit;
 
+#[derive(Clone, Copy)]
+pub(crate) enum SpellEdit {
+    General,
+    Correction,
+}
+
 pub(crate) enum InvalidationPlan {
     Full,
     Local {
         old_range: Range<usize>,
+        diagnostic_range: Range<usize>,
         edit_start: usize,
         new_text_len: usize,
         delta: isize,
@@ -80,6 +87,7 @@ impl SpellState {
         &self,
         old_text: &str,
         edits: &[TextEdit],
+        kind: SpellEdit,
     ) -> InvalidationPlan {
         let [edit] = edits else {
             return InvalidationPlan::Full;
@@ -88,17 +96,26 @@ impl SpellState {
             return InvalidationPlan::Full;
         };
         let old_range = containing_line(old_text, edit.range.start, edit.range.end);
-        if !locally_safe(old_source)
-            || !locally_safe(&edit.new_text)
-            || has_context_marker(&old_text[old_range.clone()])
-            || self
-                .exclusions
-                .iter()
-                .any(|exclusion| edit_touches(exclusion, &edit.range))
+        let correction = matches!(kind, SpellEdit::Correction)
+            && spelling_word(old_source)
+            && spelling_word(&edit.new_text);
+        if !correction
+            && (!locally_safe(old_source)
+                || !locally_safe(&edit.new_text)
+                || has_context_marker(&old_text[old_range.clone()])
+                || self
+                    .exclusions
+                    .iter()
+                    .any(|exclusion| edit_touches(exclusion, &edit.range)))
         {
             return InvalidationPlan::Full;
         }
         InvalidationPlan::Local {
+            diagnostic_range: if correction {
+                edit.range.clone()
+            } else {
+                old_range.clone()
+            },
             old_range,
             edit_start: edit.range.start,
             new_text_len: edit.new_text_len,
@@ -117,6 +134,7 @@ impl SpellState {
             }
             InvalidationPlan::Local {
                 old_range,
+                diagnostic_range,
                 edit_start,
                 new_text_len,
                 delta,
@@ -128,10 +146,10 @@ impl SpellState {
                     }
                 };
                 self.diagnostics.retain_mut(|diagnostic| {
-                    if diagnostic.range.end <= old_range.start {
+                    if diagnostic.range.end <= diagnostic_range.start {
                         return true;
                     }
-                    if diagnostic.range.start >= old_range.end {
+                    if diagnostic.range.start >= diagnostic_range.end {
                         diagnostic.range = shift_range(&diagnostic.range, delta);
                         return true;
                     }
@@ -271,6 +289,16 @@ impl SpellState {
                         }
                     }
                     if tokenizer.is_complete() {
+                        // Replace this scan window atomically. Corrections retain
+                        // valid neighbors while scanning; publishing must not
+                        // append duplicate diagnostics or exclusion ranges.
+                        self.diagnostics.retain(|diagnostic| {
+                            diagnostic.range.end <= range.start
+                                || diagnostic.range.start >= range.end
+                        });
+                        self.exclusions.retain(|excluded| {
+                            excluded.end <= range.start || excluded.start >= range.end
+                        });
                         self.exclusions.extend(exclusions);
                         self.exclusions
                             .sort_by_key(|exclusion| (exclusion.start, exclusion.end));
@@ -303,6 +331,13 @@ fn unknown_diagnostic(engine: &SpellEngine, range: Range<usize>, word: &str) -> 
         source_text: word.to_string(),
         message: format!("Possible misspelling: {word}"),
     })
+}
+
+fn spelling_word(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|character| character.is_alphabetic() || matches!(character, '\'' | '’'))
 }
 
 fn locally_safe(text: &str) -> bool {

@@ -69,7 +69,7 @@ exports the focused pending Space prefix and ordered key/label entries after
 150 ms of host-supplied time. Tick the pane even when not drawing it. These
 exports are independent of the inline-hint option. `status()` is the active
 editor-line snapshot (or none for an empty pane), with one-based source ruler,
-path, dirty/new-file, spell, prompt and disk-marker data.
+path, dirty/new-file, spell, active-search counts, prompt and disk-marker data.
 
 `bindings()` projects the single registry with stable IDs, modes, concrete core
 key sequences, variable patterns or Ex grammar, and explicit execution roles.
@@ -79,3 +79,26 @@ reference can prefill the existing prompt and still requires user submission.
 Consolidated reference presentations retain the standalone palette's exact
 wording and ordering. Run `make test-pane-bindings` for the public dispatch
 matrix, registry guards, every overlay and unchanged terminal snapshots.
+
+The core session owns active-search occurrence counts (`SearchStatus`) and
+`clear_search()`. `EditorPane::status()` exposes the same optional summary.
+`Space c` is an App-owned chord dispatched through the canonical registry to
+that session operation; `:noh` uses the same operation through the core ex grammar.
+Prompts and overlays retain exclusive input ownership. No search is active for
+an empty draft, and cancelling a draft restores the previously submitted search.
+
+For source Insert navigation, a core-only host can call
+`EditorSession::set_source_viewport(text_width, wrap)` before dispatching input.
+`render_source` supplies the same geometry. Width excludes gutters and host
+chrome; the pane supplies its effective width and configured wrap limit before
+key dispatch, including input received before a paint. Unmodified Up/Down use
+visual source rows while wrapping is enabled, and logical lines otherwise.
+Horizontal positioning, edits and width changes re-anchor the desired column.
+
+Spelling becomes due after two seconds without input, using the pane's
+post-read event timestamp. Hosts use `tick(now).idle_due` to decide when to
+call `idle_unit`, check for ready input between 4 KiB work units, and stop the
+idle drain at the 8 ms slice budget. New input restarts the idle deadline;
+text changes cancel the current document scan through the core mutation
+boundary. A completed scan replaces its window atomically. Valid spelling
+corrections publish updated diagnostic counts before returning to the host.

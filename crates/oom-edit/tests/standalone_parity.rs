@@ -165,7 +165,7 @@ fn public_hosts_match_spell_idle_suggestions_trouble_and_mouse() {
     )
     .unwrap();
     let initial = Instant::now();
-    let now = initial + std::time::Duration::from_secs(5);
+    let now = initial + std::time::Duration::from_secs(2);
     let mut a = PublicHost::new(directory.path(), CommandPolicy::Standalone, initial);
     let mut b = PublicHost::new(directory.path(), CommandPolicy::Embedded, initial);
     assert_eq!(a.events(), b.events());

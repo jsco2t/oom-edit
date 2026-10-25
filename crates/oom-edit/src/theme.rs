@@ -2274,7 +2274,11 @@ static DEFAULT_DARK_SPEC: StaticTheme = StaticTheme {
                 Modifier::UNDERLINED,
             ),
             (SemanticStyle::CursorLine, Color::Reset, Modifier::empty()),
-            (SemanticStyle::Muted, Color::Rgb(59, 64, 72), Modifier::DIM),
+            (
+                SemanticStyle::Muted,
+                Color::Rgb(122, 130, 145),
+                Modifier::empty(),
+            ),
         ],
         ui: &[
             (
@@ -2468,7 +2472,7 @@ static DEFAULT_DARK_SPEC: StaticTheme = StaticTheme {
             (SemanticStyle::Selection, Color::Reset, Modifier::REVERSED),
             (SemanticStyle::Match, Color::Yellow, Modifier::UNDERLINED),
             (SemanticStyle::CursorLine, Color::Reset, Modifier::empty()),
-            (SemanticStyle::Muted, Color::DarkGray, Modifier::DIM),
+            (SemanticStyle::Muted, Color::DarkGray, Modifier::empty()),
         ],
         ui: &[
             (
@@ -4779,10 +4783,10 @@ mod tests {
             ),
             (
                 SemanticStyle::Muted,
-                Color::Rgb(59, 64, 72),
-                Modifier::DIM,
+                Color::Rgb(122, 130, 145),
+                Modifier::empty(),
                 Color::DarkGray,
-                Modifier::DIM,
+                Modifier::empty(),
             ),
         ] {
             assert_style_parts(

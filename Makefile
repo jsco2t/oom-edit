@@ -656,3 +656,26 @@ run-isolated: ## Run with temporary XDG config for manual verification (pass ARG
 .PHONY: clean
 clean: ## Remove build artifacts
 	cargo clean
+
+.PHONY: test-search-status
+test-search-status: ## Verify search counts, clearing and meaningful help through core and pane
+	cargo test --package oom-edit-core --test search_status --offline --locked
+	cargo test --package oom-edit --test search_status --offline --locked
+	cargo test --package oom-edit --test bindings_public --offline --locked
+
+.PHONY: bench-round2
+bench-round2: ## Assert active-search, wrapped-source and spelling regression performance
+	OOM_BENCH_ROUND2_ONLY=1 cargo bench --package oom-edit-core --bench performance --offline --locked
+
+.PHONY: test-insert-navigation
+test-insert-navigation: ## Verify exact Insert newlines and wrapped cursor movement in core and pane
+	cargo test --package oom-edit-core --test insert_navigation --offline --locked
+	cargo test --package oom-edit-core --test source_viewport --offline --locked
+	cargo test --package oom-edit --test insert_navigation --offline --locked
+
+.PHONY: test-spell-updates
+test-spell-updates: ## Verify idle timing, scan cancellation and immediate correction counts
+	cargo test --package oom-edit-core --test spell_session --offline --locked
+	cargo test --package oom-edit --test pane_public --offline --locked
+	cargo test --package oom-edit --test standalone_parity --offline --locked
+	cargo test --package oom-edit --lib event::tests --offline --locked

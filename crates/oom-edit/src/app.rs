@@ -1125,7 +1125,7 @@ impl App {
     pub(crate) fn idle_start_deadline(&self) -> Option<Instant> {
         self.active()
             .is_some_and(|entry| entry.session.spell_enabled())
-            .then(|| self.last_input + std::time::Duration::from_secs(5))
+            .then(|| self.last_input + crate::event::SPELL_IDLE_DELAY)
     }
 
     /// Advance one bounded host, scan, or gutter-projection unit.
@@ -1839,6 +1839,10 @@ impl App {
         // 3. Everything else → session.handle_key(key).
         let host_elapsed = self.focus.elapsed(now);
         let effects = if let Some(ref mut entry) = self.tabs.get_mut(self.active_tab) {
+            let width = source_text_width(self.body_area.width, entry.session.line_count(), false);
+            entry
+                .session
+                .set_source_viewport(width.min(self.wrap_width), self.wrap_enabled);
             let effects = entry.session.handle_key_at(key_input, host_elapsed);
             if entry.session.diagnostics_pending() {
                 entry.invalidate_gutter_trouble_if_present();
@@ -2154,6 +2158,11 @@ impl App {
                 );
             }
             AppCommand::Trouble => self.open_trouble(),
+            AppCommand::ClearSearch => {
+                if let Some(entry) = self.tabs.get_mut(self.active_tab) {
+                    entry.session.clear_search();
+                }
+            }
         }
     }
 
@@ -6899,7 +6908,7 @@ mod tests {
         app.viewport_width = 20;
         enter_insert(&mut app);
         press(&mut app, CrosstermKeyCode::End);
-        assert_eq!(app.left_col(), 85);
+        assert_eq!(app.left_col(), 86);
     }
 
     #[test]
@@ -7153,7 +7162,7 @@ mod tests {
         app.viewport_height = 5;
         enter_insert(&mut app);
         press(&mut app, CrosstermKeyCode::End);
-        assert_eq!(app.skip_rows(), 7);
+        assert_eq!(app.skip_rows(), 8);
     }
 
     #[test]

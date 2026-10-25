@@ -272,6 +272,48 @@ five-process distribution. These globally invalidating operations are measured
 and disclosed;
 they are **not** covered by the <50 ms local-edit guarantee.
 
+## Second-round editor regression gates
+
+The second-round baseline is the complete first-round commit
+`b5ad3d488baf77f6061e35d649b27282c96942a2`. Record its complete interaction
+inventory before applying the second-round changes, then use
+`make interaction-perf-compare` as described above on the same host. All
+existing absolute budgets and comparison allowances remain unchanged.
+
+Run the new behavioral checks with `make test-search-status`,
+`make test-insert-navigation`, and `make test-spell-updates`. The last includes
+injected-clock two-second scheduling, interrupted scans and immediate
+diagnostic-count updates. These checks also run in `make test` and `make check`.
+
+`make bench-round2` runs the targeted optimized measurements below;
+`make bench` includes them too. Fixtures are approximately 1 MiB unless a
+scan-unit size is specified. Every measurement verifies its resulting state.
+
+| Measurement | Limit |
+| --- | ---: |
+| Build a rendered search summary index | <500 ms worst |
+| Read the cached search summary | <1 ms worst |
+| Source edit, source frame and active search summary | <50 ms worst |
+| Wrapped Insert Up/Down pair | <25 ms worst |
+| One spelling scan unit, at most 4 KiB | <2 ms worst |
+| Complete spelling scan | <300 ms worst |
+| Additional correction overhead with 1,000 retained diagnostics | <100 µs worst |
+| Input that interrupts a partial spelling scan | <10 ms worst |
+
+The correction measurement alternates eight matched pairs per trial, uses
+five measured trials, and compares real correction times with one versus
+1,001 published diagnostics. Both documents and corrected words are identical;
+dictionary membership changes which surrounding words are diagnosed. The
+fixture has separate paragraphs and 1,000 other misspellings on the corrected
+line. It measures additional diagnostic maintenance during a local correction;
+it does not assert a universal correction latency for a single huge paragraph.
+Search index construction may inspect all rendered rows after invalidation,
+while unchanged queries reuse the index. The navigation fixture checks that
+repeated visual motion does not edit text or build the full rendered document.
+These guards and the complete interaction comparison establish measured
+regression coverage, rather than an identical-performance claim for every
+possible Markdown document or host.
+
 ## Exact 1 MiB kitchen-sink interaction acceptance
 
 `examples/kitchen-sink-1mb.md` is a separate, authored-pattern fixture with

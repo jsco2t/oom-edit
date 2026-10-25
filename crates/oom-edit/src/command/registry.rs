@@ -130,6 +130,7 @@ pub enum AppCommand {
     SpellAdd,
     SpellToggle,
     Trouble,
+    ClearSearch,
 }
 
 /// Binding ownership and finite dispatch role.
@@ -751,7 +752,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         "repeat-search",
         RENDERED,
         &[Keys(&[character_key('n')]), Keys(&[character_key('N')])],
-        (4, "n / N", "Repeat the rendered search.", "R-N4", None)
+        (4, "n / N", "Next/Previous search matches", "R-N4", None)
     ),
     reference_row!(
         SourceInsert,
@@ -934,19 +935,28 @@ pub static COMMANDS: &[CommandSpec] = &[
             Some("%s/")
         )
     ),
-    reference_row!(
-        ClearSearch,
-        "clear-search",
-        Contexts::COMMAND,
-        &[SequenceSpec::Ex("noh")],
-        (
-            23,
-            ":noh",
-            "Clear search-match highlighting.",
-            "V-X8",
-            Some("noh")
-        )
-    ),
+    CommandSpec {
+        id: RegistryEntryId::ClearSearch,
+        name: "clear-search",
+        desc: "clear active search",
+        contexts: RENDERED,
+        binding: BindingRole::AppChord {
+            continuation: 'c',
+            command: AppCommand::ClearSearch,
+        },
+        aliases: &[],
+        sequences: &[],
+        references: &[ReferenceSpec {
+            order: 23,
+            keys: ":noh",
+            desc: "Clear active search and highlighting.",
+            conformance_id: "V-X8",
+            prefill: Some("noh"),
+        }],
+        conformance_id: None,
+        quick_bar_order: None,
+        quick_label: None,
+    },
     reference_row!(
         ExHelp,
         "ex-help",
@@ -1199,7 +1209,7 @@ mod tests {
             assert!(!rendered_binding(spec).is_empty());
         }
         assert_eq!(COMMANDS.len(), 55);
-        assert_eq!(primary_commands().count(), 33);
+        assert_eq!(primary_commands().count(), 34);
     }
 
     #[test]
@@ -1280,7 +1290,7 @@ mod tests {
             2
         );
         let palette = crate::overlay::PaletteState::new(Contexts::ALL);
-        assert_eq!(palette.build_rows(Contexts::ALL).len(), 58);
+        assert_eq!(palette.build_rows(Contexts::ALL).len(), 59);
     }
 
     #[test]
@@ -1754,6 +1764,17 @@ mod tests {
                 BindingRole::CoreEx {
                     display: ":qa",
                     prefill: Some("qa"),
+                },
+                None,
+            ),
+            (
+                RegistryEntryId::ClearSearch,
+                "clear-search",
+                "clear active search",
+                RENDERED,
+                BindingRole::AppChord {
+                    continuation: 'c',
+                    command: AppCommand::ClearSearch,
                 },
                 None,
             ),

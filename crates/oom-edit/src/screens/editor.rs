@@ -464,6 +464,7 @@ pub fn render_status_row_with_options(
             count: spell.count,
             highest_severity: spell.highest_severity,
         }),
+        search: editor_status.search,
         command_line: command_line.clone(),
     };
 

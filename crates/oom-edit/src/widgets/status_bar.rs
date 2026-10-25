@@ -92,6 +92,8 @@ pub struct StatusBar {
     pub line_count: usize,
     /// Current spelling-issue count, or `None` when spell checking is disabled.
     pub spell_issues: Option<SpellIssues>,
+    /// Active nonempty search occurrence counts.
+    pub search: Option<oom_edit_core::SearchStatus>,
     /// Command-line text (when Command or rendered search is active).
     pub command_line: Option<String>,
 }
@@ -165,13 +167,24 @@ impl StatusBar {
             .spell_issues
             .map(|issues| format!("🅂 {} ", issues.count))
             .unwrap_or_default();
+        let search_indicator = self
+            .search
+            .map(|search| format!("🄵 {}:{} ", search.current, search.total))
+            .unwrap_or_default();
         let position = ruler_text(self.cursor_line, self.cursor_col, self.line_count);
         let position_width =
             u16::try_from(Line::from(position.as_str()).width()).unwrap_or(u16::MAX);
         let ruler_width = RULER_COLS.max(position_width).saturating_add(
-            u16::try_from(Line::from(spell_indicator.as_str()).width()).unwrap_or(u16::MAX),
+            u16::try_from(Line::from(format!("{search_indicator}{spell_indicator}")).width())
+                .unwrap_or(u16::MAX),
         );
         let mut ruler_spans = Vec::new();
+        if !search_indicator.is_empty() {
+            ruler_spans.push(Span::styled(
+                search_indicator,
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+        }
         if let Some(issues) = self.spell_issues {
             let symbol_style = issues.highest_severity.map_or_else(
                 || {
@@ -473,6 +486,7 @@ mod tests {
             cursor_line: 1,
             cursor_col: 1,
             line_count: 10,
+            search: None,
             spell_issues: Some(SpellIssues {
                 count: 0,
                 highest_severity: None,

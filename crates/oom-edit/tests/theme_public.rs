@@ -234,3 +234,164 @@ error = "#ff3366"
 attention = "#ff9933"
 "##
 }
+
+fn terminal_rgb(color: ColorValue) -> [u8; 3] {
+    match color {
+        ColorValue::Rgb { red, green, blue } => [red, green, blue],
+        ColorValue::Indexed(index) => {
+            const ANSI: [[u8; 3]; 16] = [
+                [0, 0, 0],
+                [128, 0, 0],
+                [0, 128, 0],
+                [128, 128, 0],
+                [0, 0, 128],
+                [128, 0, 128],
+                [0, 128, 128],
+                [192, 192, 192],
+                [128, 128, 128],
+                [255, 0, 0],
+                [0, 255, 0],
+                [255, 255, 0],
+                [0, 0, 255],
+                [255, 0, 255],
+                [0, 255, 255],
+                [255, 255, 255],
+            ];
+            ANSI[usize::from(index)]
+        }
+        ColorValue::Default => panic!("a color-capable fence must have an explicit foreground"),
+    }
+}
+
+fn relative_luminance(rgb: [u8; 3]) -> f64 {
+    let linear = rgb.map(|channel| {
+        let value = f64::from(channel) / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    });
+    linear[0] * 0.2126 + linear[1] * 0.7152 + linear[2] * 0.0722
+}
+
+#[test]
+fn default_dark_fence_foreground_has_contrast_without_terminal_dimming() {
+    let catalog = ThemeCatalog::builtins();
+    for tier in [Tier::TrueColor, Tier::Color16] {
+        let fence = catalog
+            .semantic_style("default-dark", tier, SemanticStyle::Muted)
+            .unwrap();
+        let text = catalog
+            .semantic_style("default-dark", tier, SemanticStyle::Text)
+            .unwrap();
+        assert!(
+            !fence.modifiers.dim,
+            "terminal dim must not undermine {tier:?} contrast"
+        );
+        let foreground = relative_luminance(terminal_rgb(fence.foreground.unwrap()));
+        let body = relative_luminance(terminal_rgb(text.foreground.unwrap()));
+        assert!(
+            foreground < body,
+            "fences should remain subdued relative to text"
+        );
+        let background = if tier == Tier::TrueColor {
+            relative_luminance(terminal_rgb(
+                catalog
+                    .ui_style("default-dark", tier, UiSlot::CodeFence)
+                    .unwrap()
+                    .background
+                    .unwrap(),
+            ))
+        } else {
+            0.0
+        };
+        assert!(
+            (foreground + 0.05) / (background + 0.05) >= 3.0,
+            "insufficient {tier:?} contrast"
+        );
+    }
+    let mono = catalog
+        .semantic_style("default-dark", Tier::Monochrome, SemanticStyle::Muted)
+        .unwrap();
+    assert!(
+        mono.modifiers.dim,
+        "monochrome retains its existing non-color signal"
+    );
+}
+
+#[test]
+fn opening_and_closing_backticks_use_the_readable_style_in_owned_source_frames() {
+    use oom_edit::{
+        AllowAllFileAccess, ClipboardError, ClipboardSink, ConfigPersistError, EditorPane, KeyCode,
+        KeyCodeKind, KeyInput, Modifiers, PaneInit, PaneInput, PaneOptions, PaneServices,
+        ThemePersistenceSink, ThemeSlot,
+    };
+    use std::time::Instant;
+    struct SilentClipboard;
+    impl ClipboardSink for SilentClipboard {
+        fn copy(&mut self, _: &str) -> Result<(), ClipboardError> {
+            Ok(())
+        }
+    }
+    struct SilentTheme;
+    impl ThemePersistenceSink for SilentTheme {
+        fn persist_theme(&mut self, _: ThemeSlot, _: &str) -> Result<(), ConfigPersistError> {
+            Ok(())
+        }
+    }
+    for tier in [Tier::TrueColor, Tier::Color16] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fence.md");
+        std::fs::write(&path, "```rust\nlet value = 1;\n```\n").unwrap();
+        let now = Instant::now();
+        let expected = ThemeCatalog::builtins()
+            .semantic_style("default-dark", tier, SemanticStyle::Muted)
+            .unwrap();
+        let mut pane = EditorPane::construct(PaneInit {
+            config: Config::default(),
+            theme_catalog: ThemeCatalog::builtins(),
+            theme_selection: ThemeSelection::new(None, DisplayMode::Dark, tier),
+            services: PaneServices {
+                clipboard_sink: Box::new(SilentClipboard),
+                theme_sink: Box::new(SilentTheme),
+                file_access_policy: Box::new(AllowAllFileAccess),
+                config_base_directory: directory.path().into(),
+                personal_dictionary_path: directory.path().join("words"),
+                working_directory: directory.path().into(),
+            },
+            options: PaneOptions::default(),
+            initial_paths: vec![path],
+            now,
+        })
+        .pane;
+        pane.render(80, 12, now);
+        pane.handle_input(
+            PaneInput::Key(KeyInput {
+                code: KeyCode {
+                    kind: KeyCodeKind::Char('i'),
+                },
+                mods: Modifiers::default(),
+            }),
+            now,
+        );
+        let frame = pane.render(80, 12, now);
+        let backticks: Vec<_> = frame
+            .cells
+            .iter()
+            .filter(|cell| cell.symbol == "`")
+            .collect();
+        assert_eq!(
+            backticks.len(),
+            6,
+            "both fences must remain literal in Insert"
+        );
+        for cell in backticks {
+            assert_eq!(cell.style.foreground, expected.foreground);
+            assert!(
+                !cell.style.modifiers.dim,
+                "fence glyph must not inherit dim"
+            );
+        }
+    }
+}

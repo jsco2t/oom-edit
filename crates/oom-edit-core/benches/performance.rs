@@ -551,7 +551,228 @@ fn benchmark_spell() {
     );
 }
 
+fn benchmark_spell_correction_and_cancellation() {
+    let engine = spell_engine();
+    let mut builder = SpellEngineBuilder::new(vec!["hello\nworld\ngood\ntext\nwrng\n".to_string()]);
+    while builder.step(4096) != BuildProgress::Complete {}
+    let known = builder.finish().unwrap();
+    let ending = format!("helo {}\n", "wrng ".repeat(1_000));
+    let row = "hello world good text\n\n";
+    let mut document = row.repeat((ONE_MIB - ending.len()) / row.len());
+    document.push_str(&ending);
+    document.push_str(&" ".repeat(ONE_MIB - document.len()));
+    let correction = sampled_run(5, || {
+        let mut pairs = Vec::new();
+        for _ in 0..8 {
+            let mut baseline = EditorSession::from_text(&document);
+            let mut candidate = EditorSession::from_text(&document);
+            while baseline.diagnostics_pending() {
+                assert!(baseline.spell_tick(&known, 4096));
+            }
+            while candidate.diagnostics_pending() {
+                assert!(candidate.spell_tick(&engine, 4096));
+            }
+            assert_eq!(baseline.diagnostics().len(), 1);
+            assert_eq!(candidate.diagnostics().len(), 1_001);
+            pairs.push((baseline, candidate));
+        }
+        let mut base_time = Duration::ZERO;
+        let mut candidate_time = Duration::ZERO;
+        for (index, (baseline, candidate)) in pairs.iter_mut().enumerate() {
+            let a = baseline.diagnostics()[0].clone();
+            let b = candidate.diagnostics()[0].clone();
+            let mut correct = |first: bool| {
+                if first {
+                    base_time += measure(|| {
+                        assert!(baseline
+                            .apply_spell_replacement(&a, "hello")
+                            .contains(&oom_edit_core::Effect::Edited));
+                    });
+                } else {
+                    candidate_time += measure(|| {
+                        assert!(candidate
+                            .apply_spell_replacement(&b, "hello")
+                            .contains(&oom_edit_core::Effect::Edited));
+                    });
+                }
+            };
+            correct(index % 2 == 0);
+            correct(index % 2 != 0);
+            assert!(baseline.diagnostics().is_empty());
+            assert_eq!(candidate.diagnostics().len(), 1_000);
+            assert_eq!(baseline.document(), candidate.document());
+        }
+        println!("spell correction pair: baseline {base_time:?}, with 1000 retained diagnostics {candidate_time:?}, 8 edits each");
+        timing::checked_additional_duration(base_time, candidate_time)
+            .expect("two real correction measurements")
+            / 8
+    });
+    report_duration_gate(
+        "spell_correction_diagnostic_overhead_1mb",
+        Duration::from_micros(100),
+        document.len(),
+        document.matches('\n').count() + 1,
+        correction,
+    );
+
+    let cancellation = sampled_run(12, || {
+        let mut session = EditorSession::from_text(&document);
+        session.handle_key(KeyInput {
+            code: KeyCode {
+                kind: KeyCodeKind::Char('i'),
+            },
+            mods: Modifiers::default(),
+        });
+        assert!(session.spell_tick(&engine, 4096));
+        assert!(session.diagnostics_pending());
+        let elapsed = measure(|| {
+            session.handle_key(KeyInput {
+                code: KeyCode {
+                    kind: KeyCodeKind::Char('x'),
+                },
+                mods: Modifiers::default(),
+            });
+        });
+        assert!(session.diagnostics_pending());
+        assert!(session.document().starts_with("xhello"));
+        elapsed
+    });
+    report(
+        "spell_cancel_input_1mb",
+        Duration::from_millis(10),
+        document.len(),
+        document.matches('\n').count() + 1,
+        cancellation,
+    );
+}
+
+fn benchmark_wrapped_insert_navigation() {
+    let line = "abcdefghijklmnopqrstuvwxyz".repeat(8);
+    let text = format!("{line}\n").repeat(ONE_MIB / (line.len() + 1));
+    let mut session = EditorSession::from_text(&text);
+    session.render_layout(80);
+    let key = |kind| KeyInput {
+        code: KeyCode { kind },
+        mods: Modifiers::default(),
+    };
+    session.handle_key(key(KeyCodeKind::Char('i')));
+    session.set_source_viewport(50, true);
+    for _ in 0..75 {
+        session.handle_key(key(KeyCodeKind::Right));
+    }
+    let stats = bench_run(Duration::from_millis(250), || {
+        session.handle_key(key(KeyCodeKind::Up));
+        assert_eq!(session.cursor(), (0, 25));
+        session.handle_key(key(KeyCodeKind::Down));
+        assert_eq!(session.cursor(), (0, 75));
+    });
+    assert_eq!(session.document(), text);
+    assert!(!session.is_dirty());
+    report(
+        "wrapped_insert_up_down_1mb",
+        Duration::from_millis(25),
+        text.len(),
+        session.line_count(),
+        stats,
+    );
+}
+
+fn benchmark_search_status() {
+    let text = "how about now how about then\n\n".repeat(ONE_MIB / 30);
+    let mut session = EditorSession::from_text(&text);
+    session.render_layout(80);
+    for character in "/how".chars() {
+        session.handle_key(KeyInput {
+            code: KeyCode {
+                kind: KeyCodeKind::Char(character),
+            },
+            mods: Modifiers::default(),
+        });
+    }
+    session.handle_key(KeyInput {
+        code: KeyCode {
+            kind: KeyCodeKind::Enter,
+        },
+        mods: Modifiers::default(),
+    });
+    let build = sampled_run(5, || {
+        // A width change gives the index a new rendered-layout identity.
+        session.render_layout(81);
+        session.render_layout(80);
+        measure(|| {
+            assert!(session.search_status().unwrap().total > 10_000);
+        })
+    });
+    report(
+        "search_status_build_1mb",
+        Duration::from_millis(500),
+        text.len(),
+        session.line_count(),
+        build,
+    );
+    let cached = bench_run(Duration::from_millis(250), || {
+        std::hint::black_box(session.search_status().unwrap());
+    });
+    report(
+        "search_status_cached_1mb",
+        Duration::from_millis(1),
+        text.len(),
+        session.line_count(),
+        cached,
+    );
+    session.handle_key(KeyInput {
+        code: KeyCode {
+            kind: KeyCodeKind::Char('i'),
+        },
+        mods: Modifiers::default(),
+    });
+    let viewport = Viewport {
+        top_line: 0,
+        height: 20,
+        width: 80,
+        wrap: true,
+        left_col: 0,
+        skip_rows: 0,
+    };
+    session.render_source(viewport);
+    let matches = session.search_status().unwrap().total;
+    let editing = sampled_run(15, || {
+        let elapsed = measure(|| {
+            session.handle_key(KeyInput {
+                code: KeyCode {
+                    kind: KeyCodeKind::Char('x'),
+                },
+                mods: Modifiers::default(),
+            });
+            std::hint::black_box(session.render_source(viewport));
+            assert_eq!(session.search_status().unwrap().total, matches);
+        });
+        session.handle_key(KeyInput {
+            code: KeyCode {
+                kind: KeyCodeKind::Backspace,
+            },
+            mods: Modifiers::default(),
+        });
+        assert_eq!(session.search_status().unwrap().total, matches);
+        elapsed
+    });
+    report(
+        "active_search_edit_to_frame_1mb",
+        Duration::from_millis(50),
+        text.len(),
+        session.line_count(),
+        editing,
+    );
+}
+
 fn main() {
+    if std::env::var_os("OOM_BENCH_ROUND2_ONLY").is_some() {
+        benchmark_search_status();
+        benchmark_wrapped_insert_navigation();
+        benchmark_spell();
+        benchmark_spell_correction_and_cancellation();
+        return;
+    }
     if std::env::var_os("OOM_BENCH_FIRST_FRAME_PROFILE").is_some() {
         profile_first_frame();
         return;
@@ -572,6 +793,9 @@ fn main() {
     benchmark_rendered(&rendered_5000_line_fixture());
     benchmark_large_rendered_layout();
     benchmark_spell();
+    benchmark_search_status();
+    benchmark_wrapped_insert_navigation();
+    benchmark_spell_correction_and_cancellation();
     benchmark_analysis_batch();
 }
 

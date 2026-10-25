@@ -131,7 +131,7 @@ fn fr_081_which_key_delay() {
             .iter()
             .map(|entry| entry.key)
             .collect::<Vec<_>>(),
-        "h?wqtmsazd".chars().map(key).collect::<Vec<_>>()
+        "h?wqtmsazdc".chars().map(key).collect::<Vec<_>>()
     );
     pane.set_focused(false);
     assert!(pane.which_key().is_none());
@@ -160,7 +160,7 @@ fn fr_082_binding_roles() {
             .iter()
             .filter(|b| b.execution == BindingExecution::ExecutableApp)
             .count(),
-        10
+        11
     );
     assert_eq!(
         bindings
@@ -182,7 +182,7 @@ fn assert_binding_contract(bindings: &[oom_edit::EditorBinding]) {
             .iter()
             .filter(|row| row.execution == BindingExecution::ExecutableApp)
             .count(),
-        10
+        11
     );
     assert_eq!(
         bindings
@@ -196,7 +196,7 @@ fn assert_binding_contract(bindings: &[oom_edit::EditorBinding]) {
             .iter()
             .filter(|row| row.execution == BindingExecution::ReferenceOnly)
             .count(),
-        22
+        21
     );
     let select = bindings
         .iter()
@@ -564,6 +564,7 @@ fn app_sequences_and_context_overrides_drive_the_existing_dispatcher() {
                         .iter()
                         .any(|event| matches!(event, oom_edit::PaneEvent::ThemeChanged { .. }))),
                     BindingId::Save
+                    | BindingId::ClearSearch
                     | BindingId::SpellSuggest
                     | BindingId::SpellAdd
                     | BindingId::SpaceDigitTab => {}
@@ -573,7 +574,7 @@ fn app_sequences_and_context_overrides_drive_the_existing_dispatcher() {
             }
         }
     }
-    assert_eq!(checked, 39);
+    assert_eq!(checked, 41);
     for prefix in ["i", ":", "/"] {
         let mut pane = pane(directory.path(), now, false);
         feed(&mut pane, prefix, now);

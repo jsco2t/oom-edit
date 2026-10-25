@@ -23,7 +23,7 @@ use crate::standalone::StandaloneHost;
 /// without requesting unchanged frames.
 pub const FRAME_BUDGET: Duration = Duration::from_millis(50);
 /// Required pause after the most recently observed input before spell work.
-pub const SPELL_IDLE_DELAY: Duration = Duration::from_secs(5);
+pub const SPELL_IDLE_DELAY: Duration = Duration::from_secs(2);
 /// Maximum wall-clock slice reserved for one idle drain.
 pub const SPELL_SLICE_BUDGET: Duration = Duration::from_millis(8);
 /// Deterministic byte unit shared by file loading, engine building, and scans.
@@ -577,8 +577,8 @@ mod tests {
     }
 
     #[test]
-    fn spell_idle_delay_is_five_seconds_and_resets_after_each_input() {
-        assert_eq!(SPELL_IDLE_DELAY, Duration::from_secs(5));
+    fn spell_idle_delay_is_two_seconds_and_resets_after_each_input() {
+        assert_eq!(SPELL_IDLE_DELAY, Duration::from_secs(2));
 
         let initial = Instant::now();
         let latest_input = initial + Duration::from_secs(2);

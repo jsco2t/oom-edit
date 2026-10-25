@@ -509,6 +509,21 @@ impl VimCore {
             && matches!(key.code.kind, KeyCodeKind::Char('g'))
             && key.mods == Modifiers::default();
 
+        // Cursor-only Insert keys must not commit empty undo entries. Keep
+        // the native motion/session bookkeeping while the undo group drops
+        // its snapshot when no content changed.
+        let _navigation_undo = (mode_before == Mode::Insert
+            && key.mods == Modifiers::default()
+            && matches!(
+                key.code.kind,
+                KeyCodeKind::Left
+                    | KeyCodeKind::Right
+                    | KeyCodeKind::Up
+                    | KeyCodeKind::Down
+                    | KeyCodeKind::Home
+                    | KeyCodeKind::End
+            ))
+        .then(|| self.editor.undo_group());
         // Feed the key through hjkl
         let consumed = if self.is_visual_register_prefix(key) {
             // hjkl handles a pending register selector in every visual mode,
@@ -529,6 +544,17 @@ impl VimCore {
             return vec![VimEffect::Bell];
         }
         self.history_prefix_pending = next_history_prefix;
+        if mode_before == Mode::Insert
+            && key.mods == Modifiers::default()
+            && key.code.kind == KeyCodeKind::End
+        {
+            // Insert End points after the final scalar. The engine's normal
+            // line-end position can carry trailing whitespace into the next
+            // line, where autoindent would copy it on another Enter.
+            let row = self.cursor().0;
+            let end = self.editor.line(row).map_or(0, |line| line.chars().count());
+            self.editor.jump_cursor(row, end);
+        }
 
         // Drain any content edits
         let mut edits = self.drain_content_edits();
@@ -2501,7 +2527,7 @@ mod insert_column_tests {
         move_down(&mut end);
         end.handle_key(special(KeyCodeKind::End));
         move_down(&mut end);
-        assert_eq!(end.cursor(), (2, 2));
+        assert_eq!(end.cursor(), (2, 3));
     }
 
     #[test]

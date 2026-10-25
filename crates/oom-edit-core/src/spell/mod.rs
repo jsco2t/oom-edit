@@ -5,7 +5,7 @@ use std::error::Error;
 use std::fmt;
 use std::ops::Range;
 
-pub(crate) use state::SpellState;
+pub(crate) use state::{SpellEdit, SpellState};
 
 /// A provider-neutral document diagnostic.
 #[derive(Clone, Debug, Eq, PartialEq)]
