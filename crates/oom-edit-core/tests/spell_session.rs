@@ -862,3 +862,161 @@ proptest! {
         prop_assert_eq!(session.diagnostics(), fresh.diagnostics());
     }
 }
+
+#[test]
+fn same_line_corrections_retain_other_diagnostics_and_publish_exact_utf8_ranges() {
+    let dictionary = engine("the\nhello\nworld\ncafé\n");
+    for source in ["teh helo wrld\nteh", "**teh** helo wrld\nteh"] {
+        let mut session = EditorSession::from_text(source);
+        drain(&mut session, &dictionary, 3);
+        assert_eq!(session.diagnostics().len(), 4);
+        let original = session.diagnostics().to_vec();
+        assert!(session
+            .apply_spell_replacement(&original[0], "the")
+            .contains(&Effect::Edited));
+        assert_eq!(session.diagnostics(), &original[1..]);
+        assert!(session.diagnostics_pending());
+        // A partially resumed scan must not prevent another current correction.
+        assert!(session.spell_tick(&dictionary, 1));
+        let before_second = session.document();
+        let next = session.diagnostics()[0].clone();
+        let mut expected = session.diagnostics()[1..].to_vec();
+        for diagnostic in &mut expected {
+            diagnostic.range.start += 1;
+            diagnostic.range.end += 1;
+        }
+        assert!(session
+            .apply_spell_replacement(&next, "café")
+            .contains(&Effect::Edited));
+        assert_eq!(session.diagnostics(), expected);
+        for diagnostic in session.diagnostics() {
+            assert_eq!(
+                session.text_for_range(diagnostic.range.clone()).as_deref(),
+                Some(diagnostic.source_text.as_str())
+            );
+        }
+        let corrected = session.document();
+        drain(&mut session, &dictionary, 2);
+        let mut fresh = EditorSession::from_text(&corrected);
+        drain(&mut fresh, &dictionary, 2);
+        assert_eq!(
+            session.diagnostics(),
+            fresh.diagnostics(),
+            "no duplicates after rescan"
+        );
+        session.handle_key(key('u'));
+        assert_eq!(session.document(), before_second);
+        drain(&mut session, &dictionary, 3);
+        session.handle_key(ctrl('r'));
+        assert_eq!(session.document(), corrected);
+        drain(&mut session, &dictionary, 3);
+        assert_eq!(session.diagnostics(), fresh.diagnostics());
+    }
+}
+
+#[test]
+fn corrections_beside_multiline_inline_code_match_fresh_scans() {
+    let dictionary = engine("hello\nworld\n");
+    for source in [
+        "`wrng\nwrng` helo\nwrld",
+        "helo `wrng\nwrng`\nwrld",
+        "``wrng\nwrng`` helo\nwrld",
+    ] {
+        for budget in [1, 3, usize::MAX] {
+            let mut session = EditorSession::from_text(source);
+            drain(&mut session, &dictionary, budget);
+            let original = session.diagnostics().to_vec();
+            assert_eq!(original.len(), 2, "{source:?}");
+            assert_eq!(original[0].source_text, "helo");
+            assert_eq!(original[1].source_text, "wrld");
+            assert!(session
+                .apply_spell_replacement(&original[0], "hello")
+                .contains(&Effect::Edited));
+
+            let mut remaining = original[1].clone();
+            remaining.range.start += 1;
+            remaining.range.end += 1;
+            assert_eq!(session.diagnostics(), &[remaining]);
+            assert!(session.diagnostics_pending());
+            let corrected = session.document();
+            let mut fresh = EditorSession::from_text(&corrected);
+            drain(&mut fresh, &dictionary, budget);
+            drain(&mut session, &dictionary, budget);
+            assert_eq!(session.diagnostics(), fresh.diagnostics(), "{source:?}");
+
+            session.handle_key(key('u'));
+            assert_eq!(session.document(), source);
+            drain(&mut session, &dictionary, budget);
+            assert_eq!(session.diagnostics(), original);
+            session.handle_key(ctrl('r'));
+            assert_eq!(session.document(), corrected);
+            drain(&mut session, &dictionary, budget);
+            assert_eq!(session.diagnostics(), fresh.diagnostics());
+        }
+    }
+}
+
+#[test]
+fn typing_and_paste_cancel_partially_found_scan_results_before_publication() {
+    let dictionary = engine("hello\nworld\n");
+    for paste in [false, true] {
+        let source = "helo\n".repeat(500);
+        let mut session = EditorSession::from_text(&source);
+        session.render_layout(80);
+        assert!(session.spell_tick(&dictionary, 4096));
+        assert!(session.diagnostics_pending());
+        assert!(session.diagnostics().is_empty());
+        session.handle_key(key('i'));
+        if paste {
+            session.insert_paste("hello ");
+        } else {
+            session.handle_key(key('x'));
+        }
+        assert!(session.diagnostics_pending());
+        let current = session.document();
+        drain(&mut session, &dictionary, 64);
+        let mut fresh = EditorSession::from_text(&current);
+        drain(&mut fresh, &dictionary, 64);
+        assert_eq!(session.diagnostics(), fresh.diagnostics());
+        assert_eq!(session.diagnostics().len(), 500);
+        assert_eq!(
+            session.diagnostics()[0].source_text,
+            if paste { "helo" } else { "xhelo" }
+        );
+        for diagnostic in session.diagnostics() {
+            assert_eq!(
+                session.text_for_range(diagnostic.range.clone()).as_deref(),
+                Some(diagnostic.source_text.as_str())
+            );
+        }
+    }
+}
+
+#[test]
+fn replacement_revalidates_shifted_identity_and_disabled_spelling_without_changing_counts() {
+    let dictionary = engine("the\nworld\n");
+    let mut session = EditorSession::from_text("teh wrld teh");
+    drain(&mut session, &dictionary, 2);
+    let stale = session.diagnostics()[2].clone();
+    let first = session.diagnostics()[0].clone();
+    session.apply_spell_replacement(&first, "world");
+    assert_eq!(session.diagnostics().len(), 2);
+    let before = session.document();
+    assert!(!session
+        .apply_spell_replacement(&stale, "the")
+        .contains(&Effect::Edited));
+    assert_eq!(session.document(), before);
+    assert_eq!(session.diagnostics().len(), 2);
+    let current = session.diagnostics()[0].clone();
+    session.set_spell_enabled(false);
+    assert!(session.diagnostics().is_empty());
+    assert!(!session
+        .apply_spell_replacement(&current, "world")
+        .contains(&Effect::Edited));
+    assert_eq!(session.document(), before);
+    session.set_spell_enabled(true);
+    drain(&mut session, &dictionary, 2);
+    let mut fresh = EditorSession::from_text(&before);
+    drain(&mut fresh, &dictionary, 2);
+    assert_eq!(session.diagnostics(), fresh.diagnostics());
+}

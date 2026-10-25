@@ -131,7 +131,7 @@ fn fr_081_which_key_delay() {
             .iter()
             .map(|entry| entry.key)
             .collect::<Vec<_>>(),
-        "h?wqtmsazd".chars().map(key).collect::<Vec<_>>()
+        "h?wqtmsazdc".chars().map(key).collect::<Vec<_>>()
     );
     pane.set_focused(false);
     assert!(pane.which_key().is_none());
@@ -160,7 +160,7 @@ fn fr_082_binding_roles() {
             .iter()
             .filter(|b| b.execution == BindingExecution::ExecutableApp)
             .count(),
-        10
+        11
     );
     assert_eq!(
         bindings
@@ -175,14 +175,43 @@ fn fr_082_binding_roles() {
         .any(|b| b.execution == BindingExecution::ReferenceOnly));
 }
 
+#[test]
+fn clear_search_exports_the_ex_reference_and_the_owned_app_chord() {
+    let directory = tempfile::tempdir().unwrap();
+    let now = Instant::now();
+    let bindings = pane(directory.path(), now, false).bindings();
+    let ex = bindings
+        .iter()
+        .find(|binding| {
+            binding
+                .sequences
+                .contains(&BindingSequence::Ex("noh".into()))
+        })
+        .expect("clear-search ex grammar remains discoverable");
+    assert_eq!(ex.modes, [Mode::Command]);
+    assert_eq!(ex.execution, BindingExecution::ReferenceOnly);
+    assert_eq!(ex.id, BindingId::ClearSearchEx);
+    let chord = bindings
+        .iter()
+        .find(|binding| binding.id == BindingId::ClearSearch)
+        .unwrap();
+    assert_eq!(chord.modes, [Mode::Normal, Mode::Select]);
+    assert_eq!(chord.execution, BindingExecution::ExecutableApp);
+    assert_eq!(
+        chord.sequences,
+        [BindingSequence::Keys(vec![key(' '), key('c')])]
+    );
+    assert_ne!(chord.id, ex.id);
+}
+
 fn assert_binding_contract(bindings: &[oom_edit::EditorBinding]) {
-    assert_eq!(bindings.len(), 55);
+    assert_eq!(bindings.len(), 56);
     assert_eq!(
         bindings
             .iter()
             .filter(|row| row.execution == BindingExecution::ExecutableApp)
             .count(),
-        10
+        11
     );
     assert_eq!(
         bindings
@@ -399,7 +428,7 @@ fn fr_085_status_data() {
     assert_eq!(status.ruler.line, 3);
     assert_eq!(status.ruler.column, 6);
     assert_eq!(status.ruler.line_count, 3);
-    assert_eq!(status.ruler.text, "3:6  100% Bot");
+    assert_eq!(status.ruler.text, "3:6  100% [3] Bot");
     assert!(row(&mut pane, now).contains(&status.ruler.text));
 }
 
@@ -564,6 +593,7 @@ fn app_sequences_and_context_overrides_drive_the_existing_dispatcher() {
                         .iter()
                         .any(|event| matches!(event, oom_edit::PaneEvent::ThemeChanged { .. }))),
                     BindingId::Save
+                    | BindingId::ClearSearch
                     | BindingId::SpellSuggest
                     | BindingId::SpellAdd
                     | BindingId::SpaceDigitTab => {}
@@ -573,7 +603,7 @@ fn app_sequences_and_context_overrides_drive_the_existing_dispatcher() {
             }
         }
     }
-    assert_eq!(checked, 39);
+    assert_eq!(checked, 41);
     for prefix in ["i", ":", "/"] {
         let mut pane = pane(directory.path(), now, false);
         feed(&mut pane, prefix, now);
@@ -807,7 +837,7 @@ fn status_tracks_named_paths_active_tabs_prompts_spell_and_disk_markers() {
     assert_eq!(status.ruler.line, 1);
     assert_eq!(status.ruler.column, 1);
     assert_eq!(status.ruler.line_count, 3);
-    assert_eq!(status.ruler.text, "1:1  33% Top");
+    assert_eq!(status.ruler.text, "1:1  33% [3] Top");
     assert_eq!(status.spell.unwrap().count, 0);
     assert!(status.spell.unwrap().highest_severity.is_none());
     feed(&mut pane, " z", now);

@@ -6,7 +6,9 @@
 use std::fmt;
 use std::ops::Range;
 
-use crate::style::{RenderedLayout, RenderedSelection, RenderedSelectionRow, SelectionShape};
+use crate::style::{
+    RenderedLayout, RenderedLineRole, RenderedSelection, RenderedSelectionRow, SelectionShape,
+};
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -57,6 +59,39 @@ pub(crate) fn rendered_selection_content(
     layout: &RenderedLayout,
     document: &str,
 ) -> ClipboardContent {
+    // Selecting a fence's body is distinct from selecting its opening row,
+    // even when that body contains all of the document's rendered text.
+    let starts_inside_fence = layout
+        .lines
+        .get(selection.anchor.row.min(selection.active.row))
+        .is_some_and(|line| line.role == RenderedLineRole::CodeFence)
+        && selection
+            .source_ranges
+            .first()
+            .is_some_and(|range| range.start > 0);
+    if selection.shape != SelectionShape::Block && !starts_inside_fence {
+        let mut visible_sources = layout
+            .lines
+            .iter()
+            .flat_map(|line| &line.atoms)
+            .filter_map(|atom| atom.source.as_ref())
+            .peekable();
+        // A complete rendered selection copies the original document, including
+        // syntax and blank lines that have no rendered glyph of their own.
+        if visible_sources.peek().is_some()
+            && visible_sources.all(|source| range_is_covered(source, &selection.source_ranges))
+        {
+            let selected_end = selection.source_ranges.last().map_or(0, |range| range.end);
+            // Restoring syntax must not add unselected trailing whitespace to a
+            // character yank. Fence and line selections own their newline.
+            let end = if selection.shape == SelectionShape::Character {
+                selected_end.max(document.trim_end().len())
+            } else {
+                document.len()
+            };
+            return ClipboardContent::from_markdown(document[..end].to_owned());
+        }
+    }
     match selection.shape {
         SelectionShape::Character => {
             let constructs = inline_construct_spans(document);
@@ -200,8 +235,12 @@ fn visible_source_ranges(layout: &RenderedLayout) -> Vec<Range<usize>> {
 
 fn range_is_covered(target: &Range<usize>, selected: &[Range<usize>]) -> bool {
     selected
-        .iter()
-        .any(|range| range.start <= target.start && target.end <= range.end)
+        .get(
+            selected
+                .partition_point(|range| range.start <= target.start)
+                .saturating_sub(1),
+        )
+        .is_some_and(|range| range.start <= target.start && target.end <= range.end)
 }
 
 fn concatenate_ranges(ranges: &[Range<usize>], document: &str) -> String {

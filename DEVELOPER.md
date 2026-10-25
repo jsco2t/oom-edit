@@ -150,7 +150,7 @@ mod tests {
         let first = pane.render(80, 24, now);
         assert_eq!(first.cells.len(), 80 * 24);
         assert!(!pane.hints().is_empty());
-        assert_eq!(pane.bindings().len(), 55);
+        assert_eq!(pane.bindings().len(), 56);
         pane.handle_input(key(KeyCodeKind::Char('i')), now);
         pane.handle_input(PaneInput::Paste("# Independent λ\n".into()), now);
         assert_eq!(pane.status().unwrap().mode, Mode::Insert);

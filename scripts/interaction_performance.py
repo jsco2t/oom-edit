@@ -14,6 +14,10 @@ VERSION = "oom-edit-realistic-v1"
 KIB = 1024
 CASES = {
     "source-type": ("insert", "delete"),
+    "source-search": ("insert", "delete"),
+    "source-search-mid": ("insert", "delete"),
+    "source-search-cleared": ("insert", "delete"),
+    "source-search-cleared-mid": ("insert", "delete"),
     "source-type-mid": ("insert", "delete"),
     "source-structural": ("insert", "delete"),
     "source-structural-mid": ("insert", "delete"),
@@ -41,6 +45,10 @@ GATE_CASES = (
     "source-type", "source-type-mid", "source-line", "source-line-mid",
     "rendered-edit", "rendered-edit-mid", "exit-insert", "exit-insert-mid",
     "source-scroll", "source-scroll-mid", "rendered-scroll", "rendered-scroll-mid",
+)
+SEARCH_GATE_CASES = (
+    "source-search", "source-search-cleared",
+    "source-search-mid", "source-search-cleared-mid",
 )
 LOCAL_LIMIT_NS = 50_000_000
 SCROLL_LIMIT_NS = 25_000_000
@@ -169,6 +177,29 @@ def gate_failures(rows: list[dict[str, object]], case: str,
     return failures
 
 
+def search_gate_failures(observations: list[dict[str, object]],
+                         trials: int, iterations: int) -> list[str]:
+    """Keep exact search counts within the existing interaction allowances."""
+    cases = {case: [row for row in observations if row["case"] == case]
+             for case in SEARCH_GATE_CASES}
+    failures = [failure for case, rows in cases.items()
+                for failure in gate_failures(rows, case, trials, iterations)]
+    for suffix in ("", "-mid"):
+        for step in ("insert", "delete"):
+            active = [row for row in cases["source-search" + suffix] if row["step"] == step]
+            cleared = [row for row in cases["source-search-cleared" + suffix]
+                       if row["step"] == step]
+            for metric in ("render_ns", "total_ns", "peak_rss_bytes"):
+                before = summarize([int(row[metric]) for row in cleared])["median"]
+                after = summarize([int(row[metric]) for row in active])["median"]
+                divisor, allowance = ((20, 1_048_576) if metric == "peak_rss_bytes"
+                                      else (10, 100_000))
+                delta = after - before
+                if delta > allowance and delta * divisor > before:
+                    failures.append(f"source-search{suffix}/{step}/{metric} search overhead")
+    return failures
+
+
 def sample_phase(case: str, cycle: int) -> str:
     """Classify the first-ever rendered return separately from later returns."""
     if case.startswith("exit-insert"):
@@ -195,7 +226,9 @@ def format_phases(rows: list[dict[str, object]]) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
-    parser.add_argument("--gate", action="store_true")
+    gates = parser.add_mutually_exclusive_group()
+    gates.add_argument("--gate", action="store_true")
+    gates.add_argument("--search-gate", action="store_true")
     parser.add_argument("--trials", type=int, default=GATE_TRIALS)
     parser.add_argument("--iterations", type=int, default=GATE_ITERATIONS)
     parser.add_argument("--output", type=Path)
@@ -204,11 +237,13 @@ def main() -> int:
     args = parser.parse_args()
     if args.trials < 1 or args.iterations < 1:
         parser.error("trials and iterations must be positive")
-    if args.gate and (args.trials < GATE_TRIALS or args.iterations < GATE_ITERATIONS
-                      or args.case or args.size):
+    if (args.gate or args.search_gate) and (
+        args.trials < GATE_TRIALS or args.iterations < GATE_ITERATIONS or args.case or args.size
+    ):
         parser.error("gate requires five trials, 21 cycles and the fixed case/size inventory")
-    chosen_cases = list(GATE_CASES) if args.gate else args.case or list(CASES)
-    chosen_sizes = (1024 * KIB,) if args.gate else args.size or list(SIZES)
+    chosen_cases = (list(SEARCH_GATE_CASES) if args.search_gate else
+                    list(GATE_CASES) if args.gate else args.case or list(CASES))
+    chosen_sizes = (1024 * KIB,) if args.gate or args.search_gate else args.size or list(SIZES)
     observations: list[dict[str, object]] = []
     failures: list[str] = []
     for size in chosen_sizes:
@@ -236,6 +271,8 @@ def main() -> int:
                           f"n={len(phase_rows)}: {format_phases(phase_rows)}", flush=True)
             if args.gate:
                 failures.extend(gate_failures(rows, case, args.trials, args.iterations))
+    if args.search_gate:
+        failures.extend(search_gate_failures(observations, args.trials, args.iterations))
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text("\n".join(json.dumps(row, sort_keys=True)
@@ -243,7 +280,7 @@ def main() -> int:
     if failures:
         print("FAIL: " + ", ".join(failures), flush=True)
         return 1
-    if args.gate:
+    if args.gate or args.search_gate:
         print(f"PASS: {len(observations)} verified interaction samples", flush=True)
     return 0
 

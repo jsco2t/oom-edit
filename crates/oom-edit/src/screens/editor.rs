@@ -464,10 +464,14 @@ pub fn render_status_row_with_options(
             count: spell.count,
             highest_severity: spell.highest_severity,
         }),
+        search: editor_status.search,
         command_line: command_line.clone(),
     };
 
     let mut status_text = status.build(transient, theme, tier);
+    if let Some(cursor) = session.rendered_search_prompt_cursor() {
+        status_text.prompt_cursor = Some(cursor);
+    }
     if hints.minimal {
         status_text.content.clear();
     }
@@ -1181,7 +1185,7 @@ mod tests {
         assert_eq!(session.cursor(), (4, 2));
 
         let terminal = render_session_status(&session, 80);
-        assert!(buffer_row(&terminal, 0, 80).ends_with("5:3  83% "));
+        assert!(buffer_row(&terminal, 0, 80).ends_with("5:3  83% [6] "));
     }
 
     #[test]

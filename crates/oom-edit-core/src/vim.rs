@@ -413,6 +413,8 @@ pub(crate) struct VimCore {
     modified_since_save: bool,
     /// Whether the preceding Normal-mode key was the `g` history prefix.
     history_prefix_pending: bool,
+    /// Sequence of an unused navigation breakpoint awaiting the next Insert edit.
+    navigation_undo: Option<u64>,
     /// Whole-document materializations observed by wrapper hot paths.
     #[cfg(test)]
     full_materializations: Cell<usize>,
@@ -448,6 +450,7 @@ impl VimCore {
             save_point_content,
             modified_since_save: false,
             history_prefix_pending: false,
+            navigation_undo: None,
             #[cfg(test)]
             full_materializations: Cell::new(0),
             #[cfg(test)]
@@ -509,6 +512,29 @@ impl VimCore {
             && matches!(key.code.kind, KeyCodeKind::Char('g'))
             && key.mods == Modifiers::default();
 
+        // Keep a breakpoint after edits until the next Insert run either
+        // changes text or ends. Unused and repeated navigation snapshots
+        // drop without adding empty undo steps.
+        let navigation = mode_before == Mode::Insert
+            && key.mods == Modifiers::default()
+            && matches!(
+                key.code.kind,
+                KeyCodeKind::Left
+                    | KeyCodeKind::Right
+                    | KeyCodeKind::Up
+                    | KeyCodeKind::Down
+                    | KeyCodeKind::Home
+                    | KeyCodeKind::End
+            );
+        let navigation_boundary = (navigation
+            && self.navigation_undo.is_none()
+            && self
+                .editor
+                .insert_session()
+                .is_some_and(|session| !session.before_rope.is_instance(&before)))
+        .then(|| self.editor.buffer().current_undo_seq());
+        let navigation_undo =
+            (navigation && navigation_boundary.is_none()).then(|| self.editor.undo_group());
         // Feed the key through hjkl
         let consumed = if self.is_visual_register_prefix(key) {
             // hjkl handles a pending register selector in every visual mode,
@@ -516,9 +542,12 @@ impl VimCore {
             // that same pending state here so Visual yanks can target `+`/`*`.
             self.hjkl_state_mut().pending = HjklPending::SelectRegister;
             true
+        } else if let Some(consumed) = self.try_empty_linewise_put(key, hjkl_input.clone()) {
+            consumed
         } else {
             feed_input(&mut self.editor, hjkl_input)
         };
+        drop(navigation_undo);
 
         if !consumed {
             self.history_prefix_pending = false;
@@ -527,11 +556,32 @@ impl VimCore {
             return vec![VimEffect::Bell];
         }
         self.history_prefix_pending = next_history_prefix;
+        if mode_before == Mode::Insert
+            && key.mods == Modifiers::default()
+            && key.code.kind == KeyCodeKind::End
+        {
+            // Insert End points after the final scalar. The engine's normal
+            // line-end position can carry trailing whitespace into the next
+            // line, where autoindent would copy it on another Enter.
+            let row = self.cursor().0;
+            let end = self.editor.line(row).map_or(0, |line| line.chars().count());
+            self.editor.jump_cursor(row, end);
+        }
 
         // Drain any content edits
         let mut edits = self.drain_content_edits();
         let content_reset = self.editor.take_content_reset();
         let content_changed = self.editor.buffer().dirty_gen() != dirty_gen_before;
+        if content_changed {
+            self.navigation_undo = None;
+        } else if navigation_boundary
+            .is_some_and(|before| before != self.editor.buffer().current_undo_seq())
+        {
+            self.navigation_undo = Some(self.editor.buffer().current_undo_seq());
+        }
+        if self.compute_mode() != Mode::Insert {
+            self.discard_navigation_undo();
+        }
         if content_changed {
             let after = self.editor.buffer().rope();
             #[cfg(test)]
@@ -598,6 +648,16 @@ impl VimCore {
         }
 
         effects
+    }
+
+    fn discard_navigation_undo(&mut self) {
+        if self
+            .navigation_undo
+            .take()
+            .is_some_and(|sequence| sequence == self.editor.buffer().current_undo_seq())
+        {
+            self.editor.buffer().pop_committed();
+        }
     }
 
     /// Whether a consumed Insert action makes the resulting cursor column the
@@ -705,6 +765,65 @@ impl VimCore {
 
     fn system_clipboard_register_selected(&self) -> bool {
         matches!(self.hjkl_state().pending_register, Some('+') | Some('*'))
+    }
+
+    /// An empty buffer has no existing line to separate from a linewise put.
+    fn try_empty_linewise_put(&mut self, key: KeyInput, input: PlannedInput) -> Option<bool> {
+        if self.mode != Mode::Normal
+            || key.mods.ctrl
+            || key.mods.alt
+            || !matches!(key.code.kind, KeyCodeKind::Char('p' | 'P'))
+            || self.hjkl_state().pending != HjklPending::None
+            || self.editor.buffer().rope().len_bytes() != 0
+        {
+            return None;
+        }
+        let selector = self.hjkl_state().pending_register;
+        let count = self.hjkl_state().count.max(1);
+        let previous_input_at = self.editor.last_input_host_at();
+        // Keep engine bookkeeping (repeat, macros and one-shot Normal) on the
+        // ordinary dispatch path, then replace the placeholder-line result in
+        // the same undo step with the exact register payload.
+        let consumed = feed_input(&mut self.editor, input);
+        // Use the engine's sampled input time to resolve the same register and
+        // count it used after expiring a stale prefix.
+        let prefix_expired = previous_input_at
+            .zip(self.editor.last_input_host_at())
+            .is_some_and(|(previous, now)| {
+                now.saturating_sub(previous) > self.editor.settings().timeout_len
+            });
+        let selector = selector.filter(|_| !prefix_expired);
+        let count = if prefix_expired { 1 } else { count };
+        let slot = self.editor.with_registers(|registers| {
+            selector
+                .and_then(|register| registers.read(register))
+                .unwrap_or(&registers.unnamed)
+                .clone()
+        });
+        if !slot.linewise || slot.blockwise || slot.text.is_empty() {
+            return Some(consumed);
+        }
+        let mut text = slot.text.clone();
+        for _ in 1..count {
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(&slot.text);
+        }
+        let _ = self.editor.take_content_edits();
+        self.editor.buffer_mut().replace_all(&text);
+        self.editor.mark_content_dirty();
+        self.editor.jump_cursor(0, 0);
+        hjkl_engine::motions::move_first_non_blank(self.editor.buffer_mut());
+        self.editor.set_sticky_col(Some(self.cursor().1));
+        self.editor.set_mark('[', (0, 0));
+        let rope = self.editor.buffer().rope();
+        let end = rope.byte_to_line(rope.len_bytes().saturating_sub(1));
+        let line = rope.line(end);
+        let newline = usize::from(line.char(line.len_chars().saturating_sub(1)) == '\n');
+        let col = line.len_chars().saturating_sub(1 + newline);
+        self.editor.set_mark(']', (end, col));
+        Some(consumed)
     }
 
     /// Paste renderer-created block registers using display-cell geometry.
@@ -1043,6 +1162,7 @@ impl VimCore {
             return Some(Vec::new());
         }
 
+        self.discard_navigation_undo();
         let (start_row, start_col) = self.position_for_byte_offset(range.start);
         let (end_row, end_col) = self.position_for_byte_offset(range.end);
         {
@@ -1391,6 +1511,7 @@ impl VimCore {
     /// the hjkl input pipeline, so it counts as a single undo step.
     /// Returns the edits for the highlighter.
     pub(crate) fn insert_text(&mut self, text: &str) -> Vec<TextEdit> {
+        self.navigation_undo = None;
         self.modified_since_save = true;
         let buffer = self.editor.buffer_mut();
         let cursor = buffer.cursor();
@@ -2170,6 +2291,75 @@ mod projected_selection_tests {
     }
 
     #[test]
+    fn empty_linewise_put_preserves_payload_counts_marks_and_undo() {
+        for payload in ["  café\nlast", "  café\nlast\n"] {
+            for put in ['p', 'P'] {
+                for count in [1, 2] {
+                    let mut vim = VimCore::new("");
+                    vim.editor.record_yank(payload.into(), true, Some('a'));
+                    feed_plain(&mut vim, &format!("\"a{count}{put}"));
+                    let expected = if count == 1 {
+                        payload.to_string()
+                    } else {
+                        format!("{}\n{payload}", payload.trim_end_matches('\n'))
+                    };
+                    assert_eq!(vim.text(), expected);
+                    assert_eq!(vim.cursor(), (0, 2));
+                    assert!(!vim.has_pending_input());
+                    assert_eq!(register_state(&vim, 'a').0, payload);
+                    assert_eq!(vim.editor.mark('['), Some((0, 0)));
+                    assert_eq!(vim.editor.mark(']'), Some((2 * count - 1, 3)));
+                    feed_plain(&mut vim, "u");
+                    assert_eq!(vim.text(), "");
+                    vim.handle_key(KeyInput {
+                        code: KeyCode {
+                            kind: KeyCodeKind::Char('r'),
+                        },
+                        mods: Modifiers {
+                            ctrl: true,
+                            ..Modifiers::default()
+                        },
+                    });
+                    assert_eq!(vim.text(), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_linewise_put_records_the_change_for_dot_repeat() {
+        for put in ['p', 'P'] {
+            let mut vim = VimCore::new("");
+            vim.editor.record_yank("alpha".into(), true, None);
+            feed_plain(&mut vim, &format!("{put}."));
+            assert_eq!(vim.text(), "alpha\nalpha", "{put}");
+        }
+    }
+
+    #[test]
+    fn empty_linewise_put_is_recorded_in_macros() {
+        let mut vim = VimCore::new("");
+        vim.editor.record_yank("alpha".into(), true, None);
+        feed_plain(&mut vim, "qapq");
+        assert_eq!(register_state(&vim, 'a').0, "p");
+        feed_plain(&mut vim, "@a");
+        assert_eq!(vim.text(), "alpha\nalpha");
+    }
+
+    #[test]
+    fn empty_linewise_put_drops_expired_register_and_count_prefixes() {
+        let mut vim = VimCore::new("");
+        vim.editor.record_yank("named".into(), true, Some('a'));
+        vim.editor.record_yank("unnamed".into(), true, None);
+        vim.set_host_time(Some(core::time::Duration::ZERO));
+        feed_plain(&mut vim, "\"a2");
+        vim.set_host_time(Some(core::time::Duration::from_secs(2)));
+        feed_plain(&mut vim, "p");
+        assert_eq!(vim.text(), "unnamed");
+        assert!(!vim.has_pending_input());
+    }
+
+    #[test]
     fn projected_line_selection_preserves_linewise_register_semantics() {
         let mut vim = VimCore::new("one\ntwo\nthree\n");
         let effects = vim.apply_selection(
@@ -2371,7 +2561,7 @@ mod insert_column_tests {
         move_down(&mut end);
         end.handle_key(special(KeyCodeKind::End));
         move_down(&mut end);
-        assert_eq!(end.cursor(), (2, 2));
+        assert_eq!(end.cursor(), (2, 3));
     }
 
     #[test]

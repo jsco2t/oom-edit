@@ -43,6 +43,10 @@ are:
 | `make audit` | Check the lockfile against current RustSec advisories |
 | `make bench-check` | Run debug performance smoke gates |
 | `make bench` | Run release performance gates |
+| `make bench-round2` | Assert active-search, wrapped-source and spelling regression performance |
+| `make test-search-status` | Verify search counts, clearing, help and binding ownership |
+| `make test-insert-navigation` | Verify exact Insert newlines, source mapping and visual row motion |
+| `make test-spell-updates` | Verify two-second idle work, cancellation and correction counts |
 | `make doc` | Build API documentation without dependencies |
 | `make run ARGS=file.md` | Run the editor against a file |
 | `make run-isolated ARGS=file.md` | Run without reading or writing user configuration |

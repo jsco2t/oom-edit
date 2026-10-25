@@ -141,6 +141,8 @@ pub struct EditorStatus {
     pub is_new: bool,
     /// Spelling resource and runtime configuration.
     pub spell: Option<SpellStatus>,
+    /// Active nonempty search occurrence counts, absent when there is no search.
+    pub search: Option<oom_edit_core::SearchStatus>,
     /// Current source position and document size.
     pub ruler: EditorRuler,
     /// Active ex or search prompt text, when present.
@@ -200,6 +202,7 @@ pub(crate) fn editor_status(session: &EditorSession, disk_marker: Option<&str>) 
                 .max_by_key(|severity| crate::gutter::severity_priority(*severity)),
         }),
         ruler,
+        search: session.search_status(),
         prompt: session
             .command_line()
             .map(|text| format!(":{text}"))

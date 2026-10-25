@@ -997,10 +997,12 @@ mod tests {
                     .cell((gutter + 1, boundary_row as u16))
                     .unwrap();
                 assert_eq!(dash.symbol(), "-");
-                assert!(
-                    dash.modifier.contains(Modifier::DIM),
+                let expected = theme.style(tier, oom_edit_core::SemanticStyle::Muted);
+                assert_eq!(
+                    dash.modifier, expected.add_modifier,
                     "theme={name}, tier={tier:?}"
                 );
+                assert_eq!(Some(dash.fg), expected.fg);
             }
         }
     }

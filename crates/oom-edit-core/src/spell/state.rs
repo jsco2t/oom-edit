@@ -7,12 +7,17 @@ use super::{Diagnostic, DiagnosticProvider, DiagnosticSeverity};
 use crate::syntax::Highlighter;
 use crate::vim::TextEdit;
 
+#[derive(Clone, Copy)]
+pub(crate) enum SpellEdit {
+    General,
+    Correction,
+}
+
 pub(crate) enum InvalidationPlan {
     Full,
-    Local {
+    Rescan {
         old_range: Range<usize>,
-        edit_start: usize,
-        new_text_len: usize,
+        diagnostic_range: Range<usize>,
         delta: isize,
     },
 }
@@ -80,6 +85,7 @@ impl SpellState {
         &self,
         old_text: &str,
         edits: &[TextEdit],
+        kind: SpellEdit,
     ) -> InvalidationPlan {
         let [edit] = edits else {
             return InvalidationPlan::Full;
@@ -88,20 +94,33 @@ impl SpellState {
             return InvalidationPlan::Full;
         };
         let old_range = containing_line(old_text, edit.range.start, edit.range.end);
-        if !locally_safe(old_source)
-            || !locally_safe(&edit.new_text)
-            || has_context_marker(&old_text[old_range.clone()])
+        let correction = matches!(kind, SpellEdit::Correction)
+            && spelling_word(old_source)
+            && spelling_word(&edit.new_text);
+        let context_sensitive = has_context_marker(&old_text[old_range.clone()])
             || self
                 .exclusions
                 .iter()
-                .any(|exclusion| edit_touches(exclusion, &edit.range))
+                .any(|exclusion| edit_touches(exclusion, &old_range));
+        if !correction
+            && (!locally_safe(old_source) || !locally_safe(&edit.new_text) || context_sensitive)
         {
             return InvalidationPlan::Full;
         }
-        InvalidationPlan::Local {
+        // Corrections retain other diagnostics, but scanning must begin with
+        // complete context when inline constructs can span source lines.
+        let old_range = if correction && context_sensitive {
+            0..old_text.len()
+        } else {
+            old_range
+        };
+        InvalidationPlan::Rescan {
+            diagnostic_range: if correction {
+                edit.range.clone()
+            } else {
+                old_range.clone()
+            },
             old_range,
-            edit_start: edit.range.start,
-            new_text_len: edit.new_text_len,
             delta: edit.new_text_len as isize - edit.range.len() as isize,
         }
     }
@@ -115,10 +134,9 @@ impl SpellState {
                     range: 0..new_text.len(),
                 };
             }
-            InvalidationPlan::Local {
+            InvalidationPlan::Rescan {
                 old_range,
-                edit_start,
-                new_text_len,
+                diagnostic_range,
                 delta,
             } => {
                 let pending_range = match &self.scan {
@@ -128,10 +146,10 @@ impl SpellState {
                     }
                 };
                 self.diagnostics.retain_mut(|diagnostic| {
-                    if diagnostic.range.end <= old_range.start {
+                    if diagnostic.range.end <= diagnostic_range.start {
                         return true;
                     }
-                    if diagnostic.range.start >= old_range.end {
+                    if diagnostic.range.start >= diagnostic_range.end {
                         diagnostic.range = shift_range(&diagnostic.range, delta);
                         return true;
                     }
@@ -147,9 +165,11 @@ impl SpellState {
                     }
                     false
                 });
-                let new_end = edit_start.saturating_add(new_text_len).min(new_text.len());
-                let changed_range =
-                    containing_line(new_text, edit_start.min(new_text.len()), new_end);
+                let changed_range = old_range.start
+                    ..old_range
+                        .end
+                        .saturating_add_signed(delta)
+                        .min(new_text.len());
                 let range = pending_range.map_or(changed_range.clone(), |pending| {
                     let pending = shift_pending_range(pending, &old_range, delta, new_text.len());
                     pending.start.min(changed_range.start)..pending.end.max(changed_range.end)
@@ -271,6 +291,16 @@ impl SpellState {
                         }
                     }
                     if tokenizer.is_complete() {
+                        // Replace this scan window atomically. Corrections retain
+                        // valid neighbors while scanning; publishing must not
+                        // append duplicate diagnostics or exclusion ranges.
+                        self.diagnostics.retain(|diagnostic| {
+                            diagnostic.range.end <= range.start
+                                || diagnostic.range.start >= range.end
+                        });
+                        self.exclusions.retain(|excluded| {
+                            excluded.end <= range.start || excluded.start >= range.end
+                        });
                         self.exclusions.extend(exclusions);
                         self.exclusions
                             .sort_by_key(|exclusion| (exclusion.start, exclusion.end));
@@ -303,6 +333,13 @@ fn unknown_diagnostic(engine: &SpellEngine, range: Range<usize>, word: &str) -> 
         source_text: word.to_string(),
         message: format!("Possible misspelling: {word}"),
     })
+}
+
+fn spelling_word(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|character| character.is_alphabetic() || matches!(character, '\'' | '’'))
 }
 
 fn locally_safe(text: &str) -> bool {

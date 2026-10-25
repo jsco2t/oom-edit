@@ -943,13 +943,14 @@ fn tick_exposes_host_idle_deadline_and_mouse_uses_local_cells() {
     let mut pane = construct(dir.path(), vec![path]).pane;
     let now = Instant::now();
     pane.handle_input(PaneInput::Key(key('j')), now);
-    let early = pane.tick(now + std::time::Duration::from_secs(4));
+    let early =
+        pane.tick(now + std::time::Duration::from_secs(2) - std::time::Duration::from_nanos(1));
     assert!(!early.idle_due);
     assert_eq!(
         early.next_deadline,
-        Some(now + std::time::Duration::from_secs(5))
+        Some(now + std::time::Duration::from_secs(2))
     );
-    let due = pane.tick(now + std::time::Duration::from_secs(5));
+    let due = pane.tick(now + std::time::Duration::from_secs(2));
     assert!(due.idle_due);
     let _ = pane.idle_unit(4096);
 
@@ -1435,5 +1436,96 @@ fn unnamed_tab_metadata_and_open_events_preserve_optional_paths() {
     assert_eq!(
         std::fs::read_to_string(existing_path).unwrap(),
         "replacement\n"
+    );
+}
+
+#[test]
+fn spell_idle_starts_at_two_seconds_and_typing_restarts_the_deadline() {
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("spell.md");
+    std::fs::write(&path, "helo\n").unwrap();
+    let mut pane = construct(dir.path(), vec![path]).pane;
+    let now = Instant::now();
+    pane.handle_input(PaneInput::Key(key('i')), now);
+    assert!(
+        !pane
+            .tick(now + Duration::from_secs(2) - Duration::from_nanos(1))
+            .idle_due
+    );
+    assert!(pane.tick(now + Duration::from_secs(2)).idle_due);
+    // Begin bounded work, then observe a new character and a pasted payload.
+    assert!(pane.idle_unit(4096).worked);
+    let typed = now + Duration::from_secs(2) + Duration::from_millis(1);
+    pane.handle_input(PaneInput::Key(key('x')), typed);
+    assert!(
+        !pane
+            .tick(typed + Duration::from_secs(2) - Duration::from_nanos(1))
+            .idle_due
+    );
+    assert!(pane.tick(typed + Duration::from_secs(2)).idle_due);
+    assert!(pane.idle_unit(4096).worked);
+    let pasted = typed + Duration::from_secs(3);
+    pane.handle_input(PaneInput::Paste("hello ".into()), pasted);
+    assert!(
+        !pane
+            .tick(pasted + Duration::from_secs(2) - Duration::from_nanos(1))
+            .idle_due
+    );
+    assert!(pane.tick(pasted + Duration::from_secs(2)).idle_due);
+}
+
+#[test]
+fn selecting_a_spelling_fix_updates_the_visible_count_before_idle_rescan() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("spell.md");
+    std::fs::write(&path, "helo helo\nhelo\n").unwrap();
+    let mut pane = construct(dir.path(), vec![path]).pane;
+    let now = Instant::now();
+    pane.render(80, 24, now);
+    let drain = |pane: &mut EditorPane| {
+        for _ in 0..10_000 {
+            if !pane.idle_unit(4096).worked {
+                return;
+            }
+        }
+        panic!("bounded spelling work must become quiescent");
+    };
+    drain(&mut pane);
+    assert_eq!(pane.status().unwrap().spell.unwrap().count, 3);
+    for character in "gg s".chars() {
+        pane.handle_input(PaneInput::Key(key(character)), now);
+    }
+    assert!(pane.input_state().modal);
+    pane.handle_input(PaneInput::Key(special(KeyCodeKind::Enter)), now);
+    assert!(!pane.input_state().modal);
+    assert_eq!(
+        pane.status().unwrap().spell.unwrap().count,
+        2,
+        "remove only the corrected occurrence"
+    );
+    let frame = pane.render(80, 24, now);
+    let row: String = frame.cells[23 * 80..]
+        .iter()
+        .map(|cell| cell.symbol.as_str())
+        .collect();
+    assert!(row.contains("🅂 2"), "{row}");
+    for character in " d".chars() {
+        pane.handle_input(PaneInput::Key(key(character)), now);
+    }
+    assert!(pane.input_state().modal);
+    pane.handle_input(PaneInput::Key(special(KeyCodeKind::Esc)), now);
+    drain(&mut pane);
+    assert_eq!(
+        pane.status().unwrap().spell.unwrap().count,
+        2,
+        "rescanning must not duplicate retained diagnostics"
+    );
+    pane.handle_input(PaneInput::Key(key('u')), now);
+    drain(&mut pane);
+    assert_eq!(pane.status().unwrap().spell.unwrap().count, 3);
+    assert_eq!(
+        pane.text(&pane.active_tab().unwrap()).unwrap(),
+        "helo helo\nhelo\n"
     );
 }

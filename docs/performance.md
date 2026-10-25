@@ -272,6 +272,71 @@ five-process distribution. These globally invalidating operations are measured
 and disclosed;
 they are **not** covered by the <50 ms local-edit guarantee.
 
+## Second-round editor regression gates
+
+The second-round baseline is the complete first-round commit
+`b5ad3d488baf77f6061e35d649b27282c96942a2`. Record its complete interaction
+inventory before applying the second-round changes, then use
+`make interaction-perf-compare` as described above on the same host. All
+existing absolute budgets and comparison allowances remain unchanged.
+
+Run the new behavioral checks with `make test-search-status`,
+`make test-insert-navigation`, and `make test-spell-updates`. The last includes
+injected-clock two-second scheduling, interrupted scans and immediate
+diagnostic-count updates. These checks also run in `make test` and `make check`.
+
+`make bench-round2` runs the targeted optimized measurements below;
+`make bench` includes them too. Fixtures are approximately 1 MiB unless a
+scan-unit size is specified. Every measurement verifies its resulting state.
+
+| Measurement | Limit |
+| --- | ---: |
+| Build a rendered search summary index | <500 ms worst |
+| Read the cached search summary | <1 ms worst |
+| Source edit, source frame and active search summary | <50 ms worst |
+| Wrapped Insert Up/Down pair | <25 ms worst |
+| One spelling scan unit, at most 4 KiB | <2 ms worst |
+| Complete spelling scan | <300 ms worst |
+| Additional correction overhead with 1,000 retained diagnostics | <100 µs worst |
+| Input that interrupts a partial spelling scan | <10 ms worst |
+
+The correction measurement alternates eight matched pairs per trial, uses
+five measured trials, and compares real correction times with one versus
+1,001 published diagnostics. Both documents and corrected words are identical;
+dictionary membership changes which surrounding words are diagnosed. The
+fixture has separate paragraphs and 1,000 other misspellings on the corrected
+line. It measures additional diagnostic maintenance during a local correction;
+it does not assert a universal correction latency for a single huge paragraph.
+The cold search index scans searchable rendered glyphs through their source
+atoms. Retained row chunks cache match offsets for the current pattern;
+local edits rescan only replaced chunks, and fence splices update only the
+changed source rows. Untouched matches follow the row store's lazy source
+offsets. Rebuilding the sorted summary visits cached matches without copying
+off-screen rendered rows; unchanged queries reuse that summary. Pattern,
+width, link-marker and global document changes still invalidate the affected
+cache. The navigation fixture checks that
+repeated visual motion does not edit text or build the full rendered document.
+These guards and the complete interaction comparison establish measured
+regression coverage, rather than an identical-performance claim for every
+possible Markdown document or host.
+
+`make test-search-work` checks deterministic row-copy and glyph-scan work, and
+compares every logical-line ordinal against fresh rendering across edits,
+source shifts, fence splices, undo/redo, changed patterns and resized layouts.
+
+`make bench-search-interactions` runs active-search and cleared-search typing
+on the fixed 1 MiB mixed fixture at top and midpoint, five fresh processes and
+21 insert/delete cycles per case (840 observations, 100x41). Both variants
+first submit the same search and enter Insert at the same source position;
+the control clears it with `:noh` before timing. Every edit restores the
+expected text and checks the exact search total after its completed frame.
+Each case retains the <50 ms p99 local-edit budget. Median active-search
+render and total time must not exceed the cleared control by both more than
+10% and more than 100 microseconds; median process peak RSS uses the existing
+5% and 1 MiB allowances. The runner writes raw evidence, including failed
+runs, with `OUTPUT=/path/to/search.jsonl`. `make bench` includes this gate;
+the original 12-case comparison inventory remains unchanged.
+
 ## Exact 1 MiB kitchen-sink interaction acceptance
 
 `examples/kitchen-sink-1mb.md` is a separate, authored-pattern fixture with

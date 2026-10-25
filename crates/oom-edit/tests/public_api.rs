@@ -43,6 +43,7 @@ fn oom_edit_facade_exports_only_the_curated_host_api() {
     let _: fn(&EditorPane, KeyInput) -> KeyOwnership = EditorPane::key_ownership;
     let _: fn(KeyInput) -> Option<HostReservation> = EditorPane::host_reservation;
     let _: fn(&EditorPane) -> Option<EditorStatus> = EditorPane::status;
+    let _: Option<oom_edit::SearchStatus> = None;
     let minimal = PaneOptions {
         minimal_status_bar: true,
         ..PaneOptions::default()
@@ -256,7 +257,7 @@ fn oom_edit_facade_exports_only_the_curated_host_api() {
         "pub use args::{Args, ParseOutcome};",
         "pub use clipboard::Osc52Clipboard;",
         "pub use config::{ AutosaveConfig, ClipboardConfig, ClipboardCopyFormat, Config, ConfigApplyReport, ConfigField, ConfigPersistError, ConfigValidation, ConfigWarning, EditorConfig, FileThemeSink, SpellConfig, ThemeConfig, ThemePersistenceSink, ThemeSlot, };",
-        "pub use oom_edit_core::{ ClipboardError, ClipboardSink, DiagnosticSeverity, KeyCode, KeyCodeKind, KeyInput, Mode, Modifiers, SemanticStyle, };",
+        "pub use oom_edit_core::{ ClipboardError, ClipboardSink, DiagnosticSeverity, KeyCode, KeyCodeKind, KeyInput, Mode, Modifiers, SearchStatus, SemanticStyle, };",
         "pub use owned_style::{ColorValue, OwnedStyle, StyleModifiers};",
         "pub use pane::{ AllowAllFileAccess, CommandPolicy, DiskChange, EditorPane, ExternalChangeToken, FileAccessPolicy, FileOperation, FilePolicyError, InputDisposition, OpenCursor, OpenOptions, OpenOutcome, PaneConstruction, PaneConstructionReport, PaneError, PaneErrorKind, PaneEvent, PaneIdleResult, PaneInit, PaneInput, PaneInputState, PaneMouse, PaneMouseKind, PaneOptions, PaneServices, PaneTick, PaneWarning, PreparedClose, PreparedRetarget, RequestId, Retarget, TabId, TabSnapshot, };",
         "pub use pane_frame::{PaneCell, PaneCursor, PaneCursorShape, PaneFrame};",

@@ -87,7 +87,7 @@ pub use document::{SaveBoundary, SaveObserver};
 pub use error::{DiskDecisionError, FmError, OpenError, ReloadError, RetargetError, SaveError};
 pub use frontmatter::{FrontMatter, Num, Value};
 pub use input::{KeyCode, KeyCodeKind, KeyInput, Modifiers};
-pub use session::{CommandHistory, EditorSession};
+pub use session::{CommandHistory, EditorSession, SearchStatus};
 pub use session::{Effect, Mode, Severity, Viewport};
 pub use spell::{
     DecorationKind, Diagnostic, DiagnosticDecorationRow, DiagnosticProvider, DiagnosticSeverity,

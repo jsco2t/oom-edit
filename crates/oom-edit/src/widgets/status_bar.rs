@@ -29,7 +29,7 @@ use crate::theme::{Theme, Tier, UiSlot};
 /// Status bar transient message TTL: 4 seconds.
 pub const TRANSIENT_TTL: Duration = Duration::from_secs(4);
 
-/// Base ruler column width: `line:col  n%` — max ~22 chars for large files.
+/// Minimum ruler width; larger source positions and totals reserve more cells.
 pub const RULER_COLS: u16 = 22;
 
 /// Fixed mode-badge width, sized for the longest public mode label.
@@ -88,10 +88,12 @@ pub struct StatusBar {
     pub cursor_line: usize,
     /// Cursor column — 1-based for display.
     pub cursor_col: usize,
-    /// Total line count (for percentage calculation).
+    /// Total source-line count, displayed after the percentage.
     pub line_count: usize,
     /// Current spelling-issue count, or `None` when spell checking is disabled.
     pub spell_issues: Option<SpellIssues>,
+    /// Active nonempty search occurrence counts.
+    pub search: Option<oom_edit_core::SearchStatus>,
     /// Command-line text (when Command or rendered search is active).
     pub command_line: Option<String>,
 }
@@ -118,8 +120,8 @@ pub struct StatusBarText {
     pub ruler_width: u16,
     /// Active command or rendered-search prompt, including its prefix.
     pub prompt: Option<String>,
-    /// Whether the cursor should be visible at the end of the prompt.
-    pub prompt_cursor: bool,
+    /// UTF-8 byte cursor within the prompt, or `None` when it is hidden.
+    pub prompt_cursor: Option<usize>,
 }
 
 impl StatusBar {
@@ -165,10 +167,24 @@ impl StatusBar {
             .spell_issues
             .map(|issues| format!("🅂 {} ", issues.count))
             .unwrap_or_default();
-        let ruler_width = RULER_COLS.saturating_add(
-            u16::try_from(Line::from(spell_indicator.as_str()).width()).unwrap_or(u16::MAX),
+        let search_indicator = self
+            .search
+            .map(|search| format!("🄵 {}:{} ", search.current, search.total))
+            .unwrap_or_default();
+        let position = ruler_text(self.cursor_line, self.cursor_col, self.line_count);
+        let position_width =
+            u16::try_from(Line::from(position.as_str()).width()).unwrap_or(u16::MAX);
+        let ruler_width = RULER_COLS.max(position_width).saturating_add(
+            u16::try_from(Line::from(format!("{search_indicator}{spell_indicator}")).width())
+                .unwrap_or(u16::MAX),
         );
         let mut ruler_spans = Vec::new();
+        if !search_indicator.is_empty() {
+            ruler_spans.push(Span::styled(
+                search_indicator,
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+        }
         if let Some(issues) = self.spell_issues {
             let symbol_style = issues.highest_severity.map_or_else(
                 || {
@@ -188,7 +204,7 @@ impl StatusBar {
             ));
         }
         ruler_spans.push(Span::styled(
-            ruler_text(self.cursor_line, self.cursor_col, self.line_count),
+            position,
             Style::default().add_modifier(Modifier::DIM),
         ));
         let ruler = Line::from(ruler_spans);
@@ -199,7 +215,7 @@ impl StatusBar {
             ruler,
             ruler_width,
             prompt: self.command_line.clone(),
-            prompt_cursor: self.command_line.is_some(),
+            prompt_cursor: self.command_line.as_ref().map(String::len),
         }
     }
 }
@@ -240,17 +256,28 @@ pub fn render(
 
     if let Some(prompt) = &text.prompt {
         let prompt_area = Rect::new(flexible_x, area.y, flexible_width, 1.min(area.height));
+        let mut visible_start = 0;
+        let cursor_column = text.prompt_cursor.map(|cursor| {
+            let prefix = Span::raw(prompt.get(..cursor).unwrap_or(prompt));
+            let budget = usize::from(flexible_width.saturating_sub(1));
+            let width = prefix.width();
+            let mut skipped = 0;
+            for grapheme in prefix.styled_graphemes(Style::default()) {
+                if skipped >= width.saturating_sub(budget) {
+                    break;
+                }
+                skipped += Span::raw(grapheme.symbol).width();
+                visible_start += grapheme.symbol.len();
+            }
+            width.saturating_sub(skipped) as u16
+        });
         frame.render_widget(
-            Paragraph::new(prompt.as_str()).style(row_style),
+            Paragraph::new(&prompt[visible_start..]).style(row_style),
             prompt_area,
         );
 
-        if text.prompt_cursor {
-            let prompt_width = Line::from(prompt.as_str()).width() as u16;
-            let col = flexible_x
-                .saturating_add(prompt_width)
-                .min(area.x.saturating_add(usable_width).saturating_sub(1));
-            frame.set_cursor_position(Position::new(col, area.y));
+        if let Some(column) = cursor_column {
+            frame.set_cursor_position(Position::new(flexible_x.saturating_add(column), area.y));
         }
         return;
     }
@@ -278,9 +305,15 @@ pub fn render(
         frame.render_widget(Paragraph::new(middle_line).style(row_style), middle_area);
     }
     if ruler_width > 0 {
+        let clipped = text.ruler.width().saturating_sub(usize::from(ruler_width));
         frame.render_widget(
             Paragraph::new(text.ruler.clone())
-                .alignment(Alignment::Right)
+                .alignment(if clipped == 0 {
+                    Alignment::Right
+                } else {
+                    Alignment::Left
+                })
+                .scroll((0, u16::try_from(clipped).unwrap_or(u16::MAX)))
                 .style(row_style),
             ruler_area,
         );
@@ -308,7 +341,7 @@ fn mode_badge_style(mode: Mode, theme: &Theme, tier: Tier) -> Style {
     theme.ui_style(tier, slot)
 }
 
-/// Build the ruler text: `line:col  n%` with Top/Bot at extremes.
+/// Build the ruler text: `line:col  n% [total]` with Top/Bot at extremes.
 ///
 /// Percent = cursor_line / line_count (1-based cursor, 1-based line_count).
 /// At the top (line 1): shows `Top`. At the bottom (line == line_count): shows `Bot`.
@@ -319,7 +352,7 @@ pub fn ruler_text(cursor_line: usize, cursor_col: usize, line_count: usize) -> S
     let lc = line_count.max(1);
 
     if lc <= 1 {
-        return format!("1:{column_display}  Top");
+        return format!("1:{column_display}  [1] Top");
     }
 
     // Determine percentage and edge label.
@@ -337,9 +370,9 @@ pub fn ruler_text(cursor_line: usize, cursor_col: usize, line_count: usize) -> S
     };
 
     if edge.is_empty() {
-        format!("{cursor_display}:{column_display}  {pct_int}%")
+        format!("{cursor_display}:{column_display}  {pct_int}% [{lc}]")
     } else {
-        format!("{cursor_display}:{column_display}  {pct_int}% {edge}")
+        format!("{cursor_display}:{column_display}  {pct_int}% [{lc}] {edge}")
     }
 }
 
@@ -453,6 +486,7 @@ mod tests {
             cursor_line: 1,
             cursor_col: 1,
             line_count: 10,
+            search: None,
             spell_issues: Some(SpellIssues {
                 count: 0,
                 highest_severity: None,
@@ -514,7 +548,7 @@ mod tests {
                 .iter()
                 .map(|span| span.content.as_ref())
                 .collect::<String>(),
-            "🅂 12 1:1  10% Top"
+            "🅂 12 1:1  10% [10] Top"
         );
         assert_eq!(
             text.ruler_width,
@@ -529,7 +563,7 @@ mod tests {
                 .iter()
                 .map(|span| span.content.as_ref())
                 .collect::<String>(),
-            "1:1  10% Top"
+            "1:1  10% [10] Top"
         );
         assert_eq!(text.ruler_width, RULER_COLS);
     }
@@ -567,7 +601,7 @@ mod tests {
                     .symbol()
             })
             .collect::<String>();
-        assert!(row.ends_with("🅂 12 1:1  10% Top "), "{row:?}");
+        assert!(row.ends_with("🅂 12 1:1  10% [10] Top "), "{row:?}");
         assert!(!row.contains("🅂 12  1:1"), "{row:?}");
     }
 
@@ -601,7 +635,9 @@ mod tests {
                         .symbol(),
                     " "
                 );
-                if width > STATUS_CONTENT_OFFSET + STATUS_RIGHT_GAP_COLS && built.prompt_cursor {
+                if width > STATUS_CONTENT_OFFSET + STATUS_RIGHT_GAP_COLS
+                    && built.prompt_cursor.is_some()
+                {
                     assert!(terminal.backend().cursor_position().x < width - 1);
                 }
             }
@@ -765,14 +801,14 @@ mod tests {
 
     #[test]
     fn ruler_reports_top_middle_and_bottom() {
-        assert_eq!(ruler_text(1, 1, 10), "1:1  10% Top");
-        assert_eq!(ruler_text(5, 7, 10), "5:7  50%");
-        assert_eq!(ruler_text(10, 2, 10), "10:2  100% Bot");
+        assert_eq!(ruler_text(1, 1, 10), "1:1  10% [10] Top");
+        assert_eq!(ruler_text(5, 7, 10), "5:7  50% [10]");
+        assert_eq!(ruler_text(10, 2, 10), "10:2  100% [10] Bot");
     }
 
     #[test]
     fn ruler_handles_single_line_and_document_boundaries() {
-        assert_eq!(ruler_text(1, 9, 1), "1:9  Top");
+        assert_eq!(ruler_text(1, 9, 1), "1:9  [1] Top");
         assert!(ruler_text(2, 3, 100).contains("2%"));
         assert!(ruler_text(99, 4, 100).contains("99%"));
     }
@@ -884,7 +920,7 @@ mod tests {
         let prompt = bar.build(None, &DEFAULT_DARK, Tier::TrueColor);
         assert_eq!(prompt.badge.content.as_ref(), " :CMD ");
         assert_eq!(prompt.prompt.as_deref(), Some(":w"));
-        assert!(prompt.prompt_cursor);
+        assert!(prompt.prompt_cursor.is_some());
     }
 }
 

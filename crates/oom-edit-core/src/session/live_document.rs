@@ -8,7 +8,7 @@ use std::ops::Range;
 use crate::frontmatter::{front_matter_span, parse_front_matter, FrontMatter};
 use crate::input::KeyInput;
 use crate::rendered::{BlockModel, ModelChange, RetainedBlockModel};
-use crate::spell::{Diagnostic, SpellState};
+use crate::spell::{Diagnostic, SpellEdit, SpellState};
 use crate::syntax::Highlighter;
 use crate::vim::{
     collapsed_descending_edit, Mode as VimMode, ProjectedSelection, ProjectedYank, RangeOperator,
@@ -295,23 +295,44 @@ impl LiveDocument {
         range: Range<usize>,
         replacement: &str,
     ) -> Option<MutationOutcome> {
+        self.replace_range_for(range, replacement, SpellEdit::General)
+    }
+
+    pub(super) fn replace_spelling(
+        &mut self,
+        range: Range<usize>,
+        replacement: &str,
+    ) -> Option<MutationOutcome> {
+        self.replace_range_for(range, replacement, SpellEdit::Correction)
+    }
+
+    fn replace_range_for(
+        &mut self,
+        range: Range<usize>,
+        replacement: &str,
+        kind: SpellEdit,
+    ) -> Option<MutationOutcome> {
         let edits = self.vim.replace_range(range, replacement)?;
         let effects = if edits.is_empty() {
             Vec::new()
         } else {
             vec![VimEffect::Edited { edits }]
         };
-        self.refresh_derived(&effects);
+        self.refresh_derived_for(&effects, kind);
         Some(MutationOutcome { effects })
     }
 
     fn refresh_derived(&mut self, effects: &[VimEffect]) {
+        self.refresh_derived_for(effects, SpellEdit::General);
+    }
+
+    fn refresh_derived_for(&mut self, effects: &[VimEffect], kind: SpellEdit) {
         let mut front_matter_affected = false;
         for effect in effects {
             if let VimEffect::Edited { edits } = effect {
-                let invalidation = self
-                    .spell
-                    .prepare_invalidation(self.highlighter.text(), edits);
+                let invalidation =
+                    self.spell
+                        .prepare_invalidation(self.highlighter.text(), edits, kind);
                 if let Some(collapsed) = collapsed_descending_edit(self.highlighter.text(), edits) {
                     front_matter_affected |=
                         edit_may_change_front_matter(self.highlighter.text(), &collapsed);

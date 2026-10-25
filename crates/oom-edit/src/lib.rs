@@ -98,7 +98,7 @@ pub use config::{
 };
 pub use oom_edit_core::{
     ClipboardError, ClipboardSink, DiagnosticSeverity, KeyCode, KeyCodeKind, KeyInput, Mode,
-    Modifiers, SemanticStyle,
+    Modifiers, SearchStatus, SemanticStyle,
 };
 pub use owned_style::{ColorValue, OwnedStyle, StyleModifiers};
 pub use pane::{

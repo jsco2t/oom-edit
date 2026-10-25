@@ -434,8 +434,8 @@ fn palette_line(row: &PaletteRow, selected: bool, width: u16) -> String {
         PaletteRow::Reference {
             keys,
             desc,
-            row_id,
             prefill,
+            ..
         } => (
             match (selected, prefill.is_some()) {
                 (true, true) => "↳ ",
@@ -445,7 +445,7 @@ fn palette_line(row: &PaletteRow, selected: bool, width: u16) -> String {
             },
             keys.as_str(),
             desc.as_str(),
-            row_id.as_str(),
+            prefill.unwrap_or(""),
         ),
     };
     let columns = palette_columns(width);
@@ -627,7 +627,8 @@ mod tests {
             );
 
             let command_tail = command.find("Space h").expect("command binding");
-            let reference_tail = reference.find("R-N4").expect("reference row id");
+            assert!(!reference.contains("R-N4"));
+            let reference_tail = reference.len() - palette_columns(width).tail;
             assert_eq!(
                 Line::from(&command[..command_tail]).width(),
                 Line::from(&reference[..reference_tail]).width()

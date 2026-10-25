@@ -202,6 +202,10 @@ fn run_interaction(args: &[String]) -> Result<(), Box<dyn Error>> {
         case,
         "source-type"
             | "source-type-mid"
+            | "source-search"
+            | "source-search-mid"
+            | "source-search-cleared"
+            | "source-search-cleared-mid"
             | "source-structural"
             | "source-structural-mid"
             | "source-line"
@@ -221,6 +225,10 @@ fn run_interaction(args: &[String]) -> Result<(), Box<dyn Error>> {
         case,
         "source-type"
             | "source-type-mid"
+            | "source-search"
+            | "source-search-mid"
+            | "source-search-cleared"
+            | "source-search-cleared-mid"
             | "source-structural"
             | "source-structural-mid"
             | "source-line"
@@ -310,19 +318,60 @@ fn run_interaction(args: &[String]) -> Result<(), Box<dyn Error>> {
         std::hint::black_box(editor.render(width, height, Instant::now()));
     }
 
+    let search_total = if case.starts_with("source-search") {
+        input(&mut editor, KeyCodeKind::Esc);
+        std::hint::black_box(editor.render(width, height, Instant::now()));
+        for character in "/paragraph".chars() {
+            input(&mut editor, KeyCodeKind::Char(character));
+        }
+        input(&mut editor, KeyCodeKind::Enter);
+        std::hint::black_box(editor.render(width, height, Instant::now()));
+        let matches = editor.status().unwrap().search.unwrap().total;
+        assert!(matches > 100, "mixed search must cover off-screen content");
+        let total = if case.contains("cleared") {
+            for character in ":noh".chars() {
+                input(&mut editor, KeyCodeKind::Char(character));
+            }
+            input(&mut editor, KeyCodeKind::Enter);
+            None
+        } else {
+            Some(matches)
+        };
+        input(&mut editor, KeyCodeKind::Char('i'));
+        std::hint::black_box(editor.render(width, height, Instant::now()));
+        total
+    } else {
+        None
+    };
+
+    let verify_search = |editor: &EditorPane| {
+        if case.starts_with("source-search") {
+            assert_eq!(
+                editor.status().unwrap().search.map(|search| search.total),
+                search_total,
+                "typing must preserve exact active search counts"
+            );
+        }
+    };
+
     for index in 0..iterations {
         match case {
             "source-type"
             | "source-type-mid"
+            | "source-search"
+            | "source-search-mid"
+            | "source-search-cleared"
+            | "source-search-cleared-mid"
             | "source-structural"
             | "source-structural-mid"
             | "source-frontmatter"
             | "source-reference" => {
-                let character = if case.starts_with("source-type") {
-                    'x'
-                } else {
-                    '#'
-                };
+                let character =
+                    if case.starts_with("source-type") || case.starts_with("source-search") {
+                        'x'
+                    } else {
+                        '#'
+                    };
                 interaction_step(
                     &mut editor,
                     &identity,
@@ -335,6 +384,7 @@ fn run_interaction(args: &[String]) -> Result<(), Box<dyn Error>> {
                         Ok(())
                     },
                 )?;
+                verify_search(&editor);
                 let active = editor.active_tab().expect("interaction tab remains open");
                 assert_ne!(
                     editor.text(&active)?,
@@ -353,6 +403,7 @@ fn run_interaction(args: &[String]) -> Result<(), Box<dyn Error>> {
                         Ok(())
                     },
                 )?;
+                verify_search(&editor);
                 assert_eq!(
                     editor.text(&active)?,
                     text,
@@ -621,6 +672,10 @@ fn run_interaction(args: &[String]) -> Result<(), Box<dyn Error>> {
         case,
         "source-type"
             | "source-type-mid"
+            | "source-search"
+            | "source-search-mid"
+            | "source-search-cleared"
+            | "source-search-cleared-mid"
             | "source-structural"
             | "source-structural-mid"
             | "source-line"

@@ -3,20 +3,20 @@
   3 │ au┌ Command Palette ─────────────────────────────────────────────┐       │
   4 └───│>                                                             │───────┘
   5     │                                                              │
-  6 █ He│· v              character-wise selection       select-charac…│
-  7     │· V              line-wise selection            select-line   │
-  8 Some│· Ctrl-V         block-wise selection           select-block  │
-  9     │· Esc / Ctrl-C   cancel selection               cancel-select │
- 10 ┃ A │· "{register}    select register                select-regist…│
- 11     │· y              yank (Markdown by default) to… select-yank   │
-    ▏ ru│· Y              yank and send plain text to c… select-yank-p…│
- 13 ▏ fn│· d / x          delete selection               select-delete │
- 14 ▏   │· c              change selection               select-change │
- 15 ▏ } │· >              indent selection               select-indent │
-    ▏   │· <              outdent selection              select-outdent│
- 17     │· o              swap selection endpoint        select-swap-a…│
- 18 ────│· /              search rendered text           search        │────────
- 19     │· :              enter Command mode             command       │
+  6 █ He│· v              character-wise selection                     │
+  7     │· V              line-wise selection                          │
+  8 Some│· Ctrl-V         block-wise selection                         │
+  9     │· Esc / Ctrl-C   cancel selection                             │
+ 10 ┃ A │· "{register}    select register                              │
+ 11     │· y              yank (Markdown by default) to…               │
+    ▏ ru│· Y              yank and send plain text to c…               │
+ 13 ▏ fn│· d / x          delete selection                             │
+ 14 ▏   │· c              change selection                             │
+ 15 ▏ } │· >              indent selection                             │
+    ▏   │· <              outdent selection                            │
+ 17     │· o              swap selection endpoint                      │
+ 18 ────│· /              search rendered text                         │────────
+ 19     │· :              enter Command mode                           │
  20 Anot│▸ help           command palette                ? / Space h/? │
  21     └──────────────────────────────────────────────────────────────┘
  22 More text here.

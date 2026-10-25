@@ -90,6 +90,25 @@ downstream-negative-check: ## Reject bad resolved sources and corrupted vendored
 test-package-guards: ## Verify integrated facade documentation, consumer snippet and CI ownership
 	cargo test --package oom-edit --test package_guards --offline --locked
 
+.PHONY: test-clipboard-boundaries
+test-clipboard-boundaries: ## Verify byte-exact rendered selection copy and paste boundaries
+	cargo test --package oom-edit-core --test clipboard_boundaries --offline --locked
+
+.PHONY: test-search-editing-core
+test-search-editing-core: ## Verify editable rendered search drafts through the core session
+	cargo test --package oom-edit-core --test search_editing --offline --locked
+
+.PHONY: test-search-editing-pane
+test-search-editing-pane: ## Verify search editing and prompt cursor through the public pane
+	cargo test --package oom-edit --test search_editing --offline --locked
+
+.PHONY: test-search-editing
+test-search-editing: test-search-editing-core test-search-editing-pane ## Verify core and pane search editing
+
+.PHONY: test-status-line-count
+test-status-line-count: ## Verify total source-line counts in pane metadata and status rows
+	cargo test --package oom-edit --test status_line_count --offline --locked
+
 .PHONY: test-config-public
 test-config-public: ## Verify public config roundtrip, exact fallbacks, presence and safe persistence
 	cargo test --package oom-edit --test config_public --offline --locked
@@ -410,6 +429,7 @@ bench: ## Run exact asserting release performance gates
 	cargo bench --workspace --offline --locked
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/tui_performance.py gate
 	$(MAKE) bench-pane-frame
+	$(MAKE) bench-search-interactions
 
 .PHONY: bench-pane-frame
 bench-pane-frame: ## Assert 200x60 owned-frame conversion is at most 1 ms in release
@@ -637,3 +657,37 @@ run-isolated: ## Run with temporary XDG config for manual verification (pass ARG
 .PHONY: clean
 clean: ## Remove build artifacts
 	cargo clean
+
+.PHONY: test-search-status
+test-search-status: ## Verify search counts, clearing and meaningful help through core and pane
+	cargo test --package oom-edit-core --test search_status --offline --locked
+	cargo test --package oom-edit --test search_status --offline --locked
+	cargo test --package oom-edit --test bindings_public --offline --locked
+
+.PHONY: bench-round2
+bench-round2: ## Assert active-search, wrapped-source and spelling regression performance
+	OOM_BENCH_ROUND2_ONLY=1 cargo bench --package oom-edit-core --bench performance --offline --locked
+
+.PHONY: test-search-work
+test-search-work: ## Verify bounded retained search counting and exact search status
+	cargo test --package oom-edit-core --lib --offline --locked active_search_
+	cargo test --package oom-edit-core --lib --offline --locked local_unicode_fence_edits_keep_full_source_and_rendered_fidelity
+	$(MAKE) test-search-status
+
+.PHONY: bench-search-interactions
+bench-search-interactions: ## Compare active/cleared search typing on 1 MiB mixed notes at top and midpoint
+	cargo build --release --package oom-edit --example performance_realistic --offline --locked
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/interaction_performance.py --search-gate --binary target/release/examples/performance_realistic --trials 5 --iterations 21 $(if $(OUTPUT),--output $(OUTPUT),)
+
+.PHONY: test-insert-navigation
+test-insert-navigation: ## Verify exact Insert newlines and wrapped cursor movement in core and pane
+	cargo test --package oom-edit-core --test insert_navigation --offline --locked
+	cargo test --package oom-edit-core --test source_viewport --offline --locked
+	cargo test --package oom-edit --test insert_navigation --offline --locked
+
+.PHONY: test-spell-updates
+test-spell-updates: ## Verify idle timing, scan cancellation and immediate correction counts
+	cargo test --package oom-edit-core --test spell_session --offline --locked
+	cargo test --package oom-edit --test pane_public --offline --locked
+	cargo test --package oom-edit --test standalone_parity --offline --locked
+	cargo test --package oom-edit --lib event::tests --offline --locked

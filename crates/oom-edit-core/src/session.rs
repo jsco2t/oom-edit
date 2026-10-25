@@ -6,6 +6,9 @@
 //! document model and highlighting pipeline.
 
 mod live_document;
+mod search;
+
+pub use search::SearchStatus;
 
 // ── Mode ───────────────────────────────────────────────────────────────────
 
@@ -272,6 +275,231 @@ mod tests {
             expected.line_numbers[..viewport.line_numbers.len()]
         );
         assert_complete_reference(&mut session, 24);
+    }
+
+    #[test]
+    fn active_search_edits_do_not_copy_the_complete_retained_document() {
+        let text = crate::realistic_fixtures::generate("mixed", 256 * 1024);
+        let mut session = EditorSession::from_text(&text);
+        session.rendered_viewport(100, 0, 41);
+        session
+            .rendered_state
+            .search
+            .replace_last(RenderedSearch::new("paragraph"));
+        let expected = session.search_status().unwrap().total;
+        session
+            .jump_to_offset(text.find("A paragraph").unwrap())
+            .unwrap();
+        session.handle_key(key('i'));
+        let before = session
+            .rendered_state
+            .row_cache
+            .as_ref()
+            .unwrap()
+            .selection_reads();
+        let scanned = session
+            .rendered_state
+            .row_cache
+            .as_ref()
+            .unwrap()
+            .search_scanned_rows();
+        session.handle_key(key('x'));
+        assert_eq!(session.search_status().unwrap().total, expected);
+        let after = session
+            .rendered_state
+            .row_cache
+            .as_ref()
+            .unwrap()
+            .selection_reads();
+        assert_eq!(
+            after, before,
+            "search counts copied off-screen rendered rows"
+        );
+        let rows = session.rendered_state.row_cache.as_ref().unwrap();
+        assert!(
+            rows.search_scanned_rows() - scanned < 64,
+            "search rescanned untouched blocks"
+        );
+        let scanned = rows.search_scanned_rows();
+        assert_eq!(session.search_status().unwrap().total, expected);
+        assert_eq!(
+            session
+                .rendered_state
+                .row_cache
+                .as_ref()
+                .unwrap()
+                .search_scanned_rows(),
+            scanned
+        );
+    }
+
+    fn assert_active_search_matches_fresh(session: &EditorSession, width: u16) {
+        let search = session.rendered_search().unwrap();
+        let text = session.document();
+        let mut fresh = EditorSession::from_text(&text);
+        let expected = search::SearchIndex::build(search, width, &fresh.render_layout(width).lines);
+        let source_lines = session.live.highlighter().line_starts();
+        assert_eq!(
+            session.search_status().unwrap(),
+            expected.status(session.cursor().0, source_lines)
+        );
+        let actual = session.rendered_state.search_index.borrow();
+        for line in 0..source_lines.len() {
+            assert_eq!(
+                actual.as_ref().unwrap().status(line, source_lines),
+                expected.status(line, source_lines),
+                "search ordinal drifted on source line {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn active_search_flat_to_retained_handoff_primes_match_caches() {
+        let text = "how how\n\n".repeat(256);
+        let mut session = EditorSession::from_text(&text);
+        session.render_layout(80);
+        session
+            .rendered_state
+            .search
+            .replace_last(RenderedSearch::new("how"));
+        assert_eq!(session.search_status().unwrap().total, 512);
+        session.handle_key(key('i'));
+        let before = session
+            .rendered_state
+            .row_cache
+            .as_ref()
+            .unwrap()
+            .search_scanned_rows();
+        assert!(before > 256);
+        session.handle_key(key('x'));
+        assert_eq!(session.search_status().unwrap().total, 512);
+        let rows = session.rendered_state.row_cache.as_ref().unwrap();
+        assert!(rows.search_scanned_rows() - before < 4);
+    }
+
+    #[test]
+    fn active_search_counts_match_fresh_after_shifts_markers_undo_and_resize() {
+        let text = format!(
+            "---\ntitle: Café how\n---\n\n# how &amp; \\*how\\* 🙂\n\nhow how\n\n{}\n| how | café |\n|---|---|\n| `how` | &amp; |\n\nA how [^note].\n\n[^note]: how footnote\n",
+            "how [link](https://how.invalid)\n\n".repeat(12),
+        );
+        for pattern in ["how", "1", "2", "🙂", "&"] {
+            let mut session = EditorSession::from_text(&text);
+            session.rendered_viewport(32, 0, 20);
+            session
+                .rendered_state
+                .search
+                .replace_last(RenderedSearch::new(pattern));
+            assert_active_search_matches_fresh(&session, 32);
+            session
+                .jump_to_offset(text.find("how how").unwrap())
+                .unwrap();
+            session.handle_key(key('i'));
+            for inserted in ["x", "how", "\n", "[extra](https://extra.invalid) ", "🙂"] {
+                session.insert_paste(inserted);
+                assert_active_search_matches_fresh(&session, 32);
+            }
+            session.handle_key(special(KeyCodeKind::Backspace));
+            assert_active_search_matches_fresh(&session, 32);
+            session.handle_key(esc());
+            session.handle_key(key('u'));
+            assert_active_search_matches_fresh(&session, 32);
+            session.handle_key(ctrl('r'));
+            assert_active_search_matches_fresh(&session, 32);
+            for width in [13, 80] {
+                session.rendered_viewport(width, 0, 20);
+                assert_active_search_matches_fresh(&session, width);
+            }
+            session
+                .rendered_state
+                .search
+                .replace_last(RenderedSearch::new("link"));
+            assert_active_search_matches_fresh(&session, 80);
+            session.clear_search();
+            assert!(session.search_status().is_none());
+            session
+                .rendered_state
+                .search
+                .replace_last(RenderedSearch::new(pattern));
+            assert_active_search_matches_fresh(&session, 80);
+        }
+    }
+
+    #[test]
+    fn active_search_refreshes_lazy_link_markers_after_local_link_insertions() {
+        let text = format!("before\n\n{}", "[how](https://how.invalid)\n\n".repeat(12));
+        let mut session = EditorSession::from_text(&text);
+        session.rendered_viewport(32, 0, 20);
+        session
+            .rendered_state
+            .search
+            .replace_last(RenderedSearch::new("1"));
+        assert_active_search_matches_fresh(&session, 32);
+        session.jump_to_offset(0).unwrap();
+        session.handle_key(key('i'));
+        for inserted in [
+            "[added](https://added.invalid) ",
+            "x",
+            "[more](https://more.invalid) ",
+        ] {
+            session.insert_paste(inserted);
+            assert!(
+                session.rendered_state.row_cache.is_some(),
+                "local link edits must retain suffix chunks"
+            );
+            assert_active_search_matches_fresh(&session, 32);
+        }
+    }
+
+    #[test]
+    fn active_search_fence_splices_scan_only_changed_rows_with_lazy_offsets() {
+        let text = format!(
+            "before how\n\n```rust\n{}\n```\n\nafter how\n",
+            "fn how() { let value = 1; } // how\n".repeat(256)
+        );
+        let mut session = EditorSession::from_text(&text);
+        session.rendered_viewport(80, 0, 20);
+        session
+            .rendered_state
+            .search
+            .replace_last(RenderedSearch::new("how"));
+        assert_active_search_matches_fresh(&session, 80);
+        session.jump_to_offset(0).unwrap();
+        session.handle_key(key('i'));
+        session.insert_paste("x");
+        assert_active_search_matches_fresh(&session, 80);
+        for line in [128, 64, 192, 129] {
+            let offset = session.live.highlighter().line_starts()[line + 1] - 1;
+            session.jump_to_offset(offset).unwrap();
+            for kind in [
+                KeyCodeKind::Char('x'),
+                KeyCodeKind::Backspace,
+                KeyCodeKind::Enter,
+            ] {
+                let before = session
+                    .rendered_state
+                    .row_cache
+                    .as_ref()
+                    .unwrap()
+                    .search_scanned_rows();
+                session.handle_key(special(kind));
+                assert_active_search_matches_fresh(&session, 80);
+                let rows = session
+                    .rendered_state
+                    .row_cache
+                    .as_ref()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "lost retained rows after {kind:?} on {line}; incremental fence {}",
+                            session.live.highlighter().fence_edit_is_incremental()
+                        )
+                    });
+                assert!(
+                    rows.search_scanned_rows() - before <= 3,
+                    "fence search rescanned unchanged lines"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2364,7 +2592,24 @@ fn prepare_fenced_code_yank_selection(
     let covered: Vec<_> = fence_regions
         .iter()
         .filter(|region| {
-            selected_rows.start <= region.rows.start && region.rows.end <= selected_rows.end
+            selected_rows.start <= region.rows.start
+                && (region.rows.end <= selected_rows.end
+                    || (region.rows.start < selected_rows.end
+                        && layout.lines[region.rows.clone()]
+                            .iter()
+                            .flat_map(|line| &line.atoms)
+                            .filter_map(|atom| atom.source.as_ref())
+                            .all(|source| {
+                                let after = selection
+                                    .source_ranges
+                                    .partition_point(|selected| selected.start <= source.start);
+                                selection
+                                    .source_ranges
+                                    .get(after.saturating_sub(1))
+                                    .is_some_and(|selected| {
+                                        selected.start <= source.start && source.end <= selected.end
+                                    })
+                            })))
         })
         .cloned()
         .collect();
@@ -2580,6 +2825,7 @@ enum RenderedSearchState {
     },
     Prompt {
         draft: RenderedSearch,
+        cursor: usize,
         origin: RenderedCursor,
         last: Option<RenderedSearch>,
     },
@@ -2611,16 +2857,49 @@ impl RenderedSearchState {
             Self::Inactive { last } | Self::Prompt { last, .. } => last,
         };
         *self = Self::Prompt {
+            cursor: draft.pattern.len(),
             draft,
             origin,
             last,
         };
     }
 
-    fn update_draft(&mut self, update: impl FnOnce(&mut RenderedSearch)) {
-        if let Self::Prompt { draft, .. } = self {
-            update(draft);
+    /// Edit the prompt, returning whether its pattern changed.
+    fn edit(&mut self, key: KeyInput) -> bool {
+        let Self::Prompt { draft, cursor, .. } = self else {
+            return false;
+        };
+        if key.mods.ctrl || key.mods.alt {
+            return false;
         }
+        let pattern = &mut draft.pattern;
+        match key.code.kind {
+            KeyCodeKind::Char(c) if !c.is_control() => {
+                pattern.insert(*cursor, c);
+                *cursor += c.len_utf8();
+                return true;
+            }
+            KeyCodeKind::Backspace if *cursor > 0 => {
+                let previous = pattern[..*cursor].chars().next_back().unwrap().len_utf8();
+                pattern.drain(*cursor - previous..*cursor);
+                *cursor -= previous;
+                return true;
+            }
+            KeyCodeKind::Delete if *cursor < pattern.len() => {
+                pattern.remove(*cursor);
+                return true;
+            }
+            KeyCodeKind::Left if *cursor > 0 => {
+                *cursor -= pattern[..*cursor].chars().next_back().unwrap().len_utf8();
+            }
+            KeyCodeKind::Right if *cursor < pattern.len() => {
+                *cursor += pattern[*cursor..].chars().next().unwrap().len_utf8();
+            }
+            KeyCodeKind::Home => *cursor = 0,
+            KeyCodeKind::End => *cursor = pattern.len(),
+            _ => {}
+        }
+        false
     }
 
     fn submit(&mut self) {
@@ -2679,6 +2958,7 @@ struct RenderedState {
     /// Submitted rendered search or an atomic prompt with fixed origin and
     /// preserved prior history.
     search: RenderedSearchState,
+    search_index: std::cell::RefCell<Option<search::SearchIndex>>,
     /// Whether the front-matter panel is collapsed.
     fm_collapsed: bool,
     /// Accumulated numeric count for navigation commands.
@@ -2711,6 +2991,7 @@ impl RenderedState {
             cursor: RenderedCursor::new(0),
             register_input: RegisterInput::Default,
             search: RenderedSearchState::default(),
+            search_index: std::cell::RefCell::new(None),
             fm_collapsed: false,
             count: 0,
             pending_g: false,
@@ -2734,6 +3015,7 @@ impl RenderedState {
 
     /// Invalidate the layout cache.
     fn invalidate(&mut self) {
+        self.search_index.get_mut().take();
         self.layout_cache = None;
         self.row_cache = None;
         self.layout_boundaries.clear();
@@ -2760,6 +3042,29 @@ pub struct EditorSession {
     document: Document,
     /// Persistent rendered navigation and Select state.
     rendered_state: RenderedState,
+    source_navigation: SourceNavigation,
+}
+
+#[derive(Default)]
+enum SourceNavigation {
+    #[default]
+    Unconfigured,
+    Logical {
+        goal: Option<usize>,
+    },
+    Wrapped {
+        width: u16,
+        goal: Option<usize>,
+    },
+}
+
+impl SourceNavigation {
+    fn reset_goal(&mut self) {
+        match self {
+            Self::Logical { goal } | Self::Wrapped { goal, .. } => *goal = None,
+            Self::Unconfigured => {}
+        }
+    }
 }
 
 enum SaveBaseline {
@@ -2790,6 +3095,7 @@ impl EditorSession {
             command_history: CommandHistory::new(),
             document,
             rendered_state: RenderedState::new(),
+            source_navigation: SourceNavigation::default(),
         }
     }
 
@@ -2821,6 +3127,7 @@ impl EditorSession {
             command_history: CommandHistory::new(),
             document,
             rendered_state: RenderedState::new(),
+            source_navigation: SourceNavigation::default(),
         }
     }
 
@@ -2962,6 +3269,7 @@ impl EditorSession {
         expected: &crate::document::DiskVersion,
     ) -> Result<(), crate::error::ReloadError> {
         let candidate = self.document.prepare_reload(expected)?;
+        self.source_navigation.reset_goal();
         if candidate.text != self.live.text_ref() {
             let cursor = self.live.cursor();
             // Release rows for the obsolete text before allocating replacement
@@ -3247,7 +3555,7 @@ impl EditorSession {
         }
         let Some(outcome) = self
             .live
-            .replace_range(diagnostic.range.clone(), replacement)
+            .replace_spelling(diagnostic.range.clone(), replacement)
         else {
             return vec![Effect::Message {
                 text: "Spelling diagnostic range is invalid; no replacement was applied"
@@ -3294,6 +3602,7 @@ impl EditorSession {
         let position = self
             .position_for_offset(offset)
             .expect("validated source offset must have a position");
+        self.source_navigation.reset_goal();
         self.live.jump_to(position.line, position.column);
         self.remap_active_cursor_from_canonical();
         self.refresh_character_selection();
@@ -3486,6 +3795,18 @@ impl EditorSession {
         Some(format!("{prefix}{}", search.pattern))
     }
 
+    /// Return the active search prompt's UTF-8 byte cursor, including its prefix.
+    ///
+    /// The offset is a character boundary in [`Self::rendered_search_prompt`].
+    /// Hosts convert the preceding text to display cells when drawing a cursor.
+    /// Submitted or cancelled searches return `None`.
+    pub fn rendered_search_prompt_cursor(&self) -> Option<usize> {
+        match &self.rendered_state.search {
+            RenderedSearchState::Prompt { cursor, .. } => Some(1 + cursor),
+            RenderedSearchState::Inactive { .. } => None,
+        }
+    }
+
     /// Return the rendered cursor position.
     pub fn rendered_cursor(&self) -> RenderedPoint {
         self.rendered_state.cursor.point()
@@ -3504,6 +3825,66 @@ impl EditorSession {
     /// Return the retained rendered search state.
     pub fn rendered_search(&self) -> Option<&RenderedSearch> {
         self.rendered_state.search.current()
+    }
+
+    /// Return occurrence counts for the active nonempty rendered search.
+    ///
+    /// The current ordinal includes every occurrence through the cursor's logical
+    /// source line, including wrapped continuations. Before the first match it is
+    /// zero; a search with no matches reports zero for both fields. An empty or
+    /// cleared search returns `None`. Repeated queries reuse the rendered index.
+    pub fn search_status(&self) -> Option<SearchStatus> {
+        let search = self.rendered_state.search.current()?;
+        if search.pattern.is_empty() {
+            return None;
+        }
+        let width = self.rendered_state.last_width.max(1);
+        let mut cached = self.rendered_state.search_index.borrow_mut();
+        if cached
+            .as_ref()
+            .is_none_or(|index| index.pattern != search.pattern || index.width != width)
+        {
+            let index = if let Some(layout) = &self.rendered_state.layout_cache {
+                search::SearchIndex::build(search, width, &layout.lines)
+            } else if let Some(rows) = &self.rendered_state.row_cache {
+                let offsets = rows.search_offsets(
+                    search,
+                    self.live.rendered_model(),
+                    self.live.highlighter(),
+                    width,
+                );
+                search::SearchIndex::from_offsets(search, width, offsets)
+            } else {
+                let text = self.live.text_ref();
+                let model = crate::rendered::RetainedBlockModel::new(text);
+                let (layout, _, _) = RenderedLayout::build_with_boundaries(
+                    model.model(),
+                    width,
+                    self.live.highlighter(),
+                    self.rendered_state.fm_collapsed,
+                );
+                search::SearchIndex::build(search, width, &layout.lines)
+            };
+            *cached = Some(index);
+        }
+        Some(
+            cached
+                .as_ref()
+                .expect("search index was prepared")
+                .status(self.cursor().0, self.live.highlighter().line_starts()),
+        )
+    }
+
+    /// Clear the active search and both rendered and source search highlighting.
+    ///
+    /// Text, cursor, selection and undo history are unchanged.
+    pub fn clear_search(&mut self) {
+        self.live.clear_search_highlight();
+        self.rendered_state.search.clear();
+        self.rendered_state.search_index.get_mut().take();
+        if let Some(rows) = &mut self.rendered_state.row_cache {
+            rows.clear_search_cache();
+        }
     }
 
     /// Return renderer-neutral Select metadata, or `None` outside Select.
@@ -3755,6 +4136,22 @@ impl EditorSession {
         source_col
     }
 
+    /// Supply the source text width and wrapping policy for Insert Up/Down.
+    ///
+    /// Width excludes gutters and surrounding chrome. Zero width uses logical
+    /// line movement. Rendering a source viewport supplies the same settings;
+    /// hosts can call this before input without first painting a frame.
+    pub fn set_source_viewport(&mut self, width: u16, wrap: bool) {
+        if wrap && width > 0 {
+            if !matches!(self.source_navigation, SourceNavigation::Wrapped { width: old, .. } if old == width)
+            {
+                self.source_navigation = SourceNavigation::Wrapped { width, goal: None };
+            }
+        } else if !matches!(self.source_navigation, SourceNavigation::Logical { .. }) {
+            self.source_navigation = SourceNavigation::Logical { goal: None };
+        }
+    }
+
     /// Return the cursor's visual row within a document line and that line's
     /// total wrapped height at `width`.
     ///
@@ -3843,6 +4240,7 @@ impl EditorSession {
         Vec<Vec<RenderedSourceAtom>>,
         Vec<usize>,
     ) {
+        self.set_source_viewport(vp.width, vp.wrap);
         self.live.set_viewport(vp.top_line, vp.height);
         let line_count = self.line_count();
         let (cursor_line, cursor_col) = self.cursor();
@@ -4400,6 +4798,9 @@ impl EditorSession {
     /// ```
     pub fn render_layout(&mut self, width: u16) -> &crate::style::RenderedLayout {
         if self.rendered_state.needs_layout(width) {
+            if self.rendered_state.last_width != width {
+                self.rendered_state.search_index.get_mut().take();
+            }
             let source_anchor = self.live.cursor();
             let selection = match &self.session_mode {
                 SessionMode::Select(selection) => Some(selection.clone()),
@@ -4583,6 +4984,21 @@ impl EditorSession {
         } else {
             RetainedRows::from_complete(layout, fences, &boundaries)
         };
+        if let Some(search) = self
+            .rendered_state
+            .search
+            .current()
+            .filter(|search| !search.pattern.is_empty())
+        {
+            let offsets = rows.search_offsets(
+                search,
+                self.live.rendered_model(),
+                self.live.highlighter(),
+                width,
+            );
+            *self.rendered_state.search_index.get_mut() =
+                Some(search::SearchIndex::from_offsets(search, width, offsets));
+        }
         self.rendered_state.code_fence_regions = rows.fence_regions();
         self.rendered_state.row_cache = Some(rows);
     }
@@ -4791,8 +5207,133 @@ impl EditorSession {
     }
 
     fn handle_insert_key(&mut self, key: KeyInput) -> Vec<Effect> {
+        if key.mods == Modifiers::default()
+            && matches!(key.code.kind, KeyCodeKind::Up | KeyCodeKind::Down)
+            && !matches!(self.source_navigation, SourceNavigation::Unconfigured)
+        {
+            return self.move_insert_vertical(key);
+        }
+        self.source_navigation.reset_goal();
         let vim_effects = self.live.handle_key(key);
         self.translate_vim_effects(vim_effects)
+    }
+
+    fn source_motion_rows(
+        &self,
+        row: usize,
+        width: u16,
+    ) -> (SourceDisplayLine, Vec<crate::style::StyledLine>) {
+        let display = SourceDisplayLine::new(&crate::style::StyledLine {
+            text: self.line(row).unwrap_or_default(),
+            spans: Vec::new(),
+        });
+        let mut rows = crate::rendered::wrap_source_line(&display.styled, width);
+        // A full-width line's end insertion point is a motion destination
+        // even when the current caret is on another row.
+        if Self::cursor_needs_blank_continuation(
+            &display.styled.text,
+            &rows,
+            display.styled.text.chars().count(),
+            width,
+        ) {
+            rows.push(crate::style::StyledLine {
+                text: String::new(),
+                spans: Vec::new(),
+            });
+        }
+        (display, rows)
+    }
+
+    fn move_insert_vertical(&mut self, key: KeyInput) -> Vec<Effect> {
+        let down = key.code.kind == KeyCodeKind::Down;
+        let (row, column) = self.cursor();
+        let (target, goal) = match self.source_navigation {
+            SourceNavigation::Logical { goal } => {
+                let goal = goal.unwrap_or(column);
+                let target_row = if down {
+                    row.checked_add(1).filter(|next| *next < self.line_count())
+                } else {
+                    row.checked_sub(1)
+                };
+                let target = target_row.map(|row| {
+                    let length = self.line(row).map_or(0, |line| line.chars().count());
+                    (row, goal.min(length))
+                });
+                (target, goal)
+            }
+            SourceNavigation::Wrapped { width, goal } => {
+                let (display, rows) = self.source_motion_rows(row, width);
+                let (visual_row, visual_column) = Self::wrapped_cursor_position(
+                    &display.styled.text,
+                    &rows,
+                    display.display_char(column),
+                );
+                let prefix: String = rows[visual_row].text.chars().take(visual_column).collect();
+                let goal =
+                    goal.unwrap_or_else(|| unicode_width::UnicodeWidthStr::width(prefix.as_str()));
+                let destination = if down && visual_row + 1 < rows.len() {
+                    Some((row, visual_row + 1, display, rows))
+                } else if !down && visual_row > 0 {
+                    Some((row, visual_row - 1, display, rows))
+                } else {
+                    let next = if down {
+                        row.checked_add(1).filter(|next| *next < self.line_count())
+                    } else {
+                        row.checked_sub(1)
+                    };
+                    next.map(|next| {
+                        let (display, rows) = self.source_motion_rows(next, width);
+                        let visual_row = if down {
+                            0
+                        } else {
+                            rows.len().saturating_sub(1)
+                        };
+                        (next, visual_row, display, rows)
+                    })
+                };
+                let target = destination.map(|(row, visual_row, display, rows)| {
+                    let before: usize = rows[..visual_row]
+                        .iter()
+                        .map(|line| line.text.chars().count())
+                        .sum();
+                    let mut cells = 0;
+                    let mut characters = 0;
+                    for character in rows[visual_row].text.chars() {
+                        let width = character.width().unwrap_or(0);
+                        if cells + width > goal {
+                            break;
+                        }
+                        cells += width;
+                        characters += 1;
+                    }
+                    // A continuation owns the position just past this row's text.
+                    if visual_row + 1 < rows.len() {
+                        characters =
+                            characters.min(rows[visual_row].text.chars().count().saturating_sub(1));
+                    }
+                    let source_column = display
+                        .source_to_display_char
+                        .partition_point(|start| *start <= before + characters)
+                        .saturating_sub(1);
+                    (row, source_column)
+                });
+                (target, goal)
+            }
+            SourceNavigation::Unconfigured => unreachable!("configured source navigation"),
+        };
+        match &mut self.source_navigation {
+            SourceNavigation::Logical { goal: stored }
+            | SourceNavigation::Wrapped { goal: stored, .. } => *stored = Some(goal),
+            SourceNavigation::Unconfigured => {}
+        }
+        let Some((row, column)) = target else {
+            return Vec::new();
+        };
+        // Preserve the engine's Insert-session and key-recording bookkeeping,
+        // then publish the source position derived from the visible rows.
+        let effects = self.live.handle_key(key);
+        self.live.jump_to(row, column);
+        self.translate_vim_effects(effects)
     }
 
     fn handle_rendered_normal_key(&mut self, key: KeyInput) -> Vec<Effect> {
@@ -5513,21 +6054,13 @@ impl EditorSession {
                 self.rendered_state.search.submit();
                 Vec::new()
             }
-            KeyCodeKind::Char(c)
-                if !key.mods.ctrl
-                    && !key.mods.alt
-                    && !key.mods.shift
-                    && (c.is_ascii_alphanumeric() || c == ' ' || c == '.' || c == '_') =>
-            {
-                let Some((_, cursor)) = self.rendered_state.search.prompt() else {
+            _ => {
+                if !self.rendered_state.search.edit(key) {
                     return Vec::new();
-                };
+                }
+                let (search_state, cursor) = self.rendered_state.search.prompt().unwrap();
                 let cursor = *cursor;
-                let Some((search_state, _)) = self.rendered_state.search.prompt() else {
-                    return Vec::new();
-                };
-                let mut search_state = search_state.clone();
-                search_state.pattern.push(c);
+                let search_state = search_state.clone();
                 let match_line = if let Some(layout) = self.rendered_state.layout_cache.as_ref() {
                     nav::find_next_match(
                         &search_state,
@@ -5548,9 +6081,6 @@ impl EditorSession {
                 } else {
                     None
                 };
-                self.rendered_state
-                    .search
-                    .update_draft(|draft| *draft = search_state);
                 if let Some(match_line) = match_line {
                     self.rendered_state.cursor =
                         if let Some(layout) = self.rendered_state.layout_cache.as_ref() {
@@ -5580,11 +6110,11 @@ impl EditorSession {
                     Vec::new()
                 }
             }
-            _ => Vec::new(),
         }
     }
 
     fn enter_insert_from_rendered(&mut self, action: RenderedExitAction) -> Vec<Effect> {
+        self.source_navigation.reset_goal();
         self.commit_rendered_cursor();
         if self.rendered_state.layout_cache.is_some() {
             self.ensure_rendered_rows(self.rendered_state.last_width);
@@ -6089,6 +6619,7 @@ impl EditorSession {
             }
         }
         if edited {
+            self.source_navigation.reset_goal();
             self.publish_rendered_text_change();
         }
         if left_insert && !edited {
@@ -6101,6 +6632,7 @@ impl EditorSession {
     }
 
     fn publish_rendered_text_change(&mut self) {
+        self.rendered_state.search_index.get_mut().take();
         #[cfg(test)]
         {
             self.rendered_state.last_publish_profile_ns = [0; 3];
@@ -6339,8 +6871,7 @@ impl EditorSession {
                 }
             }
             "noh" => {
-                self.live.clear_search_highlight();
-                self.rendered_state.search.clear();
+                self.clear_search();
                 vec![Effect::Message {
                     text: "Search highlighting cleared".to_string(),
                     severity: Severity::Info,

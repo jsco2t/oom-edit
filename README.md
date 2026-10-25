@@ -276,10 +276,28 @@ affected source line: a bold `•`, additionally underlined for an error.
 The highest severity wins when a line has more than one diagnostic. The marker
 remains visible without color; Trouble rows provide the severity and message.
 
+An active search shows `🄵 current:total` immediately left of the spelling count.
+The current number includes every occurrence through the cursor's source line,
+including its wrapped continuations; it is zero before the first matching line.
+A search with no matches shows `0:0`. The indicator is hidden until a nonempty
+search is active. `n` and `N` move to the next/previous matching rendered row;
+`Space c` or `:noh` clears the search and its highlighting without editing text.
+
+In Insert mode, Up and Down move through visual wrapped rows and retain the
+preferred display column across shorter rows. With wrapping disabled they move
+by source line. End places the insertion point after the final character, so
+trailing spaces stay on their original line when Enter starts a new one.
+
 Wrapping can also be changed for the running session with `:set wrap` and
 `:set nowrap`; `wrap_width` is read at startup. Spell checking can be toggled
 with `Space z`, `:set spell`, or
 `:set nospell`; runtime toggles are not written back to configuration.
+
+Spell work starts after two seconds without input and runs in bounded idle
+units. Typing or pasting invalidates an in-progress document scan, so obsolete
+results cannot replace current diagnostics. Selecting a spelling correction
+updates the issue count immediately and retains other valid misspellings,
+including those on the same line; the later scan reconciles the edited text.
 
 Additional dictionaries are UTF-8 plain-text word lists with one entry per line.
 Relative paths are resolved from the directory containing `config.toml`.

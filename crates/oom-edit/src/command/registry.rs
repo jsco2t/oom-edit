@@ -112,8 +112,10 @@ pub enum RegistryEntryId {
     Substitute,
     /// Reference for substitution across the document.
     SubstituteAll,
-    /// Reference for clearing search highlighting.
+    /// Clear the active search through the App's Space chord.
     ClearSearch,
+    /// Reference for clearing the active search through ex input.
+    ClearSearchEx,
     /// Reference for opening editor help through ex input.
     ExHelp,
 }
@@ -130,6 +132,7 @@ pub enum AppCommand {
     SpellAdd,
     SpellToggle,
     Trouble,
+    ClearSearch,
 }
 
 /// Binding ownership and finite dispatch role.
@@ -751,7 +754,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         "repeat-search",
         RENDERED,
         &[Keys(&[character_key('n')]), Keys(&[character_key('N')])],
-        (4, "n / N", "Repeat the rendered search.", "R-N4", None)
+        (4, "n / N", "Next/Previous search matches", "R-N4", None)
     ),
     reference_row!(
         SourceInsert,
@@ -934,15 +937,31 @@ pub static COMMANDS: &[CommandSpec] = &[
             Some("%s/")
         )
     ),
+    CommandSpec {
+        id: RegistryEntryId::ClearSearch,
+        name: "clear-search",
+        desc: "clear active search",
+        contexts: RENDERED,
+        binding: BindingRole::AppChord {
+            continuation: 'c',
+            command: AppCommand::ClearSearch,
+        },
+        aliases: &[],
+        sequences: &[],
+        references: &[],
+        conformance_id: None,
+        quick_bar_order: None,
+        quick_label: None,
+    },
     reference_row!(
-        ClearSearch,
-        "clear-search",
+        ClearSearchEx,
+        "clear-search-ex",
         Contexts::COMMAND,
         &[SequenceSpec::Ex("noh")],
         (
             23,
             ":noh",
-            "Clear search-match highlighting.",
+            "Clear active search and highlighting.",
             "V-X8",
             Some("noh")
         )
@@ -1191,15 +1210,16 @@ mod tests {
                 | QuitAll | RenderedMotion | RenderedEnds | RenderedTargets | RepeatSearch
                 | SourceInsert | ExitInsert | UndoRedo | Write | WriteCopy | ExQuit
                 | ExForceQuit | WriteQuit | Exit | EditPath | Reload | ReloadAll | SaveAs
-                | LineNumber | Substitute | SubstituteAll | ClearSearch | ExHelp => {}
+                | LineNumber | Substitute | SubstituteAll | ClearSearch | ClearSearchEx
+                | ExHelp => {}
             }
             assert!(ids.insert(spec.id));
             assert!(names.insert(spec.name));
             assert!(!spec.contexts.is_empty());
             assert!(!rendered_binding(spec).is_empty());
         }
-        assert_eq!(COMMANDS.len(), 55);
-        assert_eq!(primary_commands().count(), 33);
+        assert_eq!(COMMANDS.len(), 56);
+        assert_eq!(primary_commands().count(), 34);
     }
 
     #[test]
@@ -1280,7 +1300,7 @@ mod tests {
             2
         );
         let palette = crate::overlay::PaletteState::new(Contexts::ALL);
-        assert_eq!(palette.build_rows(Contexts::ALL).len(), 58);
+        assert_eq!(palette.build_rows(Contexts::ALL).len(), 59);
     }
 
     #[test]
@@ -1754,6 +1774,17 @@ mod tests {
                 BindingRole::CoreEx {
                     display: ":qa",
                     prefill: Some("qa"),
+                },
+                None,
+            ),
+            (
+                RegistryEntryId::ClearSearch,
+                "clear-search",
+                "clear active search",
+                RENDERED,
+                BindingRole::AppChord {
+                    continuation: 'c',
+                    command: AppCommand::ClearSearch,
                 },
                 None,
             ),

@@ -58,6 +58,33 @@ fn assert_no_exported_macros(path: &Path) {
 }
 
 #[test]
+fn search_prompt_cursor_is_a_prefixed_utf8_byte_boundary() {
+    let mut session = EditorSession::from_text("plain");
+    session.render_layout(40);
+    let send = |session: &mut EditorSession, kind| {
+        session.handle_key(KeyInput {
+            code: KeyCode { kind },
+            mods: Modifiers::default(),
+        });
+    };
+    assert_eq!(session.rendered_search_prompt_cursor(), None);
+    for c in "/a界é".chars() {
+        send(&mut session, KeyCodeKind::Char(c));
+        let prompt = session.rendered_search_prompt().unwrap();
+        assert_eq!(session.rendered_search_prompt_cursor(), Some(prompt.len()));
+    }
+    send(&mut session, KeyCodeKind::Left);
+    assert_eq!(session.rendered_search_prompt_cursor(), Some(5));
+    send(&mut session, KeyCodeKind::Left);
+    assert_eq!(session.rendered_search_prompt_cursor(), Some(2));
+    send(&mut session, KeyCodeKind::Enter);
+    assert_eq!(session.rendered_search_prompt_cursor(), None);
+    send(&mut session, KeyCodeKind::Char('/'));
+    send(&mut session, KeyCodeKind::Esc);
+    assert_eq!(session.rendered_search_prompt_cursor(), None);
+}
+
+#[test]
 fn public_facade_types_are_available_at_crate_root() {
     let mut session = EditorSession::from_text("# root\n");
     let _: Vec<Effect> = session.open_command_prompt("wq");
@@ -67,6 +94,10 @@ fn public_facade_types_are_available_at_crate_root() {
     let _: Effect = Effect::ReloadCurrentRequested { force: true };
     let _: Effect = Effect::ReloadAllRequested;
     let _: Mode = session.mode();
+    let _: fn(&EditorSession) -> Option<usize> = EditorSession::rendered_search_prompt_cursor;
+    let _: fn(&EditorSession) -> Option<oom_edit_core::SearchStatus> = EditorSession::search_status;
+    let _: fn(&mut EditorSession) = EditorSession::clear_search;
+    let _: fn(&mut EditorSession, u16, bool) = EditorSession::set_source_viewport;
     let _: fn(&EditorSession) -> bool = EditorSession::has_pending_input;
     let _: fn(&mut EditorSession) = EditorSession::clear_pending_input;
     let _: fn(&mut EditorSession, KeyInput, std::time::Duration) -> Vec<Effect> =
@@ -202,7 +233,7 @@ fn public_facade_remains_curated_without_partial_spell_reexports() {
             "pub use error::{DiskDecisionError, FmError, OpenError, ReloadError, RetargetError, SaveError};",
             "pub use frontmatter::{FrontMatter, Num, Value};",
             "pub use input::{KeyCode, KeyCodeKind, KeyInput, Modifiers};",
-            "pub use session::{CommandHistory, EditorSession};",
+            "pub use session::{CommandHistory, EditorSession, SearchStatus};",
             "pub use session::{Effect, Mode, Severity, Viewport};",
             "pub use spell::{ DecorationKind, Diagnostic, DiagnosticDecorationRow, DiagnosticProvider, DiagnosticSeverity, PositionError, TextPosition, };",
             "pub use style::{ JumpTarget, LineKind, RenderedLayout, RenderedLine, RenderedLineRole, RenderedPoint, RenderedSearch, RenderedSelection, RenderedSelectionRow, RenderedSourceAtom, RenderedViewportFrame, SearchDirection, SelectionShape, SemanticStyle, SourceDecoration, SourceFrame, Span, StyledLine, TargetKind, };",
@@ -256,4 +287,45 @@ fn front_matter_error_does_not_export_gray_matter() {
     let error_source = include_str!("../src/error.rs");
     assert!(!error_source.contains("pub gray_matter"));
     assert!(!error_source.contains("impl From<gray_matter"));
+}
+
+#[test]
+fn insert_end_is_after_the_last_scalar_so_enter_does_not_carry_trailing_spaces() {
+    use oom_edit_core::{EditorSession, KeyCode, KeyCodeKind, KeyInput, Modifiers};
+    let key = |kind| KeyInput {
+        code: KeyCode { kind },
+        mods: Modifiers::default(),
+    };
+    for text in ["A sentence.", "A sentence. ", "A sentence.  ", "café 界 "] {
+        let mut session = EditorSession::from_text(text);
+        session.render_layout(80);
+        session.handle_key(key(KeyCodeKind::Char('i')));
+        session.handle_key(key(KeyCodeKind::End));
+        assert_eq!(session.cursor(), (0, text.chars().count()), "{text:?}");
+        for count in 1..=2 {
+            session.handle_key(key(KeyCodeKind::Enter));
+            assert_eq!(session.document(), format!("{text}{}", "\n".repeat(count)));
+            assert_eq!(session.cursor(), (count, 0));
+        }
+    }
+}
+
+#[test]
+fn insert_end_then_two_enters_does_not_turn_a_trailing_space_into_indentation() {
+    use oom_edit_core::{EditorSession, KeyCode, KeyCodeKind, KeyInput, Modifiers};
+    let mut session = EditorSession::from_text("A sentence. ");
+    session.render_layout(80);
+    for kind in [
+        KeyCodeKind::Char('i'),
+        KeyCodeKind::End,
+        KeyCodeKind::Enter,
+        KeyCodeKind::Enter,
+    ] {
+        session.handle_key(KeyInput {
+            code: KeyCode { kind },
+            mods: Modifiers::default(),
+        });
+    }
+    assert_eq!(session.document(), "A sentence. \n\n");
+    assert_eq!(session.cursor(), (2, 0));
 }
