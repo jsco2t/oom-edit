@@ -15,11 +15,9 @@ pub(crate) enum SpellEdit {
 
 pub(crate) enum InvalidationPlan {
     Full,
-    Local {
+    Rescan {
         old_range: Range<usize>,
         diagnostic_range: Range<usize>,
-        edit_start: usize,
-        new_text_len: usize,
         delta: isize,
     },
 }
@@ -99,26 +97,30 @@ impl SpellState {
         let correction = matches!(kind, SpellEdit::Correction)
             && spelling_word(old_source)
             && spelling_word(&edit.new_text);
+        let context_sensitive = has_context_marker(&old_text[old_range.clone()])
+            || self
+                .exclusions
+                .iter()
+                .any(|exclusion| edit_touches(exclusion, &old_range));
         if !correction
-            && (!locally_safe(old_source)
-                || !locally_safe(&edit.new_text)
-                || has_context_marker(&old_text[old_range.clone()])
-                || self
-                    .exclusions
-                    .iter()
-                    .any(|exclusion| edit_touches(exclusion, &edit.range)))
+            && (!locally_safe(old_source) || !locally_safe(&edit.new_text) || context_sensitive)
         {
             return InvalidationPlan::Full;
         }
-        InvalidationPlan::Local {
+        // Corrections retain other diagnostics, but scanning must begin with
+        // complete context when inline constructs can span source lines.
+        let old_range = if correction && context_sensitive {
+            0..old_text.len()
+        } else {
+            old_range
+        };
+        InvalidationPlan::Rescan {
             diagnostic_range: if correction {
                 edit.range.clone()
             } else {
                 old_range.clone()
             },
             old_range,
-            edit_start: edit.range.start,
-            new_text_len: edit.new_text_len,
             delta: edit.new_text_len as isize - edit.range.len() as isize,
         }
     }
@@ -132,11 +134,9 @@ impl SpellState {
                     range: 0..new_text.len(),
                 };
             }
-            InvalidationPlan::Local {
+            InvalidationPlan::Rescan {
                 old_range,
                 diagnostic_range,
-                edit_start,
-                new_text_len,
                 delta,
             } => {
                 let pending_range = match &self.scan {
@@ -165,9 +165,11 @@ impl SpellState {
                     }
                     false
                 });
-                let new_end = edit_start.saturating_add(new_text_len).min(new_text.len());
-                let changed_range =
-                    containing_line(new_text, edit_start.min(new_text.len()), new_end);
+                let changed_range = old_range.start
+                    ..old_range
+                        .end
+                        .saturating_add_signed(delta)
+                        .min(new_text.len());
                 let range = pending_range.map_or(changed_range.clone(), |pending| {
                     let pending = shift_pending_range(pending, &old_range, delta, new_text.len());
                     pending.start.min(changed_range.start)..pending.end.max(changed_range.end)

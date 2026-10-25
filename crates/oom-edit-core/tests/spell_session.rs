@@ -915,6 +915,48 @@ fn same_line_corrections_retain_other_diagnostics_and_publish_exact_utf8_ranges(
 }
 
 #[test]
+fn corrections_beside_multiline_inline_code_match_fresh_scans() {
+    let dictionary = engine("hello\nworld\n");
+    for source in [
+        "`wrng\nwrng` helo\nwrld",
+        "helo `wrng\nwrng`\nwrld",
+        "``wrng\nwrng`` helo\nwrld",
+    ] {
+        for budget in [1, 3, usize::MAX] {
+            let mut session = EditorSession::from_text(source);
+            drain(&mut session, &dictionary, budget);
+            let original = session.diagnostics().to_vec();
+            assert_eq!(original.len(), 2, "{source:?}");
+            assert_eq!(original[0].source_text, "helo");
+            assert_eq!(original[1].source_text, "wrld");
+            assert!(session
+                .apply_spell_replacement(&original[0], "hello")
+                .contains(&Effect::Edited));
+
+            let mut remaining = original[1].clone();
+            remaining.range.start += 1;
+            remaining.range.end += 1;
+            assert_eq!(session.diagnostics(), &[remaining]);
+            assert!(session.diagnostics_pending());
+            let corrected = session.document();
+            let mut fresh = EditorSession::from_text(&corrected);
+            drain(&mut fresh, &dictionary, budget);
+            drain(&mut session, &dictionary, budget);
+            assert_eq!(session.diagnostics(), fresh.diagnostics(), "{source:?}");
+
+            session.handle_key(key('u'));
+            assert_eq!(session.document(), source);
+            drain(&mut session, &dictionary, budget);
+            assert_eq!(session.diagnostics(), original);
+            session.handle_key(ctrl('r'));
+            assert_eq!(session.document(), corrected);
+            drain(&mut session, &dictionary, budget);
+            assert_eq!(session.diagnostics(), fresh.diagnostics());
+        }
+    }
+}
+
+#[test]
 fn typing_and_paste_cancel_partially_found_scan_results_before_publication() {
     let dictionary = engine("hello\nworld\n");
     for paste in [false, true] {

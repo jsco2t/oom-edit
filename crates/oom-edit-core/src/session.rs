@@ -4991,14 +4991,14 @@ impl EditorSession {
             spans: Vec::new(),
         });
         let mut rows = crate::rendered::wrap_source_line(&display.styled, width);
-        if row == self.cursor().0
-            && Self::cursor_needs_blank_continuation(
-                &display.styled.text,
-                &rows,
-                display.display_char(self.cursor().1),
-                width,
-            )
-        {
+        // A full-width line's end insertion point is a motion destination
+        // even when the current caret is on another row.
+        if Self::cursor_needs_blank_continuation(
+            &display.styled.text,
+            &rows,
+            display.styled.text.chars().count(),
+            width,
+        ) {
             rows.push(crate::style::StyledLine {
                 text: String::new(),
                 spans: Vec::new(),
@@ -5068,6 +5068,11 @@ impl EditorSession {
                         }
                         cells += width;
                         characters += 1;
+                    }
+                    // A continuation owns the position just past this row's text.
+                    if visual_row + 1 < rows.len() {
+                        characters =
+                            characters.min(rows[visual_row].text.chars().count().saturating_sub(1));
                     }
                     let source_column = display
                         .source_to_display_char

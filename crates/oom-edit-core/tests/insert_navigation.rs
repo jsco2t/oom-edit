@@ -105,6 +105,39 @@ fn insert_arrows_move_by_wrapped_rows_and_retain_the_visual_goal_across_short_li
 }
 
 #[test]
+fn wrapped_motion_clamps_before_continuations_and_preserves_the_cell_goal() {
+    let source = "abcd界xyzuvw";
+    let mut session = insert(source, 5, 7);
+    assert_eq!(session.render_source(vp(5, true)).cursor, (1, 3));
+    for (motion, column, visual) in [
+        (KeyCodeKind::Up, 3, (0, 3)),
+        (KeyCodeKind::Up, 3, (0, 3)),
+        (KeyCodeKind::Down, 7, (1, 3)),
+        (KeyCodeKind::Down, 11, (2, 3)),
+        (KeyCodeKind::Up, 7, (1, 3)),
+        (KeyCodeKind::Up, 3, (0, 3)),
+    ] {
+        send(&mut session, motion);
+        assert_eq!(session.cursor(), (0, column), "{motion:?}");
+        assert_eq!(session.render_source(vp(5, true)).cursor, visual);
+        assert_eq!(session.document(), source);
+        assert!(!session.is_dirty());
+    }
+
+    let mut session = insert("01234abcd界xyz", 5, 4);
+    for (motion, column, visual) in [
+        (KeyCodeKind::Down, 8, (1, 3)),
+        (KeyCodeKind::Down, 12, (2, 3)),
+        (KeyCodeKind::Up, 8, (1, 3)),
+        (KeyCodeKind::Up, 4, (0, 4)),
+    ] {
+        send(&mut session, motion);
+        assert_eq!(session.cursor(), (0, column), "{motion:?}");
+        assert_eq!(session.render_source(vp(5, true)).cursor, visual);
+    }
+}
+
+#[test]
 fn unicode_tabs_and_combining_scalars_use_the_rendered_cell_mapping_for_vertical_motion() {
     for source in [
         "a\tbcdefghijklmno",
@@ -169,6 +202,104 @@ fn exact_width_eof_caret_can_move_up_from_its_blank_continuation() {
     assert_eq!(session.cursor(), (0, 0));
     send(&mut session, KeyCodeKind::Up);
     assert_eq!(session.cursor(), (0, 0));
+}
+
+#[test]
+fn exact_width_carets_are_reachable_in_both_vertical_directions() {
+    for source in ["abcdefghij", "abcdefghij\nnext", "界a界界a界"] {
+        let length = source.split('\n').next().unwrap().chars().count();
+        let mut session = insert(source, 5, length);
+        assert_eq!(session.render_source(vp(5, true)).cursor, (2, 0));
+        for _ in 0..2 {
+            send(&mut session, KeyCodeKind::Up);
+            assert_eq!(session.render_source(vp(5, true)).cursor, (1, 0));
+            send(&mut session, KeyCodeKind::Down);
+            assert_eq!(session.cursor(), (0, length));
+            assert_eq!(session.render_source(vp(5, true)).cursor, (2, 0));
+        }
+        send(&mut session, KeyCodeKind::Down);
+        if source.contains('\n') {
+            assert_eq!(session.cursor(), (1, 0));
+            send(&mut session, KeyCodeKind::Up);
+        }
+        assert_eq!(session.cursor(), (0, length));
+        assert_eq!(session.document(), source);
+        assert!(!session.is_dirty());
+    }
+}
+
+#[test]
+fn insert_navigation_preserves_edit_boundaries_without_redundant_undo_steps() {
+    for wrap in [false, true] {
+        for motion in [
+            KeyCodeKind::Left,
+            KeyCodeKind::Right,
+            KeyCodeKind::Up,
+            KeyCodeKind::Down,
+            KeyCodeKind::Home,
+            KeyCodeKind::End,
+        ] {
+            let original = "one\nxyz\nlast";
+            let mut session = EditorSession::from_text(original);
+            session.render_layout(80);
+            session.jump_to_offset(4).unwrap();
+            send(&mut session, KeyCodeKind::Char('i'));
+            session.set_source_viewport(5, wrap);
+            for character in "abc".chars() {
+                send(&mut session, KeyCodeKind::Char(character));
+            }
+            let before_motion = session.document();
+            // Repeated navigation should keep exactly one boundary for the
+            // preceding edits, even when a motion reaches a document edge.
+            for _ in 0..2 {
+                send(&mut session, motion);
+            }
+            send(&mut session, KeyCodeKind::Char('X'));
+            let edited = session.document();
+            send(&mut session, KeyCodeKind::Esc);
+            send(&mut session, KeyCodeKind::Char('u'));
+            assert_eq!(session.document(), before_motion, "{motion:?}, wrap={wrap}");
+            send(&mut session, KeyCodeKind::Char('u'));
+            assert_eq!(session.document(), original, "{motion:?}, wrap={wrap}");
+            assert!(!session.is_dirty());
+            for expected in [before_motion, edited] {
+                session.handle_key(KeyInput {
+                    mods: Modifiers {
+                        ctrl: true,
+                        ..Modifiers::default()
+                    },
+                    ..key(KeyCodeKind::Char('r'))
+                });
+                assert_eq!(session.document(), expected, "{motion:?}, wrap={wrap}");
+            }
+        }
+    }
+}
+
+#[test]
+fn navigation_breakpoints_handle_paste_and_unused_final_motions() {
+    for paste in [false, true] {
+        let mut session = insert("", 5, 0);
+        for character in "abc".chars() {
+            send(&mut session, KeyCodeKind::Char(character));
+        }
+        send(&mut session, KeyCodeKind::Left);
+        if paste {
+            session.insert_paste("X\nY");
+        }
+        let edited = session.document();
+        send(&mut session, KeyCodeKind::Right);
+        send(&mut session, KeyCodeKind::End);
+        send(&mut session, KeyCodeKind::Esc);
+        send(&mut session, KeyCodeKind::Char('u'));
+        if paste {
+            assert_eq!(edited, "abX\nYc");
+            assert_eq!(session.document(), "abc");
+            send(&mut session, KeyCodeKind::Char('u'));
+        }
+        assert_eq!(session.document(), "");
+        assert!(!session.is_dirty());
+    }
 }
 
 #[test]

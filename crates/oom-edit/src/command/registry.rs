@@ -112,8 +112,10 @@ pub enum RegistryEntryId {
     Substitute,
     /// Reference for substitution across the document.
     SubstituteAll,
-    /// Reference for clearing search highlighting.
+    /// Clear the active search through the App's Space chord.
     ClearSearch,
+    /// Reference for clearing the active search through ex input.
+    ClearSearchEx,
     /// Reference for opening editor help through ex input.
     ExHelp,
 }
@@ -946,17 +948,24 @@ pub static COMMANDS: &[CommandSpec] = &[
         },
         aliases: &[],
         sequences: &[],
-        references: &[ReferenceSpec {
-            order: 23,
-            keys: ":noh",
-            desc: "Clear active search and highlighting.",
-            conformance_id: "V-X8",
-            prefill: Some("noh"),
-        }],
+        references: &[],
         conformance_id: None,
         quick_bar_order: None,
         quick_label: None,
     },
+    reference_row!(
+        ClearSearchEx,
+        "clear-search-ex",
+        Contexts::COMMAND,
+        &[SequenceSpec::Ex("noh")],
+        (
+            23,
+            ":noh",
+            "Clear active search and highlighting.",
+            "V-X8",
+            Some("noh")
+        )
+    ),
     reference_row!(
         ExHelp,
         "ex-help",
@@ -1201,14 +1210,15 @@ mod tests {
                 | QuitAll | RenderedMotion | RenderedEnds | RenderedTargets | RepeatSearch
                 | SourceInsert | ExitInsert | UndoRedo | Write | WriteCopy | ExQuit
                 | ExForceQuit | WriteQuit | Exit | EditPath | Reload | ReloadAll | SaveAs
-                | LineNumber | Substitute | SubstituteAll | ClearSearch | ExHelp => {}
+                | LineNumber | Substitute | SubstituteAll | ClearSearch | ClearSearchEx
+                | ExHelp => {}
             }
             assert!(ids.insert(spec.id));
             assert!(names.insert(spec.name));
             assert!(!spec.contexts.is_empty());
             assert!(!rendered_binding(spec).is_empty());
         }
-        assert_eq!(COMMANDS.len(), 55);
+        assert_eq!(COMMANDS.len(), 56);
         assert_eq!(primary_commands().count(), 34);
     }
 

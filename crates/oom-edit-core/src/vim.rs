@@ -413,6 +413,8 @@ pub(crate) struct VimCore {
     modified_since_save: bool,
     /// Whether the preceding Normal-mode key was the `g` history prefix.
     history_prefix_pending: bool,
+    /// Sequence of an unused navigation breakpoint awaiting the next Insert edit.
+    navigation_undo: Option<u64>,
     /// Whole-document materializations observed by wrapper hot paths.
     #[cfg(test)]
     full_materializations: Cell<usize>,
@@ -448,6 +450,7 @@ impl VimCore {
             save_point_content,
             modified_since_save: false,
             history_prefix_pending: false,
+            navigation_undo: None,
             #[cfg(test)]
             full_materializations: Cell::new(0),
             #[cfg(test)]
@@ -509,10 +512,10 @@ impl VimCore {
             && matches!(key.code.kind, KeyCodeKind::Char('g'))
             && key.mods == Modifiers::default();
 
-        // Cursor-only Insert keys must not commit empty undo entries. Keep
-        // the native motion/session bookkeeping while the undo group drops
-        // its snapshot when no content changed.
-        let _navigation_undo = (mode_before == Mode::Insert
+        // Keep a breakpoint after edits until the next Insert run either
+        // changes text or ends. Unused and repeated navigation snapshots
+        // drop without adding empty undo steps.
+        let navigation = mode_before == Mode::Insert
             && key.mods == Modifiers::default()
             && matches!(
                 key.code.kind,
@@ -522,8 +525,16 @@ impl VimCore {
                     | KeyCodeKind::Down
                     | KeyCodeKind::Home
                     | KeyCodeKind::End
-            ))
-        .then(|| self.editor.undo_group());
+            );
+        let navigation_boundary = (navigation
+            && self.navigation_undo.is_none()
+            && self
+                .editor
+                .insert_session()
+                .is_some_and(|session| !session.before_rope.is_instance(&before)))
+        .then(|| self.editor.buffer().current_undo_seq());
+        let navigation_undo =
+            (navigation && navigation_boundary.is_none()).then(|| self.editor.undo_group());
         // Feed the key through hjkl
         let consumed = if self.is_visual_register_prefix(key) {
             // hjkl handles a pending register selector in every visual mode,
@@ -536,6 +547,7 @@ impl VimCore {
         } else {
             feed_input(&mut self.editor, hjkl_input)
         };
+        drop(navigation_undo);
 
         if !consumed {
             self.history_prefix_pending = false;
@@ -560,6 +572,16 @@ impl VimCore {
         let mut edits = self.drain_content_edits();
         let content_reset = self.editor.take_content_reset();
         let content_changed = self.editor.buffer().dirty_gen() != dirty_gen_before;
+        if content_changed {
+            self.navigation_undo = None;
+        } else if navigation_boundary
+            .is_some_and(|before| before != self.editor.buffer().current_undo_seq())
+        {
+            self.navigation_undo = Some(self.editor.buffer().current_undo_seq());
+        }
+        if self.compute_mode() != Mode::Insert {
+            self.discard_navigation_undo();
+        }
         if content_changed {
             let after = self.editor.buffer().rope();
             #[cfg(test)]
@@ -626,6 +648,16 @@ impl VimCore {
         }
 
         effects
+    }
+
+    fn discard_navigation_undo(&mut self) {
+        if self
+            .navigation_undo
+            .take()
+            .is_some_and(|sequence| sequence == self.editor.buffer().current_undo_seq())
+        {
+            self.editor.buffer().pop_committed();
+        }
     }
 
     /// Whether a consumed Insert action makes the resulting cursor column the
@@ -1130,6 +1162,7 @@ impl VimCore {
             return Some(Vec::new());
         }
 
+        self.discard_navigation_undo();
         let (start_row, start_col) = self.position_for_byte_offset(range.start);
         let (end_row, end_col) = self.position_for_byte_offset(range.end);
         {
@@ -1478,6 +1511,7 @@ impl VimCore {
     /// the hjkl input pipeline, so it counts as a single undo step.
     /// Returns the edits for the highlighter.
     pub(crate) fn insert_text(&mut self, text: &str) -> Vec<TextEdit> {
+        self.navigation_undo = None;
         self.modified_since_save = true;
         let buffer = self.editor.buffer_mut();
         let cursor = buffer.cursor();

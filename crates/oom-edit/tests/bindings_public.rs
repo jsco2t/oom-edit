@@ -175,8 +175,37 @@ fn fr_082_binding_roles() {
         .any(|b| b.execution == BindingExecution::ReferenceOnly));
 }
 
+#[test]
+fn clear_search_exports_the_ex_reference_and_the_owned_app_chord() {
+    let directory = tempfile::tempdir().unwrap();
+    let now = Instant::now();
+    let bindings = pane(directory.path(), now, false).bindings();
+    let ex = bindings
+        .iter()
+        .find(|binding| {
+            binding
+                .sequences
+                .contains(&BindingSequence::Ex("noh".into()))
+        })
+        .expect("clear-search ex grammar remains discoverable");
+    assert_eq!(ex.modes, [Mode::Command]);
+    assert_eq!(ex.execution, BindingExecution::ReferenceOnly);
+    assert_eq!(ex.id, BindingId::ClearSearchEx);
+    let chord = bindings
+        .iter()
+        .find(|binding| binding.id == BindingId::ClearSearch)
+        .unwrap();
+    assert_eq!(chord.modes, [Mode::Normal, Mode::Select]);
+    assert_eq!(chord.execution, BindingExecution::ExecutableApp);
+    assert_eq!(
+        chord.sequences,
+        [BindingSequence::Keys(vec![key(' '), key('c')])]
+    );
+    assert_ne!(chord.id, ex.id);
+}
+
 fn assert_binding_contract(bindings: &[oom_edit::EditorBinding]) {
-    assert_eq!(bindings.len(), 55);
+    assert_eq!(bindings.len(), 56);
     assert_eq!(
         bindings
             .iter()
@@ -196,7 +225,7 @@ fn assert_binding_contract(bindings: &[oom_edit::EditorBinding]) {
             .iter()
             .filter(|row| row.execution == BindingExecution::ReferenceOnly)
             .count(),
-        21
+        22
     );
     let select = bindings
         .iter()
