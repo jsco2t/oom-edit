@@ -522,6 +522,8 @@ fn performance_contract_docs_scripts_and_make_targets_stay_synchronized() {
     let evidence_tool = include_str!("../../../scripts/tui_performance.py");
 
     assert!(readme.contains("[docs/performance.md](docs/performance.md)"));
+    assert!(makefile.contains("\t$(MAKE) bench-search-interactions\n"));
+    assert!(documentation.contains("`make bench-search-interactions`"));
     for contract in [
         "less than 150 ms worst case",
         "less than 250 ms worst",

@@ -2,7 +2,9 @@
 
 #[cfg(test)]
 use std::cell::Cell;
+use std::cell::RefCell;
 use std::ops::Range;
+use std::sync::Arc;
 
 use crate::style::{
     JumpTarget, LineKind, RenderedCursor, RenderedLayout, RenderedLine, RenderedPoint,
@@ -25,6 +27,34 @@ struct RowChunk {
     line_delta: isize,
     marker_delta: isize,
     offsets: Vec<RowOffset>,
+    search: RefCell<Option<ChunkSearch>>,
+}
+
+struct RowMatch {
+    row: usize,
+    /// Stored row coordinates, before the chunk and row shifts are applied.
+    source: usize,
+}
+
+struct ChunkSearch {
+    pattern: Arc<str>,
+    marker_delta: isize,
+    matches: Vec<RowMatch>,
+}
+
+fn row_matches(search: &RenderedSearch, rows: &[RenderedLine], first: usize) -> Vec<RowMatch> {
+    rows.iter()
+        .enumerate()
+        .flat_map(|(local, row)| {
+            search
+                .source_match_offsets(row)
+                .into_iter()
+                .map(move |source| RowMatch {
+                    row: first + local,
+                    source,
+                })
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -41,6 +71,7 @@ impl RowChunk {
     }
 
     fn shift_sources_after(&mut self, old_end: usize, shift: RowShift) {
+        self.search.get_mut().take();
         for local in 0..self.rows.len() {
             let offset = self.source_delta + self.offset_at(local).source;
             let current_start = self.rows[local]
@@ -72,6 +103,8 @@ pub(crate) struct RetainedRows {
     work: RowWork,
     #[cfg(test)]
     selection_reads: Cell<usize>,
+    #[cfg(test)]
+    search_scanned_rows: Cell<usize>,
 }
 
 /// Source and physical-line displacement of blocks after one local edit.
@@ -112,6 +145,11 @@ impl RetainedRows {
     #[cfg(test)]
     pub(crate) fn selection_reads(&self) -> usize {
         self.selection_reads.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn search_scanned_rows(&self) -> usize {
+        self.search_scanned_rows.get()
     }
 
     pub(crate) fn build(
@@ -158,6 +196,7 @@ impl RetainedRows {
                     }
                     row_prefix.push(row_prefix.last().unwrap() + rows.len());
                     RowChunk {
+                        search: RefCell::new(None),
                         rows,
                         line_numbers,
                         jump_targets,
@@ -198,6 +237,8 @@ impl RetainedRows {
             },
             #[cfg(test)]
             selection_reads: Cell::new(0),
+            #[cfg(test)]
+            search_scanned_rows: Cell::new(0),
         }
     }
 
@@ -276,6 +317,82 @@ impl RetainedRows {
 
     pub(crate) fn block_link_count(&self, index: usize) -> Option<usize> {
         self.chunks.get(index).map(|chunk| chunk.links.len())
+    }
+
+    pub(crate) fn clear_search_cache(&mut self) {
+        for chunk in &mut self.chunks {
+            chunk.search.get_mut().take();
+        }
+    }
+
+    /// Reuse matches in untouched chunks and apply their lazy source offsets.
+    /// Only changed text or link-marker numbering requires another glyph scan.
+    pub(crate) fn search_offsets(
+        &self,
+        search: &RenderedSearch,
+        model: &BlockModel,
+        highlighter: &Highlighter,
+        width: u16,
+    ) -> Vec<usize> {
+        let mut offsets = Vec::new();
+        let mut preceding_links = 0;
+        let mut pattern = self.chunks.iter().find_map(|chunk| {
+            let cached = chunk.search.borrow();
+            cached
+                .as_ref()
+                .filter(|cached| cached.pattern.as_ref() == search.pattern)
+                .map(|cached| Arc::clone(&cached.pattern))
+        });
+        for (index, chunk) in self.chunks.iter().enumerate() {
+            let mut cached = chunk.search.borrow_mut();
+            if cached.as_ref().is_none_or(|cached| {
+                cached.pattern.as_ref() != search.pattern
+                    || cached.marker_delta != chunk.marker_delta
+            }) {
+                let matches = if chunk.marker_delta == 0 {
+                    row_matches(search, &chunk.rows, 0)
+                } else {
+                    let replacement = render_block_chunk(
+                        model,
+                        index,
+                        width,
+                        highlighter,
+                        self.preceding_content_source(index),
+                        index > 0,
+                        preceding_links,
+                    );
+                    assert_eq!(replacement.lines.len(), chunk.rows.len());
+                    let mut matches = row_matches(search, &replacement.lines, 0);
+                    for found in &mut matches {
+                        found.source = found
+                            .source
+                            .checked_add_signed(
+                                -chunk.source_delta - chunk.offset_at(found.row).source,
+                            )
+                            .unwrap();
+                    }
+                    matches
+                };
+                #[cfg(test)]
+                self.search_scanned_rows
+                    .set(self.search_scanned_rows.get() + chunk.rows.len());
+                *cached = Some(ChunkSearch {
+                    pattern: Arc::clone(
+                        pattern.get_or_insert_with(|| Arc::from(search.pattern.as_str())),
+                    ),
+                    marker_delta: chunk.marker_delta,
+                    matches,
+                });
+            }
+            offsets.extend(cached.as_ref().unwrap().matches.iter().map(|found| {
+                found
+                    .source
+                    .checked_add_signed(chunk.source_delta + chunk.offset_at(found.row).source)
+                    .unwrap()
+            }));
+            preceding_links += chunk.links.len();
+        }
+        offsets
     }
 
     /// Splice complete code-source lines while retaining every untouched row.
@@ -406,6 +523,26 @@ impl RetainedRows {
             })
             .collect::<Vec<_>>();
         let chunk = &mut self.chunks[index];
+        if let Some(cached) = chunk.search.get_mut() {
+            let first = cached
+                .matches
+                .partition_point(|found| found.row < start_local);
+            let after = cached
+                .matches
+                .partition_point(|found| found.row < after_local);
+            for found in &mut cached.matches[after..] {
+                found.row = found.row - removed_count + added_count;
+            }
+            // Newly rendered rows already use current source coordinates, and
+            // the offset table below gives this inserted interval zero shift.
+            let search = RenderedSearch::new(&cached.pattern);
+            cached
+                .matches
+                .splice(first..after, row_matches(&search, &added, start_local));
+            #[cfg(test)]
+            self.search_scanned_rows
+                .set(self.search_scanned_rows.get() + added_count);
+        }
         let mut offsets = chunk
             .offsets
             .iter()
@@ -1031,6 +1168,7 @@ impl RetainedRows {
                 .map(|line| line.source.clone())
                 .or(preceding);
             replacements.push(RowChunk {
+                search: RefCell::new(None),
                 line_numbers: rendered_line_numbers_indexed(
                     &rendered.lines,
                     highlighter.line_starts(),
@@ -1167,6 +1305,7 @@ impl RetainedRows {
             };
         }
         self.chunks[index] = RowChunk {
+            search: RefCell::new(None),
             line_numbers: rendered_line_numbers(
                 &replacement.lines,
                 text.len(),
@@ -1254,6 +1393,7 @@ impl RetainedRows {
             first_marker,
         );
         self.chunks[index] = RowChunk {
+            search: RefCell::new(None),
             line_numbers: rendered_line_numbers(
                 &replacement.lines,
                 text.len(),
@@ -1557,6 +1697,7 @@ mod tests {
                     .or(preceding);
                 rendered_rows += chunk.lines.len();
                 replacements.push(RowChunk {
+                    search: RefCell::new(None),
                     line_numbers: numbers,
                     rows: chunk.lines,
                     jump_targets: chunk.jump_targets,
@@ -2067,6 +2208,7 @@ mod tests {
             crlf in any::<bool>(),
             index in 0usize..64,
             replacement in prop_oneof![Just("é"), Just("🙂"), Just("e"), Just(""), Just("x\n")],
+            pattern in prop_oneof![Just("é"), Just("🙂"), Just("value"), Just("caf"), Just("x")],
         ) {
             let eol = if crlf { "\r\n" } else { "\n" };
             let mut text = format!("# Title{eol}{eol}```{language}{eol}");
@@ -2079,6 +2221,8 @@ mod tests {
             let (layout, fences, boundaries) =
                 RenderedLayout::build_with_boundaries(model.model(), 100, &highlighter, false);
             let mut rows = RetainedRows::from_complete(layout, fences, &boundaries);
+            let search = RenderedSearch::new(pattern);
+            rows.search_offsets(&search, model.model(), &highlighter, 100);
             let target = format!("value_{index:03} = \"caf");
             let at = text.find(&target).unwrap() + target.len();
             let edit = TextEdit {
@@ -2126,6 +2270,11 @@ mod tests {
                 &fresh_highlighter,
                 false,
             );
+            let mut actual_matches = rows.search_offsets(&search, model.model(), &highlighter, 100);
+            let mut expected_matches = expected.lines.iter().flat_map(|row| search.source_match_offsets(row)).collect::<Vec<_>>();
+            actual_matches.sort_unstable();
+            expected_matches.sort_unstable();
+            prop_assert_eq!(actual_matches, expected_matches);
             prop_assert_eq!(rows.row_count(), expected.lines.len());
             for (row, line) in expected.lines.iter().enumerate() {
                 let actual = rows.row(row);

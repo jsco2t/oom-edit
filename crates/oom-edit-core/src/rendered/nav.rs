@@ -78,6 +78,26 @@ impl RenderedSearch {
         matches
     }
 
+    /// Map searchable glyphs through their parser-owned source atoms.
+    pub(crate) fn source_match_offsets(&self, row: &crate::style::RenderedLine) -> Vec<usize> {
+        use unicode_width::UnicodeWidthStr;
+
+        if row.kind != LineKind::Content {
+            return Vec::new();
+        }
+        self.find_matches(&row.styled.text)
+            .into_iter()
+            .map(|start| {
+                let column = row.styled.text[..start].width();
+                row.atoms
+                    .iter()
+                    .find(|atom| atom.columns.contains(&column) || atom.columns.start == column)
+                    .and_then(|atom| atom.source.as_ref())
+                    .map_or(row.source.start, |source| source.start)
+            })
+            .collect()
+    }
+
     /// Set the search direction.
     pub fn set_direction(&mut self, direction: SearchDirection) {
         self.last_direction = direction;

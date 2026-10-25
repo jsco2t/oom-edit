@@ -307,12 +307,35 @@ dictionary membership changes which surrounding words are diagnosed. The
 fixture has separate paragraphs and 1,000 other misspellings on the corrected
 line. It measures additional diagnostic maintenance during a local correction;
 it does not assert a universal correction latency for a single huge paragraph.
-Search index construction may inspect all rendered rows after invalidation,
-while unchanged queries reuse the index. The navigation fixture checks that
+The cold search index scans searchable rendered glyphs through their source
+atoms. Retained row chunks cache match offsets for the current pattern;
+local edits rescan only replaced chunks, and fence splices update only the
+changed source rows. Untouched matches follow the row store's lazy source
+offsets. Rebuilding the sorted summary visits cached matches without copying
+off-screen rendered rows; unchanged queries reuse that summary. Pattern,
+width, link-marker and global document changes still invalidate the affected
+cache. The navigation fixture checks that
 repeated visual motion does not edit text or build the full rendered document.
 These guards and the complete interaction comparison establish measured
 regression coverage, rather than an identical-performance claim for every
 possible Markdown document or host.
+
+`make test-search-work` checks deterministic row-copy and glyph-scan work, and
+compares every logical-line ordinal against fresh rendering across edits,
+source shifts, fence splices, undo/redo, changed patterns and resized layouts.
+
+`make bench-search-interactions` runs active-search and cleared-search typing
+on the fixed 1 MiB mixed fixture at top and midpoint, five fresh processes and
+21 insert/delete cycles per case (840 observations, 100x41). Both variants
+first submit the same search and enter Insert at the same source position;
+the control clears it with `:noh` before timing. Every edit restores the
+expected text and checks the exact search total after its completed frame.
+Each case retains the <50 ms p99 local-edit budget. Median active-search
+render and total time must not exceed the cleared control by both more than
+10% and more than 100 microseconds; median process peak RSS uses the existing
+5% and 1 MiB allowances. The runner writes raw evidence, including failed
+runs, with `OUTPUT=/path/to/search.jsonl`. `make bench` includes this gate;
+the original 12-case comparison inventory remains unchanged.
 
 ## Exact 1 MiB kitchen-sink interaction acceptance
 

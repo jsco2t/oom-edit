@@ -1,5 +1,9 @@
 """Contract tests for repeated public-pane interaction measurements."""
 
+import contextlib
+import io
+import json
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -77,6 +81,66 @@ class InteractionPerformanceTests(unittest.TestCase):
         ):
             self.assertIn(case, perf.CASES)
         self.assertEqual(perf.CASE_CLASSES["source-reference"], "mixed-reference")
+
+    def search_rows(self):
+        return [
+            {"case": case, "step": step, "trial": trial, "cycle": cycle,
+             "render_ns": 1_000_000, "total_ns": 2_000_000,
+             "peak_rss_bytes": 40 * 1024 * 1024}
+            for case in perf.SEARCH_GATE_CASES for trial in range(5)
+            for cycle in range(21) for step in perf.CASES[case]
+        ]
+
+    def test_search_gate_requires_active_and_cleared_top_and_midpoint_cases(self):
+        self.assertEqual(perf.SEARCH_GATE_CASES, (
+            "source-search", "source-search-cleared",
+            "source-search-mid", "source-search-cleared-mid",
+        ))
+        rows = self.search_rows()
+        self.assertEqual(len(rows), 840)
+        self.assertEqual(perf.search_gate_failures(rows, 5, 21), [])
+        for missing in perf.SEARCH_GATE_CASES:
+            with self.assertRaises(ValueError):
+                perf.search_gate_failures([row for row in rows if row["case"] != missing], 5, 21)
+
+    def test_search_overhead_keeps_existing_time_and_memory_allowances(self):
+        for metric, allowance in (("render_ns", 100_000), ("total_ns", 200_000),
+                                  ("peak_rss_bytes", 2 * 1024 * 1024)):
+            for extra, fails in ((0, False), (1, True)):
+                rows = self.search_rows()
+                for row in rows:
+                    if row["case"] == "source-search-mid" and row["step"] == "insert":
+                        row[metric] += allowance + extra
+                with self.subTest(metric=metric, extra=extra):
+                    failures = perf.search_gate_failures(rows, 5, 21)
+                    self.assertEqual(bool(failures), fails)
+                    if fails:
+                        self.assertEqual(failures, [f"source-search-mid/insert/{metric} search overhead"])
+        rows = self.search_rows()
+        for row in rows:
+            if row["case"] == "source-search":
+                row["total_ns"] = perf.LOCAL_LIMIT_NS
+        self.assertIn("source-search/insert", perf.search_gate_failures(rows, 5, 21))
+
+    def test_failed_search_gate_preserves_every_raw_observation(self):
+        def sample(_binary, _class_name, _size, case, iterations):
+            return [
+                {"case": case, "step": step, "input_ns": 800_000,
+                 "render_ns": 3_000_000 if case == "source-search" else 1_000_000,
+                 "total_ns": 4_000_000 if case == "source-search" else 2_000_000,
+                 "peak_rss_bytes": 40 * 1024 * 1024}
+                for _ in range(iterations) for step in perf.CASES[case]
+            ]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "failed.jsonl"
+            with patch("sys.argv", ["interaction_performance", "--binary", "probe",
+                                    "--search-gate", "--output", str(output)]), \
+                    patch.object(perf, "sample", side_effect=sample), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(perf.main(), 1)
+            rows = [json.loads(line) for line in output.read_text().splitlines()]
+            self.assertEqual(len(rows), 840)
+            self.assertEqual({row["case"] for row in rows}, set(perf.SEARCH_GATE_CASES))
 
     def test_return_gate_separates_exactly_one_first_render_per_trial(self):
         rows = [

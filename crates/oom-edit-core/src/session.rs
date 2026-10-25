@@ -278,6 +278,231 @@ mod tests {
     }
 
     #[test]
+    fn active_search_edits_do_not_copy_the_complete_retained_document() {
+        let text = crate::realistic_fixtures::generate("mixed", 256 * 1024);
+        let mut session = EditorSession::from_text(&text);
+        session.rendered_viewport(100, 0, 41);
+        session
+            .rendered_state
+            .search
+            .replace_last(RenderedSearch::new("paragraph"));
+        let expected = session.search_status().unwrap().total;
+        session
+            .jump_to_offset(text.find("A paragraph").unwrap())
+            .unwrap();
+        session.handle_key(key('i'));
+        let before = session
+            .rendered_state
+            .row_cache
+            .as_ref()
+            .unwrap()
+            .selection_reads();
+        let scanned = session
+            .rendered_state
+            .row_cache
+            .as_ref()
+            .unwrap()
+            .search_scanned_rows();
+        session.handle_key(key('x'));
+        assert_eq!(session.search_status().unwrap().total, expected);
+        let after = session
+            .rendered_state
+            .row_cache
+            .as_ref()
+            .unwrap()
+            .selection_reads();
+        assert_eq!(
+            after, before,
+            "search counts copied off-screen rendered rows"
+        );
+        let rows = session.rendered_state.row_cache.as_ref().unwrap();
+        assert!(
+            rows.search_scanned_rows() - scanned < 64,
+            "search rescanned untouched blocks"
+        );
+        let scanned = rows.search_scanned_rows();
+        assert_eq!(session.search_status().unwrap().total, expected);
+        assert_eq!(
+            session
+                .rendered_state
+                .row_cache
+                .as_ref()
+                .unwrap()
+                .search_scanned_rows(),
+            scanned
+        );
+    }
+
+    fn assert_active_search_matches_fresh(session: &EditorSession, width: u16) {
+        let search = session.rendered_search().unwrap();
+        let text = session.document();
+        let mut fresh = EditorSession::from_text(&text);
+        let expected = search::SearchIndex::build(search, width, &fresh.render_layout(width).lines);
+        let source_lines = session.live.highlighter().line_starts();
+        assert_eq!(
+            session.search_status().unwrap(),
+            expected.status(session.cursor().0, source_lines)
+        );
+        let actual = session.rendered_state.search_index.borrow();
+        for line in 0..source_lines.len() {
+            assert_eq!(
+                actual.as_ref().unwrap().status(line, source_lines),
+                expected.status(line, source_lines),
+                "search ordinal drifted on source line {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn active_search_flat_to_retained_handoff_primes_match_caches() {
+        let text = "how how\n\n".repeat(256);
+        let mut session = EditorSession::from_text(&text);
+        session.render_layout(80);
+        session
+            .rendered_state
+            .search
+            .replace_last(RenderedSearch::new("how"));
+        assert_eq!(session.search_status().unwrap().total, 512);
+        session.handle_key(key('i'));
+        let before = session
+            .rendered_state
+            .row_cache
+            .as_ref()
+            .unwrap()
+            .search_scanned_rows();
+        assert!(before > 256);
+        session.handle_key(key('x'));
+        assert_eq!(session.search_status().unwrap().total, 512);
+        let rows = session.rendered_state.row_cache.as_ref().unwrap();
+        assert!(rows.search_scanned_rows() - before < 4);
+    }
+
+    #[test]
+    fn active_search_counts_match_fresh_after_shifts_markers_undo_and_resize() {
+        let text = format!(
+            "---\ntitle: Café how\n---\n\n# how &amp; \\*how\\* 🙂\n\nhow how\n\n{}\n| how | café |\n|---|---|\n| `how` | &amp; |\n\nA how [^note].\n\n[^note]: how footnote\n",
+            "how [link](https://how.invalid)\n\n".repeat(12),
+        );
+        for pattern in ["how", "1", "2", "🙂", "&"] {
+            let mut session = EditorSession::from_text(&text);
+            session.rendered_viewport(32, 0, 20);
+            session
+                .rendered_state
+                .search
+                .replace_last(RenderedSearch::new(pattern));
+            assert_active_search_matches_fresh(&session, 32);
+            session
+                .jump_to_offset(text.find("how how").unwrap())
+                .unwrap();
+            session.handle_key(key('i'));
+            for inserted in ["x", "how", "\n", "[extra](https://extra.invalid) ", "🙂"] {
+                session.insert_paste(inserted);
+                assert_active_search_matches_fresh(&session, 32);
+            }
+            session.handle_key(special(KeyCodeKind::Backspace));
+            assert_active_search_matches_fresh(&session, 32);
+            session.handle_key(esc());
+            session.handle_key(key('u'));
+            assert_active_search_matches_fresh(&session, 32);
+            session.handle_key(ctrl('r'));
+            assert_active_search_matches_fresh(&session, 32);
+            for width in [13, 80] {
+                session.rendered_viewport(width, 0, 20);
+                assert_active_search_matches_fresh(&session, width);
+            }
+            session
+                .rendered_state
+                .search
+                .replace_last(RenderedSearch::new("link"));
+            assert_active_search_matches_fresh(&session, 80);
+            session.clear_search();
+            assert!(session.search_status().is_none());
+            session
+                .rendered_state
+                .search
+                .replace_last(RenderedSearch::new(pattern));
+            assert_active_search_matches_fresh(&session, 80);
+        }
+    }
+
+    #[test]
+    fn active_search_refreshes_lazy_link_markers_after_local_link_insertions() {
+        let text = format!("before\n\n{}", "[how](https://how.invalid)\n\n".repeat(12));
+        let mut session = EditorSession::from_text(&text);
+        session.rendered_viewport(32, 0, 20);
+        session
+            .rendered_state
+            .search
+            .replace_last(RenderedSearch::new("1"));
+        assert_active_search_matches_fresh(&session, 32);
+        session.jump_to_offset(0).unwrap();
+        session.handle_key(key('i'));
+        for inserted in [
+            "[added](https://added.invalid) ",
+            "x",
+            "[more](https://more.invalid) ",
+        ] {
+            session.insert_paste(inserted);
+            assert!(
+                session.rendered_state.row_cache.is_some(),
+                "local link edits must retain suffix chunks"
+            );
+            assert_active_search_matches_fresh(&session, 32);
+        }
+    }
+
+    #[test]
+    fn active_search_fence_splices_scan_only_changed_rows_with_lazy_offsets() {
+        let text = format!(
+            "before how\n\n```rust\n{}\n```\n\nafter how\n",
+            "fn how() { let value = 1; } // how\n".repeat(256)
+        );
+        let mut session = EditorSession::from_text(&text);
+        session.rendered_viewport(80, 0, 20);
+        session
+            .rendered_state
+            .search
+            .replace_last(RenderedSearch::new("how"));
+        assert_active_search_matches_fresh(&session, 80);
+        session.jump_to_offset(0).unwrap();
+        session.handle_key(key('i'));
+        session.insert_paste("x");
+        assert_active_search_matches_fresh(&session, 80);
+        for line in [128, 64, 192, 129] {
+            let offset = session.live.highlighter().line_starts()[line + 1] - 1;
+            session.jump_to_offset(offset).unwrap();
+            for kind in [
+                KeyCodeKind::Char('x'),
+                KeyCodeKind::Backspace,
+                KeyCodeKind::Enter,
+            ] {
+                let before = session
+                    .rendered_state
+                    .row_cache
+                    .as_ref()
+                    .unwrap()
+                    .search_scanned_rows();
+                session.handle_key(special(kind));
+                assert_active_search_matches_fresh(&session, 80);
+                let rows = session
+                    .rendered_state
+                    .row_cache
+                    .as_ref()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "lost retained rows after {kind:?} on {line}; incremental fence {}",
+                            session.live.highlighter().fence_edit_is_incremental()
+                        )
+                    });
+                assert!(
+                    rows.search_scanned_rows() - before <= 3,
+                    "fence search rescanned unchanged lines"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn rendered_line_delete_and_undo_keep_indexed_rows_current() {
         let text = crate::realistic_fixtures::generate("mixed", 1024 * 1024);
         let mut session = EditorSession::from_text(&text);
@@ -3619,22 +3844,16 @@ impl EditorSession {
             .as_ref()
             .is_none_or(|index| index.pattern != search.pattern || index.width != width)
         {
-            let source_lines = self.live.highlighter().line_starts();
             let index = if let Some(layout) = &self.rendered_state.layout_cache {
-                search::SearchIndex::build(search, width, &layout.lines, source_lines)
+                search::SearchIndex::build(search, width, &layout.lines)
             } else if let Some(rows) = &self.rendered_state.row_cache {
-                let lines = rows.rows_current_range(
-                    0..rows.row_count(),
+                let offsets = rows.search_offsets(
+                    search,
                     self.live.rendered_model(),
                     self.live.highlighter(),
                     width,
                 );
-                search::SearchIndex::build(
-                    search,
-                    width,
-                    lines.iter().map(|(_, line)| line),
-                    source_lines,
-                )
+                search::SearchIndex::from_offsets(search, width, offsets)
             } else {
                 let text = self.live.text_ref();
                 let model = crate::rendered::RetainedBlockModel::new(text);
@@ -3644,7 +3863,7 @@ impl EditorSession {
                     self.live.highlighter(),
                     self.rendered_state.fm_collapsed,
                 );
-                search::SearchIndex::build(search, width, &layout.lines, source_lines)
+                search::SearchIndex::build(search, width, &layout.lines)
             };
             *cached = Some(index);
         }
@@ -3652,7 +3871,7 @@ impl EditorSession {
             cached
                 .as_ref()
                 .expect("search index was prepared")
-                .status(self.cursor().0),
+                .status(self.cursor().0, self.live.highlighter().line_starts()),
         )
     }
 
@@ -3663,6 +3882,9 @@ impl EditorSession {
         self.live.clear_search_highlight();
         self.rendered_state.search.clear();
         self.rendered_state.search_index.get_mut().take();
+        if let Some(rows) = &mut self.rendered_state.row_cache {
+            rows.clear_search_cache();
+        }
     }
 
     /// Return renderer-neutral Select metadata, or `None` outside Select.
@@ -4762,6 +4984,21 @@ impl EditorSession {
         } else {
             RetainedRows::from_complete(layout, fences, &boundaries)
         };
+        if let Some(search) = self
+            .rendered_state
+            .search
+            .current()
+            .filter(|search| !search.pattern.is_empty())
+        {
+            let offsets = rows.search_offsets(
+                search,
+                self.live.rendered_model(),
+                self.live.highlighter(),
+                width,
+            );
+            *self.rendered_state.search_index.get_mut() =
+                Some(search::SearchIndex::from_offsets(search, width, offsets));
+        }
         self.rendered_state.code_fence_regions = rows.fence_regions();
         self.rendered_state.row_cache = Some(rows);
     }

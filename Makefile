@@ -429,6 +429,7 @@ bench: ## Run exact asserting release performance gates
 	cargo bench --workspace --offline --locked
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/tui_performance.py gate
 	$(MAKE) bench-pane-frame
+	$(MAKE) bench-search-interactions
 
 .PHONY: bench-pane-frame
 bench-pane-frame: ## Assert 200x60 owned-frame conversion is at most 1 ms in release
@@ -666,6 +667,17 @@ test-search-status: ## Verify search counts, clearing and meaningful help throug
 .PHONY: bench-round2
 bench-round2: ## Assert active-search, wrapped-source and spelling regression performance
 	OOM_BENCH_ROUND2_ONLY=1 cargo bench --package oom-edit-core --bench performance --offline --locked
+
+.PHONY: test-search-work
+test-search-work: ## Verify bounded retained search counting and exact search status
+	cargo test --package oom-edit-core --lib --offline --locked active_search_
+	cargo test --package oom-edit-core --lib --offline --locked local_unicode_fence_edits_keep_full_source_and_rendered_fidelity
+	$(MAKE) test-search-status
+
+.PHONY: bench-search-interactions
+bench-search-interactions: ## Compare active/cleared search typing on 1 MiB mixed notes at top and midpoint
+	cargo build --release --package oom-edit --example performance_realistic --offline --locked
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/interaction_performance.py --search-gate --binary target/release/examples/performance_realistic --trials 5 --iterations 21 $(if $(OUTPUT),--output $(OUTPUT),)
 
 .PHONY: test-insert-navigation
 test-insert-navigation: ## Verify exact Insert newlines and wrapped cursor movement in core and pane
